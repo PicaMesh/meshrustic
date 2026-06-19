@@ -1,0 +1,34 @@
+[package]
+name = "nrf52840"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+embassy-executor = { version = "0.7.0", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-time = { version = "0.4.0", features = ["defmt"] }
+embassy-nrf = { version = "0.3.0", features = ["defmt", "nrf52840", "time-driver-rtc1", "gpiote", "nfc-pins-as-gpio"] }
+embassy-sync = { version = "0.6.0", features = ["defmt"] }
+embassy-futures = "0.1.1"
+embassy-usb = { version = "0.3.0", features = ["defmt"] }
+embedded-hal-bus = "0.1"
+mesh-crypto = { path = "../../crates/mesh-crypto" }
+mesh-radio = { path = "../../crates/mesh-radio" }
+mesh-protocol = { path = "../../crates/mesh-protocol" }
+mesh-routing = { path = "../../crates/mesh-routing" }
+mesh-store = { path = "../../crates/mesh-store" }
+heapless = "0.8"
+static_cell = "2"
+sx126x = "0.3"
+defmt = "0.3"
+defmt-rtt = "0.4"
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+critical-section = "1"
+cortex-m-rt = "0.7"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+
+[features]
+default = []
+# Link for Adafruit UF2 bootloader @ 0x26000 (nice!nano and similar).
+nicenano = []

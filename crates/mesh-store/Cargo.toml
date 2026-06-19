@@ -1,0 +1,17 @@
+[package]
+name = "mesh-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MeshRustic NodeDB flash layout and defaults"
+
+[dependencies]
+mesh-crypto = { path = "../mesh-crypto", features = ["pki"] }
+mesh-radio = { path = "../mesh-radio" }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
+
+[features]
+default = ["pki"]
+pki = ["mesh-crypto/pki", "x25519-dalek"]
+std = []

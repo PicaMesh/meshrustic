@@ -1,0 +1,23 @@
+[package]
+name = "rpi-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rpi-app"
+path = "src/main.rs"
+
+[dependencies]
+mesh-protocol = { path = "../../crates/mesh-protocol", features = ["prost"] }
+mesh-routing = { path = "../../crates/mesh-routing", features = ["std"] }
+mesh-crypto = { path = "../../crates/mesh-crypto", features = ["pki"] }
+mesh-store = { path = "../../crates/mesh-store", features = ["pki"] }
+mesh-radio = { path = "../../crates/mesh-radio" }
+
+[dev-dependencies]
+heapless = "0.8"
+prost = "0.13"
+static_cell = "2"
+hex = "0.4"

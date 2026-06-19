@@ -1,0 +1,21 @@
+MeshRustic third-party notices
+===============================
+
+MeshRustic is Copyright (C) 2026 PicaMesh and dual-licensed under AGPL-3.0
+(see LICENSE) or a commercial license from PicaMesh (see LICENSE-COMMERCIAL.md).
+
+This project links to open-source Rust crates at build time. Each dependency
+retains its own license (typically MIT OR Apache-2.0). Run `cargo license`
+inside the dev container for a full inventory before release builds.
+
+Bundled tooling (not linked into firmware binaries):
+
+- `boards/nrf52840/scripts/uf2/uf2conv.py` and `uf2families.json` — MIT
+  License, Microsoft Corporation (UF2 format utilities).
+
+Wire interoperability
+-----------------------
+
+MeshRustic devices may exchange packets with other LoRa mesh nodes that use
+the same public wire encoding. That interoperability is a functional
+requirement and does not incorporate third-party source code into this tree.

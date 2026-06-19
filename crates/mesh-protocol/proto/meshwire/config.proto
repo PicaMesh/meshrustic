@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package meshwire;
+
+message Config {
+  message DeviceConfig {
+    enum Role {
+      CLIENT = 0;
+      CLIENT_MUTE = 1;
+      ROUTER = 2;
+      ROUTER_CLIENT = 3 [deprecated = true];
+      REPEATER = 4 [deprecated = true];
+      TRACKER = 5;
+      SENSOR = 6;
+      TAK = 7;
+      CLIENT_HIDDEN = 8;
+      LOST_AND_FOUND = 9;
+      TAK_TRACKER = 10;
+      ROUTER_LATE = 11;
+      CLIENT_BASE = 12;
+    }
+  }
+}

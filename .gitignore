@@ -1,0 +1,90 @@
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
+# Build output for every board (boards/*/target, plus any future
+# workspace-level target/) — never commit compiled artifacts.
+target/
+
+# rustfmt backup files
+**/*.rs.bk
+
+# NOTE: Cargo.lock is intentionally NOT listed here. Every board builds a
+# binary (firmware/app), not a library, so its Cargo.lock should be
+# committed — that's what makes `just build <board>` reproducible
+# bit-for-bit between developers and CI. Generic Rust .gitignore templates
+# often ignore Cargo.lock; that guidance is for library crates only.
+
+# ---------------------------------------------------------------------------
+# Embedded build/debug artifacts
+# ---------------------------------------------------------------------------
+*.coredump
+*.gdb_history
+.gdbinit.local
+*.log
+
+# Stray firmware images if someone manually copies output to the repo
+# root instead of leaving it in target/. If you deliberately want to
+# commit a release artifact somewhere (e.g. a /releases dir), carve out
+# an exception: `!releases/*.uf2`.
+/*.elf
+/*.bin
+/*.hex
+/*.uf2
+
+# NOTE: memory.x, link.x, and other linker-script files ARE source files
+# for these boards, not build output — don't add `*.x` or `*.ld` here.
+
+# ---------------------------------------------------------------------------
+# Docker / Compose
+# ---------------------------------------------------------------------------
+# Personal local overrides / secrets for docker compose. Keep an
+# .env.example committed, never the real .env.
+.env
+.env.*
+!.env.example
+
+# CI-only cargo cache bind mount (see docker-compose.ci.yml) — a local
+# cache directory, not part of the repo.
+.ci-cache/
+.cargo-home/
+
+# NOTE: docker-compose.override.yml IS committed in this repo — it's the
+# shared USB/--privileged config every developer needs, not a personal
+# override. Most Docker .gitignore templates ignore *.override.yml by
+# convention; don't copy that rule here.
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs — personal state only, never shared config
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.zed/
+.cursor/
+.claude/
+*.swp
+*.swo
+*~
+
+# NOTE: boards/*/.cargo/config.toml IS committed — it's the probe-rs/
+# espflash runner config every developer needs. Do not add a blanket
+# `.cargo/` ignore rule, or you'll exclude this by accident.
+
+# ---------------------------------------------------------------------------
+# Local scratch (not part of the shared repo)
+# ---------------------------------------------------------------------------
+tmp/
+
+# ---------------------------------------------------------------------------
+# OS cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Secrets — e.g. the SSH key used by `just deploy-rpi`
+# ---------------------------------------------------------------------------
+*.pem
+id_rsa
+id_ed25519
+*.p12

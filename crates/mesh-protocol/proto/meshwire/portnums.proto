@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package meshwire;
+
+enum PortNum {
+  UNKNOWN_APP = 0;
+  NODEINFO_APP = 4;
+  ROUTING_APP = 5;
+  TRACEROUTE_APP = 70;
+  SIGNAL_ROUTING_APP = 88;
+  MAX = 511;
+}

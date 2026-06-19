@@ -1,0 +1,2 @@
+# Keep the host wrapper executable on all platforms (LF shebang; no CRLF).
+just text eol=lf

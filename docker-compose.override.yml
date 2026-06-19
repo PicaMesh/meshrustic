@@ -1,0 +1,19 @@
+# Auto-loaded by `docker compose` whenever it's run from this directory
+# (no -f flag needed) — this is the standard Compose override convention.
+# CI explicitly sets COMPOSE_FILE to skip this file, since CI runners have
+# no hardware and some platforms don't have /dev/bus/usb at all.
+#
+# USB access for probe-rs (nRF52840 / RP2040) and espflash (ESP32 family).
+# Linux: works as-is. Windows: attach the device into WSL2 first with
+# `usbipd attach --wsl --busid <id>`, then run `./just` from a WSL2 shell.
+# macOS: USB passthrough isn't available in Docker Desktop's VM — build
+# and test work fine here, but run `./just flash` from Linux or WSL2.
+services:
+  dev:
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    # Simplest reliable way to reach dynamically-named /dev/ttyUSB*,
+    # /dev/ttyACM* serial ports used by espflash. If you'd rather avoid
+    # --privileged, replace with explicit `--device=/dev/ttyACM0` entries
+    # and a matching udev rule on the host.
+    privileged: true

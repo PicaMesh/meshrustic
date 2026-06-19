@@ -1,0 +1,15 @@
+[package]
+name = "mesh-radio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MeshRustic radio HAL traits, AirTime, and EU_868 constants"
+
+[dependencies]
+heapless = "0.8"
+mesh-crypto = { path = "../mesh-crypto" }
+
+[features]
+default = []
+std = []

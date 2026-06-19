@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "boards/nrf52840",
+    "boards/rpi-app",
+    "crates/mesh-crypto",
+    "crates/mesh-protocol",
+    "crates/mesh-radio",
+    "crates/mesh-routing",
+    "crates/mesh-store",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later OR LicenseRef-PicaMesh-Commercial"
+publish = false
+
+[profile.release]
+debug = 2

@@ -1,0 +1,20 @@
+[package]
+name = "mesh-routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MeshRustic routing core (static pools, unified Router)"
+
+[dependencies]
+mesh-crypto = { path = "../mesh-crypto" }
+mesh-protocol = { path = "../mesh-protocol" }
+mesh-radio = { path = "../mesh-radio" }
+heapless = "0.8"
+
+[features]
+default = []
+std = []
+
+[dev-dependencies]
+static_cell = "2"

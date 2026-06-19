@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Explicitly excludes docker-compose.override.yml (USB/privileged) — CI
+# runners have no attached hardware, and `devices: /dev/bus/usb` would
+# fail to start on a runner that doesn't have that path at all.
+env:
+  COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/embedded-rust-dev
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: tag
+        run: echo "image=${REGISTRY}/${IMAGE_NAME}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # Same Dockerfile devs build locally — this is the whole point.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.tag.outputs.image }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  check:
+    needs: build-image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Additional boards join this matrix as they are scaffolded (Phase 0+).
+          - board: nrf52840
+            run_tests: false
+          - board: rpi-app
+            run_tests: true
+    env:
+      DEV_IMAGE: ${{ needs.build-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cache/cargo-registry
+            .ci-cache/cargo-git
+            boards/${{ matrix.board }}/target
+          key: cargo-${{ matrix.board }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.board }}-
+
+      - name: Pull dev image
+        run: docker pull "$DEV_IMAGE"
+
+      - run: chmod +x ./just
+      - run: ./just build ${{ matrix.board }}
+      - run: ./just clippy ${{ matrix.board }}
+      - run: ./just fmt-check ${{ matrix.board }}
+      - if: matrix.run_tests
+        run: ./just test ${{ matrix.board }}

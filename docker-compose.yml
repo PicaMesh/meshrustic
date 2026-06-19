@@ -1,0 +1,31 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    # DEV_IMAGE lets CI point this at a freshly-built/pushed tag without
+    # rebuilding; defaults to the locally-built tag for everyday dev use.
+    image: ${DEV_IMAGE:-yourorg/embedded-rust-dev:latest}
+    # Match the host user so bind-mounted files keep correct ownership on
+    # Linux (1000), macOS (501/20), and WSL2. Set by ./just via HOST_UID/GID.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-registry:/opt/cargo/registry
+      - cargo-git:/opt/cargo/git
+    environment:
+      - CARGO_HOME=/workspace/.cargo-home
+      - RUSTUP_HOME=/opt/rustup
+      - HOME=/workspace
+      # Host /tmp is often tiny inside the container; prost/codegen needs scratch space.
+      - TMPDIR=/workspace/.ci-cache/tmp
+    tty: true
+    stdin_open: true
+    # NOTE: USB/privileged access lives in docker-compose.override.yml,
+    # which `docker compose` auto-loads on developer machines but CI
+    # deliberately excludes (no hardware on CI runners; see ci workflow).
+
+volumes:
+  cargo-registry:
+  cargo-git:

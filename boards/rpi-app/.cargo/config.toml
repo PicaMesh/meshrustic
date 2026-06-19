@@ -1,0 +1,5 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Default build target is the host (for `cargo test` in Docker/CI).
+# Cross-build for Pi deployment via `just deploy-rpi` / explicit `--target`.
