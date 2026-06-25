@@ -74,6 +74,7 @@ fn hops_away(hop_start: u8, hop_limit: u8) -> u8 {
 
 /// Fixed-size per-node abuse filter on the RX path.
 pub struct NodeRateLimiter {
+    node_num: u32,
     slots: [Slot; MAX_SLOTS],
 }
 
@@ -85,7 +86,12 @@ impl Default for NodeRateLimiter {
 
 impl NodeRateLimiter {
     pub const fn new() -> Self {
+        Self::with_node_num(0)
+    }
+
+    pub const fn with_node_num(node_num: u32) -> Self {
         Self {
+            node_num,
             slots: [Slot {
                 from: 0,
                 text: Bucket {
@@ -117,6 +123,10 @@ impl NodeRateLimiter {
         hop_limit: u8,
         now_ms: u32,
     ) -> bool {
+        if from == 0 || from == self.node_num {
+            return false;
+        }
+
         let bucket_kind = rate_limit_bucket(decoded_portnum);
         let threshold = match bucket_kind {
             RateLimitBucket::Text => THRESHOLD_TEXT,
@@ -235,6 +245,10 @@ mod tests {
     impl NodeRateLimiter {
         fn is_tracking(&self, from: u32) -> bool {
             self.slots.iter().any(|s| s.from == from)
+        }
+
+        fn active_slot_count(&self) -> usize {
+            self.slots.iter().filter(|s| s.from != 0).count()
         }
     }
 
@@ -438,5 +452,34 @@ mod tests {
         assert_eq!(hops_away(3, 3), 0);
         assert_eq!(hops_away(5, 3), 2);
         assert_eq!(hops_away(2, 5), 0);
+    }
+
+    #[test]
+    fn from_zero_is_never_rate_limited() {
+        let mut limiter = NodeRateLimiter::with_node_num(0xBEEF_BEEF);
+        for i in 0..10 {
+            assert!(
+                !limiter.should_drop(0, None, 3, 3, i * 1000),
+                "from=0 must never drop"
+            );
+        }
+        assert_eq!(limiter.active_slot_count(), 0);
+    }
+
+    #[test]
+    fn own_node_is_never_rate_limited() {
+        let own = 0xCAFE_BABE;
+        let mut limiter = NodeRateLimiter::with_node_num(own);
+        for i in 0..10 {
+            assert!(
+                !limiter.should_drop(own, None, 3, 3, i * 1000),
+                "own node must never drop"
+            );
+            assert!(
+                !limiter.should_drop(own, Some(num::TEXT_MESSAGE_APP), 3, 3, i * 100),
+                "own node text must never drop"
+            );
+        }
+        assert_eq!(limiter.active_slot_count(), 0);
     }
 }

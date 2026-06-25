@@ -263,7 +263,7 @@ impl Router {
             node_num,
             pool: PacketPool::new(),
             history: PacketHistory::new(),
-            rate_limit: NodeRateLimiter::new(),
+            rate_limit: NodeRateLimiter::with_node_num(node_num),
             qos: ChannelQoS::new(),
             graph,
             pending: [PendingRelay {
