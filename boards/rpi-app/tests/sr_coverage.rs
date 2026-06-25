@@ -48,6 +48,7 @@ fn commit_broadcast_relay(graph: &mut NeighborGraph, heard_from: u32) {
         50,
         DEFAULT_SLOT_MS,
         ME,
+        None,
     );
 }
 

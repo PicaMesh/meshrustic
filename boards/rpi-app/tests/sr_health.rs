@@ -53,21 +53,29 @@ fn evaluate_broadcast(router: &mut Router, from: u32, now_ms: u32) -> mesh_routi
 }
 
 #[test]
-fn healthy_topology_allows_suppression() {
+fn healthy_topology_schedules_phased_relay() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let router = ROUTER.init(Router::new(ME));
     setup_stock_relay_topology(router, true);
     assert!(router.graph_mut().topology_healthy_for_broadcast());
-    assert_eq!(
-        router
-            .graph_mut()
-            .find_best_relay_candidate(99, NEIGHBOR, 0),
-        STOCK
-    );
 
-    let plan = evaluate_broadcast(router, NEIGHBOR, 0);
-    assert!(plan.relay.is_none());
-    assert!(router.relay_tx_after(NEIGHBOR, 99, 0).is_none());
+    let half = coordinated_relay::half_airtime_ms(coordinated_relay::DEFAULT_SLOT_MS);
+    let relay_plan = router.graph_mut().plan_broadcast_relay(
+        99,
+        NEIGHBOR,
+        NEIGHBOR,
+        mesh_protocol::NODENUM_BROADCAST,
+        0,
+        half,
+    );
+    assert!(relay_plan.should_relay);
+    assert!(relay_plan.slot_delay_ms >= half);
+
+    let _ = evaluate_broadcast(router, NEIGHBOR, 0);
+    let tx_after = router
+        .relay_tx_after(NEIGHBOR, 99, 0)
+        .expect("healthy SR schedules deferred relay");
+    assert!(tx_after >= half);
 }
 
 #[test]

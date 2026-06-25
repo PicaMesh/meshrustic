@@ -63,6 +63,20 @@ fn three_node_middle_node_defers_to_stock_router() {
     c.merge_topology(0xD000_0004, &header, &[neighbor], true, 0, 0);
 
     assert_eq!(c.find_best_relay_candidate(0x99, 0xB000_0002, 0), 0xD000_0004);
+
+    let half = mesh_routing::coordinated_relay::half_airtime_ms(
+        mesh_routing::coordinated_relay::DEFAULT_SLOT_MS,
+    );
+    let plan = c.plan_broadcast_relay(
+        0x99,
+        0xB000_0002,
+        0xB000_0002,
+        0xFFFF_FFFF,
+        0,
+        half,
+    );
+    assert!(plan.should_relay);
+    assert!(plan.slot_delay_ms >= half);
 }
 
 #[test]

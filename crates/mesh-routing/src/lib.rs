@@ -2,6 +2,7 @@
 #![no_std]
 
 pub mod bridge;
+pub mod broadcast_relay;
 pub mod capability;
 pub mod coordinated_relay;
 pub mod graph;
@@ -23,6 +24,10 @@ pub mod topology;
 pub mod traceroute;
 
 pub use bridge::{BridgeDedupCache, BridgeEval, BridgeLeg, evaluate_bridge_targets, should_bridge_to};
+pub use broadcast_relay::{
+    find_best_relay_candidate as rank_broadcast_relay_candidate, plan_broadcast_relay,
+    BroadcastRelayContext, BroadcastRelayPlan, RelayCandidate, POOR_LINK_ETX_THRESHOLD,
+};
 pub use capability::{CapabilityStatus, CapabilityCache, CAPABILITY_TTL_MS, MAX_CAPABILITY_RECORDS};
 pub use coordinated_relay::{
     cw_size_from_snr, half_airtime_ms, slot_time_for_preset, tx_delay_ms_router, tx_delay_ms_worst,

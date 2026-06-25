@@ -245,6 +245,7 @@ fn enqueue_bridge_leg(
         half_airtime,
         cw_slot_ms,
         node_num,
+        None,
     );
     let delay_ms = tx_after_ms.wrapping_sub(eval.now_ms);
 

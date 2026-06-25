@@ -496,6 +496,34 @@ impl NeighborGraph {
         0
     }
 
+    /// Phased broadcast relay schedule (stock slots → ranked SR → downstream → stock coverage).
+    pub fn plan_broadcast_relay(
+        &self,
+        packet_id: u32,
+        source: u32,
+        heard_from: u32,
+        broadcast_dest: u32,
+        now_ms: u32,
+        half_airtime_ms: u32,
+    ) -> crate::broadcast_relay::BroadcastRelayPlan {
+        let ctx = crate::broadcast_relay::BroadcastRelayContext {
+            my_node: self.my_node,
+            edges: &self.edges,
+            capability: &self.capability,
+            downstream: &self.downstream,
+        };
+        crate::broadcast_relay::plan_broadcast_relay(
+            &ctx,
+            packet_id,
+            source,
+            heard_from,
+            broadcast_dest,
+            now_ms,
+            half_airtime_ms,
+            |node| self.has_node_transmitted(node, packet_id, now_ms),
+        )
+    }
+
     fn fill_stock_relay_candidates(
         &self,
         packet_id: u32,
@@ -962,9 +990,15 @@ impl NeighborGraph {
         half_airtime_ms: u32,
         cw_slot_ms: u32,
         node_num: u32,
+        broadcast_plan: Option<&crate::broadcast_relay::BroadcastRelayPlan>,
     ) -> (u32, u8, u8) {
-        let (slot_index, candidates) = self.relay_slot_index(id, heard_from, now_ms);
-        let spacing = slot_index as u32 * half_airtime_ms.max(50);
+        let half = half_airtime_ms.max(50);
+        let (slot_index, candidates, spacing) = if let Some(plan) = broadcast_plan {
+            (plan.slot_index, plan.candidate_count, plan.slot_delay_ms)
+        } else {
+            let (idx, count) = self.relay_slot_index(id, heard_from, now_ms);
+            (idx, count, idx as u32 * half)
+        };
         let snr_delay = tx_delay_ms_router(snr, cw_slot_ms, from, id, node_num);
         let delay = spacing.saturating_add(snr_delay);
         let tx_after_ms = now_ms.wrapping_add(delay);
@@ -1778,7 +1812,7 @@ mod tests {
     #[test]
     fn rebroadcast_cancels_commit() {
         let mut graph = NeighborGraph::new();
-        graph.commit_relay(1, 2, 0, 8, 1, 100, 20, DEFAULT_SLOT_MS, 0xAA);
+        graph.commit_relay(1, 2, 0, 8, 1, 100, 20, DEFAULT_SLOT_MS, 0xAA, None);
         assert!(graph.relay_tx_after(1, 2, 0).is_some());
         graph.cancel_relay_on_rebroadcast(1, 2, 3, 2, 0xAB, 0xDEAD_BEEF, 100);
         assert!(graph.relay_tx_after(1, 2, 0).is_none());

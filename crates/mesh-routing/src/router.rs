@@ -892,15 +892,26 @@ impl Router {
             now_ms,
         );
 
-        if parsed.to == NODENUM_BROADCAST
+        let half_airtime = half_airtime_ms(slot_ms);
+        let broadcast_plan = if parsed.to == NODENUM_BROADCAST
             && self.graph.signal_routing_active()
             && parsed.from != self.node_num
             && self.graph.topology_healthy_for_broadcast()
         {
-            let best = self
-                .graph
-                .find_best_relay_candidate(parsed.id, heard_from, now_ms);
-            if best != 0 && best != self.node_num {
+            Some(self.graph.plan_broadcast_relay(
+                parsed.id,
+                parsed.from,
+                heard_from,
+                parsed.to,
+                now_ms,
+                half_airtime,
+            ))
+        } else {
+            None
+        };
+
+        if let Some(ref plan) = broadcast_plan {
+            if !plan.should_relay {
                 self.pool.release(handle);
                 self.sr_log.push(SrLogEvent::RelaySkip {
                     from: parsed.from,
@@ -908,6 +919,8 @@ impl Router {
                 });
                 return plan;
             }
+            self.graph
+                .record_node_transmission(self.node_num, parsed.id, now_ms);
         }
 
         if parsed.to != NODENUM_BROADCAST
@@ -1051,7 +1064,6 @@ impl Router {
             }
         }
 
-        let half_airtime = half_airtime_ms(slot_ms);
         let (tx_after_ms, slot_index, candidates) = self.graph.commit_relay(
             parsed.from,
             parsed.id,
@@ -1062,6 +1074,7 @@ impl Router {
             half_airtime,
             cw_slot,
             self.node_num,
+            broadcast_plan.as_ref(),
         );
         let delay_ms = tx_after_ms.wrapping_sub(now_ms);
         self.sr_log.push(SrLogEvent::SlotScheduling {
