@@ -80,7 +80,7 @@ where
                 self.driver.start_rx()?;
                 report.tx_len = Some(len);
             }
-        } else if self.tx_queue.len() > 0 {
+        } else if !self.tx_queue.is_empty() {
             report.duty_cycle_blocked = true;
         }
 
