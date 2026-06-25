@@ -28,11 +28,21 @@ pub fn relay_header_with_next_hop(
     our_node: u32,
     next_hop: u32,
 ) -> Option<PacketHeader> {
+    relay_header_with_next_hop_opts(rx, our_node, next_hop, None)
+}
+
+/// Build a relay header, optionally applying a direct-neighbor hop budget instead of decrementing.
+pub fn relay_header_with_next_hop_opts(
+    rx: &ParsedPacket,
+    our_node: u32,
+    next_hop: u32,
+    direct_neighbor_hop_limit: Option<u8>,
+) -> Option<PacketHeader> {
     if rx.hop_limit == 0 {
         return None;
     }
 
-    let hop_limit = rx.hop_limit - 1;
+    let (hop_limit, hop_start) = relay_hop_fields(rx, direct_neighbor_hop_limit)?;
     let relay_node = (our_node & 0xFF) as u8;
     let next_hop_byte = if next_hop != 0 {
         (next_hop & 0xFF) as u8
@@ -46,12 +56,32 @@ pub fn relay_header_with_next_hop(
         rx.id,
         rx.channel,
         hop_limit,
-        rx.hop_start,
+        hop_start,
         rx.want_ack,
         rx.via_mqtt,
         next_hop_byte,
         relay_node,
     ))
+}
+
+/// Outgoing hop fields for a relay: normal decrement, or a direct-neighbor hop budget.
+pub fn relay_hop_fields(
+    rx: &ParsedPacket,
+    direct_neighbor_hop_limit: Option<u8>,
+) -> Option<(u8, u8)> {
+    if rx.hop_limit == 0 {
+        return None;
+    }
+    match direct_neighbor_hop_limit {
+        Some(limited) => {
+            let hop_start = (rx.hop_start as i16)
+                .saturating_sub(rx.hop_limit as i16)
+                .saturating_add(limited as i16)
+                .saturating_add(1);
+            Some((limited, hop_start.max(0).min(u8::MAX as i16) as u8))
+        }
+        None => Some((rx.hop_limit - 1, rx.hop_start)),
+    }
 }
 
 /// Copy encrypted payload bytes unchanged into a TX pool slot.
@@ -123,5 +153,29 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn direct_neighbor_hop_limit_adjusts_hop_start() {
+        let parsed =
+            PacketHeader::from_fields(0xDD00_00DD, 0xBB00_00BB, 1, 0, 5, 3, false, false, 0, 0)
+                .parse();
+        let hdr =
+            relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(0)).expect("relay");
+        assert_eq!(hdr.hop_limit(), 0);
+        assert_eq!(hdr.hop_start(), 3);
+        assert_eq!(hdr.hop_start().saturating_sub(hdr.hop_limit()), 3);
+    }
+
+    #[test]
+    fn direct_neighbor_hop_limit_marginal_allows_one_hop() {
+        let parsed =
+            PacketHeader::from_fields(0xDD00_00DD, 0xBB00_00BB, 1, 0, 5, 3, false, false, 0, 0)
+                .parse();
+        let hdr =
+            relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(1)).expect("relay");
+        assert_eq!(hdr.hop_limit(), 1);
+        assert_eq!(hdr.hop_start(), 4);
+        assert_eq!(hdr.hop_start().saturating_sub(hdr.hop_limit()), 3);
     }
 }

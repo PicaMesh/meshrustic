@@ -19,7 +19,7 @@ use crate::pool::{PacketHandle, PacketPool, PacketSlot, MAX_PACKET_PAYLOAD};
 use crate::qos::ChannelQoS;
 use crate::rate_limit::NodeRateLimiter;
 use crate::relay_identity::RelayIdentityCache;
-use crate::relay::{copy_opaque_payload, relay_header_with_next_hop, wire_may_relay};
+use crate::relay::{copy_opaque_payload, relay_header_with_next_hop_opts, wire_may_relay};
 use crate::reliable::{
     bump_reliable_delays, due_retransmit, schedule_reliable, stop_reliable, PendingReliable,
     MAX_PENDING_RELIABLE,
@@ -951,7 +951,17 @@ impl Router {
             0
         };
 
-        let relay_hdr = match relay_header_with_next_hop(&parsed, self.node_num, next_hop) {
+        let direct_hop_limit = if parsed.to != NODENUM_BROADCAST {
+            self.graph.unicast_hop_limit_for_direct_neighbor(parsed.to)
+        } else {
+            None
+        };
+        let relay_hdr = match relay_header_with_next_hop_opts(
+            &parsed,
+            self.node_num,
+            next_hop,
+            direct_hop_limit,
+        ) {
             Some(h) => h,
             None => {
                 self.pool.release(handle);

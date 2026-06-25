@@ -1,6 +1,6 @@
 //! Topology graph and per-radio relay commit state (Phase 6 SR).
 
-use mesh_protocol::is_direct_packet;
+use mesh_protocol::{is_direct_packet, NODENUM_BROADCAST};
 use mesh_radio::{contention_window_ms, RadioId, MODEM_SHORT_SLOW};
 
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
@@ -175,6 +175,50 @@ impl NeighborGraph {
 
     pub fn is_our_direct_neighbor(&self, node_id: u32) -> bool {
         self.edges.is_our_direct_neighbor(node_id, self.my_node)
+    }
+
+    /// Limit remaining hops for unicast to a direct `hears_us` neighbor when stock peers exist.
+    ///
+    /// Good link (ETX < 3.0) ⇒ 0 hops (direct delivery only); marginal ⇒ 1 hop.
+    pub fn unicast_hop_limit_for_direct_neighbor(&self, destination: u32) -> Option<u8> {
+        if destination == 0 || destination == NODENUM_BROADCAST {
+            return None;
+        }
+        let Some(my_edges) = self.edges.find_node(self.my_node) else {
+            return None;
+        };
+
+        let mut dest_etx = None;
+        for i in 0..my_edges.edge_count as usize {
+            let edge = my_edges.edges[i];
+            if edge.to == destination && edge.hears_us {
+                dest_etx = Some(edge.etx());
+                break;
+            }
+        }
+        let dest_etx = dest_etx?;
+
+        let mut has_stock_neighbor = false;
+        for i in 0..my_edges.edge_count as usize {
+            let neighbor = my_edges.edges[i].to;
+            if neighbor == 0 || neighbor == destination {
+                continue;
+            }
+            if self.capability.status(neighbor) != CapabilityStatus::SrActive {
+                has_stock_neighbor = true;
+                break;
+            }
+        }
+        if !has_stock_neighbor {
+            return None;
+        }
+
+        const RELIABLE_ETX_CEILING: f32 = 3.0;
+        if dest_etx < RELIABLE_ETX_CEILING {
+            Some(0)
+        } else {
+            Some(1)
+        }
     }
 
     #[doc(hidden)]
@@ -1908,6 +1952,62 @@ mod tests {
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
         graph.merge_topology(COV_A, &header, &[remote], true, 100, 0);
         assert!(!graph.has_unique_coverage(&[COV_A]));
+    }
+
+    #[test]
+    fn unicast_hop_limit_good_link_returns_zero() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xCC00_00CC);
+        graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
+        graph.confirm_direct_neighbor_hears_us(0xDD00_00DD);
+        graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
+        assert_eq!(
+            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn unicast_hop_limit_marginal_link_returns_one() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xCC00_00CC);
+        graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
+        graph.confirm_direct_neighbor_hears_us(0xDD00_00DD);
+        graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
+        graph.edges_mut().update_edge(
+            0xCC00_00CC,
+            0xCC00_00CC,
+            0xDD00_00DD,
+            4.0,
+            0,
+            EdgeSource::Reported,
+            true,
+            0,
+        );
+        assert_eq!(
+            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn unicast_hop_limit_skips_without_stock_neighbor() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xCC00_00CC);
+        graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
+        graph.confirm_direct_neighbor_hears_us(0xDD00_00DD);
+        graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
+        graph.capability_mut().track_topology(0xEE00_00EE, true, 0);
+        assert_eq!(graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD), None);
+    }
+
+    #[test]
+    fn unicast_hop_limit_requires_hears_us() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xCC00_00CC);
+        graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
+        graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
+        assert_eq!(graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD), None);
     }
 }
 
