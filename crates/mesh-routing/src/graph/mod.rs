@@ -14,8 +14,8 @@ pub use edge::{
 pub use etx::{calculate_etx, etx_to_fixed, etx_to_signal, fixed_to_etx, EtxFixed};
 pub use placeholder::{is_placeholder_node, placeholder_node_id, PLACEHOLDER_NODE_PREFIX};
 pub use route::{
-    calculate_route, find_better_positioned_neighbor, Route, RouteCache, MAX_CACHED_ROUTES,
-    ROUTE_CACHE_TIMEOUT_MS,
+    calculate_route, find_better_positioned_neighbor, is_node_routable, verified_connectivity,
+    Route, RouteCache, RoutableFilter, MAX_CACHED_ROUTES, ROUTE_CACHE_TIMEOUT_MS,
 };
 
 pub const MAX_GRAPH_NODES: usize = 24;

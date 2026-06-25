@@ -3,10 +3,33 @@
 use mesh_radio::RadioId;
 
 use super::{DownstreamTable, EdgeStore, MAX_GRAPH_NODES};
+use super::is_placeholder_node;
+use crate::capability::{CapabilityCache, CapabilityStatus};
+use crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE;
 
 pub const MAX_CACHED_ROUTES: usize = 32;
 pub const ROUTE_CACHE_TIMEOUT_MS: u32 = 300_000;
 pub const ROUTE_COST_UNKNOWN: u16 = 0xFFFF;
+
+/// Inputs for Dijkstra hop filtering (`is_node_routable`).
+pub struct RoutableFilter<'a> {
+    pub capability: &'a CapabilityCache,
+    pub my_node: u32,
+    pub device_role: u32,
+}
+
+pub fn is_node_routable(filter: &RoutableFilter<'_>, node_id: u32) -> bool {
+    if node_id == 0 {
+        return false;
+    }
+    if filter.device_role == DEVICE_ROLE_CLIENT_MUTE && node_id == filter.my_node {
+        return false;
+    }
+    match filter.capability.status(node_id) {
+        CapabilityStatus::Legacy => filter.capability.is_legacy_router(node_id),
+        _ => true,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Route {
@@ -132,6 +155,7 @@ pub fn calculate_route(
     my_node: u32,
     destination: u32,
     now_ms: u32,
+    routable: Option<&RoutableFilter<'_>>,
 ) -> Route {
     let mut result = Route {
         destination,
@@ -193,6 +217,14 @@ pub fn calculate_route(
         nodes[u_idx].visited = true;
         if u == destination {
             break;
+        }
+
+        if u != my_node {
+            if let Some(filter) = routable {
+                if !is_node_routable(filter, u) {
+                    continue;
+                }
+            }
         }
 
         let Some(u_edges) = edges.find_node(u) else {
@@ -287,24 +319,74 @@ pub fn calculate_route(
     result
 }
 
+/// Returns `(verified, unknown)` for whether `transmitter` can reach `receiver`.
+pub fn verified_connectivity(
+    edges: &EdgeStore,
+    capability: &CapabilityCache,
+    transmitter: u32,
+    receiver: u32,
+) -> (bool, bool) {
+    let tx_stock = is_stock_for_connectivity(capability, transmitter);
+    let rx_stock = is_stock_for_connectivity(capability, receiver);
+    if tx_stock && rx_stock {
+        return (false, true);
+    }
+    if !tx_stock && edges.has_direct_reported_edge_to(transmitter, receiver) {
+        return (true, false);
+    }
+    if !rx_stock && edges.has_direct_reported_edge_to(receiver, transmitter) {
+        return (true, false);
+    }
+    if tx_stock || rx_stock {
+        (false, true)
+    } else {
+        (false, false)
+    }
+}
+
+fn is_stock_for_connectivity(capability: &CapabilityCache, node: u32) -> bool {
+    is_placeholder_node(node)
+        || matches!(
+            capability.status(node),
+            CapabilityStatus::Legacy | CapabilityStatus::Unknown
+        )
+}
+
 /// Opportunistic next hop: neighbor with a direct edge to `destination` significantly better than our route.
 pub fn find_better_positioned_neighbor(
     edges: &EdgeStore,
+    capability: &CapabilityCache,
     my_node: u32,
+    device_role: u32,
     destination: u32,
+    source_node: u32,
     heard_from: u32,
-    our_route_cost_fixed: u16,
+    our_route_cost: f32,
 ) -> u32 {
-    let our_cost = our_route_cost_fixed as f32 / 100.0;
+    let filter = RoutableFilter {
+        capability,
+        my_node,
+        device_role,
+    };
     let mut best_neighbor = 0u32;
-    let mut best_cost = our_cost;
+    let mut best_cost = our_route_cost;
     let Some(my_edges) = edges.find_node(my_node) else {
         return 0;
     };
     for i in 0..my_edges.edge_count as usize {
         let neighbor = my_edges.edges[i].to;
-        if neighbor == 0 || neighbor == heard_from {
+        if neighbor == 0 || neighbor == source_node || neighbor == heard_from {
             continue;
+        }
+        if !is_node_routable(&filter, neighbor) {
+            continue;
+        }
+        if heard_from != 0 {
+            let (verified, unknown) =
+                verified_connectivity(edges, capability, heard_from, neighbor);
+            if !verified || unknown {
+                continue;
+            }
         }
         let Some(neighbor_edges) = edges.find_node(neighbor) else {
             continue;
@@ -327,6 +409,8 @@ pub fn find_better_positioned_neighbor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::CapabilityCache;
+    use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE};
     use crate::graph::{EdgeSource, EdgeStore, DownstreamTable};
 
     #[test]
@@ -335,7 +419,7 @@ mod tests {
         edges.ensure_local_node(0xAA, 0);
         edges.update_edge_from_observation(0xAA, 0xAA, 0xBB, -70, 8, 0, EdgeSource::Reported, 1);
         let downstream = DownstreamTable::new();
-        let route = calculate_route(&edges, &downstream, 0xAA, 0xBB, 0);
+        let route = calculate_route(&edges, &downstream, 0xAA, 0xBB, 0, None);
         assert_eq!(route.next_hop, 0xBB);
         assert_eq!(route.egress_radio, 1);
     }
@@ -347,7 +431,7 @@ mod tests {
         edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(0xAA, 0xBB, 0xCC, 2.0, 0, EdgeSource::Mirrored, true, 0);
         let downstream = DownstreamTable::new();
-        let route = calculate_route(&edges, &downstream, 0xAA, 0xCC, 0);
+        let route = calculate_route(&edges, &downstream, 0xAA, 0xCC, 0, None);
         assert_eq!(route.next_hop, 0xBB);
     }
 
@@ -360,8 +444,61 @@ mod tests {
         edges.update_edge(0xAA, 0xAA, 0xCC, 2.0, 0, EdgeSource::Reported, true, 1);
         edges.update_edge(0xAA, 0xCC, 0xDD, 2.0, 0, EdgeSource::Mirrored, true, 1);
         assert_eq!(
-            find_better_positioned_neighbor(&edges, 0xAA, 0xDD, 0xEE, 800),
+            find_better_positioned_neighbor(
+                &edges,
+                &CapabilityCache::new(),
+                0xAA,
+                DEVICE_ROLE_CLIENT,
+                0xDD,
+                0,
+                0,
+                8.0,
+            ),
             0xCC
         );
+    }
+
+    #[test]
+    fn better_neighbor_skips_source_and_heard_from() {
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(0xAA, 0);
+        edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xAA, 0xCC, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xBB, 0xDD, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(0xAA, 0xCC, 0xDD, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        assert_eq!(
+            find_better_positioned_neighbor(
+                &edges,
+                &CapabilityCache::new(),
+                0xAA,
+                DEVICE_ROLE_CLIENT,
+                0xDD,
+                0xBB,
+                0,
+                8.0,
+            ),
+            0xCC
+        );
+    }
+
+    #[test]
+    fn dijkstra_skips_non_routable_intermediate() {
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(0xAA, 0);
+        const M1: u32 = 0x0100_0001;
+        edges.update_edge(0xAA, 0xAA, M1, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, M1, 0xCC, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xBB, 0xCC, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_role(M1, DEVICE_ROLE_CLIENT_MUTE, 0);
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: 0xAA,
+            device_role: DEVICE_ROLE_CLIENT,
+        };
+        let downstream = DownstreamTable::new();
+        let route = calculate_route(&edges, &downstream, 0xAA, 0xCC, 0, Some(&filter));
+        assert_eq!(route.next_hop, 0xBB);
     }
 }

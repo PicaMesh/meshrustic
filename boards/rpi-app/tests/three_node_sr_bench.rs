@@ -36,7 +36,7 @@ fn three_node_line_learns_remote_via_topology() {
     let result = a.merge_topology(0xB000_0002, &header, &[remote], true, 100, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
 
-    let hop = a.get_next_hop(0xC000_0003, 0xB000_0002, 100);
+    let hop = a.get_next_hop(0xC000_0003, 0xB000_0002, 0xB000_0002, 100);
     assert_ne!(hop, 0);
 }
 

@@ -7,8 +7,9 @@ use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatu
 use crate::coordinated_relay::tx_delay_ms_router;
 use crate::graph::{
     calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor,
-    is_placeholder_node, placeholder_node_id, EdgeSource, EdgeStore, DownstreamTable, Route,
-    RouteCache, EDGE_NEW, EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
+    is_node_routable, verified_connectivity, is_placeholder_node, placeholder_node_id,
+    EdgeSource, EdgeStore, DownstreamTable, Route, RouteCache, RoutableFilter, EDGE_NEW,
+    EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
 use crate::nodeinfo::{
     DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE,
@@ -943,7 +944,19 @@ impl NeighborGraph {
         if let Some(cached) = self.route_cache.get(destination, now_ms) {
             return cached;
         }
-        let route = calculate_route(&self.edges, &self.downstream, self.my_node, destination, now_ms);
+        let filter = RoutableFilter {
+            capability: &self.capability,
+            my_node: self.my_node,
+            device_role: self.device_role,
+        };
+        let route = calculate_route(
+            &self.edges,
+            &self.downstream,
+            self.my_node,
+            destination,
+            now_ms,
+            Some(&filter),
+        );
         if route.next_hop != 0 {
             self.route_cache.insert(route);
         }
@@ -959,53 +972,158 @@ impl NeighborGraph {
         self.edges.relay_heard_on(self.my_node, peer)
     }
 
-    pub fn get_next_hop(&mut self, destination: u32, heard_from: u32, now_ms: u32) -> u32 {
+    pub fn has_verified_connectivity(&self, transmitter: u32, receiver: u32) -> (bool, bool) {
+        verified_connectivity(&self.edges, &self.capability, transmitter, receiver)
+    }
+
+    pub fn is_node_routable(&self, node_id: u32) -> bool {
+        let filter = RoutableFilter {
+            capability: &self.capability,
+            my_node: self.my_node,
+            device_role: self.device_role,
+        };
+        is_node_routable(&filter, node_id)
+    }
+
+    pub fn get_next_hop(
+        &mut self,
+        destination: u32,
+        source_node: u32,
+        heard_from: u32,
+        now_ms: u32,
+    ) -> u32 {
+        self.get_next_hop_inner(destination, source_node, heard_from, now_ms, true)
+    }
+
+    fn get_next_hop_inner(
+        &mut self,
+        destination: u32,
+        source_node: u32,
+        heard_from: u32,
+        now_ms: u32,
+        allow_opportunistic: bool,
+    ) -> u32 {
         if destination == 0 || destination == self.my_node {
             return 0;
         }
+
         let route = self.get_route(destination, now_ms);
-        if route.next_hop == 0 {
-            return if self.has_any_hears_us_neighbor() {
-                self.my_node
-            } else {
-                0
-            };
-        }
-        if route.next_hop == self.my_node {
+        if route.next_hop != 0 {
+            let route_cost = route.cost();
+            let mut next_hop_can_hear = true;
+            if heard_from != 0 && route.next_hop != heard_from {
+                let (verified, _unknown) = self.has_verified_connectivity(heard_from, route.next_hop);
+                next_hop_can_hear = verified;
+            }
+
+            if next_hop_can_hear {
+                if allow_opportunistic && route_cost > 2.0 {
+                    let better = find_better_positioned_neighbor(
+                        &self.edges,
+                        &self.capability,
+                        self.my_node,
+                        self.device_role,
+                        destination,
+                        source_node,
+                        heard_from,
+                        route_cost,
+                    );
+                    if better != 0 {
+                        return better;
+                    }
+                }
+                return route.next_hop;
+            }
+
+            if self.edge_hears_us(route.next_hop) {
+                return route.next_hop;
+            }
+
+            if allow_opportunistic {
+                let better = find_better_positioned_neighbor(
+                    &self.edges,
+                    &self.capability,
+                    self.my_node,
+                    self.device_role,
+                    destination,
+                    source_node,
+                    heard_from,
+                    f32::MAX,
+                );
+                if better != 0 {
+                    return better;
+                }
+            }
+
             return self.my_node;
         }
 
-        let next_hop = route.next_hop;
-        let next_hop_can_hear_transmitter = heard_from == 0
-            || next_hop == heard_from
-            || next_hop == destination;
+        if let Some(relay_for_dest) = self.get_downstream_relay(destination, now_ms) {
+            let mut relay_can_hear = true;
+            let mut connectivity_unknown = false;
+            if heard_from != 0 && relay_for_dest != heard_from {
+                let (verified, unknown) =
+                    self.has_verified_connectivity(heard_from, relay_for_dest);
+                relay_can_hear = verified;
+                connectivity_unknown = unknown;
+            }
+            if relay_can_hear
+                && !connectivity_unknown
+                && self.has_direct_edge(relay_for_dest)
+            {
+                return relay_for_dest;
+            }
+        }
 
-        if route.cost_fixed > 200 {
+        if allow_opportunistic {
             let better = find_better_positioned_neighbor(
                 &self.edges,
+                &self.capability,
                 self.my_node,
+                self.device_role,
                 destination,
+                source_node,
                 heard_from,
-                route.cost_fixed,
+                f32::MAX,
             );
             if better != 0 {
                 return better;
             }
         }
 
-        if next_hop_can_hear_transmitter {
-            return next_hop;
+        if heard_from != source_node && self.has_direct_edge(destination) {
+            return destination;
         }
 
-        if self.edge_hears_us(next_hop) {
-            return next_hop;
+        if self.is_downstream_relay_for(self.my_node, destination, now_ms) {
+            self.downstream.update(
+                self.my_node,
+                destination,
+                self.my_node,
+                1.0,
+                now_ms,
+                false,
+                0,
+            );
+            return destination;
         }
 
-        if self.has_direct_edge(next_hop) {
-            return next_hop;
+        if let Some(dest_node) = self.edges.find_node(destination) {
+            if dest_node.edge_count == 1 && dest_node.edges[0].to == self.my_node {
+                self.downstream.update(
+                    self.my_node,
+                    destination,
+                    self.my_node,
+                    1.0,
+                    now_ms,
+                    false,
+                    0,
+                );
+                return destination;
+            }
         }
 
-        self.my_node
+        0
     }
 
     fn has_direct_edge(&self, peer: u32) -> bool {

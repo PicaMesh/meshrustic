@@ -139,6 +139,22 @@ impl CapabilityCache {
         self.status(node_id) == CapabilityStatus::Legacy
     }
 
+    pub fn is_legacy_router(&self, node_id: u32) -> bool {
+        if self.status(node_id) != CapabilityStatus::Legacy {
+            return false;
+        }
+        let Some(role) = self.role(node_id) else {
+            return false;
+        };
+        matches!(
+            role,
+            DEVICE_ROLE_ROUTER
+                | DEVICE_ROLE_ROUTER_LATE
+                | DEVICE_ROLE_ROUTER_CLIENT
+                | DEVICE_ROLE_REPEATER
+        )
+    }
+
     fn find(&self, node_id: u32) -> Option<&CapabilityRecord> {
         for i in 0..self.count as usize {
             if self.records[i].node_id == node_id {

@@ -130,6 +130,6 @@ fn field_three_node_sr_learns_remote_route() {
     let result = graph_a.merge_topology(B, &header, &[remote], true, 100, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
 
-    let hop = graph_a.get_next_hop(C, B, 100);
+    let hop = graph_a.get_next_hop(C, B, B, 100);
     assert_ne!(hop, 0, "node A should route to C via learned topology");
 }

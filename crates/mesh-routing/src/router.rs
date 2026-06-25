@@ -422,8 +422,15 @@ impl Router {
         self.graph.confirm_direct_neighbor_hears_us(neighbor);
     }
 
-    pub fn get_next_hop(&mut self, destination: u32, heard_from: u32, now_ms: u32) -> u32 {
-        self.graph.get_next_hop(destination, heard_from, now_ms)
+    pub fn get_next_hop(
+        &mut self,
+        destination: u32,
+        source_node: u32,
+        heard_from: u32,
+        now_ms: u32,
+    ) -> u32 {
+        self.graph
+            .get_next_hop(destination, source_node, heard_from, now_ms)
     }
 
     pub fn drain_sr_logs(&mut self, out: &mut heapless::Vec<SrLogEvent, MAX_SR_LOG>) {
@@ -886,7 +893,7 @@ impl Router {
         }
 
         let next_hop = if parsed.to != NODENUM_BROADCAST {
-            let hop = self.graph.get_next_hop(parsed.to, parsed.from, now_ms);
+            let hop = self.graph.get_next_hop(parsed.to, parsed.from, heard_from, now_ms);
             if hop != 0 {
                 let route = self.graph.get_route(parsed.to, now_ms);
                 self.sr_log.push(SrLogEvent::RouteNextHop {
