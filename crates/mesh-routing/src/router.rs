@@ -586,7 +586,13 @@ impl Router {
         let decoded_portnum = decode.portnum;
         if self
             .rate_limit
-            .should_drop(parsed.from, decoded_portnum, now_ms)
+            .should_drop(
+                parsed.from,
+                decoded_portnum,
+                parsed.hop_start,
+                parsed.hop_limit,
+                now_ms,
+            )
         {
             self.sr_log.push(SrLogEvent::RelaySkip {
                 from: parsed.from,
