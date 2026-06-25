@@ -522,10 +522,6 @@ impl Router {
             ObserveResult::New => {}
         }
 
-        if let Some(data) = decoded_data.as_ref() {
-            self.maybe_cancel_relay_for_foreign_ack(&parsed, data);
-        }
-
         let direct = is_direct_packet(
             parsed.from,
             parsed.hop_start,
@@ -587,6 +583,33 @@ impl Router {
             }
         }
 
+        let decoded_portnum = decode.portnum;
+        if self
+            .rate_limit
+            .should_drop(parsed.from, decoded_portnum, now_ms)
+        {
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::RateLimited,
+            });
+            return Some(ProcessResult {
+                parsed,
+                duplicate: false,
+                rate_limited: true,
+                handle: None,
+                radio_id: packet.radio_id,
+                rssi: packet.rssi,
+                snr: packet.snr,
+                decoded_portnum,
+                decode,
+                decoded_data,
+            });
+        }
+
+        if let Some(data) = decoded_data.as_ref() {
+            self.maybe_cancel_relay_for_foreign_ack(&parsed, data);
+        }
+
         if let Some(data) = decoded_data {
             if data.portnum == SIGNAL_ROUTING_APP {
                 if let Some(ref inner) = inner {
@@ -614,29 +637,6 @@ impl Router {
         }
 
         self.process_reliable_rx(&parsed, decoded_data.as_ref(), inner.as_deref(), now_ms);
-
-        let decoded_portnum = decode.portnum;
-        if self
-            .rate_limit
-            .should_drop(parsed.from, decoded_portnum, now_ms)
-        {
-            self.sr_log.push(SrLogEvent::RelaySkip {
-                from: parsed.from,
-                reason: SrSkipReason::RateLimited,
-            });
-            return Some(ProcessResult {
-                parsed,
-                duplicate: false,
-                rate_limited: true,
-                handle: None,
-                radio_id: packet.radio_id,
-                rssi: packet.rssi,
-                snr: packet.snr,
-                decoded_portnum,
-                decode,
-                decoded_data,
-            });
-        }
 
         let handle = self.pool.alloc()?;
         {
