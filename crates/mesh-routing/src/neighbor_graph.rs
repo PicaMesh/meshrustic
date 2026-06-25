@@ -162,6 +162,11 @@ impl NeighborGraph {
         &self.edges
     }
 
+    #[doc(hidden)]
+    pub fn downstream_mut(&mut self) -> &mut DownstreamTable {
+        &mut self.downstream
+    }
+
     /// Outgoing edge whose destination low byte matches `relay_byte` (non-placeholder preferred).
     pub fn match_relay_byte_on_outgoing_edges(&self, relay_byte: u8) -> Option<u32> {
         let node = self.edges.find_node(self.my_node)?;
@@ -909,8 +914,29 @@ impl NeighborGraph {
         }
     }
 
-    pub fn get_downstream_relay(&self, destination: u32) -> Option<u32> {
-        self.downstream.get_relay(destination)
+    pub fn get_downstream_relay(&self, destination: u32, now_ms: u32) -> Option<u32> {
+        self.downstream
+            .get_relay(destination, now_ms, NEIGHBOR_TTL_MS)
+    }
+
+    pub fn downstream_count_for_relay(&self, relay: u32, now_ms: u32) -> usize {
+        self.downstream
+            .count_for_relay(relay, now_ms, NEIGHBOR_TTL_MS)
+    }
+
+    pub fn downstream_nodes_for_relay(&self, relay: u32, out: &mut [u32], now_ms: u32) -> usize {
+        self.downstream
+            .nodes_for_relay(relay, out, now_ms, NEIGHBOR_TTL_MS)
+    }
+
+    pub fn is_downstream_relay_for(&self, relay: u32, destination: u32, now_ms: u32) -> bool {
+        self.downstream
+            .is_relay_for(relay, destination, now_ms, NEIGHBOR_TTL_MS)
+    }
+
+    pub fn transfer_downstream(&mut self, old_relay: u32, new_relay: u32, now_ms: u32) -> usize {
+        self.downstream
+            .transfer_downstream(old_relay, new_relay, now_ms)
     }
 
     pub fn get_route(&mut self, destination: u32, now_ms: u32) -> Route {

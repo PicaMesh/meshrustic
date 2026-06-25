@@ -118,7 +118,7 @@ fn rate_limited_packet_does_not_merge_topology() {
         .process_inbound(&inbound(&wire), 1_000)
         .expect("topology rx");
     assert!(result.rate_limited);
-    assert_eq!(router.graph_mut().get_downstream_relay(listed), None);
+    assert_eq!(router.graph_mut().get_downstream_relay(listed, 1_000), None);
 
     let mut control = Router::with_modem_preset(our_node, "", MODEM_SHORT_SLOW, true, key, 3);
     control.set_device_role(mesh_routing::DEVICE_ROLE_ROUTER);
@@ -130,7 +130,7 @@ fn rate_limited_packet_does_not_merge_topology() {
         .expect("unlimited topology rx");
     assert!(!control_result.rate_limited);
     assert_eq!(
-        control.graph_mut().get_downstream_relay(listed),
+        control.graph_mut().get_downstream_relay(listed, 1_000),
         Some(attacker)
     );
 }

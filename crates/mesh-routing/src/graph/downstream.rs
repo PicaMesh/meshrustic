@@ -44,10 +44,142 @@ impl DownstreamTable {
         }
     }
 
-    pub fn get_relay(&self, destination: u32) -> Option<u32> {
-        (0..self.count as usize)
-            .find(|&i| self.entries[i].destination == destination)
-            .map(|i| self.entries[i].relay)
+    pub fn get_relay(&self, destination: u32, now_ms: u32, ttl_ms: u32) -> Option<u32> {
+        let mut best_relay = None;
+        let mut best_cost = u16::MAX;
+        for i in 0..self.count as usize {
+            let entry = &self.entries[i];
+            if entry.destination != destination {
+                continue;
+            }
+            if now_ms.wrapping_sub(entry.last_update_ms) >= ttl_ms {
+                continue;
+            }
+            if entry.cost_fixed < best_cost {
+                best_cost = entry.cost_fixed;
+                best_relay = Some(entry.relay);
+            }
+        }
+        best_relay
+    }
+
+    pub fn count_for_relay(&self, relay: u32, now_ms: u32, ttl_ms: u32) -> usize {
+        let mut count = 0usize;
+        for i in 0..self.count as usize {
+            let entry = &self.entries[i];
+            if entry.relay != relay {
+                continue;
+            }
+            if now_ms.wrapping_sub(entry.last_update_ms) >= ttl_ms {
+                continue;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    pub fn nodes_for_relay(
+        &self,
+        relay: u32,
+        out: &mut [u32],
+        now_ms: u32,
+        ttl_ms: u32,
+    ) -> usize {
+        let mut count = 0usize;
+        for i in 0..self.count as usize {
+            if count >= out.len() {
+                break;
+            }
+            let entry = &self.entries[i];
+            if entry.relay != relay {
+                continue;
+            }
+            if now_ms.wrapping_sub(entry.last_update_ms) >= ttl_ms {
+                continue;
+            }
+            out[count] = entry.destination;
+            count += 1;
+        }
+        count
+    }
+
+    pub fn is_relay_for(&self, relay: u32, destination: u32, now_ms: u32, ttl_ms: u32) -> bool {
+        for i in 0..self.count as usize {
+            let entry = &self.entries[i];
+            if entry.destination != destination || entry.relay != relay {
+                continue;
+            }
+            if now_ms.wrapping_sub(entry.last_update_ms) < ttl_ms {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn transfer_downstream(&mut self, old_relay: u32, new_relay: u32, now_ms: u32) -> usize {
+        if old_relay == 0 || new_relay == 0 || old_relay == new_relay {
+            return 0;
+        }
+        let mut moved = 0usize;
+        for i in 0..self.count as usize {
+            if self.entries[i].relay != old_relay {
+                continue;
+            }
+            let destination = self.entries[i].destination;
+            let cost_fixed = self.entries[i].cost_fixed;
+            let via_radio = self.entries[i].via_radio;
+            self.upsert_entry(destination, new_relay, cost_fixed, via_radio, now_ms);
+            moved += 1;
+        }
+        self.clear_for_relay(old_relay);
+        moved
+    }
+
+    fn upsert_entry(
+        &mut self,
+        destination: u32,
+        relay: u32,
+        cost_fixed: u16,
+        via_radio: RadioId,
+        now_ms: u32,
+    ) {
+        for i in 0..self.count as usize {
+            if self.entries[i].destination == destination && self.entries[i].relay == relay {
+                self.entries[i].cost_fixed = cost_fixed;
+                self.entries[i].last_update_ms = now_ms;
+                if via_radio != 0 {
+                    self.entries[i].via_radio = via_radio;
+                }
+                return;
+            }
+        }
+        if (self.count as usize) < MAX_DOWNSTREAM {
+            let idx = self.count as usize;
+            self.entries[idx] = DownstreamEntry {
+                destination,
+                relay,
+                via_radio,
+                cost_fixed,
+                last_update_ms: now_ms,
+            };
+            self.count += 1;
+            return;
+        }
+        let mut oldest_idx = 0usize;
+        let mut oldest = self.entries[0].last_update_ms;
+        for i in 1..self.count as usize {
+            if self.entries[i].last_update_ms < oldest {
+                oldest = self.entries[i].last_update_ms;
+                oldest_idx = i;
+            }
+        }
+        self.entries[oldest_idx] = DownstreamEntry {
+            destination,
+            relay,
+            via_radio,
+            cost_fixed,
+            last_update_ms: now_ms,
+        };
     }
 
     pub fn update(
@@ -211,5 +343,36 @@ mod tests {
             );
         }
         assert_eq!(table.count(), MAX_DOWNSTREAM as u16);
+    }
+
+    #[test]
+    fn get_relay_picks_lowest_cost_among_fresh_entries() {
+        let mut table = DownstreamTable::new();
+        table.update(0xAA, 0xDD, 0xBB, 4.0, 1_000, false, 0);
+        table.update(0xAA, 0xDD, 0xCC, 2.5, 1_000, false, 0);
+        assert_eq!(table.get_relay(0xDD, 1_500, 10_000), Some(0xCC));
+    }
+
+    #[test]
+    fn get_relay_skips_stale_entries() {
+        let mut table = DownstreamTable::new();
+        table.update(0xAA, 0xDD, 0xBB, 2.0, 9_000, false, 0);
+        table.update(0xAA, 0xDD, 0xCC, 5.0, 1_000, false, 0);
+        assert_eq!(table.get_relay(0xDD, 10_000, 5_000), Some(0xBB));
+        assert_eq!(table.get_relay(0xDD, 20_000, 5_000), None);
+    }
+
+    #[test]
+    fn transfer_downstream_moves_entries_to_new_relay() {
+        let mut table = DownstreamTable::new();
+        table.update(0xAA, 0xD1, 0x0100_0001, 2.0, 1_000, false, 0);
+        table.update(0xAA, 0xD2, 0x0100_0001, 3.0, 1_000, false, 0);
+        assert_eq!(table.transfer_downstream(0x0100_0001, 0x0200_0002, 2_000), 2);
+        assert_eq!(table.count_for_relay(0x0100_0001, 2_000, 10_000), 0);
+        assert_eq!(table.count_for_relay(0x0200_0002, 2_000, 10_000), 2);
+        let mut nodes = [0u32; 4];
+        assert_eq!(table.nodes_for_relay(0x0200_0002, &mut nodes, 2_000, 10_000), 2);
+        assert!(nodes[..2].contains(&0xD1));
+        assert!(nodes[..2].contains(&0xD2));
     }
 }

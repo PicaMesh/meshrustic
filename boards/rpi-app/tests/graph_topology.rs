@@ -174,7 +174,7 @@ fn relayed_topology_adds_sender_edges_and_downstream_without_destination_node() 
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
     assert!(graph.has_graph_node(0x108a_ef6c));
     assert!(!graph.has_graph_node(0xd6c2_3e3e));
-    assert!(graph.get_downstream_relay(0xd6c2_3e3e).is_some());
+    assert!(graph.get_downstream_relay(0xd6c2_3e3e, 2_000).is_some());
 }
 
 #[test]

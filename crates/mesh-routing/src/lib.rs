@@ -26,13 +26,13 @@ pub use bridge::{BridgeDedupCache, BridgeEval, BridgeLeg, evaluate_bridge_target
 pub use capability::{CapabilityStatus, CapabilityCache, MAX_CAPABILITY_RECORDS};
 pub use coordinated_relay::{cw_size_from_snr, tx_delay_ms_router, tx_delay_ms_worst, DEFAULT_SLOT_MS};
 pub use graph::{
-    calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor, EdgeSource,
-    is_placeholder_node, placeholder_node_id, Route, RouteCache, PLACEHOLDER_NODE_PREFIX,
+    calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor, DownstreamTable,
+    EdgeSource, is_placeholder_node, placeholder_node_id, Route, RouteCache, PLACEHOLDER_NODE_PREFIX,
     MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE,
 };
 pub use neighbor_graph::{
     MaintenanceReport, NeighborEntry, NeighborGraph, TopologyMergeResult, MAX_HEARD_TRANSMITTERS,
-    MAX_NEIGHBORS, MAX_RELAY_STATES,
+    MAX_NEIGHBORS, MAX_RELAY_STATES, NEIGHBOR_TTL_MS,
 };
 pub use packet_history::{ObserveResult, PacketHistory};
 pub use pool::{PacketGuard, PacketHandle, PacketPool, PacketSlot, POOL_SIZE};
