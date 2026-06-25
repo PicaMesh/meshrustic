@@ -166,7 +166,9 @@ impl EdgeStore {
     }
 
     pub fn is_our_direct_neighbor(&self, node_id: u32, my_node: u32) -> bool {
-        self.has_direct_reported_edge_to(my_node, node_id)
+        self.find_node(my_node)
+            .and_then(|node| node.find_edge(node_id))
+            .is_some()
     }
 
     pub fn has_direct_reported_edge_to(&self, from: u32, to: u32) -> bool {
@@ -321,13 +323,18 @@ impl EdgeStore {
     }
 
     pub fn count_direct_neighbors(&self, my_node: u32) -> u8 {
-        let Some(node) = self.find_node(my_node) else {
-            return 0;
-        };
         let mut count = 0u8;
-        for i in 0..node.edge_count as usize {
-            if node.edges[i].source == EdgeSource::Reported && node.edges[i].to != 0 {
-                count = count.saturating_add(1);
+        for i in 0..self.node_count as usize {
+            let node_id = self.nodes[i].node_id;
+            if node_id == my_node {
+                continue;
+            }
+            for e in 0..self.nodes[i].edge_count as usize {
+                let edge = self.nodes[i].edges[e];
+                if edge.to == my_node && edge.source == EdgeSource::Reported {
+                    count = count.saturating_add(1);
+                    break;
+                }
             }
         }
         count
@@ -506,5 +513,24 @@ mod tests {
 
         assert!(edges.age_edges(0xAA, 61_000, 7_200_000, Some(&mut downstream)));
         assert_eq!(downstream.count(), 0);
+    }
+
+    #[test]
+    fn direct_neighbor_count_uses_reported_to_us() {
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(0xAA, 1_000);
+        let _ = edges.update_node_activity(0xBB, 1_000, 0xAA);
+        edges.update_edge(0xAA, 0xBB, 0xAA, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        assert_eq!(edges.count_direct_neighbors(0xAA), 1);
+        assert_eq!(edges.direct_neighbor_ids(0xAA, &mut [0; MAX_EDGES_PER_NODE]), 0);
+    }
+
+    #[test]
+    fn is_our_direct_neighbor_any_edge() {
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(0xAA, 1_000);
+        edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
+        assert!(edges.is_our_direct_neighbor(0xBB, 0xAA));
+        assert!(!edges.has_direct_reported_edge_to(0xAA, 0xBB));
     }
 }

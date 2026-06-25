@@ -168,6 +168,15 @@ impl NeighborGraph {
     }
 
     #[doc(hidden)]
+    pub fn edges_mut(&mut self) -> &mut EdgeStore {
+        &mut self.edges
+    }
+
+    pub fn is_our_direct_neighbor(&self, node_id: u32) -> bool {
+        self.edges.is_our_direct_neighbor(node_id, self.my_node)
+    }
+
+    #[doc(hidden)]
     pub fn downstream_mut(&mut self) -> &mut DownstreamTable {
         &mut self.downstream
     }

@@ -289,3 +289,41 @@ fn topology_log_omits_self_as_neighbor() {
         SrLogEvent::NetworkTopologyNeighbor { node_id: 0xBB, .. }
     )));
 }
+
+#[test]
+fn direct_neighbor_count_uses_reported_to_us() {
+    let mut graph = NeighborGraph::new();
+    graph.set_my_node(0xAA);
+    graph.update_node_activity(0xBB, 100);
+    graph.edges_mut().update_edge(
+        0xAA,
+        0xBB,
+        0xAA,
+        2.0,
+        100,
+        mesh_routing::EdgeSource::Reported,
+        true,
+        0,
+    );
+    assert_eq!(graph.neighbor_count(), 1);
+    assert_eq!(graph.fill_neighbor_entries(&mut [NeighborEntry::default(); MAX_EDGES_PER_NODE]), 0);
+}
+
+#[test]
+fn is_our_direct_neighbor_any_edge() {
+    let mut graph = NeighborGraph::new();
+    graph.set_my_node(0xAA);
+    graph.update_node_activity(0xBB, 100);
+    graph.edges_mut().update_edge(
+        0xAA,
+        0xAA,
+        0xBB,
+        2.0,
+        100,
+        mesh_routing::EdgeSource::Mirrored,
+        true,
+        0,
+    );
+    assert!(graph.is_our_direct_neighbor(0xBB));
+    assert!(!graph.edges().has_direct_reported_edge_to(0xAA, 0xBB));
+}
