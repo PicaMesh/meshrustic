@@ -12,6 +12,7 @@ pub mod pool;
 pub mod qos;
 pub mod rate_limit;
 pub mod relay;
+pub mod relay_identity;
 pub mod reliable;
 pub mod routing_ack;
 pub mod router;
@@ -30,14 +31,15 @@ pub use graph::{
     MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE,
 };
 pub use neighbor_graph::{
-    MaintenanceReport, NeighborEntry, NeighborGraph, TopologyMergeResult, MAX_NEIGHBORS,
-    MAX_RELAY_STATES,
+    MaintenanceReport, NeighborEntry, NeighborGraph, TopologyMergeResult, MAX_HEARD_TRANSMITTERS,
+    MAX_NEIGHBORS, MAX_RELAY_STATES,
 };
 pub use packet_history::{ObserveResult, PacketHistory};
 pub use pool::{PacketGuard, PacketHandle, PacketPool, PacketSlot, POOL_SIZE};
 pub use qos::ChannelQoS;
 pub use rate_limit::NodeRateLimiter;
 pub use relay::{copy_opaque_payload, relay_header, relay_header_with_next_hop, wire_may_relay};
+pub use relay_identity::{RelayIdentityCache, RELAY_ID_CACHE_TTL_MS, MAX_RELAY_IDENTITY_ENTRIES};
 pub use reliable::{PendingReliable, MAX_PENDING_RELIABLE};
 pub use routing_ack::{
     build_ack_nak_frame, decode_routing_payload, hop_limit_for_response, retransmission_delay_ms,

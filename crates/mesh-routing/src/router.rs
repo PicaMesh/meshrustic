@@ -18,6 +18,7 @@ use crate::packet_history::{ObserveResult, PacketHistory};
 use crate::pool::{PacketHandle, PacketPool, PacketSlot, MAX_PACKET_PAYLOAD};
 use crate::qos::ChannelQoS;
 use crate::rate_limit::NodeRateLimiter;
+use crate::relay_identity::RelayIdentityCache;
 use crate::relay::{copy_opaque_payload, relay_header_with_next_hop, wire_may_relay};
 use crate::reliable::{
     bump_reliable_delays, due_retransmit, schedule_reliable, stop_reliable, PendingReliable,
@@ -173,6 +174,7 @@ pub struct Router {
     pool: PacketPool,
     history: PacketHistory,
     rate_limit: NodeRateLimiter,
+    relay_identity: RelayIdentityCache,
     qos: ChannelQoS,
     graph: NeighborGraph,
     pending: [PendingRelay; MAX_PENDING_RELAYS],
@@ -264,6 +266,7 @@ impl Router {
             pool: PacketPool::new(),
             history: PacketHistory::new(),
             rate_limit: NodeRateLimiter::with_node_num(node_num),
+            relay_identity: RelayIdentityCache::new(),
             qos: ChannelQoS::new(),
             graph,
             pending: [PendingRelay {
@@ -583,6 +586,14 @@ impl Router {
             }
         }
 
+        if direct {
+            let relay_byte = (parsed.from & 0xFF) as u8;
+            if relay_byte != 0 {
+                self.relay_identity
+                    .remember_relay_identity(parsed.from, relay_byte, now_ms);
+            }
+        }
+
         let decoded_portnum = decode.portnum;
         if self
             .rate_limit
@@ -849,13 +860,21 @@ impl Router {
             return plan;
         }
 
+        let heard_from = self.resolve_heard_from_node(
+            parsed.relay_node,
+            parsed.from,
+            result.rssi,
+            result.snr,
+            now_ms,
+        );
+
         if parsed.to == NODENUM_BROADCAST
             && self.graph.signal_routing_active()
             && parsed.from != self.node_num
         {
             let best = self
                 .graph
-                .find_best_relay_candidate(parsed.id, parsed.from, now_ms);
+                .find_best_relay_candidate(parsed.id, heard_from, now_ms);
             if best != 0 && best != self.node_num {
                 self.pool.release(handle);
                 self.sr_log.push(SrLogEvent::RelaySkip {
@@ -997,7 +1016,7 @@ impl Router {
             parsed.id,
             result.radio_id,
             result.snr,
-            parsed.from,
+            heard_from,
             now_ms,
             half_airtime,
             DEFAULT_SLOT_MS,
@@ -1012,7 +1031,7 @@ impl Router {
         });
         self.sr_log.push(SrLogEvent::RelayCommitted {
             id: parsed.id,
-            heard_from: parsed.from,
+            heard_from,
             delay_ms,
         });
 
@@ -1108,6 +1127,7 @@ impl Router {
     }
 
     pub fn run_maintenance(&mut self, now_ms: u32, slot_ms: u32) -> MaintenanceReport {
+        self.relay_identity.prune_relay_identity_cache(now_ms);
         let report = self.graph.run_maintenance(now_ms);
         if let Some((before, after)) = report.graph_aged {
             self.sr_log.push(SrLogEvent::GraphAged { before, after });
@@ -1150,9 +1170,35 @@ impl Router {
         self.graph.emit_topology_log(self.node_num, sink);
     }
 
-    /// Which radio heard the packet (v1: single radio — always `packet.radio_id`).
-    pub fn resolve_heard_from(packet: &InboundPacket<'_>) -> u8 {
+    /// Receiving radio index for a captured inbound frame (v1: single radio).
+    pub fn received_on_radio(packet: &InboundPacket<'_>) -> u8 {
         packet.radio_id
+    }
+
+    /// Resolve the NodeNum of the relaying neighbor for SR flooding decisions.
+    pub fn resolve_heard_from_node(
+        &mut self,
+        relay_node: u8,
+        source: u32,
+        rssi: i16,
+        snr: i8,
+        now_ms: u32,
+    ) -> u32 {
+        self.relay_identity.resolve_heard_from(
+            relay_node,
+            source,
+            rssi,
+            snr,
+            &self.graph,
+            now_ms,
+        )
+    }
+
+    /// Record a relay-byte mapping (host tests and topology learning paths).
+    #[doc(hidden)]
+    pub fn remember_relay_identity(&mut self, node_id: u32, relay_byte: u8, now_ms: u32) {
+        self.relay_identity
+            .remember_relay_identity(node_id, relay_byte, now_ms);
     }
 
     /// Cancel a scheduled T1 broadcast retransmit (fork: cancelBroadcastRetransmit).
@@ -1160,10 +1206,10 @@ impl Router {
         self.cancel_t1_retransmit(packet_id, T1CancelReason::RelayHeard);
     }
 
-    /// True when every direct `hearsUs` neighbor has relayed this packet (fork: areAllNeighborsCovered).
-    pub fn all_neighbors_covered(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> bool {
+    /// True when every direct neighbor is covered by accumulated transmitters (broadcast dupe cancel).
+    pub fn all_neighbors_covered(&mut self, from: u32, packet_id: u32, dupe_relayer: u32) -> bool {
         self.graph
-            .all_hears_us_neighbors_heard_packet(packet_id, heard_from, now_ms)
+            .all_neighbors_covered(from, packet_id, dupe_relayer)
     }
 
     /// True when router has scheduled TX work (relays, topology, ACKs, retransmits).
@@ -1793,10 +1839,17 @@ impl Router {
                 }
                 return;
             }
-            if rebroadcast
-                && !self.all_neighbors_covered(parsed.id, parsed.from, now_ms)
-            {
-                return;
+            if rebroadcast {
+                let heard_from = self.resolve_heard_from_node(
+                    parsed.relay_node,
+                    parsed.from,
+                    packet.rssi,
+                    packet.snr,
+                    now_ms,
+                );
+                if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from) {
+                    return;
+                }
             }
         }
 

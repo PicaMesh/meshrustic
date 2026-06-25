@@ -6,9 +6,9 @@ use mesh_radio::RadioId;
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
 use crate::graph::{
-    calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor, placeholder_node_id,
-    EdgeSource, EdgeStore, DownstreamTable, Route, RouteCache, EDGE_NEW, EDGE_SIGNIFICANT_CHANGE,
-    MAX_EDGES_PER_NODE,
+    calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor,
+    is_placeholder_node, placeholder_node_id, EdgeSource, EdgeStore, DownstreamTable, Route,
+    RouteCache, EDGE_NEW, EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
 use crate::nodeinfo::{
     DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE,
@@ -21,6 +21,7 @@ use crate::topology::{
 
 pub const MAX_NEIGHBORS: usize = MAX_EDGES_PER_NODE;
 pub const MAX_RELAY_STATES: usize = 32;
+pub const MAX_HEARD_TRANSMITTERS: usize = 6;
 pub const MAX_TOPOLOGY_VERSION_ENTRIES: usize = 24;
 pub const TOPOLOGY_BROADCAST_MS: u32 = 600_000;
 pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
@@ -46,6 +47,9 @@ struct RelayCommit {
     radio_id: u8,
     tx_after_ms: u32,
     snr: i8,
+    original_heard_from: u32,
+    heard_transmitters: [u32; MAX_HEARD_TRANSMITTERS],
+    heard_transmitter_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,6 +119,9 @@ impl NeighborGraph {
                 radio_id: 0,
                 tx_after_ms: 0,
                 snr: 0,
+                original_heard_from: 0,
+                heard_transmitters: [0; MAX_HEARD_TRANSMITTERS],
+                heard_transmitter_count: 0,
             }; MAX_RELAY_STATES],
             topo_versions: [TopologyVersionEntry {
                 node_id: 0,
@@ -149,6 +156,36 @@ impl NeighborGraph {
 
     pub fn my_node(&self) -> u32 {
         self.my_node
+    }
+
+    pub fn edges(&self) -> &EdgeStore {
+        &self.edges
+    }
+
+    /// Outgoing edge whose destination low byte matches `relay_byte` (non-placeholder preferred).
+    pub fn match_relay_byte_on_outgoing_edges(&self, relay_byte: u8) -> Option<u32> {
+        let node = self.edges.find_node(self.my_node)?;
+        for i in 0..node.edge_count as usize {
+            let to = node.edges[i].to;
+            if (to & 0xFF) as u8 != relay_byte {
+                continue;
+            }
+            if !is_placeholder_node(to) {
+                return Some(to);
+            }
+        }
+        None
+    }
+
+    pub fn match_relay_placeholder_on_outgoing_edges(&self, relay_byte: u8) -> Option<u32> {
+        let node = self.edges.find_node(self.my_node)?;
+        for i in 0..node.edge_count as usize {
+            let to = node.edges[i].to;
+            if (to & 0xFF) as u8 == relay_byte && is_placeholder_node(to) {
+                return Some(to);
+            }
+        }
+        None
     }
 
     pub fn update_node_activity(&mut self, node_id: u32, now_ms: u32) {
@@ -831,6 +868,9 @@ impl NeighborGraph {
                 radio_id,
                 tx_after_ms,
                 snr,
+                original_heard_from: heard_from,
+                heard_transmitters: [0; MAX_HEARD_TRANSMITTERS],
+                heard_transmitter_count: 0,
             };
             return (tx_after_ms, slot_index, candidates);
         }
@@ -993,6 +1033,105 @@ impl NeighborGraph {
             }
         }
         hears_us_count > 0
+    }
+
+    /// True when at least one direct neighbor is not covered by the union of `covered_by` edge sets.
+    pub fn has_unique_coverage(&self, covered_by: &[u32]) -> bool {
+        let Some(node) = self.edges.find_node(self.my_node) else {
+            return false;
+        };
+        for i in 0..node.edge_count as usize {
+            let neighbor = node.edges[i].to;
+            if is_placeholder_node(neighbor) {
+                continue;
+            }
+            if covered_by.contains(&neighbor) {
+                continue;
+            }
+            let mut covered = false;
+            for &coverer in covered_by {
+                let Some(coverer_node) = self.edges.find_node(coverer) else {
+                    continue;
+                };
+                for j in 0..coverer_node.edge_count as usize {
+                    if coverer_node.edges[j].to == neighbor {
+                        covered = true;
+                        break;
+                    }
+                }
+                if covered {
+                    break;
+                }
+            }
+            if !covered {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_relay_commit(&self, from: u32, id: u32) -> Option<usize> {
+        self.relay_states
+            .iter()
+            .position(|s| s.active && s.from == from && s.id == id)
+    }
+
+    fn accumulate_heard_transmitter(&mut self, from: u32, id: u32, transmitter: u32) {
+        if transmitter == 0 || transmitter == self.my_node {
+            return;
+        }
+        let Some(idx) = self.find_relay_commit(from, id) else {
+            return;
+        };
+        let relay = &mut self.relay_states[idx];
+        for i in 0..relay.heard_transmitter_count as usize {
+            if relay.heard_transmitters[i] == transmitter {
+                return;
+            }
+        }
+        if (relay.heard_transmitter_count as usize) >= MAX_HEARD_TRANSMITTERS {
+            return;
+        }
+        relay.heard_transmitters[relay.heard_transmitter_count as usize] = transmitter;
+        relay.heard_transmitter_count = relay.heard_transmitter_count.saturating_add(1);
+    }
+
+    fn build_coverage_transmitters(&self, from: u32, id: u32, out: &mut [u32; 1 + MAX_HEARD_TRANSMITTERS]) -> u8 {
+        let mut count = 0u8;
+        let Some(idx) = self.find_relay_commit(from, id) else {
+            return 0;
+        };
+        let relay = &self.relay_states[idx];
+        if relay.original_heard_from != 0 && relay.original_heard_from != self.my_node {
+            out[count as usize] = relay.original_heard_from;
+            count += 1;
+        }
+        for i in 0..relay.heard_transmitter_count as usize {
+            let transmitter = relay.heard_transmitters[i];
+            if transmitter != relay.original_heard_from {
+                out[count as usize] = transmitter;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Broadcast dupe coverage: accumulate the relayer and return true only when no unique coverage remains.
+    pub fn all_neighbors_covered(&mut self, from: u32, packet_id: u32, dupe_relayer: u32) -> bool {
+        if dupe_relayer == 0 || dupe_relayer == self.my_node {
+            return false;
+        }
+        self.accumulate_heard_transmitter(from, packet_id, dupe_relayer);
+        let mut covered_by = [0u32; 1 + MAX_HEARD_TRANSMITTERS];
+        let count = self.build_coverage_transmitters(from, packet_id, &mut covered_by);
+        !self.has_unique_coverage(&covered_by[..count as usize])
+    }
+
+    /// Distinct accumulated relayers for a committed broadcast relay (testing / diagnostics).
+    pub fn relay_heard_transmitter_count(&self, from: u32, id: u32) -> u8 {
+        self.find_relay_commit(from, id)
+            .map(|idx| self.relay_states[idx].heard_transmitter_count)
+            .unwrap_or(0)
     }
 
     /// True when a `hears_us` neighbor on `radio` has not yet transmitted this packet id.
@@ -1237,7 +1376,7 @@ mod tests {
     use super::*;
     use crate::coordinated_relay::DEFAULT_SLOT_MS;
     use crate::decode_packed_neighbors;
-    use crate::topology::write_packed_header;
+    use crate::topology::{write_packed_header, PackedNeighbor};
 
     #[test]
     fn relayed_packet_does_not_add_direct_neighbor() {
@@ -1331,6 +1470,40 @@ mod tests {
         graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0);
         let placeholder = placeholder_node_id(0xCD);
         assert!(graph.test_has_edge(placeholder, 0xBB00_00BB));
+    }
+
+    const COV_ME: u32 = 0x1000_0001;
+    const COV_A: u32 = 0xA000_000A;
+    const COV_B: u32 = 0xB000_000B;
+
+    #[test]
+    fn has_unique_coverage_detects_gap() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(COV_ME);
+        graph.observe_direct_neighbor(COV_A, -70, 8, 0, 0);
+        graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
+        assert!(graph.has_unique_coverage(&[COV_A]));
+    }
+
+    #[test]
+    fn has_unique_coverage_satisfied_when_coverer_reaches_neighbor() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(COV_ME);
+        graph.observe_direct_neighbor(COV_A, -70, 8, 0, 0);
+        graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
+        let remote = PackedNeighbor {
+            node_id: COV_B,
+            rssi: -72,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: false,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(COV_A, &header, &[remote], true, 100, 0);
+        assert!(!graph.has_unique_coverage(&[COV_A]));
     }
 }
 
