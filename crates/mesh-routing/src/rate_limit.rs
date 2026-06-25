@@ -124,7 +124,7 @@ impl NodeRateLimiter {
         }
 
         bucket.count = bucket.count.saturating_add(1);
-        if bucket.count > threshold {
+        if bucket.count >= threshold {
             bucket.limited = true;
             bucket.window_start_ms = now_ms;
             return true;
@@ -163,34 +163,56 @@ mod tests {
     fn other_bucket_limits_at_four() {
         let mut limiter = NodeRateLimiter::new();
         let from = 0xAABB_CCDD;
-        for i in 0..4 {
+        for i in 0..3 {
             assert!(
                 !limiter.should_drop(from, None, i * 1000),
                 "packet {i} should pass"
             );
         }
-        assert!(limiter.should_drop(from, None, 5000));
-        assert!(limiter.should_drop(from, None, 6000));
+        assert!(
+            limiter.should_drop(from, None, 3000),
+            "4th OTHER packet should drop"
+        );
+        assert!(limiter.should_drop(from, None, 4000));
     }
 
     #[test]
     fn routing_bucket_has_higher_threshold() {
         let mut limiter = NodeRateLimiter::new();
         let from = 0x1111_2222;
-        for i in 0..10 {
+        for i in 0..9 {
             assert!(
                 !limiter.should_drop(from, Some(num::ROUTING_APP), i * 100),
                 "packet {i} should pass"
             );
         }
-        assert!(limiter.should_drop(from, Some(num::ROUTING_APP), 2000));
+        assert!(
+            limiter.should_drop(from, Some(num::ROUTING_APP), 900),
+            "10th routing packet should drop"
+        );
+    }
+
+    #[test]
+    fn text_bucket_limits_at_thirty() {
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0x5555_6666;
+        for i in 0..29 {
+            assert!(
+                !limiter.should_drop(from, Some(num::TEXT_MESSAGE_APP), i * 100),
+                "packet {i} should pass"
+            );
+        }
+        assert!(
+            limiter.should_drop(from, Some(num::TEXT_MESSAGE_APP), 2900),
+            "30th text packet should drop"
+        );
     }
 
     #[test]
     fn limiting_other_bucket_does_not_limit_text() {
         let mut limiter = NodeRateLimiter::new();
         let from = 0xDEAD_BEEF;
-        for i in 0..5 {
+        for i in 0..4 {
             limiter.should_drop(from, None, i * 1000);
         }
         assert!(
@@ -207,12 +229,12 @@ mod tests {
     fn limited_node_recovers_after_quiet_window() {
         let mut limiter = NodeRateLimiter::new();
         let from = 0x1234_5678;
-        for _ in 0..4 {
+        for _ in 0..3 {
             assert!(!limiter.should_drop(from, None, 0));
         }
         assert!(
             limiter.should_drop(from, None, 0),
-            "5th OTHER packet should trip the limit"
+            "4th OTHER packet should trip the limit"
         );
         assert!(
             !limiter.should_drop(from, None, WINDOW_MS + 1),
@@ -224,7 +246,7 @@ mod tests {
     fn activity_during_limit_prevents_recovery() {
         let mut limiter = NodeRateLimiter::new();
         let from = 0x8765_4321;
-        for _ in 0..4 {
+        for _ in 0..3 {
             assert!(!limiter.should_drop(from, None, 0));
         }
         assert!(limiter.should_drop(from, None, 0));
@@ -244,13 +266,13 @@ mod tests {
         let mut limiter = NodeRateLimiter::new();
         let from = 0xCAFE_BABE;
 
-        for i in 0..10 {
+        for i in 0..9 {
             assert!(
                 !limiter.should_drop(from, Some(num::ROUTING_APP), i * 1000),
                 "routing packet {i} should pass"
             );
         }
-        for i in 0..29 {
+        for i in 0..28 {
             assert!(
                 !limiter.should_drop(from, Some(num::TEXT_MESSAGE_APP), 10_000 + i * 100),
                 "text packet {i} should pass"
@@ -259,11 +281,11 @@ mod tests {
 
         assert!(
             limiter.should_drop(from, Some(num::ROUTING_APP), 20_000),
-            "11th routing packet should drop"
+            "10th routing packet should drop"
         );
         assert!(
             !limiter.should_drop(from, Some(num::TEXT_MESSAGE_APP), 21_000),
-            "30th text packet not yet reached"
+            "29th text packet should still pass"
         );
     }
 }

@@ -22,7 +22,7 @@ fn inbound(bytes: &[u8]) -> InboundPacket<'_> {
 }
 
 fn flood_other_bucket(router: &mut Router, from: u32, channel: u8, key: &CryptoKey, t: u32) {
-    for i in 0..5u32 {
+    for i in 0..4u32 {
         let (len, frame) = build_app_wire_frame(
             NODENUM_BROADCAST,
             from,
@@ -66,7 +66,7 @@ fn establish_direct_peer(router: &mut Router, from: u32, channel: u8, key: &Cryp
 fn flood_routing_bucket(router: &mut Router, from: u32, channel: u8, key: &CryptoKey, t: u32) {
     let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
     write_packed_header(&mut packed, 1, true);
-    for i in 0..11u32 {
+    for i in 0..10u32 {
         let (len, frame) = build_topology_wire_frame(from, 0x6000 + i, channel, 3, key, &packed)
             .expect("routing flood wire");
         router
