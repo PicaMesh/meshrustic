@@ -4,7 +4,7 @@ use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{is_direct_packet, PacketHeader, ParsedPacket, PACKET_HEADER_LEN, NODENUM_BROADCAST};
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
 
-use crate::coordinated_relay::{tx_delay_ms_worst, DEFAULT_SLOT_MS};
+use crate::coordinated_relay::{half_airtime_ms, slot_time_for_preset, tx_delay_ms_worst, DEFAULT_SLOT_MS};
 use crate::neighbor_graph::{
     MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS,
     TOPOLOGY_BROADCAST_MS, TOPOLOGY_DIRTY_MIN_MS,
@@ -384,6 +384,10 @@ impl Router {
 
     pub fn modem_preset(&self) -> u8 {
         self.modem_preset
+    }
+
+    fn cw_slot_ms(&self) -> u32 {
+        slot_time_for_preset(self.modem_preset)
     }
 
     /// Call when a frame is actually queued for TX (own-rebroadcast detection).
@@ -1007,6 +1011,8 @@ impl Router {
             delay_ms: 0,
         };
 
+        let cw_slot = self.cw_slot_ms();
+
         if parsed.to != NODENUM_BROADCAST
             && route.next_hop != 0
             && route.egress_radio != result.radio_id
@@ -1022,13 +1028,14 @@ impl Router {
                 self.node_num,
                 result.snr,
                 slot_ms,
+                cw_slot,
                 &mut bridged,
             ) {
                 return bridged;
             }
         }
 
-        let half_airtime = (slot_ms / 2).max(50);
+        let half_airtime = half_airtime_ms(slot_ms);
         let (tx_after_ms, slot_index, candidates) = self.graph.commit_relay(
             parsed.from,
             parsed.id,
@@ -1037,7 +1044,7 @@ impl Router {
             heard_from,
             now_ms,
             half_airtime,
-            DEFAULT_SLOT_MS,
+            cw_slot,
             self.node_num,
         );
         let delay_ms = tx_after_ms.wrapping_sub(now_ms);
@@ -1080,6 +1087,7 @@ impl Router {
                 self.node_num,
                 result.snr,
                 slot_ms,
+                cw_slot,
                 &mut plan,
             );
             return plan;
@@ -1112,6 +1120,7 @@ impl Router {
             self.node_num,
             result.snr,
             slot_ms,
+            cw_slot,
             &mut plan,
         );
         plan
@@ -2016,7 +2025,7 @@ impl Router {
         else {
             return;
         };
-        let fire_delay = tx_delay_ms_worst(DEFAULT_SLOT_MS).saturating_add(airtime_ms);
+        let fire_delay = tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms);
         self.pending_retransmits[idx] = PendingRetransmit {
             active: true,
             canceled: false,

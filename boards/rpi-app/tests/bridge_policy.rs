@@ -87,6 +87,7 @@ fn bridge_stub_direct_call_returns_zero() {
         0x677a_1caf,
         10,
         coordinated_relay::DEFAULT_SLOT_MS,
+        coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
         &mut plan,
     ));
     assert_eq!(plan.bridge_count, 0);
@@ -174,6 +175,7 @@ fn bridge_dedup_suppresses_second_bridge_to_same_target() {
         0xAA00_00AA,
         10,
         coordinated_relay::DEFAULT_SLOT_MS,
+        coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
         &mut plan,
     ));
     assert_eq!(plan.bridge_count, 1);
@@ -188,6 +190,7 @@ fn bridge_dedup_suppresses_second_bridge_to_same_target() {
         0xAA00_00AA,
         10,
         coordinated_relay::DEFAULT_SLOT_MS,
+        coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
         &mut plan,
     ));
     assert_eq!(plan.bridge_count, 0);

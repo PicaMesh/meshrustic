@@ -160,7 +160,8 @@ pub fn evaluate_bridge_targets(
     sr_log: &mut SrLog,
     node_num: u32,
     snr: i8,
-    slot_ms: u32,
+    packet_airtime_ms: u32,
+    cw_slot_ms: u32,
     plan: &mut TxPlan,
 ) -> bool {
     plan.bridge_count = 0;
@@ -183,7 +184,8 @@ pub fn evaluate_bridge_targets(
                 sr_log,
                 node_num,
                 snr,
-                slot_ms,
+                packet_airtime_ms,
+                cw_slot_ms,
                 plan,
             );
         }
@@ -206,7 +208,8 @@ pub fn evaluate_bridge_targets(
             sr_log,
             node_num,
             snr,
-            slot_ms,
+            packet_airtime_ms,
+            cw_slot_ms,
             plan,
         ) {
             return true;
@@ -224,13 +227,14 @@ fn enqueue_bridge_leg(
     sr_log: &mut SrLog,
     node_num: u32,
     snr: i8,
-    slot_ms: u32,
+    packet_airtime_ms: u32,
+    cw_slot_ms: u32,
     plan: &mut TxPlan,
 ) -> bool {
     if plan.bridge_count as usize >= MAX_BRIDGE_TARGETS {
         return false;
     }
-    let half_airtime = (slot_ms / 2).max(50);
+    let half_airtime = crate::coordinated_relay::half_airtime_ms(packet_airtime_ms);
     let (tx_after_ms, _, _) = graph.commit_relay(
         eval.parsed.from,
         eval.parsed.id,
@@ -239,7 +243,7 @@ fn enqueue_bridge_leg(
         eval.parsed.from,
         eval.now_ms,
         half_airtime,
-        crate::coordinated_relay::DEFAULT_SLOT_MS,
+        cw_slot_ms,
         node_num,
     );
     let delay_ms = tx_after_ms.wrapping_sub(eval.now_ms);

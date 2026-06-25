@@ -9,6 +9,7 @@ mod config;
 mod frame;
 mod interface;
 mod packet_time;
+mod timing;
 mod queue;
 mod slot;
 
@@ -25,6 +26,7 @@ pub use config::{
 pub use frame::{RadioId, RxFrame, TxFrame, MAX_BRIDGE_TARGETS, MAX_LORA_PAYLOAD, MAX_RADIOS};
 pub use interface::{RadioError, RadioInterface};
 pub use packet_time::packet_time_ms;
+pub use timing::{contention_window_ms, eu868_config_for_preset, slot_time_ms};
 pub use queue::{QueueError, RxQueue, TxQueue, DEFAULT_RX_QUEUE, DEFAULT_TX_QUEUE};
 pub use slot::{RadioSlot, ServiceReport};
 
