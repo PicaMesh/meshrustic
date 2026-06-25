@@ -1,7 +1,7 @@
 //! Topology graph and per-radio relay commit state (Phase 6 SR).
 
 use mesh_protocol::is_direct_packet;
-use mesh_radio::RadioId;
+use mesh_radio::{contention_window_ms, RadioId, MODEM_SHORT_SLOW};
 
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
@@ -28,6 +28,8 @@ pub const TOPOLOGY_BROADCAST_MS: u32 = 600_000;
 pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
 pub const NEIGHBOR_TTL_MS: u32 = 7_200_000;
+
+/// Transmission-memory window for SHORT_SLOW (see `contention_window_ms`).
 pub const NODE_TX_RECORD_MS: u32 = 2_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,6 +90,7 @@ const MAX_NODE_TX_RECORDS: usize = 32;
 pub struct NeighborGraph {
     my_node: u32,
     device_role: u32,
+    modem_preset: u8,
     edges: EdgeStore,
     downstream: DownstreamTable,
     relay_states: [RelayCommit; MAX_RELAY_STATES],
@@ -111,6 +114,7 @@ impl NeighborGraph {
         Self {
             my_node: 0,
             device_role: DEVICE_ROLE_CLIENT,
+            modem_preset: MODEM_SHORT_SLOW,
             edges: EdgeStore::new(),
             downstream: DownstreamTable::new(),
             relay_states: [RelayCommit {
@@ -202,6 +206,18 @@ impl NeighborGraph {
     pub fn set_device_role(&mut self, role: u32) {
         self.device_role = role;
         self.signal_routing_active = Self::role_is_active_routing(role);
+    }
+
+    pub fn set_modem_preset(&mut self, modem_preset: u8) {
+        self.modem_preset = modem_preset;
+    }
+
+    pub fn modem_preset(&self) -> u8 {
+        self.modem_preset
+    }
+
+    fn node_tx_record_window_ms(&self) -> u32 {
+        contention_window_ms(self.modem_preset)
     }
 
     pub fn is_active_routing_role(&self) -> bool {
@@ -306,10 +322,8 @@ impl NeighborGraph {
             self.node_tx_count += 1;
             return;
         }
-        for i in 1..MAX_NODE_TX_RECORDS {
-            self.node_tx[i - 1] = self.node_tx[i];
-        }
-        self.node_tx[MAX_NODE_TX_RECORDS - 1] = NodeTxRecord {
+        let oldest = self.oldest_node_tx_index(now_ms);
+        self.node_tx[oldest] = NodeTxRecord {
             node_id,
             packet_id,
             at_ms: now_ms,
@@ -317,16 +331,30 @@ impl NeighborGraph {
     }
 
     pub fn has_node_transmitted(&self, node_id: u32, packet_id: u32, now_ms: u32) -> bool {
+        let window = self.node_tx_record_window_ms();
         for i in 0..self.node_tx_count as usize {
             let rec = self.node_tx[i];
             if rec.node_id == node_id
                 && rec.packet_id == packet_id
-                && now_ms.wrapping_sub(rec.at_ms) <= NODE_TX_RECORD_MS
+                && now_ms.wrapping_sub(rec.at_ms) <= window
             {
                 return true;
             }
         }
         false
+    }
+
+    fn oldest_node_tx_index(&self, now_ms: u32) -> usize {
+        let mut oldest_idx = 0usize;
+        let mut oldest_age = now_ms.wrapping_sub(self.node_tx[0].at_ms);
+        for i in 1..self.node_tx_count as usize {
+            let age = now_ms.wrapping_sub(self.node_tx[i].at_ms);
+            if age > oldest_age {
+                oldest_idx = i;
+                oldest_age = age;
+            }
+        }
+        oldest_idx
     }
 
     pub fn apply_topology_hears_us(
@@ -1603,6 +1631,37 @@ mod tests {
     use crate::coordinated_relay::DEFAULT_SLOT_MS;
     use crate::decode_packed_neighbors;
     use crate::topology::{write_packed_header, PackedNeighbor};
+    use mesh_radio::{contention_window_ms, MODEM_LONG_SLOW, MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
+
+    #[test]
+    fn recorded_transmission_expires_after_cw_window() {
+        let mut graph = NeighborGraph::new();
+        graph.set_modem_preset(MODEM_SHORT_SLOW);
+        graph.record_node_transmission(0xBB, 42, 0);
+        let window = contention_window_ms(MODEM_SHORT_SLOW);
+        assert!(graph.has_node_transmitted(0xBB, 42, window));
+        assert!(!graph.has_node_transmitted(0xBB, 42, window + 1));
+
+        graph.set_modem_preset(MODEM_SHORT_FAST);
+        graph.record_node_transmission(0xCC, 7, 10_000);
+        let fast_window = contention_window_ms(MODEM_SHORT_FAST);
+        assert!(graph.has_node_transmitted(0xCC, 7, 10_000 + fast_window));
+        assert!(!graph.has_node_transmitted(0xCC, 7, 10_000 + fast_window + 1));
+        assert!(fast_window < contention_window_ms(MODEM_LONG_SLOW));
+    }
+
+    #[test]
+    fn recorded_transmission_capacity_evicts_oldest() {
+        let mut graph = NeighborGraph::new();
+        for i in 0..MAX_NODE_TX_RECORDS as u32 {
+            graph.record_node_transmission(0x1000 + i, i + 1, i * 100);
+        }
+        assert!(graph.has_node_transmitted(0x1000, 1, 50_000));
+        graph.record_node_transmission(0x9999, 99, 50_000);
+        assert!(!graph.has_node_transmitted(0x1000, 1, 50_000));
+        assert!(graph.has_node_transmitted(0x9999, 99, 50_000));
+        assert!(graph.has_node_transmitted(0x1001, 2, 50_000));
+    }
 
     #[test]
     fn relayed_packet_does_not_add_direct_neighbor() {

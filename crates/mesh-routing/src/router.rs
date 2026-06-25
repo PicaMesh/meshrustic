@@ -261,6 +261,7 @@ impl Router {
     ) -> Self {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(node_num);
+        graph.set_modem_preset(modem_preset);
         Self {
             node_num,
             pool: PacketPool::new(),
@@ -366,6 +367,7 @@ impl Router {
         self.channel_key = channel_key;
         self.modem_preset = modem_preset;
         self.use_preset = use_preset;
+        self.graph.set_modem_preset(modem_preset);
         self.channel_hash =
             primary_channel_hash(stored_channel_name, modem_preset, use_preset, psk_bytes(&channel_key));
     }
