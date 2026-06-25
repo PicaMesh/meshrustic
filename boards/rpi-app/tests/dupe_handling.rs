@@ -36,12 +36,12 @@ fn router_role_router_keeps_relay_commit_on_dupe() {
         0x1234_5678,
         42,
         0x77,
-        3,
+        2,
         3,
         false,
         false,
         0,
-        0,
+        0x12,
     );
     let wire = wire_bytes(header, &[0xDE, 0xAD]);
     let inbound = InboundPacket {
@@ -88,12 +88,12 @@ fn client_cancels_relay_commit_on_dupe() {
         0x1234_5678,
         43,
         0x77,
-        3,
+        2,
         3,
         false,
         false,
         0,
-        0,
+        0x12,
     );
     let wire = wire_bytes(header, &[0xBE, 0xEF]);
     let inbound = InboundPacket {
@@ -166,6 +166,9 @@ fn foreign_routing_ack_cancels_pending_relay() {
     const DEST: u32 = 0x2222_2222;
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
     let mut router = Router::with_channel(US, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+    router
+        .graph_mut()
+        .observe_direct_neighbor(DEST, -70, 8, 1_000, 0);
 
     let (dm_len, dm_frame) = build_app_wire_frame(
         DEST,
@@ -248,7 +251,7 @@ fn upgraded_hop_limit_reprocesses_after_dropping_lower_pending() {
         FROM,
         88,
         0x77,
-        2,
+        1,
         3,
         false,
         &key,

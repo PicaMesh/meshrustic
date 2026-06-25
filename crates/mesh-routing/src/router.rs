@@ -4,7 +4,7 @@ use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{is_direct_packet, PacketHeader, ParsedPacket, PACKET_HEADER_LEN, NODENUM_BROADCAST};
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
 
-use crate::coordinated_relay::{half_airtime_ms, slot_time_for_preset, tx_delay_ms_worst, DEFAULT_SLOT_MS};
+use crate::coordinated_relay::{half_airtime_ms, slot_time_for_preset, tx_delay_ms_worst};
 use crate::neighbor_graph::{
     MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS,
     TOPOLOGY_BROADCAST_MS, TOPOLOGY_DIRTY_MIN_MS,
@@ -910,8 +910,8 @@ impl Router {
             None
         };
 
-        if let Some(ref plan) = broadcast_plan {
-            if !plan.should_relay {
+        if let Some(ref relay_plan) = broadcast_plan {
+            if !relay_plan.should_relay {
                 self.pool.release(handle);
                 self.sr_log.push(SrLogEvent::RelaySkip {
                     from: parsed.from,

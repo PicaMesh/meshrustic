@@ -4,7 +4,10 @@ use embassy_time::{Duration, Instant, Timer};
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::PacketHeader;
 use mesh_radio::{packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868};
-use mesh_routing::{wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, InboundPacket, Router, RxDecodeInfo, SrLogEvent, MAX_SR_LOG};
+use mesh_routing::{
+    wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, InboundPacket, Router, RxDecodeInfo,
+    SrLogEvent, MAX_SR_LOG,
+};
 use static_cell::StaticCell;
 
 use super::sx1262::Sx1262Driver;
@@ -112,11 +115,7 @@ pub async fn radio_task(
                         report.tx_to.unwrap_or(0),
                         len
                     );
-                    crate::usb_log::log::radio::tx_done(
-                        report.tx_id,
-                        report.tx_to,
-                        len,
-                    );
+                    crate::usb_log::log::radio::tx_done(report.tx_id, report.tx_to, len);
                 }
                 if report.duty_cycle_blocked
                     && Instant::now().duration_since(last_duty_log) >= Duration::from_secs(10)
@@ -284,7 +283,10 @@ fn handle_rx_frame(
         }
     } else if let Ok(header) = PacketHeader::decode(frame.payload()) {
         let parsed = header.parse();
-        let payload_len = frame.payload().len().saturating_sub(mesh_protocol::PACKET_HEADER_LEN);
+        let payload_len = frame
+            .payload()
+            .len()
+            .saturating_sub(mesh_protocol::PACKET_HEADER_LEN);
         crate::usb_log::log::radio::rx_packet(
             &parsed,
             frame.rssi,

@@ -1,7 +1,7 @@
 //! Phased broadcast relay slot scheduling (stock → SR ranked → downstream → stock coverage).
 
 use crate::capability::{CapabilityCache, CapabilityStatus};
-use crate::graph::{is_placeholder_node, DownstreamTable, EdgeStore, MAX_EDGES_PER_NODE, NEIGHBOR_TTL_MS};
+use crate::graph::{is_placeholder_node, DownstreamTable, EdgeStore, MAX_EDGES_PER_NODE};
 use crate::nodeinfo::{
     DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_LOST_AND_FOUND,
 };
@@ -9,6 +9,7 @@ use crate::nodeinfo::{
 /// ETX above this threshold is not treated as good pre-coverage from `heard_from`.
 pub const POOR_LINK_ETX_THRESHOLD: f32 = 7.0;
 const BIDI_ETX_CEILING: f32 = 20.0;
+const DOWNSTREAM_TTL_MS: u32 = 7_200_000;
 const MAX_COVERED: usize = MAX_EDGES_PER_NODE + 8;
 const MAX_CANDIDATES: usize = MAX_EDGES_PER_NODE + 4;
 
@@ -146,7 +147,7 @@ fn absorb_relay_coverage(edges: &EdgeStore, covered: &mut CoveredSet, relay: u32
     }
 }
 
-pub fn find_best_relay_candidate<F>(
+fn find_best_relay_candidate<F>(
     ctx: &BroadcastRelayContext<'_>,
     candidates: &NodeSet,
     already_covered: &CoveredSet,
@@ -451,8 +452,8 @@ where
     }
 
     if !should_relay {
-        let relay_for_source = ctx.downstream.get_relay(source, now_ms, NEIGHBOR_TTL_MS);
-        let relay_for_dest = ctx.downstream.get_relay(broadcast_dest, now_ms, NEIGHBOR_TTL_MS);
+        let relay_for_source = ctx.downstream.get_relay(source, now_ms, DOWNSTREAM_TTL_MS);
+        let relay_for_dest = ctx.downstream.get_relay(broadcast_dest, now_ms, DOWNSTREAM_TTL_MS);
         if relay_for_source == Some(ctx.my_node) || relay_for_dest == Some(ctx.my_node) {
             should_relay = true;
             my_delay = slot_delay;
@@ -579,12 +580,13 @@ mod tests {
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, EE, 0xFF00_00FF, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, 0xFF00_00FF, 2.0, 0, EdgeSource::Reported, true, 0);
         capability.track_topology(EE, true, 0);
         capability.track_topology(ME, true, 0);
         let plan = plan_broadcast_relay(
             &ctx(&edges, &capability, &downstream),
-            0x98,
+            0x99,
             BB,
             BB,
             0xFFFF_FFFF,

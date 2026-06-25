@@ -200,8 +200,10 @@ pub mod mesh {
 
 /// Mirror key `[Radio0]` defmt lines as plain text for USB CDC.
 pub mod radio {
-    use super::{finish_line, line_prefix, push_freq_mhz, push_hex_u16_4, push_hex_u32_8,
-                push_hex_u8_2, push_i32, push_u32, MAX_LOG_LINE};
+    use super::{
+        finish_line, line_prefix, push_freq_mhz, push_hex_u16_4, push_hex_u32_8, push_hex_u8_2,
+        push_i32, push_u32, MAX_LOG_LINE,
+    };
 
     pub fn init_ok(module: &str, node_num: u32, preset: &str, freq_mhz: f32) {
         let mut line = [0u8; 192];
@@ -336,7 +338,11 @@ pub mod radio {
         finish_line(&mut line, pos);
     }
 
-    fn append_maybe_packet_header(line: &mut [u8], pos: &mut usize, parsed: &mesh_protocol::ParsedPacket) {
+    fn append_maybe_packet_header(
+        line: &mut [u8],
+        pos: &mut usize,
+        parsed: &mesh_protocol::ParsedPacket,
+    ) {
         append_slice(line, pos, b", maybe: id=0x");
         *pos += push_hex_u32_8(&mut line[*pos..], parsed.id);
         append_slice(line, pos, b" fr=!");
@@ -545,7 +551,9 @@ pub mod radio {
                 append_u32(
                     &mut line,
                     &mut pos,
-                    decode.portnum.unwrap_or(mesh_protocol::num::TEXT_MESSAGE_APP),
+                    decode
+                        .portnum
+                        .unwrap_or(mesh_protocol::num::TEXT_MESSAGE_APP),
                 );
                 append_slice(&mut line, &mut pos, b" text=\"");
                 let n = preview_len as usize;
@@ -562,7 +570,11 @@ pub mod radio {
                 append_u32(&mut line, &mut pos, neighbors as u32);
                 append_slice(&mut line, &mut pos, b" v=");
                 append_u32(&mut line, &mut pos, topo_v as u32);
-                append_slice(&mut line, &mut pos, if sr_active { b" SR=1" } else { b" SR=0" });
+                append_slice(
+                    &mut line,
+                    &mut pos,
+                    if sr_active { b" SR=1" } else { b" SR=0" },
+                );
             }
             RxPayloadSummary::Position {
                 latitude_i,
@@ -742,7 +754,7 @@ pub mod battery {
 /// Signal-routing decision logs (`[SR]` prefix).
 pub mod sr {
     use super::{finish_line, line_prefix, push_hex_u32_8, push_hex_u8_2, push_i32, push_u32};
-    use mesh_routing::{Router, SrLogEvent, SrSkipReason, TopologyLogSink, T1CancelReason};
+    use mesh_routing::{Router, SrLogEvent, SrSkipReason, T1CancelReason, TopologyLogSink};
 
     fn emit_topology_event(event: SrLogEvent) {
         match event {
@@ -799,7 +811,11 @@ pub mod sr {
             } => {
                 let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
-                let branch = if last { b"[SR]   \\- !" } else { b"[SR]   +- !" };
+                let branch = if last {
+                    b"[SR]   \\- !"
+                } else {
+                    b"[SR]   +- !"
+                };
                 line[pos..pos + branch.len()].copy_from_slice(branch);
                 pos += branch.len();
                 pos += push_hex_u32_8(&mut line[pos..], node_id);
@@ -1239,16 +1255,14 @@ pub mod sr {
                 pos += tail.len();
                 finish_line(&mut line, pos);
             }
-            event @ (
-                SrLogEvent::NetworkTopologyHeader { .. }
-                | SrLogEvent::NetworkTopologyUs { .. }
-                | SrLogEvent::NetworkTopologyEmpty
-                | SrLogEvent::NetworkTopologyNeighbor { .. }
-                | SrLogEvent::NetworkTopologyMirrored { .. }
-                | SrLogEvent::NetworkTopologyDownstreamHeader { .. }
-                | SrLogEvent::NetworkTopologyDownstreamRoute { .. }
-                | SrLogEvent::TopologyLoggingComplete
-            ) => emit_topology_event(event),
+            event @ (SrLogEvent::NetworkTopologyHeader { .. }
+            | SrLogEvent::NetworkTopologyUs { .. }
+            | SrLogEvent::NetworkTopologyEmpty
+            | SrLogEvent::NetworkTopologyNeighbor { .. }
+            | SrLogEvent::NetworkTopologyMirrored { .. }
+            | SrLogEvent::NetworkTopologyDownstreamHeader { .. }
+            | SrLogEvent::NetworkTopologyDownstreamRoute { .. }
+            | SrLogEvent::TopologyLoggingComplete) => emit_topology_event(event),
             SrLogEvent::GraphAged { before, after } => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);
@@ -1310,7 +1324,9 @@ pub mod sr {
                 let mid = b" short=";
                 line[pos..pos + mid.len()].copy_from_slice(mid);
                 pos += mid.len();
-                let n = (short_len as usize).min(5).min(line.len().saturating_sub(pos + 2));
+                let n = (short_len as usize)
+                    .min(5)
+                    .min(line.len().saturating_sub(pos + 2));
                 line[pos..pos + n].copy_from_slice(&short_name[..n]);
                 pos += n;
                 let mid2 = b" role=";

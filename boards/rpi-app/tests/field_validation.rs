@@ -73,6 +73,13 @@ fn field_traceroute_three_node_chain() {
     .expect("wire frame");
 
     let mut router_b = Router::with_channel(B, key, CHANNEL, MODEM_SHORT_SLOW, true, 3);
+    router_b
+        .graph_mut()
+        .observe_direct_neighbor(0xF000_000F, -75, 8, 0, 0);
+    router_b
+        .graph_mut()
+        .capability_mut()
+        .track_topology(0xF000_000F, true, 0);
     let result_b = router_b
         .process_inbound(
             &InboundPacket {
@@ -89,6 +96,13 @@ fn field_traceroute_three_node_chain() {
     assert_eq!(rd_b.route.as_slice(), &[B]);
 
     let mut router_c = Router::with_channel(C, key, CHANNEL, MODEM_SHORT_SLOW, true, 3);
+    router_c
+        .graph_mut()
+        .observe_direct_neighbor(0xF000_000F, -75, 8, 0, 0);
+    router_c
+        .graph_mut()
+        .capability_mut()
+        .track_topology(0xF000_000F, true, 0);
     let result_c = router_c
         .process_inbound(
             &InboundPacket {

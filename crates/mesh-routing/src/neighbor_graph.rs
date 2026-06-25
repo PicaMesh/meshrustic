@@ -12,7 +12,7 @@ use crate::graph::{
     EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
 use crate::nodeinfo::{
-    DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
+    DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_ROUTER,
     DEVICE_ROLE_ROUTER_LATE,
 };
 use crate::topology::{
@@ -771,7 +771,8 @@ impl NeighborGraph {
     }
 
     pub fn topology_packet_count(&self) -> u8 {
-        let total = self.neighbor_count() as usize;
+        let mut scratch = [NeighborEntry::default(); MAX_NEIGHBORS];
+        let total = self.fill_neighbor_entries(&mut scratch) as usize;
         if total == 0 {
             1
         } else {
@@ -1767,6 +1768,7 @@ mod tests {
     use super::*;
     use crate::coordinated_relay::DEFAULT_SLOT_MS;
     use crate::decode_packed_neighbors;
+    use crate::nodeinfo::DEVICE_ROLE_REPEATER;
     use crate::topology::{write_packed_header, PackedNeighbor};
     use mesh_radio::{contention_window_ms, MODEM_LONG_SLOW, MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
 

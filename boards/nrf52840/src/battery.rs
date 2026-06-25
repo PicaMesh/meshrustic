@@ -57,8 +57,7 @@ async fn sample_battery(saadc: &mut Saadc<'static, 1>) -> BatteryReading {
     let mv_per_lsb = ADC_MULTIPLIER * (1000.0 * AREF_VOLTAGE / (1u32 << BATTERY_SENSE_BITS) as f32);
     let measured_mv = (mv_per_lsb * raw_avg as f32) as u32;
     let usb = crate::usb_log::is_usb_connected();
-    let (voltage_mv, battery_level, valid) =
-        interpret_battery_reading(measured_mv, raw_avg, usb);
+    let (voltage_mv, battery_level, valid) = interpret_battery_reading(measured_mv, raw_avg, usb);
     BatteryReading {
         voltage_mv,
         battery_level,

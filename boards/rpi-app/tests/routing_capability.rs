@@ -87,7 +87,7 @@ fn send_local_broadcast_schedules_t1() {
     router.confirm_direct_neighbor_hears_us(0xBB);
 
     let airtime = 200;
-    let slot_ms = coordinated_relay::DEFAULT_SLOT_MS;
+    let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW);
     let plan = router
         .send_local(
             NODENUM_BROADCAST,

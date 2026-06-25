@@ -58,7 +58,7 @@ impl CapabilityCache {
         }
         if now_ms != 0 {
             let age = now_ms.wrapping_sub(rec.last_updated_ms);
-            if age >= CAPABILITY_TTL_MS && age < 0x8000_0000 {
+            if age > CAPABILITY_TTL_MS && age < 0x8000_0000 {
                 return CapabilityStatus::Unknown;
             }
         }
@@ -143,7 +143,7 @@ impl CapabilityCache {
                 continue;
             }
             let age = now_ms.wrapping_sub(rec.last_updated_ms);
-            if age >= CAPABILITY_TTL_MS && age < 0x8000_0000 {
+            if age > CAPABILITY_TTL_MS && age < 0x8000_0000 {
                 if matches!(
                     rec.status,
                     CapabilityStatus::SrActive | CapabilityStatus::Passive

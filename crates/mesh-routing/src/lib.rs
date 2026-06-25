@@ -25,8 +25,8 @@ pub mod traceroute;
 
 pub use bridge::{BridgeDedupCache, BridgeEval, BridgeLeg, evaluate_bridge_targets, should_bridge_to};
 pub use broadcast_relay::{
-    find_best_relay_candidate as rank_broadcast_relay_candidate, plan_broadcast_relay,
-    BroadcastRelayContext, BroadcastRelayPlan, RelayCandidate, POOR_LINK_ETX_THRESHOLD,
+    plan_broadcast_relay, BroadcastRelayContext, BroadcastRelayPlan, RelayCandidate,
+    POOR_LINK_ETX_THRESHOLD,
 };
 pub use capability::{CapabilityStatus, CapabilityCache, CAPABILITY_TTL_MS, MAX_CAPABILITY_RECORDS};
 pub use coordinated_relay::{

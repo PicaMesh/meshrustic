@@ -67,6 +67,10 @@ fn router_appends_traceroute_hop_on_rebroadcast() {
         .expect("accepted");
     assert_eq!(result.decoded_portnum, Some(TRACEROUTE_APP));
 
+    router
+        .graph_mut()
+        .downstream_mut()
+        .update(RELAY, FROM, RELAY, 1.0, 0, false, 0);
     let relay = ready_relay(&mut router, &result, 0);
     let payload_len = relay.len as usize - PACKET_HEADER_LEN;
     let mut cipher = vec![0u8; payload_len];
@@ -131,6 +135,10 @@ fn router_appends_traceroute_reply_on_route_back() {
         )
         .expect("accepted");
 
+    router
+        .graph_mut()
+        .downstream_mut()
+        .update(RELAY, FROM, RELAY, 1.0, 0, false, 0);
     let relay = ready_relay(&mut router, &result, 0);
     let payload_len = relay.len as usize - PACKET_HEADER_LEN;
     let mut cipher = vec![0u8; payload_len];

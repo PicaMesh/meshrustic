@@ -4,9 +4,9 @@ use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
 use mesh_protocol::PacketHeader;
 use mesh_routing::{
-    build_topology_wire_frame, decode_packed_neighbors, NeighborGraph, Router, TopologyMergeResult,
-    MAX_NEIGHBORS_PER_PACKET, PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
-    write_packed_header,
+    build_topology_wire_frame, decode_packed_neighbors, NeighborEntry, NeighborGraph, Router,
+    TopologyMergeResult, MAX_NEIGHBORS, MAX_NEIGHBORS_PER_PACKET, PACKED_NEIGHBOR_HEADER_SIZE,
+    SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION, write_packed_header,
 };
 use static_cell::StaticCell;
 
@@ -26,7 +26,11 @@ fn multi_packet_chunk_size_golden() {
     for i in 0..30u32 {
         graph.observe_direct_neighbor(0x1000 + i, -70, 8, 0, 0);
     }
-    assert_eq!(graph.neighbor_count(), 24);
+    // Graph node cap (24 slots including self) limits incoming direct neighbors to 23,
+    // while outgoing edges on our node can still reach MAX_EDGES_PER_NODE (24).
+    assert_eq!(graph.neighbor_count(), 23);
+    let mut packed_neighbors = [NeighborEntry::default(); MAX_NEIGHBORS];
+    assert_eq!(graph.topology_neighbors_for_pack(&mut packed_neighbors), 24);
     assert_eq!(graph.topology_packet_count(), 1);
 
     let per_packet = MAX_NEIGHBORS_PER_PACKET;

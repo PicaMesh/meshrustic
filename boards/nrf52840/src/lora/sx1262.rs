@@ -11,7 +11,6 @@ use mesh_radio::{
 use sx126x::conf::Config;
 use sx126x::op::calib::CalibParam;
 use sx126x::op::irq::{IrqMask, IrqMaskBit, IrqStatus};
-use sx126x::op::status::ChipMode;
 use sx126x::op::modulation::{
     LoRaBandWidth, LoRaSpreadFactor, LoraCodingRate, LoraModParams, ModParams,
 };
@@ -19,6 +18,7 @@ use sx126x::op::packet::{
     LoRaCrcType, LoRaHeaderType, LoRaInvertIq, LoRaPacketParams, PacketParams, PacketType,
 };
 use sx126x::op::rxtx::{PaConfig, RampTime, RxTxTimeout, TxParams};
+use sx126x::op::status::ChipMode;
 use sx126x::reg::Register;
 use sx126x::{calc_rf_freq, SX126x};
 
@@ -232,13 +232,8 @@ impl Sx1262Driver {
         self.chip
             .set_rx(RxTxTimeout::continuous_rx())
             .map_err(|_| RadioError::Hardware)?;
-        self.chip
-            .wait_on_busy()
-            .map_err(|_| RadioError::Hardware)?;
-        let status = self
-            .chip
-            .get_status()
-            .map_err(|_| RadioError::Hardware)?;
+        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        let status = self.chip.get_status().map_err(|_| RadioError::Hardware)?;
         if status.chip_mode() != Some(sx126x::op::status::ChipMode::RX) {
             defmt::warn!("[Radio0] set_rx failed, not in RX mode");
             crate::usb_log::log::radio::warn("set_rx failed (not in RX mode)");
@@ -249,9 +244,7 @@ impl Sx1262Driver {
 
     /// Semtech packet counters — useful to see if the modem sees any RF activity.
     pub fn chip_stats(&mut self) -> Result<(u16, u16, u16), RadioError> {
-        self.chip
-            .wait_on_busy()
-            .map_err(|_| RadioError::Hardware)?;
+        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
         let stats = self.chip.get_stats().map_err(|_| RadioError::Hardware)?;
         Ok((stats.rx_pkt, stats.crc_error, stats.header_error))
     }
@@ -288,17 +281,15 @@ impl Sx1262Driver {
             self.profile.name(),
             self.profile.dio2_rf_switch()
         );
-        crate::usb_log::log::radio::config_profile(self.profile.name(), self.profile.dio2_rf_switch());
+        crate::usb_log::log::radio::config_profile(
+            self.profile.name(),
+            self.profile.dio2_rf_switch(),
+        );
     }
 
     pub fn log_chip_status(&mut self) -> Result<(), RadioError> {
-        self.chip
-            .wait_on_busy()
-            .map_err(|_| RadioError::Hardware)?;
-        let status = self
-            .chip
-            .get_status()
-            .map_err(|_| RadioError::Hardware)?;
+        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        let status = self.chip.get_status().map_err(|_| RadioError::Hardware)?;
         let (rx_pkt, crc, hdr) = self.chip_stats()?;
         let mode = Self::chip_mode_name(status.chip_mode());
         defmt::info!(

@@ -74,11 +74,10 @@ pub fn relay_hop_fields(
     }
     match direct_neighbor_hop_limit {
         Some(limited) => {
-            let hop_start = (rx.hop_start as i16)
-                .saturating_sub(rx.hop_limit as i16)
-                .saturating_add(limited as i16)
-                .saturating_add(1);
-            Some((limited, hop_start.max(0).min(u8::MAX as i16) as u8))
+            let hops_away_rx = rx.hop_limit.saturating_sub(rx.hop_start);
+            let hops_away_tx = hops_away_rx.saturating_add(1);
+            let hop_start = hops_away_tx.saturating_add(limited);
+            Some((limited, hop_start))
         }
         None => Some((rx.hop_limit - 1, rx.hop_start)),
     }

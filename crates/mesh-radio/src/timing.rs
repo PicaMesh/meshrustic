@@ -39,7 +39,7 @@ pub fn slot_time_ms(config: &RadioConfig) -> u32 {
     // symbolTime (ms) = 2^sf / bw_khz
     let symbol_time_x1000 = ((1u32 << sf).saturating_mul(1000)) / bw_khz;
     let cad_ms_x1000 = (NUM_SYM_CAD_NUMER * symbol_time_x1000) / NUM_SYM_CAD_DENOM;
-    (cad_ms_x1000 + PROP_TURNAROUND_MAC_MS_X1000 + 999) / 1000
+    (cad_ms_x1000 + PROP_TURNAROUND_MAC_MS_X1000).div_ceil(1000)
 }
 
 /// SR transmission-memory / edge-aging window from modem preset.

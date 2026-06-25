@@ -35,7 +35,7 @@ fn router_relays_broadcast_with_unchanged_ciphertext() {
     let router = ROUTER.init(Router::new(0xAABB_CCDD));
 
     let header =
-        PacketHeader::from_fields(0xFFFF_FFFF, 0x1234_5678, 7, 0, 3, 3, false, false, 0, 0);
+        PacketHeader::from_fields(0xFFFF_FFFF, 0x1234_5678, 7, 0, 2, 3, false, false, 0, 0x12);
     let payload = [0xDE, 0xAD, 0xBE, 0xEF];
     let wire = wire_bytes(header, &payload);
 
