@@ -6,8 +6,9 @@ use crate::nodeinfo::{
     DEVICE_ROLE_ROUTER_CLIENT, DEVICE_ROLE_ROUTER_LATE,
 };
 
-pub const MAX_CAPABILITY_RECORDS: usize = 32;
-pub const CAPABILITY_TTL_MS: u32 = 7_200_000;
+pub const MAX_CAPABILITY_RECORDS: usize = 64;
+/// Three topology broadcast intervals plus margin (1810 s).
+pub const CAPABILITY_TTL_MS: u32 = 1_810_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CapabilityStatus {
@@ -45,9 +46,28 @@ impl CapabilityCache {
     }
 
     pub fn status(&self, node_id: u32) -> CapabilityStatus {
-        self.find(node_id)
-            .map(|r| r.status)
-            .unwrap_or(CapabilityStatus::Unknown)
+        self.status_at(node_id, 0, 0)
+    }
+
+    pub fn status_at(&self, node_id: u32, my_node: u32, now_ms: u32) -> CapabilityStatus {
+        let Some(rec) = self.find(node_id) else {
+            return CapabilityStatus::Unknown;
+        };
+        if rec.node_id == my_node && my_node != 0 {
+            return rec.status;
+        }
+        if now_ms != 0 {
+            let age = now_ms.wrapping_sub(rec.last_updated_ms);
+            if age >= CAPABILITY_TTL_MS && age < 0x8000_0000 {
+                return CapabilityStatus::Unknown;
+            }
+        }
+        rec.status
+    }
+
+    #[doc(hidden)]
+    pub fn record_count(&self) -> u8 {
+        self.count
     }
 
     pub fn role(&self, node_id: u32) -> Option<u32> {
@@ -109,16 +129,37 @@ impl CapabilityCache {
         self.count += 1;
     }
 
-    pub fn prune(&mut self, now_ms: u32) {
+    /// Remove stale records. Returns neighbor ids whose SR/passive capability expired;
+    /// the graph should clear `hears_us` on those edges.
+    pub fn prune(&mut self, now_ms: u32, my_node: u32) -> ([u32; MAX_CAPABILITY_RECORDS], u8) {
+        let mut clear_hears_us = [0u32; MAX_CAPABILITY_RECORDS];
+        let mut clear_hears_us_count = 0u8;
         let mut i = 0u8;
         while i < self.count {
-            let age = now_ms.wrapping_sub(self.records[i as usize].last_updated_ms);
+            let idx = i as usize;
+            let rec = self.records[idx];
+            if rec.node_id == my_node {
+                i += 1;
+                continue;
+            }
+            let age = now_ms.wrapping_sub(rec.last_updated_ms);
             if age >= CAPABILITY_TTL_MS && age < 0x8000_0000 {
+                if matches!(
+                    rec.status,
+                    CapabilityStatus::SrActive | CapabilityStatus::Passive
+                ) {
+                    let n = clear_hears_us_count as usize;
+                    if n < MAX_CAPABILITY_RECORDS {
+                        clear_hears_us[n] = rec.node_id;
+                        clear_hears_us_count += 1;
+                    }
+                }
                 self.remove_at(i);
             } else {
                 i += 1;
             }
         }
+        (clear_hears_us, clear_hears_us_count)
     }
 
     /// Stock ROUTER / REPEATER / ROUTER_CLIENT that are not SR-active relay immediately.
@@ -228,5 +269,44 @@ mod tests {
         assert!(cache.is_immediate_relay_router(0xBB));
         cache.track_topology(0xBB, true, 100);
         assert!(!cache.is_immediate_relay_router(0xBB));
+    }
+
+    #[test]
+    fn status_at_returns_unknown_after_ttl() {
+        let mut cache = CapabilityCache::new();
+        cache.track_topology(0xBB, true, 0);
+        assert_eq!(
+            cache.status_at(0xBB, 0, CAPABILITY_TTL_MS),
+            CapabilityStatus::SrActive
+        );
+        assert_eq!(
+            cache.status_at(0xBB, 0, CAPABILITY_TTL_MS + 1),
+            CapabilityStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn prune_skips_local_node_and_collects_sr_expiry() {
+        let mut cache = CapabilityCache::new();
+        cache.track_topology(0xAA, true, 0);
+        cache.track_topology(0xBB, false, 0);
+        cache.track_topology(0xCC, true, 0);
+        let (cleared, n) = cache.prune(CAPABILITY_TTL_MS + 1, 0xAA);
+        assert_eq!(n, 2);
+        assert_eq!(cleared[0], 0xBB);
+        assert_eq!(cleared[1], 0xCC);
+        assert_eq!(cache.record_count(), 1);
+        assert_eq!(cache.status(0xAA), CapabilityStatus::SrActive);
+    }
+
+    #[test]
+    fn cache_holds_max_records() {
+        let mut cache = CapabilityCache::new();
+        for i in 1..=MAX_CAPABILITY_RECORDS as u32 {
+            cache.track_topology(i, true, 0);
+        }
+        assert_eq!(cache.record_count(), MAX_CAPABILITY_RECORDS as u8);
+        cache.track_topology(MAX_CAPABILITY_RECORDS as u32 + 1, true, 0);
+        assert_eq!(cache.record_count(), MAX_CAPABILITY_RECORDS as u8);
     }
 }

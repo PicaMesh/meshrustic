@@ -23,7 +23,7 @@ pub mod topology;
 pub mod traceroute;
 
 pub use bridge::{BridgeDedupCache, BridgeEval, BridgeLeg, evaluate_bridge_targets, should_bridge_to};
-pub use capability::{CapabilityStatus, CapabilityCache, MAX_CAPABILITY_RECORDS};
+pub use capability::{CapabilityStatus, CapabilityCache, CAPABILITY_TTL_MS, MAX_CAPABILITY_RECORDS};
 pub use coordinated_relay::{cw_size_from_snr, tx_delay_ms_router, tx_delay_ms_worst, DEFAULT_SLOT_MS};
 pub use graph::{
     calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor, DownstreamTable,

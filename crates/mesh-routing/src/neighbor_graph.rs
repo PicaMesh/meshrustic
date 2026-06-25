@@ -216,8 +216,31 @@ impl NeighborGraph {
         self.capability.track_role(node_id, role, now_ms);
     }
 
+    #[doc(hidden)]
+    pub fn capability_mut(&mut self) -> &mut CapabilityCache {
+        &mut self.capability
+    }
+
     pub fn capability_status(&self, node_id: u32) -> CapabilityStatus {
-        self.capability.status(node_id)
+        self.capability_status_at(node_id, 0)
+    }
+
+    pub fn capability_status_at(&self, node_id: u32, now_ms: u32) -> CapabilityStatus {
+        if node_id == self.my_node && self.my_node != 0 {
+            return self.local_capability_status();
+        }
+        self.capability
+            .status_at(node_id, self.my_node, now_ms)
+    }
+
+    fn local_capability_status(&self) -> CapabilityStatus {
+        if self.is_active_routing_role() {
+            CapabilityStatus::SrActive
+        } else if self.can_send_topology() {
+            CapabilityStatus::Passive
+        } else {
+            CapabilityStatus::Legacy
+        }
     }
 
     fn role_is_active_routing(role: u32) -> bool {
@@ -1405,7 +1428,11 @@ impl NeighborGraph {
             .downstream
             .age(now_ms, NEIGHBOR_TTL_MS, relay_in_graph);
         self.clear_expired_commits(now_ms);
-        self.capability.prune(now_ms);
+        let (clear_hears_us, clear_hears_us_count) = self.capability.prune(now_ms, self.my_node);
+        for i in 0..clear_hears_us_count as usize {
+            self.edges
+                .set_edge_hears_us(self.my_node, clear_hears_us[i], false);
+        }
 
         if edges_aged || downstream_aged {
             self.topology_dirty = true;

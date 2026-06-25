@@ -4,7 +4,8 @@ use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
     coordinated_relay, write_packed_header, CapabilityStatus, InboundPacket, NeighborGraph,
-    Router, TopologyMergeResult, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER,
+    Router, TopologyMergeResult, CAPABILITY_TTL_MS, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER,
+    MAX_CAPABILITY_RECORDS,
 };
 
 #[test]
@@ -135,4 +136,68 @@ fn three_node_topology_versions_converge() {
     let (header2, _) = mesh_routing::decode_packed_neighbors(&packed, 8).unwrap();
     let r2 = a.merge_topology(0xB000_0002, &header2, &[neighbor], false, 200, 0);
     assert!(matches!(r2, TopologyMergeResult::Applied { .. }));
+}
+
+#[test]
+fn capability_expires_at_1810s() {
+    let mut graph = NeighborGraph::new();
+    graph.set_my_node(0xAA);
+    graph.track_node_role(0xBB, DEVICE_ROLE_REPEATER, 0);
+    graph.capability_mut().track_topology(0xBB, true, 0);
+    assert_eq!(
+        graph.capability_status_at(0xBB, CAPABILITY_TTL_MS),
+        CapabilityStatus::SrActive
+    );
+    assert_eq!(
+        graph.capability_status_at(0xBB, CAPABILITY_TTL_MS + 1),
+        CapabilityStatus::Unknown
+    );
+}
+
+#[test]
+fn capability_cache_holds_64() {
+    let mut graph = NeighborGraph::new();
+    graph.set_my_node(0xAA);
+    for i in 1..=MAX_CAPABILITY_RECORDS as u32 {
+        graph.capability_mut().track_topology(i, true, 0);
+    }
+    assert_eq!(
+        graph.capability_mut().record_count(),
+        MAX_CAPABILITY_RECORDS as u8
+    );
+    graph
+        .capability_mut()
+        .track_topology(MAX_CAPABILITY_RECORDS as u32 + 1, true, 0);
+    assert_eq!(
+        graph.capability_mut().record_count(),
+        MAX_CAPABILITY_RECORDS as u8
+    );
+}
+
+#[test]
+fn sr_capability_expiry_clears_hears_us() {
+    let mut graph = NeighborGraph::new();
+    graph.set_my_node(0xAA);
+    graph.observe_direct_neighbor(0xBB, -70, 8, 0, 0);
+    graph.confirm_direct_neighbor_hears_us(0xBB);
+    assert!(graph.has_any_hears_us_neighbor());
+    graph.capability_mut().track_topology(0xBB, true, 0);
+    graph.run_maintenance(CAPABILITY_TTL_MS + 1);
+    assert!(!graph.has_any_hears_us_neighbor());
+}
+
+#[test]
+fn local_node_capability_from_role() {
+    let mut graph = NeighborGraph::new();
+    graph.set_my_node(0xAA);
+    graph.set_device_role(DEVICE_ROLE_REPEATER);
+    assert_eq!(
+        graph.capability_status(0xAA),
+        CapabilityStatus::SrActive
+    );
+    graph.set_device_role(DEVICE_ROLE_CLIENT_MUTE);
+    assert_eq!(
+        graph.capability_status(0xAA),
+        CapabilityStatus::Passive
+    );
 }
