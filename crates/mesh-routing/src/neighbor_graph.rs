@@ -940,6 +940,61 @@ impl NeighborGraph {
             .transfer_downstream(old_relay, new_relay, now_ms)
     }
 
+    pub fn replace_gateway_node(&mut self, old_node: u32, new_node: u32, now_ms: u32) {
+        if old_node == 0 || new_node == 0 || old_node == new_node {
+            return;
+        }
+        let _ = self.transfer_downstream(old_node, new_node, now_ms);
+        self.downstream.clear_for_destination(old_node);
+        self.route_cache.clear();
+    }
+
+    /// Replace a synthetic placeholder with a learned real node id.
+    pub fn resolve_placeholder(&mut self, placeholder_id: u32, real_node_id: u32, now_ms: u32) -> bool {
+        if !is_placeholder_node(placeholder_id) || is_placeholder_node(real_node_id) {
+            return false;
+        }
+        if real_node_id == 0 || real_node_id == self.my_node {
+            return false;
+        }
+        if self.edges.find_node(placeholder_id).is_none() {
+            return false;
+        }
+
+        self.edges.ensure_local_node(self.my_node, now_ms);
+        let mut copied = None::<(f32, mesh_radio::RadioId)>;
+        if let Some(my_edges) = self.edges.find_node(self.my_node) {
+            for i in 0..my_edges.edge_count as usize {
+                let edge = my_edges.edges[i];
+                if edge.to == placeholder_id {
+                    copied = Some((edge.etx(), edge.heard_on));
+                    break;
+                }
+            }
+        }
+        if let Some((etx, heard_on)) = copied {
+            let result = self.edges.update_edge(
+                self.my_node,
+                self.my_node,
+                real_node_id,
+                etx,
+                now_ms,
+                EdgeSource::Reported,
+                true,
+                heard_on,
+            );
+            if result == EDGE_NEW || result == EDGE_SIGNIFICANT_CHANGE {
+                self.topology_dirty = true;
+            }
+        }
+
+        self.replace_gateway_node(placeholder_id, real_node_id, now_ms);
+        self.edges.remove_edges_to(placeholder_id);
+        let _ = self.edges.remove_node(placeholder_id);
+        self.route_cache.clear();
+        true
+    }
+
     pub fn get_route(&mut self, destination: u32, now_ms: u32) -> Route {
         if let Some(cached) = self.route_cache.get(destination, now_ms) {
             return cached;
@@ -1614,6 +1669,21 @@ mod tests {
         graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0);
         let placeholder = placeholder_node_id(0xCD);
         assert!(graph.test_has_edge(placeholder, 0xBB00_00BB));
+    }
+
+    #[test]
+    fn resolve_placeholder_transfers_downstream_and_removes_node() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA00_00AA);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_packet(0xBEEF_00CD, 3, 2, 0xCD, -70, 8, 100, 0);
+        let placeholder = placeholder_node_id(0xCD);
+        graph
+            .downstream_mut()
+            .update(0xAA00_00AA, 0xDD00_00DD, placeholder, 2.0, 100, false, 0);
+        assert!(graph.resolve_placeholder(placeholder, 0xBEEF_00CD, 200));
+        assert!(!graph.has_graph_node(placeholder));
+        assert_eq!(graph.get_downstream_relay(0xDD00_00DD, 200), Some(0xBEEF_00CD));
     }
 
     const COV_ME: u32 = 0x1000_0001;

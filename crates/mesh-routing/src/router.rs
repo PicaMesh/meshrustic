@@ -596,6 +596,7 @@ impl Router {
         if direct {
             let relay_byte = (parsed.from & 0xFF) as u8;
             if relay_byte != 0 {
+                self.try_resolve_placeholder(relay_byte, parsed.from, now_ms);
                 self.relay_identity
                     .remember_relay_identity(parsed.from, relay_byte, now_ms);
             }
@@ -865,6 +866,16 @@ impl Router {
                 reason: SrSkipReason::Qos,
             });
             return plan;
+        }
+
+        if mesh_protocol::is_direct_packet(
+            parsed.from,
+            parsed.hop_start,
+            parsed.hop_limit,
+            parsed.relay_node,
+        ) && parsed.relay_node != 0
+        {
+            self.try_resolve_placeholder(parsed.relay_node, parsed.from, now_ms);
         }
 
         let heard_from = self.resolve_heard_from_node(
@@ -1206,6 +1217,33 @@ impl Router {
     pub fn remember_relay_identity(&mut self, node_id: u32, relay_byte: u8, now_ms: u32) {
         self.relay_identity
             .remember_relay_identity(node_id, relay_byte, now_ms);
+    }
+
+    fn try_resolve_placeholder(&mut self, relay_byte: u8, real_node_id: u32, now_ms: u32) -> bool {
+        if relay_byte == 0 || crate::graph::is_placeholder_node(real_node_id) {
+            return false;
+        }
+        let placeholder_id = crate::graph::get_placeholder_for_relay(relay_byte);
+        if self.relay_identity.resolve_relay_identity(
+            relay_byte,
+            0,
+            0,
+            self.graph.edges(),
+            self.node_num,
+            now_ms,
+        ).is_some()
+        {
+            return false;
+        }
+        if !self
+            .graph
+            .resolve_placeholder(placeholder_id, real_node_id, now_ms)
+        {
+            return false;
+        }
+        self.relay_identity
+            .remember_relay_identity(real_node_id, relay_byte, now_ms);
+        true
     }
 
     /// Cancel a scheduled T1 broadcast retransmit (fork: cancelBroadcastRetransmit).

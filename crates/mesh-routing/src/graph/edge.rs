@@ -417,6 +417,25 @@ impl EdgeStore {
         }
     }
 
+    pub fn remove_edges_to(&mut self, target: u32) {
+        self.remove_node_edges_to(target);
+    }
+
+    pub fn remove_node(&mut self, node_id: u32) -> bool {
+        if node_id == 0 {
+            return false;
+        }
+        self.remove_node_edges_to(node_id);
+        let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == node_id) else {
+            return false;
+        };
+        if idx < self.node_count as usize - 1 {
+            self.nodes[idx] = self.nodes[self.node_count as usize - 1];
+        }
+        self.node_count -= 1;
+        true
+    }
+
     pub fn ensure_local_node(&mut self, my_node: u32, now_ms: u32) {
         if self.find_node(my_node).is_none() {
             let _ = self.find_or_create_node(my_node, now_ms, my_node);

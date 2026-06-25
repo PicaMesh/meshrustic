@@ -7,6 +7,10 @@ pub fn placeholder_node_id(relay_byte: u8) -> u32 {
     PLACEHOLDER_NODE_PREFIX | u32::from(relay_byte)
 }
 
+pub fn get_placeholder_for_relay(relay_byte: u8) -> u32 {
+    placeholder_node_id(relay_byte)
+}
+
 pub fn is_placeholder_node(node_id: u32) -> bool {
     (node_id & 0xFF00_0000) == PLACEHOLDER_NODE_PREFIX
 }

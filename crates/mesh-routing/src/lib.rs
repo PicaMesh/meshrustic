@@ -27,7 +27,7 @@ pub use capability::{CapabilityStatus, CapabilityCache, MAX_CAPABILITY_RECORDS};
 pub use coordinated_relay::{cw_size_from_snr, tx_delay_ms_router, tx_delay_ms_worst, DEFAULT_SLOT_MS};
 pub use graph::{
     calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor, DownstreamTable,
-    EdgeSource, is_node_routable, is_placeholder_node, placeholder_node_id, verified_connectivity,
+    EdgeSource, get_placeholder_for_relay, is_node_routable, is_placeholder_node, placeholder_node_id, verified_connectivity,
     Route, RouteCache, RoutableFilter, PLACEHOLDER_NODE_PREFIX, MAX_CACHED_ROUTES,
     MAX_DOWNSTREAM, MAX_EDGES_PER_NODE,
 };
