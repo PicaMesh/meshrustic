@@ -12,7 +12,8 @@ use crate::graph::{
     EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
 use crate::nodeinfo::{
-    DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE,
+    DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
+    DEVICE_ROLE_ROUTER_LATE,
 };
 use crate::topology::{
     write_packed_header, PackedHeader, PackedNeighbor, MAX_NEIGHBORS_PER_PACKET,
@@ -390,6 +391,55 @@ impl NeighborGraph {
 
     pub fn neighbor_count(&self) -> u8 {
         self.edges.count_direct_neighbors(self.my_node)
+    }
+
+    /// True when we have at least one direct neighbor that could participate in SR broadcast routing.
+    pub fn topology_healthy_for_broadcast(&self) -> bool {
+        if self.my_node == 0 {
+            return false;
+        }
+        let Some(node) = self.edges.find_node(self.my_node) else {
+            return false;
+        };
+        if node.edge_count == 0 {
+            return false;
+        }
+        let mut capable = 0u8;
+        for i in 0..node.edge_count as usize {
+            let neighbor = node.edges[i].to;
+            if neighbor == 0 {
+                continue;
+            }
+            match self.capability.status(neighbor) {
+                CapabilityStatus::SrActive | CapabilityStatus::Unknown => {
+                    capable = capable.saturating_add(1);
+                }
+                _ if self.capability.is_legacy_router(neighbor) => {
+                    capable = capable.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        capable >= 1
+    }
+
+    /// True when `destination` is reachable via the topology graph or a downstream relay chain.
+    pub fn topology_healthy_for_unicast(&mut self, destination: u32, now_ms: u32) -> bool {
+        if self.my_node == 0 || destination == 0 || destination == self.my_node {
+            return false;
+        }
+        let route = self.get_route(destination, now_ms);
+        if route.next_hop != 0 {
+            return true;
+        }
+        let Some(relay) = self.get_downstream_relay(destination, now_ms) else {
+            return false;
+        };
+        self.get_route(relay, now_ms).next_hop != 0
+    }
+
+    pub fn is_known_relay_target(&self, destination: u32, now_ms: u32) -> bool {
+        self.has_graph_node(destination) || self.get_downstream_relay(destination, now_ms).is_some()
     }
 
     pub fn topology_version(&self) -> u8 {
@@ -1670,6 +1720,17 @@ mod tests {
         assert!(!graph.has_node_transmitted(0x1000, 1, 50_000));
         assert!(graph.has_node_transmitted(0x9999, 99, 50_000));
         assert!(graph.has_node_transmitted(0x1001, 2, 50_000));
+    }
+
+    #[test]
+    fn topology_health_requires_capable_direct_neighbor() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA);
+        graph.observe_direct_neighbor(0xBB, -70, 8, 0, 0);
+        graph.track_node_role(0xBB, DEVICE_ROLE_REPEATER, 0);
+        assert!(graph.topology_healthy_for_broadcast());
+        graph.capability_mut().track_topology(0xBB, false, 0);
+        assert!(!graph.topology_healthy_for_broadcast());
     }
 
     #[test]

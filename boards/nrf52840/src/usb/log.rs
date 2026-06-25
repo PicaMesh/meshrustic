@@ -1077,6 +1077,7 @@ pub mod sr {
                     SrSkipReason::Duplicate => b"duplicate",
                     SrSkipReason::RateLimited => b"rate limit",
                     SrSkipReason::OwnRebroadcast => b"own rebroadcast",
+                    SrSkipReason::UnknownDestination => b"unknown dest",
                     SrSkipReason::BetterNeighbor => b"better neighbor",
                 };
                 let mut line = [0u8; 128];

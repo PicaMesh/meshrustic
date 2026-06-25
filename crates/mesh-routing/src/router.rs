@@ -895,6 +895,7 @@ impl Router {
         if parsed.to == NODENUM_BROADCAST
             && self.graph.signal_routing_active()
             && parsed.from != self.node_num
+            && self.graph.topology_healthy_for_broadcast()
         {
             let best = self
                 .graph
@@ -907,6 +908,19 @@ impl Router {
                 });
                 return plan;
             }
+        }
+
+        if parsed.to != NODENUM_BROADCAST
+            && parsed.to != self.node_num
+            && !self.graph.topology_healthy_for_unicast(parsed.to, now_ms)
+            && !self.graph.is_known_relay_target(parsed.to, now_ms)
+        {
+            self.pool.release(handle);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::UnknownDestination,
+            });
+            return plan;
         }
 
         let next_hop = if parsed.to != NODENUM_BROADCAST {

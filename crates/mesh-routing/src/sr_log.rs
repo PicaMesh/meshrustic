@@ -166,6 +166,7 @@ pub enum SrSkipReason {
     Duplicate,
     RateLimited,
     OwnRebroadcast,
+    UnknownDestination,
     BetterNeighbor,
 }
 
