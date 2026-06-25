@@ -335,7 +335,7 @@ mod tests {
             air_util_tx: 1.5,
             uptime_seconds: 42,
         };
-        let (len, frame) = build_device_telemetry_wire_frame(
+        let (len, mut frame) = build_device_telemetry_wire_frame(
             0x677a_1caf,
             88,
             channel_hash,

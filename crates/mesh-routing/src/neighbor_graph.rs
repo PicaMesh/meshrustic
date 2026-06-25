@@ -1236,7 +1236,7 @@ impl NeighborGraph {
 mod tests {
     use super::*;
     use crate::coordinated_relay::DEFAULT_SLOT_MS;
-    use crate::coordinated_relay;
+    use crate::decode_packed_neighbors;
     use crate::topology::write_packed_header;
 
     #[test]

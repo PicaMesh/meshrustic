@@ -107,8 +107,15 @@ impl NodeRateLimiter {
         let bucket = slot.bucket_mut(bucket_kind);
 
         if bucket.limited {
-            bucket.window_start_ms = now_ms;
-            return true;
+            let window_age = now_ms.wrapping_sub(bucket.window_start_ms);
+            if window_age >= WINDOW_MS {
+                bucket.limited = false;
+                bucket.count = 0;
+                bucket.window_start_ms = now_ms;
+            } else {
+                bucket.window_start_ms = now_ms;
+                return true;
+            }
         }
 
         if now_ms.wrapping_sub(bucket.window_start_ms) >= WINDOW_MS {
@@ -197,11 +204,47 @@ mod tests {
     }
 
     #[test]
+    fn limited_node_recovers_after_quiet_window() {
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0x1234_5678;
+        for _ in 0..4 {
+            assert!(!limiter.should_drop(from, None, 0));
+        }
+        assert!(
+            limiter.should_drop(from, None, 0),
+            "5th OTHER packet should trip the limit"
+        );
+        assert!(
+            !limiter.should_drop(from, None, WINDOW_MS + 1),
+            "quiet for a full window should lift the limit"
+        );
+    }
+
+    #[test]
+    fn activity_during_limit_prevents_recovery() {
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0x8765_4321;
+        for _ in 0..4 {
+            assert!(!limiter.should_drop(from, None, 0));
+        }
+        assert!(limiter.should_drop(from, None, 0));
+
+        let mut t = WINDOW_MS - 1;
+        for _ in 0..5 {
+            assert!(
+                limiter.should_drop(from, None, t),
+                "activity every WINDOW_MS-1 ms should stay limited"
+            );
+            t = t.wrapping_add(WINDOW_MS - 1);
+        }
+    }
+
+    #[test]
     fn each_bucket_has_its_own_window() {
         let mut limiter = NodeRateLimiter::new();
         let from = 0xCAFE_BABE;
 
-        for i in 0..9 {
+        for i in 0..10 {
             assert!(
                 !limiter.should_drop(from, Some(num::ROUTING_APP), i * 1000),
                 "routing packet {i} should pass"
@@ -216,7 +259,7 @@ mod tests {
 
         assert!(
             limiter.should_drop(from, Some(num::ROUTING_APP), 20_000),
-            "10th routing packet should drop"
+            "11th routing packet should drop"
         );
         assert!(
             !limiter.should_drop(from, Some(num::TEXT_MESSAGE_APP), 21_000),

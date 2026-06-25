@@ -439,7 +439,7 @@ impl EdgeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::DownstreamTable;
+    use crate::graph::DownstreamTable;
 
     #[test]
     fn age_removes_nodes_with_no_outgoing_edges() {
