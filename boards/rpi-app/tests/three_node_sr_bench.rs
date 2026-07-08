@@ -1,8 +1,8 @@
 //! Host three-node SR bench — line topology without hardware.
 
 use mesh_routing::{
-    decode_packed_neighbors, write_packed_header, NeighborGraph, PackedNeighbor,
-    TopologyMergeResult, DEVICE_ROLE_ROUTER, MAX_DOWNSTREAM,
+    calculate_etx, decode_packed_neighbors, etx_to_fixed, write_packed_header, NeighborGraph,
+    PackedNeighbor, TopologyMergeResult, DEVICE_ROLE_ROUTER, MAX_DOWNSTREAM,
 };
 
 #[test]
@@ -23,8 +23,7 @@ fn three_node_line_learns_remote_via_topology() {
 
     let remote = PackedNeighbor {
         node_id: 0xC000_0003,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: true,
         hears_us: false,
         etx_variance: 0,
@@ -54,8 +53,7 @@ fn three_node_middle_node_defers_to_stock_router() {
     let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
     let neighbor = PackedNeighbor {
         node_id: 0xB000_0002,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: false,
         hears_us: false,
         etx_variance: 0,
@@ -85,7 +83,7 @@ fn three_node_relayed_packet_infers_upstream_placeholder() {
     b.set_my_node(0xB000_0002);
     b.set_device_role(DEVICE_ROLE_ROUTER);
     b.observe_direct_neighbor(0xA000_0001, -70, 8, 0, 0);
-    b.observe_packet(0xA000_0001, 3, 2, 0xEF, -70, 8, 50, 0);
+    b.observe_packet(0xA000_0001, 3, 2, 0xEF, -70, 8, 50, 0, None);
 
     let placeholder = mesh_routing::placeholder_node_id(0xEF);
     let route = b.get_route(0xA000_0001, 50);

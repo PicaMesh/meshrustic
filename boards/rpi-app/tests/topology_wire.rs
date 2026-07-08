@@ -85,6 +85,28 @@ fn ensure_boot_broadcasts_queues_empty_topology() {
 }
 
 #[test]
+fn maintenance_does_not_rebroadcast_topology_after_one_minute() {
+    static ROUTER: StaticCell<Router> = StaticCell::new();
+    let router = ROUTER.init(Router::new(0x677A_1CAE));
+    router.set_modem_preset(
+        "",
+        MODEM_SHORT_SLOW,
+        true,
+        CryptoKey::from_bytes(&DEFAULT_PSK),
+    );
+
+    router.ensure_boot_broadcasts(100, 50);
+    let topo = router.poll_topology_tx(100).expect("boot topology must be ready");
+    let header = PacketHeader::decode(&topo.bytes[..topo.len as usize]).unwrap();
+    router.record_tx_on_air(header.parse().id, 100);
+    assert!(router.poll_topology_tx(100).is_none());
+
+    let report = router.run_maintenance(60_100, 50);
+    assert!(!report.topology_due);
+    assert!(router.poll_topology_tx(60_100).is_none());
+}
+
+#[test]
 fn router_topology_tx_decrypt_round_trip() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let _router = ROUTER.init(Router::new(0xAABB_CCDD));

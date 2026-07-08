@@ -6,7 +6,8 @@ use mesh_radio::{contention_window_ms, RadioId, MODEM_SHORT_SLOW};
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
 use crate::graph::{
-    calculate_etx, calculate_route, etx_to_signal, find_better_positioned_neighbor,
+    calculate_etx, calculate_route, etx_to_fixed, etx_to_signal, fixed_to_etx,
+    find_better_positioned_neighbor,
     is_node_routable, verified_connectivity, is_placeholder_node, placeholder_node_id,
     EdgeSource, EdgeStore, DownstreamTable, Route, RouteCache, RoutableFilter, EDGE_NEW,
     EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
@@ -454,6 +455,9 @@ impl NeighborGraph {
             if neighbor == 0 {
                 continue;
             }
+            if is_placeholder_node(neighbor) {
+                continue;
+            }
             match self.capability.status(neighbor) {
                 CapabilityStatus::SrActive | CapabilityStatus::Unknown => {
                     capable = capable.saturating_add(1);
@@ -751,8 +755,17 @@ impl NeighborGraph {
             let entry = sorted[start + i];
             let base = PACKED_NEIGHBOR_HEADER_SIZE + i * PACKED_NEIGHBOR_ENTRY_SIZE;
             out[base..base + 4].copy_from_slice(&entry.node_id.to_le_bytes());
-            out[base + 4] = entry.rssi as i8 as u8;
-            out[base + 5] = entry.snr as u8;
+            // Topology wire-format encodes ETX directly (byte pairs 4..6).
+            let etx_fixed = self
+                .edges
+                .find_node(self.my_node)
+                .and_then(|n| n.find_edge(entry.node_id))
+                .map(|e| e.etx_fixed)
+                .unwrap_or_else(|| {
+                    let etx = calculate_etx(entry.rssi as i32, entry.snr as f32);
+                    etx_to_fixed(etx)
+                });
+            out[base + 4..base + 6].copy_from_slice(&etx_fixed.to_le_bytes());
             let mut flags = 0u8;
             if entry.signal_routing_active {
                 flags |= PACKED_NEIGHBOR_FLAG_SR_ACTIVE;
@@ -841,7 +854,7 @@ impl NeighborGraph {
             {
                 continue;
             }
-            let etx = calculate_etx(neighbor.rssi as i32, neighbor.snr as f32);
+            let etx = fixed_to_etx(neighbor.etx_fixed);
             let relay_has_edge = self
                 .edges
                 .find_node(sender)
@@ -964,6 +977,9 @@ impl NeighborGraph {
     }
 
     /// Update graph from a received packet header. `heard_on` tags which preset segment heard it.
+    ///
+    /// `known_relay`, when set to a resolved non-placeholder NodeNum, lets relayed-packet
+    /// learning use the real gateway instead of a synthetic placeholder.
     pub fn observe_packet(
         &mut self,
         from: u32,
@@ -974,14 +990,42 @@ impl NeighborGraph {
         snr: i8,
         now_ms: u32,
         heard_on: RadioId,
+        known_relay: Option<u32>,
     ) -> Option<(u32, i16, i8, bool)> {
         if is_direct_packet(from, hop_start, hop_limit, relay_node) {
             let is_new = self.observe_direct_neighbor(from, rssi, snr, now_ms, heard_on);
             Some((from, rssi, snr, is_new))
         } else {
-            self.observe_relayed_packet(from, relay_node, rssi, snr, now_ms, heard_on);
+            self.observe_relayed_packet(from, relay_node, rssi, snr, now_ms, heard_on, known_relay);
             None
         }
+    }
+
+    fn relay_gateway_for_observation(
+        &mut self,
+        from: u32,
+        relay_node: u8,
+        known_relay: Option<u32>,
+        _now_ms: u32,
+    ) -> u32 {
+        let placeholder = placeholder_node_id(relay_node);
+        // Placeholder → real NodeNum resolution only happens on directly-heard frames
+        // (hop_start == hop_limit, relay byte matches originator). While a placeholder
+        // remains in the graph, relayed observations keep using it as the gateway.
+        if self.edges.find_node(placeholder).is_some() {
+            return placeholder;
+        }
+        if let Some(real) = known_relay {
+            if real != 0
+                && real != self.my_node
+                && real != from
+                && !is_placeholder_node(real)
+                && (real & 0xFF) as u8 == relay_node
+            {
+                return real;
+            }
+        }
+        placeholder
     }
 
     fn observe_relayed_packet(
@@ -992,6 +1036,7 @@ impl NeighborGraph {
         snr: i8,
         now_ms: u32,
         heard_on: RadioId,
+        known_relay: Option<u32>,
     ) {
         if !self.is_active_routing_role() {
             return;
@@ -1003,14 +1048,17 @@ impl NeighborGraph {
         if relay_node == 0 || relay_node == from_low {
             return;
         }
-        let placeholder = placeholder_node_id(relay_node);
-        if placeholder == from || placeholder == self.my_node {
+        let gateway = self.relay_gateway_for_observation(from, relay_node, known_relay, now_ms);
+        if gateway == from || gateway == self.my_node {
             return;
         }
         self.edges.ensure_local_node(self.my_node, now_ms);
-        let result = self.edges.update_edge_from_observation(
+        let etx = calculate_etx(rssi as i32, snr as f32);
+
+        // Learn (relay_gateway -> from) using the relayed packet as the signal source.
+        let result_relay_to_dest = self.edges.update_edge_from_observation(
             self.my_node,
-            placeholder,
+            gateway,
             from,
             rssi,
             snr,
@@ -1018,8 +1066,40 @@ impl NeighborGraph {
             EdgeSource::Mirrored,
             heard_on,
         );
-        if result == EDGE_NEW || result == EDGE_SIGNIFICANT_CHANGE {
-            self.topology_dirty = true;
+        // Also learn (us -> relay_gateway) so routing can egress via the relay.
+        let result_us_to_relay = self.edges.update_edge_from_observation(
+            self.my_node,
+            self.my_node,
+            gateway,
+            rssi,
+            snr,
+            now_ms,
+            EdgeSource::Mirrored,
+            heard_on,
+        );
+
+        if result_relay_to_dest == EDGE_NEW
+            || result_relay_to_dest == EDGE_SIGNIFICANT_CHANGE
+            || result_us_to_relay == EDGE_NEW
+            || result_us_to_relay == EDGE_SIGNIFICANT_CHANGE
+        {
+            self.route_cache.clear();
+        }
+
+        // Populate downstream routing from relayed packets, so legacy neighbors can still
+        // be treated as gateways even when topology broadcast decoding can't provide
+        // `hears_us` claims. Downstream entries are not part of the topology broadcast
+        // payload, so they must not trigger early rebroadcasts.
+        if !self.is_downstream_relay_for(gateway, from, now_ms) {
+            self.downstream.update(
+                self.my_node,
+                from,
+                gateway,
+                etx,
+                now_ms,
+                false,
+                heard_on,
+            );
             self.route_cache.clear();
         }
     }
@@ -1139,11 +1219,18 @@ impl NeighborGraph {
     }
 
     /// Replace a synthetic placeholder with a learned real node id.
+    ///
+    /// Call only after a **directly-heard** frame from `real_node_id` (see
+    /// [`mesh_protocol::is_direct_packet`]): originator and relay byte in sync,
+    /// hop budget not yet consumed.
     pub fn resolve_placeholder(&mut self, placeholder_id: u32, real_node_id: u32, now_ms: u32) -> bool {
         if !is_placeholder_node(placeholder_id) || is_placeholder_node(real_node_id) {
             return false;
         }
         if real_node_id == 0 || real_node_id == self.my_node {
+            return false;
+        }
+        if (real_node_id & 0xFF) as u8 != (placeholder_id & 0xFF) as u8 {
             return false;
         }
         if self.edges.find_node(placeholder_id).is_none() {
@@ -1600,8 +1687,11 @@ impl NeighborGraph {
                 .set_edge_hears_us(self.my_node, clear_hears_us[i], false);
         }
 
-        if edges_aged || downstream_aged {
+        let after = self.neighbor_count();
+        if before != after {
             self.topology_dirty = true;
+            self.route_cache.clear();
+        } else if edges_aged || downstream_aged {
             self.route_cache.clear();
         }
 
@@ -1821,7 +1911,7 @@ mod tests {
         graph.observe_direct_neighbor(0xA000_0001, -70, 8, 0, 0);
         assert_eq!(graph.neighbor_count(), 1);
 
-        graph.observe_packet(0xC000_0003, 3, 2, 0xEF, -70, 8, 50, 0);
+        graph.observe_packet(0xC000_0003, 3, 2, 0xEF, -70, 8, 50, 0, None);
         assert_eq!(
             graph.neighbor_count(),
             1,
@@ -1875,10 +1965,10 @@ mod tests {
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, false);
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let etx_fixed = etx_to_fixed(calculate_etx(-75, 8.0));
         let neighbor = PackedNeighbor {
             node_id: 0xBB00_00BB,
-            rssi: -75,
-            snr: 8,
+            etx_fixed,
             signal_routing_active: false,
             hears_us: false,
             etx_variance: 0,
@@ -1902,9 +1992,85 @@ mod tests {
         graph.set_my_node(0xAA00_00AA);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 0, 0);
-        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0);
+        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0, None);
         let placeholder = placeholder_node_id(0xCD);
         assert!(graph.test_has_edge(placeholder, 0xBB00_00BB));
+    }
+
+    #[test]
+    fn relayed_packet_creates_downstream_entry() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA00_00AA);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0, None);
+
+        let placeholder = placeholder_node_id(0xCD);
+        assert!(graph.test_has_edge(0xAA00_00AA, placeholder));
+        assert!(graph.test_has_edge(placeholder, 0xBB00_00BB));
+        assert_eq!(
+            graph.get_downstream_relay(0xBB00_00BB, 200),
+            Some(placeholder)
+        );
+    }
+
+    #[test]
+    fn relayed_packet_does_not_mark_topology_dirty() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA00_00AA);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 0, 0);
+        graph.commit_topology_broadcast(0, true);
+
+        for t in (1..20).map(|i| i * 1_000) {
+            graph.observe_packet(0xCC00_00CC, 3, 2, 0xCD, -70, 8, t, 0, None);
+        }
+        assert!(graph.get_downstream_relay(0xCC00_00CC, 20_000).is_some());
+
+        let report = graph.run_maintenance(350_000);
+        assert!(!report.topology_dirty_send);
+        assert!(!report.topology_due);
+    }
+
+    #[test]
+    fn relayed_packet_with_known_relay_uses_real_gateway() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA00_00AA);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        let relay = 0x1000_00CD;
+        graph.observe_direct_neighbor(relay, -70, 8, 0, 0);
+        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0, Some(relay));
+
+        let placeholder = placeholder_node_id(0xCD);
+        assert!(!graph.has_graph_node(placeholder));
+        assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 200), Some(relay));
+        assert!(graph.test_has_edge(relay, 0xBB00_00BB));
+    }
+
+    #[test]
+    fn resolve_placeholder_rejects_low_byte_mismatch() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA00_00AA);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_packet(0xBEEF_00CD, 3, 2, 0xCD, -70, 8, 100, 0, None);
+        let placeholder = placeholder_node_id(0xCD);
+        assert!(!graph.resolve_placeholder(placeholder, 0x1234_00AB, 200));
+        assert!(graph.has_graph_node(placeholder));
+    }
+
+    #[test]
+    fn relayed_packet_keeps_placeholder_until_direct_frame() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA00_00AA);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        let relay = 0x1000_00CD;
+        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0, None);
+        let placeholder = placeholder_node_id(0xCD);
+        assert!(graph.has_graph_node(placeholder));
+
+        // Relayed frame must not resolve even when the real relay is already known.
+        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 200, 0, Some(relay));
+        assert!(graph.has_graph_node(placeholder));
+        assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 300), Some(placeholder));
     }
 
     #[test]
@@ -1912,7 +2078,7 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA00_00AA);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        graph.observe_packet(0xBEEF_00CD, 3, 2, 0xCD, -70, 8, 100, 0);
+        graph.observe_packet(0xBEEF_00CD, 3, 2, 0xCD, -70, 8, 100, 0, None);
         let placeholder = placeholder_node_id(0xCD);
         graph
             .downstream_mut()
@@ -1943,8 +2109,7 @@ mod tests {
         graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
         let remote = PackedNeighbor {
             node_id: COV_B,
-            rssi: -72,
-            snr: 8,
+            etx_fixed: etx_to_fixed(calculate_etx(-72, 8.0)),
             signal_routing_active: true,
             hears_us: false,
             etx_variance: 0,

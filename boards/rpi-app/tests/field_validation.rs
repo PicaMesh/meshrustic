@@ -7,7 +7,7 @@ use mesh_routing::{
     build_app_wire_frame, coordinated_relay, decode_packed_neighbors, decode_route_discovery,
     encode_route_discovery, try_decrypt_data_full, write_packed_header, DataEncodeOpts,
     InboundPacket, NeighborGraph, PackedNeighbor, RouteDiscovery, Router, TopologyMergeResult,
-    TRACEROUTE_APP,
+    TRACEROUTE_APP, calculate_etx, etx_to_fixed,
 };
 
 fn ready_relay(
@@ -131,8 +131,7 @@ fn field_three_node_sr_learns_remote_route() {
 
     let remote = PackedNeighbor {
         node_id: C,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: true,
         hears_us: false,
         etx_variance: 0,

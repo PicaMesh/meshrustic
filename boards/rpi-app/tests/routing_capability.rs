@@ -3,9 +3,9 @@
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
-    coordinated_relay, write_packed_header, CapabilityStatus, InboundPacket, NeighborGraph,
-    Router, TopologyMergeResult, CAPABILITY_TTL_MS, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER,
-    MAX_CAPABILITY_RECORDS,
+    calculate_etx, coordinated_relay, etx_to_fixed, write_packed_header, CapabilityStatus,
+    InboundPacket, NeighborGraph, Router, TopologyMergeResult, CAPABILITY_TTL_MS,
+    DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, MAX_CAPABILITY_RECORDS,
 };
 
 #[test]
@@ -41,8 +41,7 @@ fn stock_router_gets_earlier_slot_than_sr_self() {
     let (header, _) = mesh_routing::decode_packed_neighbors(&packed, 8).unwrap();
     let remote = mesh_routing::PackedNeighbor {
         node_id: 0xDD,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: false,
         hears_us: false,
         etx_variance: 0,
@@ -122,8 +121,7 @@ fn three_node_topology_versions_converge() {
     let (header, _) = mesh_routing::decode_packed_neighbors(&packed, 8).unwrap();
     let neighbor = mesh_routing::PackedNeighbor {
         node_id: 0xC000_0003,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: true,
         hears_us: false,
         etx_variance: 0,

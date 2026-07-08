@@ -1,9 +1,9 @@
 //! Graph topology merge, ETX, and downstream tests.
 
 use mesh_routing::{
-    calculate_etx, etx_to_signal, decode_packed_neighbors, write_packed_header, NeighborGraph,
-    PackedNeighbor, SrLog, SrLogEvent, TopologyMergeResult, MAX_EDGES_PER_NODE, NeighborEntry,
-    PACKED_NEIGHBOR_HEADER_SIZE,
+    calculate_etx, etx_to_fixed, etx_to_signal, decode_packed_neighbors, write_packed_header,
+    NeighborGraph, PackedNeighbor, SrLog, SrLogEvent, TopologyMergeResult, MAX_EDGES_PER_NODE,
+    NeighborEntry, PACKED_NEIGHBOR_HEADER_SIZE,
 };
 
 #[test]
@@ -21,8 +21,7 @@ fn downstream_created_for_hears_us_remote_neighbor() {
 
     let neighbor = PackedNeighbor {
         node_id: 0xCC,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -43,8 +42,7 @@ fn reported_edges_sort_before_mirrored_in_topology_pack() {
 
     let neighbor = PackedNeighbor {
         node_id: 0x33,
-        rssi: -70,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-70, 8.0)),
         signal_routing_active: true,
         hears_us: false,
         etx_variance: 0,
@@ -61,10 +59,11 @@ fn reported_edges_sort_before_mirrored_in_topology_pack() {
 }
 
 #[test]
-fn topology_pack_uses_etx_signal_mapping() {
+fn topology_pack_round_trips_etx_fixed() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.observe_direct_neighbor(0x1234_5678, -80, 10, 0, 0);
+    let expected_etx_fixed = etx_to_fixed(calculate_etx(-80, 10.0));
 
     let mut packed = [0u8; 64];
     let len = graph
@@ -74,6 +73,7 @@ fn topology_pack_uses_etx_signal_mapping() {
     let (_, neighbors) = decode_packed_neighbors(&packed[..len], len).unwrap();
     assert_eq!(neighbors.len(), 1);
     assert_eq!(neighbors[0].node_id, 0x1234_5678);
+    assert_eq!(neighbors[0].etx_fixed, expected_etx_fixed);
 }
 
 #[test]
@@ -107,8 +107,7 @@ fn merge_topology_accepts_high_version_on_first_contact() {
 
     let neighbor = PackedNeighbor {
         node_id: 0xCC,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -145,7 +144,7 @@ fn relayed_packet_creates_placeholder_edge_to_transmitter() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
-    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0);
+    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None);
     let placeholder = placeholder_node_id(0x8f);
     assert!(graph.has_graph_node(placeholder));
 }
@@ -157,12 +156,11 @@ fn relayed_topology_adds_sender_edges_and_downstream_without_destination_node() 
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
-    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0);
+    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None);
 
     let neighbor = PackedNeighbor {
         node_id: 0xd6c2_3e3e,
-        rssi: -80,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-80, 8.0)),
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -197,12 +195,11 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
-    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0);
+    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None);
 
     let neighbor = PackedNeighbor {
         node_id: 0xd6c2_3e3e,
-        rssi: -80,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-80, 8.0)),
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -222,7 +219,7 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
         SrLogEvent::NetworkTopologyHeader {
             direct_neighbors: 0,
             graph_nodes,
-            downstream_routes: 1,
+            downstream_routes: 2,
         } if *graph_nodes >= 1
     )));
 }
@@ -235,8 +232,7 @@ fn emit_topology_log_lists_mirrored_and_downstream_nodes() {
 
     let neighbor = PackedNeighbor {
         node_id: 0xCC,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,

@@ -396,7 +396,6 @@ impl Router {
     pub fn record_tx_on_air(&mut self, packet_id: u32, now_ms: u32) {
         if packet_id != 0 {
             self.graph.record_our_transmission(packet_id, now_ms);
-            self.graph.notify_originated_packet_sent(now_ms);
         }
     }
 
@@ -552,6 +551,18 @@ impl Router {
             direct,
         });
 
+        let known_relay = if !direct && parsed.relay_node != 0 {
+            Some(self.resolve_heard_from_node(
+                parsed.relay_node,
+                parsed.from,
+                packet.rssi,
+                packet.snr,
+                now_ms,
+            ))
+        } else {
+            None
+        };
+
         if let Some((node_id, rssi, snr, is_new)) = self.graph.observe_packet(
             parsed.from,
             parsed.hop_start,
@@ -561,6 +572,7 @@ impl Router {
             packet.snr,
             now_ms,
             packet.radio_id,
+            known_relay,
         ) {
             if is_new {
                 self.sr_log.push(SrLogEvent::DirectNeighbor {
@@ -591,7 +603,9 @@ impl Router {
             if !direct && parsed.relay_node != 0 {
                 let from_low = (parsed.from & 0xFF) as u8;
                 if parsed.relay_node != from_low {
-                    let relay = crate::graph::placeholder_node_id(parsed.relay_node);
+                    let relay = known_relay
+                        .filter(|&id| id != 0 && !crate::graph::is_placeholder_node(id))
+                        .unwrap_or_else(|| crate::graph::placeholder_node_id(parsed.relay_node));
                     if relay != parsed.from && relay != self.node_num {
                         self.graph.update_node_activity(relay, now_ms);
                     }
@@ -600,9 +614,9 @@ impl Router {
         }
 
         if direct {
+            self.try_resolve_placeholder(&parsed, now_ms);
             let relay_byte = (parsed.from & 0xFF) as u8;
             if relay_byte != 0 {
-                self.try_resolve_placeholder(relay_byte, parsed.from, now_ms);
                 self.relay_identity
                     .remember_relay_identity(parsed.from, relay_byte, now_ms);
             }
@@ -879,9 +893,8 @@ impl Router {
             parsed.hop_start,
             parsed.hop_limit,
             parsed.relay_node,
-        ) && parsed.relay_node != 0
-        {
-            self.try_resolve_placeholder(parsed.relay_node, parsed.from, now_ms);
+        ) {
+            self.try_resolve_placeholder(&parsed, now_ms);
         }
 
         let heard_from = self.resolve_heard_from_node(
@@ -972,6 +985,20 @@ impl Router {
                 return plan;
             }
         };
+
+        if parsed.to == NODENUM_BROADCAST
+            && relay_hdr.hop_limit() == 0
+            && !self
+                .graph
+                .is_downstream_relay_for(self.node_num, parsed.from, now_ms)
+        {
+            self.pool.release(handle);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::LastHop,
+            });
+            return plan;
+        }
 
         let mut staging = PacketSlot::empty();
         {
@@ -1267,21 +1294,37 @@ impl Router {
             .remember_relay_identity(node_id, relay_byte, now_ms);
     }
 
-    fn try_resolve_placeholder(&mut self, relay_byte: u8, real_node_id: u32, now_ms: u32) -> bool {
-        if relay_byte == 0 || crate::graph::is_placeholder_node(real_node_id) {
+    fn try_resolve_placeholder(&mut self, parsed: &ParsedPacket, now_ms: u32) -> bool {
+        if !is_direct_packet(
+            parsed.from,
+            parsed.hop_start,
+            parsed.hop_limit,
+            parsed.relay_node,
+        ) {
             return false;
         }
+        let relay_byte = (parsed.from & 0xFF) as u8;
+        if relay_byte == 0 || crate::graph::is_placeholder_node(parsed.from) {
+            return false;
+        }
+        let real_node_id = parsed.from;
         let placeholder_id = crate::graph::get_placeholder_for_relay(relay_byte);
-        if self.relay_identity.resolve_relay_identity(
+        if self.graph.edges().find_node(placeholder_id).is_none() {
+            self.relay_identity
+                .remember_relay_identity(real_node_id, relay_byte, now_ms);
+            return false;
+        }
+        if let Some(cached) = self.relay_identity.resolve_relay_identity(
             relay_byte,
             0,
             0,
             self.graph.edges(),
             self.node_num,
             now_ms,
-        ).is_some()
-        {
-            return false;
+        ) {
+            if cached != real_node_id {
+                return false;
+            }
         }
         if !self
             .graph
@@ -2279,5 +2322,147 @@ mod tests {
             1_000,
         );
         assert!(router.has_pending_work());
+    }
+
+    const LAST_HOP_ME: u32 = 0xCC00_00CC;
+    const LAST_HOP_SOURCE: u32 = 0xBB00_00BB;
+    const LAST_HOP_GATEWAY: u32 = 0xEE00_00EE;
+
+    fn last_hop_broadcast_wire(
+        source: u32,
+        relay: u32,
+        hop_limit: u8,
+        hop_start: u8,
+        id: u32,
+    ) -> heapless::Vec<u8, 128> {
+        let header = PacketHeader::from_fields(
+            0xFFFF_FFFF,
+            source,
+            id,
+            0,
+            hop_limit,
+            hop_start,
+            false,
+            false,
+            0,
+            (relay & 0xFF) as u8,
+        );
+        encode_wire(header, &[0xDE, 0xAD])
+    }
+
+    #[test]
+    fn last_hop_broadcast_skipped_without_downstream_gateway() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(LAST_HOP_ME));
+        router.graph_mut().downstream_mut().update(
+            LAST_HOP_ME,
+            LAST_HOP_SOURCE,
+            LAST_HOP_GATEWAY,
+            100,
+            0,
+            false,
+            0,
+        );
+
+        let wire = last_hop_broadcast_wire(LAST_HOP_SOURCE, LAST_HOP_GATEWAY, 1, 3, 42);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -80,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(
+            &result,
+            0.0,
+            coordinated_relay::DEFAULT_SLOT_MS,
+            0,
+        );
+        assert!(plan.relay.is_none());
+        assert!(router.poll_ready_relay(u32::MAX).is_none());
+
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|event| matches!(
+            event,
+            SrLogEvent::RelaySkip {
+                from: LAST_HOP_SOURCE,
+                reason: SrSkipReason::LastHop,
+            }
+        )));
+    }
+
+    #[test]
+    fn last_hop_broadcast_allowed_when_downstream_gateway() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(LAST_HOP_ME));
+        router.graph_mut().downstream_mut().update(
+            LAST_HOP_ME,
+            LAST_HOP_SOURCE,
+            LAST_HOP_ME,
+            100,
+            0,
+            false,
+            0,
+        );
+
+        let wire = last_hop_broadcast_wire(LAST_HOP_SOURCE, LAST_HOP_GATEWAY, 1, 3, 43);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -80,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(
+            &result,
+            0.0,
+            coordinated_relay::DEFAULT_SLOT_MS,
+            0,
+        );
+        assert!(plan.relay.is_some() || router.poll_ready_relay(u32::MAX).is_some());
+    }
+
+    #[test]
+    fn last_hop_guard_does_not_apply_when_hop_budget_remains() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(LAST_HOP_ME));
+        router.graph_mut().downstream_mut().update(
+            LAST_HOP_ME,
+            LAST_HOP_SOURCE,
+            LAST_HOP_GATEWAY,
+            100,
+            0,
+            false,
+            0,
+        );
+
+        let wire = last_hop_broadcast_wire(LAST_HOP_SOURCE, LAST_HOP_GATEWAY, 2, 3, 44);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -80,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(
+            &result,
+            0.0,
+            coordinated_relay::DEFAULT_SLOT_MS,
+            0,
+        );
+        assert!(plan.relay.is_some() || router.poll_ready_relay(u32::MAX).is_some());
     }
 }

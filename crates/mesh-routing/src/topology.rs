@@ -5,9 +5,10 @@ use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
+use crate::graph::EtxFixed;
 
 pub const SIGNAL_ROUTING_VERSION: u8 = 3;
-pub const PACKED_NEIGHBOR_FORMAT_VERSION: u8 = 1;
+pub const PACKED_NEIGHBOR_FORMAT_VERSION: u8 = 2;
 pub const PACKED_NEIGHBOR_ENTRY_SIZE: usize = 8;
 pub const PACKED_NEIGHBOR_HEADER_SIZE: usize = 5;
 pub const PACKED_NEIGHBOR_FLAG_SR_ACTIVE: u8 = 0x01;
@@ -50,8 +51,7 @@ pub struct PackedHeader {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PackedNeighbor {
     pub node_id: u32,
-    pub rssi: i8,
-    pub snr: i8,
+    pub etx_fixed: EtxFixed,
     pub signal_routing_active: bool,
     pub hears_us: bool,
     pub etx_variance: u8,
@@ -110,10 +110,10 @@ pub fn decode_packed_neighbors(data: &[u8], max_entries: usize) -> Option<(Packe
         let e = &data[base..base + PACKED_NEIGHBOR_ENTRY_SIZE];
         let node_id = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
         let flags = e[6];
+        let etx_fixed = u16::from_le_bytes([e[4], e[5]]);
         let neighbor = PackedNeighbor {
             node_id,
-            rssi: e[4] as i8,
-            snr: e[5] as i8,
+            etx_fixed,
             signal_routing_active: flags & PACKED_NEIGHBOR_FLAG_SR_ACTIVE != 0,
             hears_us: flags & PACKED_NEIGHBOR_FLAG_HEARS_US != 0,
             etx_variance: e[7],
@@ -439,8 +439,8 @@ mod tests {
         let mut packed = [0u8; 13];
         write_packed_header(&mut packed, 7, true);
         packed[5..9].copy_from_slice(&0x1122_3344u32.to_le_bytes());
-        packed[9] = 0xB0u8; // -80
-        packed[10] = 8;
+        let etx_fixed = 12_345u16;
+        packed[9..11].copy_from_slice(&etx_fixed.to_le_bytes());
         packed[11] = PACKED_NEIGHBOR_FLAG_SR_ACTIVE | PACKED_NEIGHBOR_FLAG_HEARS_US;
         packed[12] = 0;
 
@@ -449,7 +449,7 @@ mod tests {
         assert!(hdr.signal_routing_active);
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].node_id, 0x1122_3344);
-        assert_eq!(neighbors[0].rssi, -80);
+        assert_eq!(neighbors[0].etx_fixed, etx_fixed);
     }
 
     #[test]

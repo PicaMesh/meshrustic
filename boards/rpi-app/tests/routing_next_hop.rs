@@ -2,15 +2,15 @@
 
 use mesh_protocol::PacketHeader;
 use mesh_routing::{
-    decode_packed_neighbors, relay_header_with_next_hop, write_packed_header, DEVICE_ROLE_CLIENT_MUTE,
-    NeighborGraph, PackedNeighbor, TopologyMergeResult,
+    calculate_etx, decode_packed_neighbors, etx_to_fixed, relay_header_with_next_hop,
+    write_packed_header, DEVICE_ROLE_CLIENT_MUTE, NeighborGraph, PackedNeighbor,
+    TopologyMergeResult,
 };
 
 fn merge_remote(graph: &mut NeighborGraph, reporter: u32, neighbor: u32, now_ms: u32) {
     let remote = PackedNeighbor {
         node_id: neighbor,
-        rssi: -75,
-        snr: 8,
+        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
         signal_routing_active: true,
         hears_us: false,
         etx_variance: 0,
