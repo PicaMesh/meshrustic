@@ -5,10 +5,8 @@ use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
-use crate::graph::EtxFixed;
-
 pub const SIGNAL_ROUTING_VERSION: u8 = 3;
-pub const PACKED_NEIGHBOR_FORMAT_VERSION: u8 = 2;
+pub const PACKED_NEIGHBOR_FORMAT_VERSION: u8 = 1;
 pub const PACKED_NEIGHBOR_ENTRY_SIZE: usize = 8;
 pub const PACKED_NEIGHBOR_HEADER_SIZE: usize = 5;
 pub const PACKED_NEIGHBOR_FLAG_SR_ACTIVE: u8 = 0x01;
@@ -51,7 +49,8 @@ pub struct PackedHeader {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PackedNeighbor {
     pub node_id: u32,
-    pub etx_fixed: EtxFixed,
+    pub rssi: i8,
+    pub snr: i8,
     pub signal_routing_active: bool,
     pub hears_us: bool,
     pub etx_variance: u8,
@@ -110,10 +109,12 @@ pub fn decode_packed_neighbors(data: &[u8], max_entries: usize) -> Option<(Packe
         let e = &data[base..base + PACKED_NEIGHBOR_ENTRY_SIZE];
         let node_id = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
         let flags = e[6];
-        let etx_fixed = u16::from_le_bytes([e[4], e[5]]);
+        let rssi = e[4] as i8;
+        let snr = e[5] as i8;
         let neighbor = PackedNeighbor {
             node_id,
-            etx_fixed,
+            rssi,
+            snr,
             signal_routing_active: flags & PACKED_NEIGHBOR_FLAG_SR_ACTIVE != 0,
             hears_us: flags & PACKED_NEIGHBOR_FLAG_HEARS_US != 0,
             etx_variance: e[7],
@@ -121,6 +122,21 @@ pub fn decode_packed_neighbors(data: &[u8], max_entries: usize) -> Option<(Packe
         let _ = out.push(neighbor);
     }
     Some((header, out))
+}
+
+pub fn encode_packed_neighbor_entry(
+    out: &mut [u8],
+    node_id: u32,
+    rssi: i8,
+    snr: i8,
+    flags: u8,
+    etx_variance: u8,
+) {
+    out[0..4].copy_from_slice(&node_id.to_le_bytes());
+    out[4] = rssi as u8;
+    out[5] = snr as u8;
+    out[6] = flags;
+    out[7] = etx_variance;
 }
 
 pub fn encode_signal_routing_info(packed: &[u8]) -> heapless::Vec<u8, 240> {
@@ -438,18 +454,41 @@ mod tests {
     fn packed_round_trip() {
         let mut packed = [0u8; 13];
         write_packed_header(&mut packed, 7, true);
-        packed[5..9].copy_from_slice(&0x1122_3344u32.to_le_bytes());
-        let etx_fixed = 12_345u16;
-        packed[9..11].copy_from_slice(&etx_fixed.to_le_bytes());
-        packed[11] = PACKED_NEIGHBOR_FLAG_SR_ACTIVE | PACKED_NEIGHBOR_FLAG_HEARS_US;
-        packed[12] = 0;
+        encode_packed_neighbor_entry(
+            &mut packed[5..13],
+            0x1122_3344,
+            -75,
+            8,
+            PACKED_NEIGHBOR_FLAG_SR_ACTIVE | PACKED_NEIGHBOR_FLAG_HEARS_US,
+            0,
+        );
 
         let (hdr, neighbors) = decode_packed_neighbors(&packed, 8).unwrap();
         assert_eq!(hdr.topology_version, 7);
         assert!(hdr.signal_routing_active);
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].node_id, 0x1122_3344);
-        assert_eq!(neighbors[0].etx_fixed, etx_fixed);
+        assert_eq!(neighbors[0].rssi, -75);
+        assert_eq!(neighbors[0].snr, 8);
+    }
+
+    #[test]
+    fn rejects_format_version_two() {
+        let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE];
+        packed[0] = 2;
+        packed[1] = PACKED_NEIGHBOR_ENTRY_SIZE as u8;
+        packed[2] = SIGNAL_ROUTING_VERSION;
+        packed[3] = 1;
+        packed[4] = PACKED_HEADER_FLAG_SR_ACTIVE;
+        encode_packed_neighbor_entry(
+            &mut packed[PACKED_NEIGHBOR_HEADER_SIZE..],
+            0x1122_3344,
+            -80,
+            10,
+            0,
+            0,
+        );
+        assert!(decode_packed_neighbors(&packed, 8).is_none());
     }
 
     #[test]

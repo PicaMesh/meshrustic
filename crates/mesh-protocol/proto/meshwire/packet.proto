@@ -139,7 +139,7 @@ message MeshPacket {
 }
 
 message SignalRoutingInfo {
-  // V3 wire format: field 3 is packed_neighbors bytes (see topology.rs).
+  // V3 wire format: field 3 is packed_neighbors bytes (format_version 1, RSSI+SNR entries; see topology.rs).
   // Legacy fields 1–2 and repeated neighbors on 3 are not emitted.
   bytes packed_neighbors = 3;
 }

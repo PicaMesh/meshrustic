@@ -6,7 +6,7 @@ use mesh_radio::{contention_window_ms, RadioId, MODEM_SHORT_SLOW};
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
 use crate::graph::{
-    calculate_etx, calculate_route, etx_to_fixed, etx_to_signal, fixed_to_etx,
+    calculate_etx, calculate_route,
     find_better_positioned_neighbor,
     is_node_routable, verified_connectivity, is_placeholder_node, placeholder_node_id,
     EdgeSource, EdgeStore, DownstreamTable, Route, RouteCache, RoutableFilter, EDGE_NEW,
@@ -42,6 +42,14 @@ pub struct NeighborEntry {
     pub last_seen_ms: u32,
     pub signal_routing_active: bool,
     pub hears_us: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DirectNeighborSignal {
+    node_id: u32,
+    rssi: i16,
+    snr: i8,
+    last_rx_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -109,6 +117,8 @@ pub struct NeighborGraph {
     node_tx_count: u8,
     route_cache: RouteCache,
     capability: CapabilityCache,
+    direct_signals: [DirectNeighborSignal; MAX_NEIGHBORS],
+    direct_signal_count: u8,
 }
 
 impl NeighborGraph {
@@ -154,6 +164,13 @@ impl NeighborGraph {
             node_tx_count: 0,
             route_cache: RouteCache::new(),
             capability: CapabilityCache::new(),
+            direct_signals: [DirectNeighborSignal {
+                node_id: 0,
+                rssi: 0,
+                snr: 0,
+                last_rx_ms: 0,
+            }; MAX_NEIGHBORS],
+            direct_signal_count: 0,
         }
     }
 
@@ -656,6 +673,100 @@ impl NeighborGraph {
         self.relay_slot_index(packet_id, heard_from, now_ms).1.max(1)
     }
 
+    fn clamp_topology_rssi(rssi: i16) -> i8 {
+        rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8
+    }
+
+    fn clamp_topology_snr(snr: i8) -> i8 {
+        snr.clamp(-20, 20)
+    }
+
+    fn upsert_direct_signal(&mut self, node_id: u32, rssi: i16, snr: i8, now_ms: u32) {
+        if node_id == 0 || node_id == self.my_node {
+            return;
+        }
+        let snr = Self::clamp_topology_snr(snr);
+        for i in 0..self.direct_signal_count as usize {
+            if self.direct_signals[i].node_id == node_id {
+                self.direct_signals[i].rssi = rssi;
+                self.direct_signals[i].snr = snr;
+                self.direct_signals[i].last_rx_ms = now_ms;
+                return;
+            }
+        }
+        let slot = if (self.direct_signal_count as usize) < MAX_NEIGHBORS {
+            let idx = self.direct_signal_count as usize;
+            self.direct_signal_count += 1;
+            idx
+        } else {
+            let mut oldest = 0usize;
+            let mut oldest_ms = self.direct_signals[0].last_rx_ms;
+            for i in 1..MAX_NEIGHBORS {
+                if self.direct_signals[i].last_rx_ms < oldest_ms {
+                    oldest = i;
+                    oldest_ms = self.direct_signals[i].last_rx_ms;
+                }
+            }
+            oldest
+        };
+        self.direct_signals[slot] = DirectNeighborSignal {
+            node_id,
+            rssi,
+            snr,
+            last_rx_ms: now_ms,
+        };
+    }
+
+    fn lookup_direct_signal(&self, node_id: u32) -> Option<&DirectNeighborSignal> {
+        for i in 0..self.direct_signal_count as usize {
+            if self.direct_signals[i].node_id == node_id {
+                return Some(&self.direct_signals[i]);
+            }
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    fn remove_direct_signal(&mut self, node_id: u32) {
+        let mut write = 0u8;
+        for i in 0..self.direct_signal_count as usize {
+            if self.direct_signals[i].node_id != node_id {
+                if write as usize != i {
+                    self.direct_signals[write as usize] = self.direct_signals[i];
+                }
+                write += 1;
+            }
+        }
+        self.direct_signal_count = write;
+    }
+
+    fn prune_direct_signals(&mut self, now_ms: u32) {
+        let mut write = 0u8;
+        for i in 0..self.direct_signal_count as usize {
+            let entry = self.direct_signals[i];
+            if entry.node_id == 0 {
+                continue;
+            }
+            if now_ms.wrapping_sub(entry.last_rx_ms) > NEIGHBOR_TTL_MS {
+                continue;
+            }
+            let has_reported = self
+                .edges
+                .find_node(self.my_node)
+                .and_then(|n| n.find_edge(entry.node_id))
+                .map(|e| e.source == EdgeSource::Reported)
+                .unwrap_or(false);
+            if !has_reported {
+                continue;
+            }
+            if write as usize != i {
+                self.direct_signals[write as usize] = entry;
+            }
+            write += 1;
+        }
+        self.direct_signal_count = write;
+    }
+
     pub fn fill_neighbor_entries(&self, out: &mut [NeighborEntry; MAX_NEIGHBORS]) -> u8 {
         let Some(node) = self.edges.find_node(self.my_node) else {
             return 0;
@@ -670,11 +781,13 @@ impl NeighborGraph {
             if written >= MAX_NEIGHBORS {
                 break;
             }
-            let (rssi, snr) = etx_to_signal(edge.etx());
+            let Some(signal) = self.lookup_direct_signal(edge.to) else {
+                continue;
+            };
             out[written] = NeighborEntry {
                 node_id: edge.to,
-                rssi: rssi as i16,
-                snr,
+                rssi: signal.rssi,
+                snr: signal.snr,
                 last_seen_ms: edge.last_update_ms,
                 signal_routing_active: self.signal_routing_active,
                 hears_us: edge.hears_us,
@@ -755,17 +868,8 @@ impl NeighborGraph {
             let entry = sorted[start + i];
             let base = PACKED_NEIGHBOR_HEADER_SIZE + i * PACKED_NEIGHBOR_ENTRY_SIZE;
             out[base..base + 4].copy_from_slice(&entry.node_id.to_le_bytes());
-            // Topology wire-format encodes ETX directly (byte pairs 4..6).
-            let etx_fixed = self
-                .edges
-                .find_node(self.my_node)
-                .and_then(|n| n.find_edge(entry.node_id))
-                .map(|e| e.etx_fixed)
-                .unwrap_or_else(|| {
-                    let etx = calculate_etx(entry.rssi as i32, entry.snr as f32);
-                    etx_to_fixed(etx)
-                });
-            out[base + 4..base + 6].copy_from_slice(&etx_fixed.to_le_bytes());
+            out[base + 4] = Self::clamp_topology_rssi(entry.rssi) as u8;
+            out[base + 5] = Self::clamp_topology_snr(entry.snr) as u8;
             let mut flags = 0u8;
             if entry.signal_routing_active {
                 flags |= PACKED_NEIGHBOR_FLAG_SR_ACTIVE;
@@ -854,7 +958,7 @@ impl NeighborGraph {
             {
                 continue;
             }
-            let etx = fixed_to_etx(neighbor.etx_fixed);
+            let etx = calculate_etx(neighbor.rssi as i32, neighbor.snr as f32);
             let relay_has_edge = self
                 .edges
                 .find_node(sender)
@@ -972,6 +1076,7 @@ impl NeighborGraph {
         if result == EDGE_NEW || result == EDGE_SIGNIFICANT_CHANGE {
             self.topology_dirty = true;
         }
+        self.upsert_direct_signal(node_id, rssi, snr, now_ms);
         self.downstream.clear_for_destination(node_id);
         result == EDGE_NEW
     }
@@ -1676,6 +1781,7 @@ impl NeighborGraph {
         let edges_aged = self
             .edges
             .age_edges(self.my_node, now_ms, NEIGHBOR_TTL_MS, Some(&mut self.downstream));
+        self.prune_direct_signals(now_ms);
         let relay_in_graph = |relay: u32| self.edges.find_node(relay).is_some();
         let downstream_aged = self
             .downstream
@@ -1856,6 +1962,7 @@ impl NeighborGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{calculate_etx, etx_to_fixed};
     use crate::coordinated_relay::DEFAULT_SLOT_MS;
     use crate::decode_packed_neighbors;
     use crate::nodeinfo::DEVICE_ROLE_REPEATER;
@@ -1965,10 +2072,10 @@ mod tests {
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, false);
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
-        let etx_fixed = etx_to_fixed(calculate_etx(-75, 8.0));
         let neighbor = PackedNeighbor {
             node_id: 0xBB00_00BB,
-            etx_fixed,
+            rssi: -75,
+            snr: 8,
             signal_routing_active: false,
             hears_us: false,
             etx_variance: 0,
@@ -2109,7 +2216,8 @@ mod tests {
         graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
         let remote = PackedNeighbor {
             node_id: COV_B,
-            etx_fixed: etx_to_fixed(calculate_etx(-72, 8.0)),
+            rssi: -72,
+            snr: 8,
             signal_routing_active: true,
             hears_us: false,
             etx_variance: 0,
@@ -2175,6 +2283,70 @@ mod tests {
         graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
         graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
         assert_eq!(graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD), None);
+    }
+
+    #[test]
+    fn topology_pack_emits_measured_rssi_snr() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA);
+        graph.observe_direct_neighbor(0x1234_5678, -80, 10, 0, 0);
+
+        let mut packed = [0u8; 64];
+        let len = graph
+            .build_topology_chunk(0, 1, &mut packed)
+            .expect("chunk");
+        let (_, neighbors) = decode_packed_neighbors(&packed[..len], len).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, 0x1234_5678);
+        assert_eq!(neighbors[0].rssi, -80);
+        assert_eq!(neighbors[0].snr, 10);
+    }
+
+    #[test]
+    fn fill_neighbor_entries_skips_without_side_table() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA);
+        graph.edges_mut().update_edge(
+            0xAA,
+            0xAA,
+            0xBB,
+            2.0,
+            100,
+            EdgeSource::Reported,
+            true,
+            0,
+        );
+        assert_eq!(
+            graph.fill_neighbor_entries(&mut [NeighborEntry::default(); MAX_NEIGHBORS]),
+            0
+        );
+    }
+
+    #[test]
+    fn merge_topology_uses_rssi_snr_for_etx() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA);
+        graph.observe_direct_neighbor(0xBB, -70, 8, 100, 0);
+        let expected_etx = etx_to_fixed(calculate_etx(-75, 8.0));
+        let neighbor = PackedNeighbor {
+            node_id: 0xCC,
+            rssi: -75,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: false,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(0xBB, &header, &[neighbor], true, 200, 0);
+        let edge_etx = graph
+            .edges()
+            .find_node(0xBB)
+            .and_then(|n| n.find_edge(0xCC))
+            .map(|e| e.etx_fixed)
+            .expect("mirrored edge");
+        assert_eq!(edge_etx, expected_etx);
     }
 }
 

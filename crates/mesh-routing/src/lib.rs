@@ -77,7 +77,7 @@ pub use telemetry::{
 };
 pub use topology::{
     build_app_wire_frame, build_topology_wire_frame, decode_data_payload, decode_data_payload_full, decode_packed_neighbors,
-    encode_data_payload, encode_data_payload_opts, encode_signal_routing_info,
+    encode_data_payload, encode_data_payload_opts, encode_packed_neighbor_entry, encode_signal_routing_info,
     extract_packed_neighbors, try_decrypt_data, try_decrypt_data_full, write_packed_header,
     DataEncodeOpts, DecodedData, PackedHeader, PackedNeighbor, MAX_NEIGHBORS_PER_PACKET,
     MAX_TOPOLOGY_PACKETS, PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP,

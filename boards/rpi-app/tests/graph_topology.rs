@@ -1,7 +1,7 @@
 //! Graph topology merge, ETX, and downstream tests.
 
 use mesh_routing::{
-    calculate_etx, etx_to_fixed, etx_to_signal, decode_packed_neighbors, write_packed_header,
+    calculate_etx, etx_to_signal, decode_packed_neighbors, write_packed_header,
     NeighborGraph, PackedNeighbor, SrLog, SrLogEvent, TopologyMergeResult, MAX_EDGES_PER_NODE,
     NeighborEntry, PACKED_NEIGHBOR_HEADER_SIZE,
 };
@@ -21,7 +21,8 @@ fn downstream_created_for_hears_us_remote_neighbor() {
 
     let neighbor = PackedNeighbor {
         node_id: 0xCC,
-        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
+        rssi: -75,
+        snr: 8,
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -42,7 +43,8 @@ fn reported_edges_sort_before_mirrored_in_topology_pack() {
 
     let neighbor = PackedNeighbor {
         node_id: 0x33,
-        etx_fixed: etx_to_fixed(calculate_etx(-70, 8.0)),
+        rssi: -70,
+        snr: 8,
         signal_routing_active: true,
         hears_us: false,
         etx_variance: 0,
@@ -59,11 +61,10 @@ fn reported_edges_sort_before_mirrored_in_topology_pack() {
 }
 
 #[test]
-fn topology_pack_round_trips_etx_fixed() {
+fn topology_pack_round_trips_rssi_snr() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.observe_direct_neighbor(0x1234_5678, -80, 10, 0, 0);
-    let expected_etx_fixed = etx_to_fixed(calculate_etx(-80, 10.0));
 
     let mut packed = [0u8; 64];
     let len = graph
@@ -73,7 +74,8 @@ fn topology_pack_round_trips_etx_fixed() {
     let (_, neighbors) = decode_packed_neighbors(&packed[..len], len).unwrap();
     assert_eq!(neighbors.len(), 1);
     assert_eq!(neighbors[0].node_id, 0x1234_5678);
-    assert_eq!(neighbors[0].etx_fixed, expected_etx_fixed);
+    assert_eq!(neighbors[0].rssi, -80);
+    assert_eq!(neighbors[0].snr, 10);
 }
 
 #[test]
@@ -107,7 +109,8 @@ fn merge_topology_accepts_high_version_on_first_contact() {
 
     let neighbor = PackedNeighbor {
         node_id: 0xCC,
-        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
+        rssi: -75,
+        snr: 8,
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -160,7 +163,8 @@ fn relayed_topology_adds_sender_edges_and_downstream_without_destination_node() 
 
     let neighbor = PackedNeighbor {
         node_id: 0xd6c2_3e3e,
-        etx_fixed: etx_to_fixed(calculate_etx(-80, 8.0)),
+        rssi: -80,
+        snr: 8,
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -199,7 +203,8 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
 
     let neighbor = PackedNeighbor {
         node_id: 0xd6c2_3e3e,
-        etx_fixed: etx_to_fixed(calculate_etx(-80, 8.0)),
+        rssi: -80,
+        snr: 8,
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,
@@ -232,7 +237,8 @@ fn emit_topology_log_lists_mirrored_and_downstream_nodes() {
 
     let neighbor = PackedNeighbor {
         node_id: 0xCC,
-        etx_fixed: etx_to_fixed(calculate_etx(-75, 8.0)),
+        rssi: -75,
+        snr: 8,
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,

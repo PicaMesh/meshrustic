@@ -32,7 +32,7 @@ fn merge_topology_downstream_stores_via_radio() {
     graph.set_my_node(0xAA00_00AA);
     graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 1);
     let header = PackedHeader {
-        format_version: 2,
+        format_version: 1,
         entry_size: 8,
         routing_version: 3,
         topology_version: 1,
@@ -40,7 +40,8 @@ fn merge_topology_downstream_stores_via_radio() {
     };
     let neighbor = PackedNeighbor {
         node_id: 0xEE00_00EE,
-        etx_fixed: mesh_routing::etx_to_fixed(mesh_routing::calculate_etx(-70, 8.0)),
+        rssi: -70,
+        snr: 8,
         signal_routing_active: true,
         hears_us: true,
         etx_variance: 0,

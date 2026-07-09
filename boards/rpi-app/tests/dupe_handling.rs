@@ -251,7 +251,7 @@ fn upgraded_hop_limit_reprocesses_after_dropping_lower_pending() {
         FROM,
         88,
         0x77,
-        1,
+        2,
         3,
         false,
         &key,

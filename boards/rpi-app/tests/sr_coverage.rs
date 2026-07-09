@@ -1,7 +1,7 @@
 //! Broadcast dupe coverage via accumulated transmitters + unique coverage.
 
 use mesh_routing::{
-    calculate_etx, decode_packed_neighbors, etx_to_fixed, write_packed_header, NeighborGraph,
+    decode_packed_neighbors, write_packed_header, NeighborGraph,
     PackedNeighbor, TopologyMergeResult, DEFAULT_SLOT_MS,
 };
 
@@ -24,7 +24,8 @@ fn hears_us_neighbors(graph: &mut NeighborGraph, neighbors: &[u32]) {
 fn merge_remote_neighbor(graph: &mut NeighborGraph, reporter: u32, neighbor: u32, now_ms: u32) {
     let remote = PackedNeighbor {
         node_id: neighbor,
-        etx_fixed: etx_to_fixed(calculate_etx(-72, 8.0)),
+        rssi: -72,
+        snr: 8,
         signal_routing_active: true,
         hears_us: false,
         etx_variance: 0,
