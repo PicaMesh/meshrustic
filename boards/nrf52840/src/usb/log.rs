@@ -1251,7 +1251,7 @@ pub mod sr {
                 line[pos..pos + prefix.len()].copy_from_slice(prefix);
                 pos += prefix.len();
                 pos += push_hex_u32_8(&mut line[pos..], from);
-                let tail = b" - marking topology dirty";
+                let tail = b" - scheduling topology reply on next maintenance";
                 line[pos..pos + tail.len()].copy_from_slice(tail);
                 pos += tail.len();
                 finish_line(&mut line, pos);

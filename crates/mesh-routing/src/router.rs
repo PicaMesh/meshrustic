@@ -113,12 +113,6 @@ struct PendingRelay {
 }
 
 #[derive(Clone, Copy)]
-struct PendingTopologyReply {
-    active: bool,
-    fire_after_ms: u32,
-}
-
-#[derive(Clone, Copy)]
 struct PendingTopology {
     active: bool,
     count: u8,
@@ -185,7 +179,7 @@ pub struct Router {
     graph: NeighborGraph,
     pending: [PendingRelay; MAX_PENDING_RELAYS],
     pending_topology: PendingTopology,
-    pending_topology_reply: PendingTopologyReply,
+    pending_topology_reply: bool,
     pending_nodeinfo: PendingNodeInfo,
     pending_telemetry: PendingTelemetry,
     pending_traceroute: PendingTraceroute,
@@ -295,10 +289,7 @@ impl Router {
                 lens: [0; MAX_TOPOLOGY_PACKETS],
                 frames: [[0; MAX_WIRE_LEN]; MAX_TOPOLOGY_PACKETS],
             },
-            pending_topology_reply: PendingTopologyReply {
-                active: false,
-                fire_after_ms: 0,
-            },
+            pending_topology_reply: false,
             pending_nodeinfo: PendingNodeInfo {
                 active: false,
                 next_tx_ms: 0,
@@ -838,42 +829,15 @@ impl Router {
             self.sr_log.push(SrLogEvent::TopologyDirtyFromNeighbor {
                 from: parsed.from,
             });
-            self.schedule_topology_reply_to_empty(parsed.from, parsed.id, now_ms);
+            self.pending_topology_reply = true;
         }
-    }
-
-    /// Jittered 5–16 s delay before answering a peer's empty SR topology bootstrap.
-    fn topology_reply_delay_ms(from: u32, packet_id: u32, node_num: u32) -> u32 {
-        const MIN_MS: u32 = 5_000;
-        const SPAN_MS: u32 = 11_001;
-        MIN_MS + ((from ^ packet_id ^ node_num) % SPAN_MS)
-    }
-
-    fn schedule_topology_reply_to_empty(&mut self, from: u32, packet_id: u32, now_ms: u32) {
-        let fire_after_ms = now_ms.wrapping_add(Self::topology_reply_delay_ms(from, packet_id, self.node_num));
-        if self.pending_topology_reply.active {
-            if fire_after_ms.wrapping_sub(self.pending_topology_reply.fire_after_ms) >= 0x8000_0000 {
-                self.pending_topology_reply.fire_after_ms = fire_after_ms;
-            }
-            return;
-        }
-        self.pending_topology_reply = PendingTopologyReply {
-            active: true,
-            fire_after_ms,
-        };
     }
 
     fn poll_scheduled_topology_reply(&mut self, now_ms: u32, slot_ms: u32) {
-        if !self.pending_topology_reply.active {
+        if !self.pending_topology_reply {
             return;
         }
-        if now_ms.wrapping_sub(self.pending_topology_reply.fire_after_ms) >= 0x8000_0000 {
-            return;
-        }
-        if now_ms < self.pending_topology_reply.fire_after_ms {
-            return;
-        }
-        self.pending_topology_reply.active = false;
+        self.pending_topology_reply = false;
         if self.pending_topology.active || !self.graph.can_send_topology() {
             return;
         }
@@ -2199,7 +2163,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_peer_topology_schedules_delayed_reply() {
+    fn empty_peer_topology_replies_on_next_maintenance() {
         use mesh_crypto::{CryptoKey, DEFAULT_PSK};
         use mesh_radio::MODEM_SHORT_SLOW;
         use crate::topology::{build_topology_wire_frame, write_packed_header, PACKED_NEIGHBOR_HEADER_SIZE};
@@ -2251,11 +2215,8 @@ mod tests {
         router.process_inbound(&inbound, 1_000).unwrap();
         assert!(router.poll_topology_tx(1_000).is_none());
 
-        let delay = Router::topology_reply_delay_ms(PEER, 99, ME);
-        assert!((5_000..=16_000).contains(&delay));
-        let fire = 1_000u32.wrapping_add(delay);
-        router.run_maintenance(fire, 20);
-        assert!(router.poll_topology_tx(fire).is_some());
+        router.run_maintenance(1_000, 20);
+        assert!(router.poll_topology_tx(1_000).is_some());
     }
 
     #[test]
