@@ -1,7 +1,7 @@
 //! Topology graph and per-radio relay commit state (Phase 6 SR).
 
 use mesh_protocol::{is_direct_packet, NODENUM_BROADCAST};
-use mesh_radio::{contention_window_ms, RadioId, MODEM_SHORT_SLOW};
+use mesh_radio::{RadioId, MODEM_SHORT_SLOW};
 
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
@@ -31,7 +31,7 @@ pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
 pub const NEIGHBOR_TTL_MS: u32 = 7_200_000;
 
-/// Transmission-memory window for SHORT_SLOW (see `contention_window_ms`).
+/// Legacy SHORT_SLOW contention window; live retention uses `transmission_record_window_ms`.
 pub const NODE_TX_RECORD_MS: u32 = 2_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -293,7 +293,7 @@ impl NeighborGraph {
     }
 
     fn node_tx_record_window_ms(&self) -> u32 {
-        contention_window_ms(self.modem_preset)
+        crate::coordinated_relay::transmission_record_window_ms(self.modem_preset)
     }
 
     pub fn is_active_routing_role(&self) -> bool {
@@ -1716,11 +1716,12 @@ impl NeighborGraph {
         };
         let mut hears_us_count = 0u8;
         for i in 0..node.edge_count as usize {
-            if !node.edges[i].hears_us {
+            let edge = node.edges[i];
+            let neighbor = edge.to;
+            if is_placeholder_node(neighbor) || !edge.hears_us {
                 continue;
             }
             hears_us_count = hears_us_count.saturating_add(1);
-            let neighbor = node.edges[i].to;
             if neighbor == heard_from {
                 continue;
             }
@@ -2112,40 +2113,84 @@ impl NeighborGraph {
 mod tests {
     use super::*;
     use crate::graph::{calculate_etx, etx_to_fixed};
-    use crate::coordinated_relay::DEFAULT_SLOT_MS;
+    use crate::coordinated_relay::{transmission_record_window_ms, DEFAULT_SLOT_MS, tx_delay_ms_worst, slot_time_for_preset};
     use crate::decode_packed_neighbors;
     use crate::nodeinfo::DEVICE_ROLE_REPEATER;
     use crate::topology::{write_packed_header, PackedNeighbor};
-    use mesh_radio::{contention_window_ms, MODEM_LONG_SLOW, MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
+    use mesh_radio::{MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
 
     #[test]
-    fn recorded_transmission_expires_after_cw_window() {
+    fn recorded_transmission_expires_after_retention_window() {
         let mut graph = NeighborGraph::new();
         graph.set_modem_preset(MODEM_SHORT_SLOW);
         graph.record_node_transmission(0xBB, 42, 0);
-        let window = contention_window_ms(MODEM_SHORT_SLOW);
+        let window = transmission_record_window_ms(MODEM_SHORT_SLOW);
         assert!(graph.has_node_transmitted(0xBB, 42, window));
         assert!(!graph.has_node_transmitted(0xBB, 42, window + 1));
 
         graph.set_modem_preset(MODEM_SHORT_FAST);
         graph.record_node_transmission(0xCC, 7, 10_000);
-        let fast_window = contention_window_ms(MODEM_SHORT_FAST);
+        let fast_window = transmission_record_window_ms(MODEM_SHORT_FAST);
         assert!(graph.has_node_transmitted(0xCC, 7, 10_000 + fast_window));
         assert!(!graph.has_node_transmitted(0xCC, 7, 10_000 + fast_window + 1));
-        assert!(fast_window < contention_window_ms(MODEM_LONG_SLOW));
+        assert!(fast_window > mesh_radio::contention_window_ms(MODEM_SHORT_FAST));
+    }
+
+    #[test]
+    fn recorded_transmission_survives_t1_worst_delay() {
+        const ME: u32 = 0xAA00_00AA;
+        const GATEWAY: u32 = 0xBB00_00BB;
+        const REMOTE: u32 = 0xCC00_00CC;
+        const PACKET_ID: u32 = 0xDEAD_BEEF;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.set_modem_preset(MODEM_SHORT_SLOW);
+        graph.observe_direct_neighbor(GATEWAY, -70, 8, 0, 0);
+        graph.confirm_direct_neighbor_hears_us(GATEWAY);
+
+        let t0 = 100_000u32;
+        graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, t0, 0, Some(GATEWAY), PACKET_ID);
+
+        let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
+        let cfg = mesh_radio::eu868_config_for_preset(MODEM_SHORT_SLOW);
+        let airtime = mesh_radio::packet_time_ms(&cfg, 44, false);
+        let t1_delay = tx_delay_ms_worst(slot).saturating_add(airtime);
+        let at_t1 = t0.wrapping_add(t1_delay);
+        assert!(graph.has_node_transmitted(GATEWAY, PACKET_ID, at_t1));
+    }
+
+    #[test]
+    fn all_hears_us_heard_skips_placeholder_neighbor() {
+        const ME: u32 = 0xAA00_00AA;
+        const SOURCE: u32 = 0xCC00_00CC;
+        const GATEWAY: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        let placeholder = placeholder_node_id(0xBB);
+        graph.observe_packet(SOURCE, 3, 2, 0xBB, -70, 12, 1_000, 0, None, 42);
+        graph.confirm_direct_neighbor_hears_us(placeholder);
+        graph.observe_direct_neighbor(GATEWAY, -70, 8, 1_000, 0);
+        graph.confirm_direct_neighbor_hears_us(GATEWAY);
+        graph.record_node_transmission(GATEWAY, 42, 1_000);
+
+        assert!(graph.all_hears_us_neighbors_heard_packet(42, SOURCE, 2_000));
     }
 
     #[test]
     fn recorded_transmission_capacity_evicts_oldest() {
         let mut graph = NeighborGraph::new();
+        let base = 10_000u32;
         for i in 0..MAX_NODE_TX_RECORDS as u32 {
-            graph.record_node_transmission(0x1000 + i, i + 1, i * 100);
+            graph.record_node_transmission(0x1000 + i, i + 1, base + i);
         }
-        assert!(graph.has_node_transmitted(0x1000, 1, 50_000));
-        graph.record_node_transmission(0x9999, 99, 50_000);
-        assert!(!graph.has_node_transmitted(0x1000, 1, 50_000));
-        assert!(graph.has_node_transmitted(0x9999, 99, 50_000));
-        assert!(graph.has_node_transmitted(0x1001, 2, 50_000));
+        let now = base + MAX_NODE_TX_RECORDS as u32;
+        assert!(graph.has_node_transmitted(0x1000, 1, now));
+        graph.record_node_transmission(0x9999, 99, now);
+        assert!(!graph.has_node_transmitted(0x1000, 1, now));
+        assert!(graph.has_node_transmitted(0x9999, 99, now));
+        assert!(graph.has_node_transmitted(0x1001, 2, now));
     }
 
     #[test]

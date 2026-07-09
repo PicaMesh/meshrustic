@@ -30,8 +30,8 @@ pub use broadcast_relay::{
 };
 pub use capability::{CapabilityStatus, CapabilityCache, CAPABILITY_TTL_MS, MAX_CAPABILITY_RECORDS};
 pub use coordinated_relay::{
-    cw_size_from_snr, half_airtime_ms, slot_time_for_preset, tx_delay_ms_router, tx_delay_ms_worst,
-    DEFAULT_SLOT_MS,
+    cw_size_from_snr, half_airtime_ms, slot_time_for_preset, transmission_record_window_ms,
+    tx_delay_ms_router, tx_delay_ms_worst, DEFAULT_SLOT_MS,
 };
 pub use graph::{
     calculate_etx, calculate_route, etx_to_fixed, etx_to_signal, fixed_to_etx,

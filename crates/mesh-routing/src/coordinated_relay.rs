@@ -62,6 +62,16 @@ pub fn tx_delay_ms_worst(cw_slot_ms: u32) -> u32 {
     (2 * cw_max * cw_slot_ms).saturating_add(pow2 * cw_slot_ms)
 }
 
+/// `has_node_transmitted` retention: contention window or worst-case T1 delay, whichever is longer.
+pub fn transmission_record_window_ms(modem_preset: u8) -> u32 {
+    let preset_window = mesh_radio::contention_window_ms(modem_preset);
+    let slot = slot_time_for_preset(modem_preset);
+    let cfg = mesh_radio::eu868_config_for_preset(modem_preset);
+    let max_airtime = mesh_radio::packet_time_ms(&cfg, mesh_radio::MAX_LORA_PAYLOAD, false);
+    let t1_window = tx_delay_ms_worst(slot).saturating_add(max_airtime);
+    preset_window.max(t1_window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +119,17 @@ mod tests {
         let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
         let cfg = RadioConfig::eu868_short_slow();
         assert_eq!(slot, mesh_radio::slot_time_ms(&cfg));
+    }
+
+    #[test]
+    fn transmission_record_window_covers_t1_worst_case() {
+        let preset = MODEM_SHORT_SLOW;
+        let slot = slot_time_for_preset(preset);
+        let cfg = mesh_radio::eu868_config_for_preset(preset);
+        let max_airtime = mesh_radio::packet_time_ms(&cfg, mesh_radio::MAX_LORA_PAYLOAD, false);
+        let t1_delay = tx_delay_ms_worst(slot).saturating_add(max_airtime);
+        let window = transmission_record_window_ms(preset);
+        assert!(window >= t1_delay);
+        assert!(window > mesh_radio::contention_window_ms(preset));
     }
 }

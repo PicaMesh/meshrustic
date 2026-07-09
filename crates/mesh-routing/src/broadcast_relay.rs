@@ -574,12 +574,12 @@ mod tests {
         edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         capability.track_topology(EE, true, 0);
-        let ctx = ctx(&edges, &capability, &downstream);
-        let candidates = build_candidates(&ctx, 0x99, BB);
+        let relay_ctx = ctx(&edges, &capability, &downstream);
+        let candidates = build_candidates(&relay_ctx, 0x99, BB);
         assert!(!candidates.contains(EE));
         edges.set_edge_hears_us(ME, EE, true);
-        let ctx_hears = ctx(&edges, &capability, &downstream);
-        let candidates = build_candidates(&ctx_hears, 0x99, BB);
+        let relay_ctx = ctx(&edges, &capability, &downstream);
+        let candidates = build_candidates(&relay_ctx, 0x99, BB);
         assert!(candidates.contains(EE));
     }
 
