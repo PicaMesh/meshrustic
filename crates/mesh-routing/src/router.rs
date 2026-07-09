@@ -113,6 +113,12 @@ struct PendingRelay {
 }
 
 #[derive(Clone, Copy)]
+struct PendingTopologyReply {
+    active: bool,
+    fire_after_ms: u32,
+}
+
+#[derive(Clone, Copy)]
 struct PendingTopology {
     active: bool,
     count: u8,
@@ -179,6 +185,7 @@ pub struct Router {
     graph: NeighborGraph,
     pending: [PendingRelay; MAX_PENDING_RELAYS],
     pending_topology: PendingTopology,
+    pending_topology_reply: PendingTopologyReply,
     pending_nodeinfo: PendingNodeInfo,
     pending_telemetry: PendingTelemetry,
     pending_traceroute: PendingTraceroute,
@@ -287,6 +294,10 @@ impl Router {
                 spacing_ms: 0,
                 lens: [0; MAX_TOPOLOGY_PACKETS],
                 frames: [[0; MAX_WIRE_LEN]; MAX_TOPOLOGY_PACKETS],
+            },
+            pending_topology_reply: PendingTopologyReply {
+                active: false,
+                fire_after_ms: 0,
             },
             pending_nodeinfo: PendingNodeInfo {
                 active: false,
@@ -827,12 +838,47 @@ impl Router {
             self.sr_log.push(SrLogEvent::TopologyDirtyFromNeighbor {
                 from: parsed.from,
             });
-            if !self.pending_topology.active {
-                if self.schedule_topology_broadcast(now_ms, crate::coordinated_relay::DEFAULT_SLOT_MS, true)
-                {
-                    self.graph.commit_topology_broadcast(now_ms, true);
-                }
+            self.schedule_topology_reply_to_empty(parsed.from, parsed.id, now_ms);
+        }
+    }
+
+    /// Jittered 5–16 s delay before answering a peer's empty SR topology bootstrap.
+    fn topology_reply_delay_ms(from: u32, packet_id: u32, node_num: u32) -> u32 {
+        const MIN_MS: u32 = 5_000;
+        const SPAN_MS: u32 = 11_001;
+        MIN_MS + ((from ^ packet_id ^ node_num) % SPAN_MS)
+    }
+
+    fn schedule_topology_reply_to_empty(&mut self, from: u32, packet_id: u32, now_ms: u32) {
+        let fire_after_ms = now_ms.wrapping_add(Self::topology_reply_delay_ms(from, packet_id, self.node_num));
+        if self.pending_topology_reply.active {
+            if fire_after_ms.wrapping_sub(self.pending_topology_reply.fire_after_ms) >= 0x8000_0000 {
+                self.pending_topology_reply.fire_after_ms = fire_after_ms;
             }
+            return;
+        }
+        self.pending_topology_reply = PendingTopologyReply {
+            active: true,
+            fire_after_ms,
+        };
+    }
+
+    fn poll_scheduled_topology_reply(&mut self, now_ms: u32, slot_ms: u32) {
+        if !self.pending_topology_reply.active {
+            return;
+        }
+        if now_ms.wrapping_sub(self.pending_topology_reply.fire_after_ms) >= 0x8000_0000 {
+            return;
+        }
+        if now_ms < self.pending_topology_reply.fire_after_ms {
+            return;
+        }
+        self.pending_topology_reply.active = false;
+        if self.pending_topology.active || !self.graph.can_send_topology() {
+            return;
+        }
+        if self.schedule_topology_broadcast(now_ms, slot_ms, false) {
+            self.graph.commit_topology_broadcast(now_ms, false);
         }
     }
 
@@ -1221,6 +1267,7 @@ impl Router {
 
     pub fn run_maintenance(&mut self, now_ms: u32, slot_ms: u32) -> MaintenanceReport {
         self.relay_identity.prune_relay_identity_cache(now_ms);
+        self.poll_scheduled_topology_reply(now_ms, slot_ms);
         let report = self.graph.run_maintenance(now_ms);
         if let Some((before, after)) = report.graph_aged {
             self.sr_log.push(SrLogEvent::GraphAged { before, after });
@@ -2152,6 +2199,66 @@ mod tests {
     }
 
     #[test]
+    fn empty_peer_topology_schedules_delayed_reply() {
+        use mesh_crypto::{CryptoKey, DEFAULT_PSK};
+        use mesh_radio::MODEM_SHORT_SLOW;
+        use crate::topology::{build_topology_wire_frame, write_packed_header, PACKED_NEIGHBOR_HEADER_SIZE};
+
+        const ME: u32 = 0x677a_1caf;
+        const PEER: u32 = 0x63dc_8f8c;
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut router = Router::with_channel(ME, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+        router.ensure_boot_broadcasts(0, 20);
+        let _ = router.poll_topology_tx(0);
+
+        let direct_wire = encode_wire(
+            PacketHeader::from_fields(
+                NODENUM_BROADCAST,
+                PEER,
+                1,
+                0x77,
+                3,
+                3,
+                false,
+                false,
+                0,
+                (PEER & 0xFF) as u8,
+            ),
+            &[0x01],
+        );
+        router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &direct_wire,
+                },
+                500,
+            )
+            .unwrap();
+        let _ = router.poll_topology_tx(500);
+
+        let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
+        write_packed_header(&mut packed, 1, true);
+        let (len, frame) = build_topology_wire_frame(PEER, 99, 0x77, 3, &key, &packed).unwrap();
+        let inbound = InboundPacket {
+            radio_id: 0,
+            rssi: -70,
+            snr: 8,
+            bytes: &frame[..len as usize],
+        };
+        router.process_inbound(&inbound, 1_000).unwrap();
+        assert!(router.poll_topology_tx(1_000).is_none());
+
+        let delay = Router::topology_reply_delay_ms(PEER, 99, ME);
+        assert!((5_000..=16_000).contains(&delay));
+        let fire = 1_000u32.wrapping_add(delay);
+        router.run_maintenance(fire, 20);
+        assert!(router.poll_topology_tx(fire).is_some());
+    }
+
+    #[test]
     fn relays_third_party_opaque_packet() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(0xDEAD_BEEF));
@@ -2358,7 +2465,7 @@ mod tests {
             LAST_HOP_ME,
             LAST_HOP_SOURCE,
             LAST_HOP_GATEWAY,
-            100,
+            100.0,
             0,
             false,
             0,
@@ -2404,7 +2511,7 @@ mod tests {
             LAST_HOP_ME,
             LAST_HOP_SOURCE,
             LAST_HOP_ME,
-            100,
+            100.0,
             0,
             false,
             0,
@@ -2439,7 +2546,7 @@ mod tests {
             LAST_HOP_ME,
             LAST_HOP_SOURCE,
             LAST_HOP_GATEWAY,
-            100,
+            100.0,
             0,
             false,
             0,

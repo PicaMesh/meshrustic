@@ -543,7 +543,7 @@ mod tests {
     fn poor_etx_neighbor_not_precovered() {
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
-        let downstream = DownstreamTable::new();
+        let _downstream = DownstreamTable::new();
         setup_stock_topology(&mut edges, &mut capability);
         edges.update_edge(ME, BB, ME, 10.0, 0, EdgeSource::Reported, true, 0);
         let covered = build_already_covered(&edges, BB, BB);

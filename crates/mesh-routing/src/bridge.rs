@@ -273,22 +273,6 @@ mod tests {
     use super::*;
     use mesh_protocol::PacketHeader;
 
-    fn parsed_broadcast(from: u32) -> ParsedPacket {
-        PacketHeader::from_fields(
-            NODENUM_BROADCAST,
-            from,
-            1,
-            0x77,
-            3,
-            3,
-            false,
-            false,
-            0,
-            0,
-        )
-        .parse()
-    }
-
     fn parsed_unicast(from: u32, to: u32) -> ParsedPacket {
         PacketHeader::from_fields(to, from, 2, 0x77, 3, 3, false, false, 0, 0).parse()
     }
