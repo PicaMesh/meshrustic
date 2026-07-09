@@ -1221,6 +1221,22 @@ pub mod sr {
                 }
                 finish_line(&mut line, pos);
             }
+            SrLogEvent::TopologyDownstreamSkippedAsymmetric { sender, destination } => {
+                let mut line = [0u8; 160];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Skipping asymmetric downstream !";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], sender);
+                let mid = b" -> !";
+                line[pos..pos + mid.len()].copy_from_slice(mid);
+                pos += mid.len();
+                pos += push_hex_u32_8(&mut line[pos..], destination);
+                let tail = b" (hears_us=false)";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::TopologyStale {
                 from,
                 received,
@@ -1299,6 +1315,15 @@ pub mod sr {
                 pos += push_u32(&mut line[pos..], total as u32);
                 line[pos] = b')';
                 pos += 1;
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RelayConfirmedHearsUs { node_id } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Confirmed hears_us via relay from !";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], node_id);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::DirectNeighborLostDirty => {

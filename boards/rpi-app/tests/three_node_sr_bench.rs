@@ -85,7 +85,7 @@ fn three_node_relayed_packet_infers_upstream_placeholder() {
     b.set_my_node(0xB000_0002);
     b.set_device_role(DEVICE_ROLE_ROUTER);
     b.observe_direct_neighbor(0xA000_0001, -70, 8, 0, 0);
-    b.observe_packet(0xA000_0001, 3, 2, 0xEF, -70, 8, 50, 0, None);
+    b.observe_packet(0xA000_0001, 3, 2, 0xEF, -70, 8, 50, 0, None, 0);
 
     let placeholder = mesh_routing::placeholder_node_id(0xEF);
     let route = b.get_route(0xA000_0001, 50);

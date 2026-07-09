@@ -72,7 +72,7 @@ fn direct_inbound(from: u32, id: u32, wire: &mut heapless::Vec<u8, 280>) -> Inbo
 fn relayed_placeholder(graph: &mut NeighborGraph) -> u32 {
     graph.set_my_node(ME);
     graph.set_device_role(DEVICE_ROLE_ROUTER);
-    graph.observe_packet(SOURCE, 3, 2, RELAY_BYTE, -70, 8, 100, 0, None);
+    graph.observe_packet(SOURCE, 3, 2, RELAY_BYTE, -70, 8, 100, 0, None, 0);
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(graph.has_graph_node(placeholder));
     placeholder
@@ -132,7 +132,7 @@ fn relayed_packet_uses_known_direct_neighbor_as_gateway() {
     graph.set_my_node(ME);
     graph.set_device_role(DEVICE_ROLE_ROUTER);
     graph.observe_direct_neighbor(REAL_RELAY, -70, 8, 0, 0);
-    graph.observe_packet(SOURCE, 3, 2, RELAY_BYTE, -70, 8, 200, 0, Some(REAL_RELAY));
+    graph.observe_packet(SOURCE, 3, 2, RELAY_BYTE, -70, 8, 200, 0, Some(REAL_RELAY), 0);
 
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(!graph.has_graph_node(placeholder));

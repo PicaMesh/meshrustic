@@ -119,7 +119,20 @@ fn is_non_relaying_legacy(capability: &CapabilityCache, node_id: u32) -> bool {
     )
 }
 
-fn get_coverage_if_relays(edges: &EdgeStore, relay: u32, out: &mut [u32; MAX_EDGES_PER_NODE]) -> u8 {
+fn we_egress_to(edges: &EdgeStore, my_node: u32, target: u32) -> bool {
+    edges
+        .find_node(my_node)
+        .and_then(|node| node.find_edge(target))
+        .map(|edge| edge.hears_us)
+        .unwrap_or(false)
+}
+
+fn get_coverage_if_relays(
+    edges: &EdgeStore,
+    my_node: u32,
+    relay: u32,
+    out: &mut [u32; MAX_EDGES_PER_NODE],
+) -> u8 {
     let Some(relay_edges) = edges.find_node(relay) else {
         return 0;
     };
@@ -127,6 +140,9 @@ fn get_coverage_if_relays(edges: &EdgeStore, relay: u32, out: &mut [u32; MAX_EDG
     for i in 0..relay_edges.edge_count as usize {
         let target = relay_edges.edges[i].to;
         if target == 0 || is_placeholder_node(target) {
+            continue;
+        }
+        if !we_egress_to(edges, my_node, target) {
             continue;
         }
         if (count as usize) < MAX_EDGES_PER_NODE {
@@ -167,7 +183,7 @@ where
         }
 
         let mut coverage_buf = [0u32; MAX_EDGES_PER_NODE];
-        let coverage_n = get_coverage_if_relays(ctx.edges, candidate, &mut coverage_buf);
+        let coverage_n = get_coverage_if_relays(ctx.edges, ctx.my_node, candidate, &mut coverage_buf);
         let mut unique = [0u32; MAX_EDGES_PER_NODE];
         let mut unique_count = 0u8;
         for j in 0..coverage_n as usize {
@@ -177,7 +193,7 @@ where
                 unique_count += 1;
             }
         }
-        if unique_count == 0 {
+        if unique_count == 0 && candidate != ctx.my_node {
             continue;
         }
 
@@ -194,11 +210,15 @@ where
                 valid_costs += 1;
             }
         }
-        if valid_costs == 0 {
+        if unique_count > 0 && valid_costs == 0 {
             continue;
         }
 
-        let avg_cost_fixed = (total_cost / valid_costs as f32 * 100.0) as u16;
+        let avg_cost_fixed = if valid_costs > 0 {
+            (total_cost / valid_costs as f32 * 100.0) as u16
+        } else {
+            0
+        };
         let mut tier = 0u8;
         if source_node != 0 {
             if let Some(edge) = candidate_edges.find_edge(source_node) {
@@ -270,8 +290,9 @@ fn build_candidates(
     };
 
     for i in 0..my_edges.edge_count as usize {
-        let neighbor = my_edges.edges[i].to;
-        if neighbor == 0 || neighbor == heard_from || neighbor == source {
+        let edge = my_edges.edges[i];
+        let neighbor = edge.to;
+        if neighbor == 0 || neighbor == heard_from || neighbor == source || !edge.hears_us {
             continue;
         }
         let status = ctx.capability.status(neighbor);
@@ -281,8 +302,9 @@ fn build_candidates(
     }
 
     for i in 0..my_edges.edge_count as usize {
-        let neighbor = my_edges.edges[i].to;
-        if neighbor == 0 || neighbor == heard_from || neighbor == source {
+        let edge = my_edges.edges[i];
+        let neighbor = edge.to;
+        if neighbor == 0 || neighbor == heard_from || neighbor == source || !edge.hears_us {
             continue;
         }
         if ctx.capability.status(neighbor) != CapabilityStatus::SrActive {
@@ -503,6 +525,8 @@ mod tests {
         edges.update_edge(ME, ME, DD, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, DD, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, BB, DD, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(ME, DD, true);
         capability.track_role(DD, DEVICE_ROLE_REPEATER, 0);
     }
 
@@ -517,6 +541,46 @@ mod tests {
             capability,
             downstream,
         }
+    }
+
+    #[test]
+    fn relay_when_sole_candidate_without_egress_neighbors() {
+        const A: u32 = 0xA000_0001;
+        let mut edges = EdgeStore::new();
+        let capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, A, 2.0, 0, EdgeSource::Reported, true, 0);
+        let ctx = ctx(&edges, &capability, &downstream);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            0x77,
+            A,
+            A,
+            0xFFFF_FFFF,
+            0,
+            100,
+            |_| false,
+        );
+        assert!(plan.should_relay);
+    }
+
+    #[test]
+    fn relay_candidates_require_hears_us() {
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+        capability.track_topology(EE, true, 0);
+        let ctx = ctx(&edges, &capability, &downstream);
+        let candidates = build_candidates(&ctx, 0x99, BB);
+        assert!(!candidates.contains(EE));
+        edges.set_edge_hears_us(ME, EE, true);
+        let ctx_hears = ctx(&edges, &capability, &downstream);
+        let candidates = build_candidates(&ctx_hears, 0x99, BB);
+        assert!(candidates.contains(EE));
     }
 
     #[test]
@@ -578,6 +642,8 @@ mod tests {
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(ME, EE, true);
         edges.update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, 0xFF00_00FF, 1.5, 0, EdgeSource::Reported, true, 0);

@@ -105,6 +105,10 @@ pub enum SrLogEvent {
         relay: u32,
         last: bool,
     },
+    TopologyDownstreamSkippedAsymmetric {
+        sender: u32,
+        destination: u32,
+    },
     TopologyLoggingComplete,
     GraphAged {
         before: u8,
@@ -113,6 +117,9 @@ pub enum SrLogEvent {
     TopologyChangedNewNeighbor {
         node_id: u32,
         total: u8,
+    },
+    RelayConfirmedHearsUs {
+        node_id: u32,
     },
     DirectNeighborLostDirty,
     NodeInfoReceived {

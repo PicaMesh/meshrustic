@@ -147,7 +147,7 @@ fn relayed_packet_creates_placeholder_edge_to_transmitter() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
-    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None);
+    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None, 0);
     let placeholder = placeholder_node_id(0x8f);
     assert!(graph.has_graph_node(placeholder));
 }
@@ -159,7 +159,7 @@ fn relayed_topology_adds_sender_edges_and_downstream_without_destination_node() 
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
-    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None);
+    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None, 0);
 
     let neighbor = PackedNeighbor {
         node_id: 0xd6c2_3e3e,
@@ -199,7 +199,7 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
-    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None);
+    graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None, 0);
 
     let neighbor = PackedNeighbor {
         node_id: 0xd6c2_3e3e,

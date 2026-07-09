@@ -565,7 +565,7 @@ impl Router {
             None
         };
 
-        if let Some((node_id, rssi, snr, is_new)) = self.graph.observe_packet(
+        if let Some((node_id, rssi, snr, is_new, hears_us)) = self.graph.observe_packet(
             parsed.from,
             parsed.hop_start,
             parsed.hop_limit,
@@ -575,7 +575,12 @@ impl Router {
             now_ms,
             packet.radio_id,
             known_relay,
+            parsed.id,
         ) {
+            if hears_us {
+                self.sr_log
+                    .push(SrLogEvent::RelayConfirmedHearsUs { node_id });
+            }
             if is_new {
                 self.sr_log.push(SrLogEvent::DirectNeighbor {
                     node_id,
@@ -802,6 +807,13 @@ impl Router {
             TopologyMergeResult::Applied { neighbors, topo_v } => {
                 self.graph
                     .apply_topology_hears_us(parsed.from, self.node_num, &neighbor_list);
+                for (sender, destination) in self.graph.drain_merge_asymmetric_skips() {
+                    self.sr_log
+                        .push(SrLogEvent::TopologyDownstreamSkippedAsymmetric {
+                            sender,
+                            destination,
+                        });
+                }
                 self.sr_log.push(SrLogEvent::TopologyProcessing {
                     from: parsed.from,
                     neighbors,
@@ -934,7 +946,12 @@ impl Router {
         };
 
         if let Some(ref relay_plan) = broadcast_plan {
-            if !relay_plan.should_relay {
+            if relay_plan.should_relay {
+                self.graph
+                    .record_node_transmission(self.node_num, parsed.id, now_ms);
+            } else if relay_plan.candidate_count <= 1 {
+                // No SR peer to defer to — use coordinated relay timing below.
+            } else {
                 self.pool.release(handle);
                 self.sr_log.push(SrLogEvent::RelaySkip {
                     from: parsed.from,
@@ -942,8 +959,6 @@ impl Router {
                 });
                 return plan;
             }
-            self.graph
-                .record_node_transmission(self.node_num, parsed.id, now_ms);
         }
 
         if parsed.to != NODENUM_BROADCAST
@@ -1973,6 +1988,33 @@ impl Router {
         let committed = self.graph.is_committed_relay(parsed.from, parsed.id);
         let has_pending = self.has_pending_relay(parsed.from, parsed.id);
         let rebroadcast = Self::duplicate_is_rebroadcast(parsed, self.node_num);
+        let heard_relayer = if rebroadcast {
+            Some(self.resolve_heard_from_node(
+                parsed.relay_node,
+                parsed.from,
+                packet.rssi,
+                packet.snr,
+                now_ms,
+            ))
+        } else {
+            None
+        };
+
+        if let Some(heard_from) = heard_relayer {
+            self.graph.record_heard_transmissions(
+                parsed.from,
+                parsed.id,
+                Some(heard_from),
+                now_ms,
+            );
+            if self
+                .graph
+                .maybe_confirm_hears_us_from_relay(heard_from, parsed.from, parsed.id)
+            {
+                self.sr_log
+                    .push(SrLogEvent::RelayConfirmedHearsUs { node_id: heard_from });
+            }
+        }
 
         if committed {
             if !has_pending {
@@ -1986,14 +2028,7 @@ impl Router {
                 }
                 return;
             }
-            if rebroadcast {
-                let heard_from = self.resolve_heard_from_node(
-                    parsed.relay_node,
-                    parsed.from,
-                    packet.rssi,
-                    packet.snr,
-                    now_ms,
-                );
+            if let Some(heard_from) = heard_relayer {
                 if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from) {
                     return;
                 }
