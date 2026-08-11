@@ -119,17 +119,9 @@ fn is_non_relaying_legacy(capability: &CapabilityCache, node_id: u32) -> bool {
     )
 }
 
-fn we_egress_to(edges: &EdgeStore, my_node: u32, target: u32) -> bool {
-    edges
-        .find_node(my_node)
-        .and_then(|node| node.find_edge(target))
-        .map(|edge| edge.hears_us)
-        .unwrap_or(false)
-}
-
 fn get_coverage_if_relays(
     edges: &EdgeStore,
-    my_node: u32,
+    _my_node: u32,
     relay: u32,
     out: &mut [u32; MAX_EDGES_PER_NODE],
 ) -> u8 {
@@ -138,11 +130,14 @@ fn get_coverage_if_relays(
     };
     let mut count = 0u8;
     for i in 0..relay_edges.edge_count as usize {
-        let target = relay_edges.edges[i].to;
+        let edge = relay_edges.edges[i];
+        let target = edge.to;
         if target == 0 || is_placeholder_node(target) {
             continue;
         }
-        if !we_egress_to(edges, my_node, target) {
+        // Count nodes that can hear this relay (not our own egress set — that
+        // under-counted SR peers that cover remote topology we do not hear).
+        if !edge.hears_us {
             continue;
         }
         if (count as usize) < MAX_EDGES_PER_NODE {
@@ -193,7 +188,9 @@ where
                 unique_count += 1;
             }
         }
-        if unique_count == 0 && candidate != ctx.my_node {
+        // Zero unique coverage never wins a slot (including self). Sparse sole-candidate
+        // flood and stock-trailing slots are handled after the ranking loop.
+        if unique_count == 0 {
             continue;
         }
 
@@ -344,6 +341,10 @@ fn should_relay_for_stock_neighbors(
     };
     for i in 0..my_edges.edge_count as usize {
         let neighbor = my_edges.edges[i].to;
+        if ctx.capability.is_immediate_relay_router(neighbor) {
+            // Immediate routers take their own early slot — not our coverage burden.
+            continue;
+        }
         if ctx.capability.status(neighbor) != CapabilityStatus::Legacy {
             continue;
         }
@@ -439,9 +440,9 @@ where
                 continue;
             }
             candidates.erase(neighbor);
-            if has_transmitted(neighbor) {
-                absorb_relay_coverage(ctx.edges, &mut already_covered, neighbor);
-            }
+            // Stock takes the early slot — count their coverage now so we only
+            // trail if we still have unique nodes after they relay.
+            absorb_relay_coverage(ctx.edges, &mut already_covered, neighbor);
             slot_delay = slot_delay.saturating_add(half);
         }
     }
@@ -471,6 +472,9 @@ where
             break;
         }
 
+        // Earlier-ranked peer is assumed to relay — subtract their coverage so we
+        // only take a later slot when we still have unique nodes to reach.
+        absorb_relay_coverage(ctx.edges, &mut already_covered, best.node_id);
         slot_delay = slot_delay.saturating_add(half);
     }
 
@@ -486,6 +490,12 @@ where
     if !should_relay
         && should_relay_for_stock_neighbors(ctx, source, heard_from)
     {
+        should_relay = true;
+        my_delay = slot_delay;
+    }
+
+    // Sparse mesh: only we were a candidate and ranking found no unique coverage.
+    if !should_relay && initial_candidates <= 1 {
         should_relay = true;
         my_delay = slot_delay;
     }
@@ -600,11 +610,8 @@ mod tests {
             100,
             never_transmitted,
         );
-        // Immediate REPEATER occupies slot 0; self still takes a later Phase-2 slot when
-        // we have hears_us toward the source (stock-first does not suppress self entirely).
-        assert!(plan.should_relay);
-        assert_eq!(plan.slot_delay_ms, 100);
-        assert_eq!(plan.slot_index, 1);
+        // Immediate REPEATER takes the early slot; with no remaining unique coverage we defer.
+        assert!(!plan.should_relay);
     }
 
     #[test]
@@ -639,26 +646,101 @@ mod tests {
     }
 
     #[test]
+    fn repeater_neighbor_defers_like_field() {
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        const C: u32 = 0xC000_0003;
+        const B: u32 = 0xB000_0002;
+        const D: u32 = 0xD000_0004;
+        edges.ensure_local_node(C, 0);
+        edges.update_edge(C, C, B, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(C, C, D, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(C, B, true);
+        edges.set_edge_hears_us(C, D, true);
+        edges.update_edge(C, D, B, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(D, B, true);
+        capability.track_role(D, DEVICE_ROLE_REPEATER, 0);
+        let ctx = BroadcastRelayContext {
+            my_node: C,
+            edges: &edges,
+            capability: &capability,
+            downstream: &downstream,
+        };
+        let plan = plan_broadcast_relay(&ctx, 0x99, B, B, 0xFFFF_FFFF, 0, 100, |_| false);
+        assert!(
+            !plan.should_relay,
+            "got should_relay delay={} cands={}",
+            plan.slot_delay_ms,
+            plan.candidate_count
+        );
+    }
+
+    #[test]
+    fn better_peer_with_unique_coverage_suppresses_us() {
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        const FF: u32 = 0xAA00_00FF;
+        edges.ensure_local_node(ME, 0);
+        // Direct: ME ↔ BB (heard_from), ME ↔ EE (SR peer).
+        edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(ME, EE, true);
+        // Transmitter BB already covers ME's only other neighbor EE.
+        edges.update_edge(ME, BB, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(BB, EE, true);
+        // EE uniquely covers remote FF (we do not hear FF).
+        edges.update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, EE, FF, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(EE, BB, true);
+        edges.set_edge_hears_us(EE, ME, true);
+        edges.set_edge_hears_us(EE, FF, true);
+        capability.track_topology(EE, true, 0);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            never_transmitted,
+        );
+        assert!(
+            !plan.should_relay,
+            "must defer when an SR peer has unique coverage and we have none"
+        );
+        assert!(plan.candidate_count >= 2);
+    }
+
+    #[test]
     fn best_candidate_assigned_earlier_slot() {
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
         let downstream = DownstreamTable::new();
         // Not a placeholder id (0xFF00_xxxx are reserved).
         const FF: u32 = 0xAA00_00FF;
+        const GG: u32 = 0xAA00_0011;
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
         edges.set_edge_hears_us(ME, EE, true);
-        // Transmitter already covers EE, so ME's unique coverage is only FF.
+        // Transmitter already covers EE, so ME's unique coverage is only GG.
         edges.update_edge(ME, BB, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(BB, EE, true);
         edges.update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, FF, 1.5, 0, EdgeSource::Reported, true, 0);
-        edges.update_edge(ME, ME, FF, 2.0, 0, EdgeSource::Reported, true, 0);
-        edges.set_edge_hears_us(ME, FF, true);
-        // EE hears source → same tier as ME; lower avg ETX to unique targets wins slot 0.
         edges.set_edge_hears_us(EE, BB, true);
+        edges.set_edge_hears_us(EE, ME, true);
+        edges.set_edge_hears_us(EE, FF, true);
+        // ME also uniquely reaches GG (EE does not).
+        edges.update_edge(ME, ME, GG, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, GG, true);
         capability.track_topology(EE, true, 0);
         capability.track_topology(ME, true, 0);
         let plan = plan_broadcast_relay(

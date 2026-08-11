@@ -15,6 +15,8 @@ fn setup_stock_relay_topology(router: &mut Router, healthy: bool) {
     let graph = router.graph_mut();
     graph.observe_direct_neighbor(NEIGHBOR, -70, 8, 0, 0);
     graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
+    graph.confirm_direct_neighbor_hears_us(NEIGHBOR);
+    graph.confirm_direct_neighbor_hears_us(STOCK);
     graph.track_node_role(STOCK, DEVICE_ROLE_REPEATER, 0);
     graph.capability_mut().track_topology(NEIGHBOR, false, 0);
     if !healthy {
@@ -30,6 +32,7 @@ fn setup_stock_relay_topology(router: &mut Router, healthy: bool) {
         true,
         0,
     );
+    graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
 }
 
 fn evaluate_broadcast(router: &mut Router, from: u32, now_ms: u32) -> mesh_routing::TxPlan {
@@ -53,7 +56,7 @@ fn evaluate_broadcast(router: &mut Router, from: u32, now_ms: u32) -> mesh_routi
 }
 
 #[test]
-fn healthy_topology_schedules_phased_relay() {
+fn healthy_topology_defers_when_stock_router_covers() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let router = ROUTER.init(Router::new(ME));
     setup_stock_relay_topology(router, true);
@@ -68,14 +71,18 @@ fn healthy_topology_schedules_phased_relay() {
         0,
         half,
     );
-    assert!(relay_plan.should_relay);
-    assert!(relay_plan.slot_delay_ms >= half);
+    assert!(
+        !relay_plan.should_relay,
+        "stock REPEATER present with no unique coverage left for us"
+    );
+    assert!(relay_plan.candidate_count >= 2);
 
-    let _ = evaluate_broadcast(router, NEIGHBOR, 0);
-    let tx_after = router
-        .relay_tx_after(NEIGHBOR, 99, 0)
-        .expect("healthy SR schedules deferred relay");
-    assert!(tx_after >= half);
+    let plan = evaluate_broadcast(router, NEIGHBOR, 0);
+    assert!(plan.relay.is_none());
+    assert!(
+        router.relay_tx_after(NEIGHBOR, 99, 0).is_none(),
+        "BetterNeighbor skip must not commit a redundant relay"
+    );
 }
 
 #[test]

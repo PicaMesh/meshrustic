@@ -2692,6 +2692,21 @@ impl Router {
             if now_ms < slot.fire_after_ms {
                 continue;
             }
+            // After we actually TX'd this packet, cancel T1 unless a hears_us neighbor
+            // remains uncovered by heard_from ∪ us (do not require neighbors to retransmit).
+            if self.graph.has_our_transmission(slot.packet_id) {
+                let coverers = [slot.heard_from, self.node_num];
+                if !self.graph.has_unique_coverage(&coverers) {
+                    let id = slot.packet_id;
+                    slot.active = false;
+                    slot.canceled = true;
+                    self.sr_log.push(SrLogEvent::T1Canceled {
+                        id,
+                        reason: T1CancelReason::AllHearsUsHeard,
+                    });
+                    continue;
+                }
+            }
             if self.graph.all_hears_us_neighbors_heard_packet(
                 slot.packet_id,
                 slot.heard_from,

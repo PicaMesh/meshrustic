@@ -2,7 +2,7 @@
 
 use mesh_routing::{
     decode_packed_neighbors, write_packed_header, NeighborGraph,
-    PackedNeighbor, TopologyMergeResult, DEVICE_ROLE_ROUTER, MAX_DOWNSTREAM,
+    PackedNeighbor, TopologyMergeResult, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, MAX_DOWNSTREAM,
 };
 
 #[test]
@@ -42,41 +42,34 @@ fn three_node_line_learns_remote_via_topology() {
 
 #[test]
 fn three_node_middle_node_defers_to_stock_router() {
+    use mesh_routing::EdgeSource;
     let mut c = NeighborGraph::new();
     c.set_my_node(0xC000_0003);
     c.set_device_role(DEVICE_ROLE_ROUTER);
-    c.observe_direct_neighbor(0xB000_0002, -70, 8, 0, 0);
-    c.observe_direct_neighbor(0xD000_0004, -72, 7, 0, 0);
-    c.track_node_role(0xD000_0004, DEVICE_ROLE_ROUTER, 0);
+    const B: u32 = 0xB000_0002;
+    const D: u32 = 0xD000_0004;
+    c.edges_mut().ensure_local_node(0xC000_0003, 0);
+    c.edges_mut()
+        .update_edge(0xC000_0003, 0xC000_0003, B, 2.0, 0, EdgeSource::Reported, true, 0);
+    c.edges_mut()
+        .update_edge(0xC000_0003, 0xC000_0003, D, 2.0, 0, EdgeSource::Reported, true, 0);
+    c.edges_mut().set_edge_hears_us(0xC000_0003, B, true);
+    c.edges_mut().set_edge_hears_us(0xC000_0003, D, true);
+    c.edges_mut()
+        .update_edge(0xC000_0003, D, B, 2.0, 0, EdgeSource::Reported, true, 0);
+    c.edges_mut().set_edge_hears_us(D, B, true);
+    c.track_node_role(D, DEVICE_ROLE_REPEATER, 0);
 
-    let mut packed = [0u8; 16];
-    write_packed_header(&mut packed, 1, false);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
-    let neighbor = PackedNeighbor {
-        node_id: 0xB000_0002,
-        rssi: -75,
-        snr: 8,
-        signal_routing_active: false,
-        hears_us: false,
-        etx_variance: 0,
-    };
-    c.merge_topology(0xD000_0004, &header, &[neighbor], true, 0, 0);
-
-    assert_eq!(c.find_best_relay_candidate(0x99, 0xB000_0002, 0), 0xD000_0004);
+    assert_eq!(c.find_best_relay_candidate(0x99, B, 0), D);
 
     let half = mesh_routing::coordinated_relay::half_airtime_ms(
         mesh_routing::coordinated_relay::DEFAULT_SLOT_MS,
     );
-    let plan = c.plan_broadcast_relay(
-        0x99,
-        0xB000_0002,
-        0xB000_0002,
-        0xFFFF_FFFF,
-        0,
-        half,
+    let plan = c.plan_broadcast_relay(0x99, B, B, 0xFFFF_FFFF, 0, half);
+    assert!(
+        !plan.should_relay,
+        "middle node must defer to stock router with no unique coverage"
     );
-    assert!(plan.should_relay);
-    assert!(plan.slot_delay_ms >= half);
 }
 
 #[test]
