@@ -18,14 +18,14 @@ _in_board cmd board:
         [ -f /opt/export-esp.sh ] && source /opt/export-esp.sh; \
         cd boards/{{board}} && {{cmd}}'
 
-build board:
-    just _in_board "cargo build --release" {{board}}
+build board *args:
+    just _in_board "cargo build --release {{args}}" {{board}}
 
-test board:
-    just _in_board "cargo test" {{board}}
+test board *args:
+    just _in_board "cargo test {{args}}" {{board}}
 
-clippy board:
-    just _in_board "cargo clippy --bins -- -D warnings" {{board}}
+clippy board *args:
+    just _in_board "cargo clippy --bins -- -D warnings {{args}}" {{board}}
 
 fmt board:
     just _in_board "cargo fmt" {{board}}

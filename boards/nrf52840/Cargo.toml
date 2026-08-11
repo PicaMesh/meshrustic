@@ -6,18 +6,19 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-embassy-executor = { version = "0.7.0", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-executor = { version = "0.7.0", features = ["arch-cortex-m", "executor-thread", "defmt", "task-arena-size-32768"] }
 embassy-time = { version = "0.4.0", features = ["defmt"] }
 embassy-nrf = { version = "0.3.0", features = ["defmt", "nrf52840", "time-driver-rtc1", "gpiote", "nfc-pins-as-gpio"] }
 embassy-sync = { version = "0.6.0", features = ["defmt"] }
 embassy-futures = "0.1.1"
 embassy-usb = { version = "0.3.0", features = ["defmt"] }
 embedded-hal-bus = "0.1"
-mesh-crypto = { path = "../../crates/mesh-crypto" }
+embedded-storage = "0.3"
+mesh-crypto = { path = "../../crates/mesh-crypto", features = ["pki"] }
 mesh-radio = { path = "../../crates/mesh-radio" }
 mesh-protocol = { path = "../../crates/mesh-protocol" }
-mesh-routing = { path = "../../crates/mesh-routing" }
-mesh-store = { path = "../../crates/mesh-store" }
+mesh-routing = { path = "../../crates/mesh-routing", features = ["pki"] }
+mesh-store = { path = "../../crates/mesh-store", features = ["pki"] }
 heapless = "0.8"
 static_cell = "2"
 sx126x = "0.3"

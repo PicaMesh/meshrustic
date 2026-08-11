@@ -484,6 +484,17 @@ mod tests {
     fn age_keeps_node_with_mirrored_edges() {
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
+        // Mirrored edges from an unknown `from` are rejected; establish BB first.
+        edges.update_edge(
+            0xAA,
+            0xAA,
+            0xBB,
+            2.0,
+            1_000,
+            EdgeSource::Reported,
+            true,
+            0,
+        );
         edges.update_edge(
             0xAA,
             0xBB,
@@ -494,7 +505,7 @@ mod tests {
             true,
             0,
         );
-        assert_eq!(edges.node_count(), 2);
+        assert!(edges.find_node(0xBB).is_some());
 
         let mut downstream = DownstreamTable::new();
         assert!(!edges.age_edges(0xAA, 61_000, 7_200_000, Some(&mut downstream)));

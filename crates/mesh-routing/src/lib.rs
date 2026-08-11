@@ -1,6 +1,8 @@
 //! Static routing infrastructure — zero heap.
 #![no_std]
 
+pub mod admin;
+pub mod admin_codec;
 pub mod bridge;
 pub mod broadcast_relay;
 pub mod capability;
@@ -23,6 +25,20 @@ pub mod telemetry;
 pub mod topology;
 pub mod traceroute;
 
+pub use admin::{
+    encode_admin_response, encode_owner_response, handle_admin, AdminOutcome, AdminState,
+    ADMIN_PRESET_REBOOT_SECS, ADMIN_SESSION_TTL_MS, ROUTING_ERROR_ADMIN_BAD_SESSION_KEY,
+    ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED, ROUTING_ERROR_BAD_REQUEST, ROUTING_ERROR_PKI_FAILED,
+    ROUTING_ERROR_PKI_UNKNOWN_PUBKEY,
+};
+pub use admin_codec::{
+    decode_admin_message, decode_channel, decode_config, encode_admin_message, encode_channel,
+    encode_config, AdminMessage, AdminPayload, ConfigPayload, DeviceMetadata, WireChannel,
+    WireChannelSettings, WireDeviceConfig, WireLoRaConfig, WireSecurityConfig, ADMIN_APP,
+    CHANNEL_ROLE_DISABLED, CHANNEL_ROLE_PRIMARY, CHANNEL_ROLE_SECONDARY, CONFIG_TYPE_DEVICE,
+    CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS, REGION_EU_868,
+    SESSION_PASSKEY_LEN,
+};
 pub use bridge::{BridgeDedupCache, BridgeEval, BridgeLeg, evaluate_bridge_targets, should_bridge_to};
 pub use broadcast_relay::{
     plan_broadcast_relay, BroadcastRelayContext, BroadcastRelayPlan, RelayCandidate,

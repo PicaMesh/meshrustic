@@ -56,6 +56,11 @@ impl Sx1262Driver {
         }
     }
 
+    /// Set LoRa modem parameters before [`RadioInterface::init`].
+    pub fn set_radio_config(&mut self, config: RadioConfig) {
+        self.config = config;
+    }
+
     pub fn profile(&self) -> Sx1262ModuleProfile {
         self.profile
     }

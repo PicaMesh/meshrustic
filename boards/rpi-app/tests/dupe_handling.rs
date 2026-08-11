@@ -160,6 +160,124 @@ fn repeated_want_ack_to_us_schedules_ack_on_duplicate() {
 }
 
 #[test]
+fn router_role_repeated_want_ack_still_re_acks() {
+    // Field log 0041: SR-active router skipped WantAck dupe re-ACK → intermittent admin save.
+    const US: u32 = 0xCCCC_CCCE;
+    const FROM: u32 = 0x1111_1112;
+    let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+    let mut router = Router::with_channel(US, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+    router.set_device_role(DEVICE_ROLE_ROUTER);
+
+    let payload = b"hi";
+    let (len, frame) = build_app_wire_frame(
+        US,
+        FROM,
+        100,
+        0x77,
+        3,
+        3,
+        true,
+        &key,
+        TEXT_MESSAGE_APP,
+        payload,
+        DataEncodeOpts::default(),
+    )
+    .expect("wire");
+
+    let inbound = InboundPacket {
+        radio_id: 0,
+        rssi: -65,
+        snr: 8,
+        bytes: &frame[..usize::from(len)],
+    };
+
+    router.process_inbound(&inbound, 0).expect("first");
+    let first = router.poll_ack_tx(0).expect("first ACK");
+    let first_hop = PacketHeader::decode(&first.bytes[..PACKET_HEADER_LEN])
+        .unwrap()
+        .parse()
+        .hop_limit;
+    assert!(first_hop > 0, "first WantAck ACK uses response hop limit");
+
+    router.process_inbound(&inbound, 50).expect("dupe");
+    let dupe = router
+        .poll_ack_tx(50)
+        .expect("ROUTER must re-ACK original-sender WantAck retries");
+    let dupe_parsed = PacketHeader::decode(&dupe.bytes[..PACKET_HEADER_LEN])
+        .unwrap()
+        .parse();
+    assert_eq!(
+        dupe_parsed.hop_limit, 0,
+        "dupe WantAck re-ACK must be hop_limit=0 (cheap; no module re-run)"
+    );
+}
+
+#[test]
+fn want_ack_dupe_does_not_bypass_rate_limit_on_new_packets() {
+    // Dupes short-circuit before rate_limit; new packets from a limited node still drop.
+    const US: u32 = 0xCCCC_CCCF;
+    const FROM: u32 = 0x1111_1113;
+    let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+    let mut router = Router::with_channel(US, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+    router.set_device_role(DEVICE_ROLE_ROUTER);
+
+    // Exhaust TEXT bucket (threshold 30); buckets are independent.
+    for id in 1u32..=31 {
+        let (len, frame) = build_app_wire_frame(
+            US,
+            FROM,
+            id,
+            0x77,
+            3,
+            3,
+            false,
+            &key,
+            TEXT_MESSAGE_APP,
+            b"x",
+            DataEncodeOpts::default(),
+        )
+        .expect("wire");
+        let inbound = InboundPacket {
+            radio_id: 0,
+            rssi: -65,
+            snr: 8,
+            bytes: &frame[..usize::from(len)],
+        };
+        let _ = router.process_inbound(&inbound, id * 10);
+    }
+
+    let (len, frame) = build_app_wire_frame(
+        US,
+        FROM,
+        99,
+        0x77,
+        3,
+        3,
+        true,
+        &key,
+        TEXT_MESSAGE_APP,
+        b"hi",
+        DataEncodeOpts::default(),
+    )
+    .expect("wire");
+    let inbound = InboundPacket {
+        radio_id: 0,
+        rssi: -65,
+        snr: 8,
+        bytes: &frame[..usize::from(len)],
+    };
+    let result = router.process_inbound(&inbound, 1_000).expect("rx");
+    assert!(
+        result.rate_limited,
+        "new WantAck from a rate-limited node must still be dropped"
+    );
+    assert!(
+        router.poll_ack_tx(1_000).is_none(),
+        "rate-limited WantAck must not schedule ACK"
+    );
+}
+
+#[test]
 fn foreign_routing_ack_cancels_pending_relay() {
     const US: u32 = 0xDDDD_DDDD;
     const ORIGIN: u32 = 0x1111_1111;

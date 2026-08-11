@@ -124,7 +124,8 @@ impl CryptoEngine {
         init_nonce(&mut self.nonce, from_node, packet_num, extra_nonce);
 
         let crypt_end = plain.len();
-        let (crypt, tail) = bytes_out.split_at_mut(crypt_end);
+        let out = &mut bytes_out[..crypt_end + 12];
+        let (crypt, tail) = out.split_at_mut(crypt_end);
         let (tag, extra) = tail.split_at_mut(8);
         if !aes_ccm_ae(&self.shared_key, &self.nonce, 8, plain, &[], crypt, tag) {
             return false;

@@ -127,6 +127,11 @@ impl NodeRateLimiter {
             return false;
         }
 
+        // Admin settings-load bursts must not be dropped by the OTHER 4/90s bucket.
+        if decoded_portnum == Some(mesh_protocol::num::ADMIN_APP) {
+            return false;
+        }
+
         let bucket_kind = rate_limit_bucket(decoded_portnum);
         let threshold = match bucket_kind {
             RateLimitBucket::Text => THRESHOLD_TEXT,
@@ -240,6 +245,24 @@ mod tests {
 
     fn drop_text(limiter: &mut NodeRateLimiter, from: u32, now_ms: u32) -> bool {
         limiter.should_drop(from, Some(num::TEXT_MESSAGE_APP), 3, 3, now_ms)
+    }
+
+    #[test]
+    fn admin_app_exempt_from_other_bucket() {
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0xADAD_0001;
+        // OTHER would trip at 4, but ADMIN_APP must keep passing.
+        for i in 0..12 {
+            assert!(
+                !limiter.should_drop(from, Some(num::ADMIN_APP), 3, 3, i * 100),
+                "admin get {i} must not be rate-limited"
+            );
+        }
+        // Non-admin OTHER still trips independently.
+        for i in 0..3 {
+            assert!(!drop_other(&mut limiter, from, 10_000 + i * 100));
+        }
+        assert!(drop_other(&mut limiter, from, 10_300));
     }
 
     impl NodeRateLimiter {

@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package meshwire;
+
+// Wire-compatible Channel / ChannelSettings for AdminMessage get_channel.
+message ChannelSettings {
+  bytes psk = 2;
+  string name = 3;
+  fixed32 id = 4;
+}
+
+message Channel {
+  enum Role {
+    DISABLED = 0;
+    PRIMARY = 1;
+    SECONDARY = 2;
+  }
+
+  int32 index = 1;
+  ChannelSettings settings = 2;
+  Role role = 3;
+}

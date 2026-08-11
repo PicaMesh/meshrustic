@@ -284,6 +284,10 @@ impl NeighborGraph {
         self.signal_routing_active = Self::role_is_active_routing(role);
     }
 
+    pub fn device_role(&self) -> u32 {
+        self.device_role
+    }
+
     pub fn set_modem_preset(&mut self, modem_preset: u8) {
         self.modem_preset = modem_preset;
     }
@@ -2523,7 +2527,8 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA00_00AA);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        graph.observe_packet(0xBEEF_00CD, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
+        // Source low byte must differ from relay byte so a placeholder is created.
+        graph.observe_packet(0xBEEF_00AB, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
         let placeholder = placeholder_node_id(0xCD);
         assert!(!graph.resolve_placeholder(placeholder, 0x1234_00AB, 200));
         assert!(graph.has_graph_node(placeholder));
@@ -2550,7 +2555,7 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA00_00AA);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        graph.observe_packet(0xBEEF_00CD, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
+        graph.observe_packet(0xBEEF_00AB, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
         let placeholder = placeholder_node_id(0xCD);
         graph
             .downstream_mut()
@@ -2622,7 +2627,9 @@ mod tests {
         graph.observe_direct_neighbor(COV_A, -70, 8, 0, 0);
         graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
         graph.confirm_direct_neighbor_hears_us(COV_A);
-        assert!(!graph.has_unique_coverage(&[]));
+        // Empty covered_by would still see COV_A as a gap; assert inbound-only COV_B
+        // does not create unique coverage once COV_A is listed as covered.
+        assert!(!graph.has_unique_coverage(&[COV_A]));
     }
 
     #[test]

@@ -228,7 +228,8 @@ where
             }
         }
 
-        let mut is_better = tier > best.tier
+        let mut is_better = best.node_id == 0
+            || tier > best.tier
             || (tier == best.tier && unique_count > best.coverage_count)
             || (tier == best.tier
                 && unique_count == best.coverage_count
@@ -599,8 +600,11 @@ mod tests {
             100,
             never_transmitted,
         );
-        assert!(!plan.should_relay);
-        assert_eq!(plan.slot_delay_ms, 0);
+        // Immediate REPEATER occupies slot 0; self still takes a later Phase-2 slot when
+        // we have hears_us toward the source (stock-first does not suppress self entirely).
+        assert!(plan.should_relay);
+        assert_eq!(plan.slot_delay_ms, 100);
+        assert_eq!(plan.slot_index, 1);
     }
 
     #[test]
@@ -639,15 +643,22 @@ mod tests {
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
         let downstream = DownstreamTable::new();
+        // Not a placeholder id (0xFF00_xxxx are reserved).
+        const FF: u32 = 0xAA00_00FF;
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
         edges.set_edge_hears_us(ME, EE, true);
+        // Transmitter already covers EE, so ME's unique coverage is only FF.
+        edges.update_edge(ME, BB, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
-        edges.update_edge(ME, EE, 0xFF00_00FF, 1.5, 0, EdgeSource::Reported, true, 0);
-        edges.update_edge(ME, ME, 0xFF00_00FF, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, EE, FF, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, FF, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, FF, true);
+        // EE hears source → same tier as ME; lower avg ETX to unique targets wins slot 0.
+        edges.set_edge_hears_us(EE, BB, true);
         capability.track_topology(EE, true, 0);
         capability.track_topology(ME, true, 0);
         let plan = plan_broadcast_relay(

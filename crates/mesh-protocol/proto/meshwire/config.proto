@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package meshwire;
 
+// Wire-compatible Config subset used by MeshRustic remote admin.
 message Config {
   message DeviceConfig {
     enum Role {
@@ -19,5 +20,67 @@ message Config {
       ROUTER_LATE = 11;
       CLIENT_BASE = 12;
     }
+
+    Role role = 1;
+  }
+
+  enum RegionCode {
+    UNSET = 0;
+    US = 1;
+    EU_433 = 2;
+    EU_868 = 3;
+    CN = 4;
+    JP = 5;
+    ANZ = 6;
+    KR = 7;
+    TW = 8;
+    RU = 9;
+    IN = 10;
+    NZ_865 = 11;
+    TH = 12;
+    LORA_24 = 13;
+    UA_433 = 14;
+    UA_868 = 15;
+    MY_919 = 16;
+    SG_923 = 17;
+    PH_868 = 18;
+  }
+
+  enum ModemPreset {
+    LONG_FAST = 0;
+    LONG_SLOW = 1;
+    VERY_LONG_SLOW = 2;
+    MEDIUM_SLOW = 3;
+    MEDIUM_FAST = 4;
+    SHORT_SLOW = 5;
+    SHORT_FAST = 6;
+    LONG_MODERATE = 7;
+    SHORT_TURBO = 8;
+    LONG_TURBO = 9;
+  }
+
+  message LoRaConfig {
+    bool use_preset = 1;
+    ModemPreset modem_preset = 2;
+    uint32 hop_limit = 8;
+    sint32 tx_power = 11;
+    RegionCode region = 7;
+  }
+
+  message SecurityConfig {
+    bytes public_key = 1;
+    bytes private_key = 2;
+    repeated bytes admin_key = 3;
+    bool is_managed = 4;
+    bool admin_channel_enabled = 8;
+  }
+
+  message SessionkeyConfig {}
+
+  oneof payload_variant {
+    DeviceConfig device = 1;
+    LoRaConfig lora = 6;
+    SecurityConfig security = 8;
+    SessionkeyConfig sessionkey = 9;
   }
 }

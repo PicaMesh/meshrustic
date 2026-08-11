@@ -890,6 +890,7 @@ dependencies = [
  "mesh-crypto",
  "mesh-protocol",
  "mesh-radio",
+ "mesh-store",
  "static_cell",
 ]
 
@@ -949,6 +950,7 @@ dependencies = [
  "embassy-time",
  "embassy-usb",
  "embedded-hal-bus",
+ "embedded-storage",
  "heapless",
  "mesh-crypto",
  "mesh-protocol",

@@ -101,7 +101,7 @@ pub fn encode_route_discovery(rd: &RouteDiscovery, out: &mut heapless::Vec<u8, 1
     true
 }
 
-/// Update RouteDiscovery before rebroadcast (Meshtastic TraceRouteModule-compatible).
+/// Update RouteDiscovery before rebroadcast (wire-compatible traceroute hop append).
 pub fn alter_on_relay(
     rd: &mut RouteDiscovery,
     parsed: &ParsedPacket,
@@ -353,7 +353,9 @@ mod tests {
     #[test]
     fn snr_only_when_packet_to_us() {
         let mut rd = RouteDiscovery::default();
-        let parsed = PacketHeader::from_fields(0xAA, 0xCC, 1, 0x77, 2, 3, false, false, 0, 0).parse();
+        // Direct unicast to us: append SNR only (no route id).
+        let parsed =
+            PacketHeader::from_fields(0xCC, 0xAA, 1, 0x77, 3, 3, false, false, 0, 0).parse();
         alter_on_relay(&mut rd, &parsed, 0xCC, 8, 0);
         assert!(rd.route.is_empty());
         assert_eq!(rd.snr_towards.as_slice(), &[32]);

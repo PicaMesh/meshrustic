@@ -55,7 +55,7 @@ pub fn contention_window_ms(modem_preset: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MODEM_SHORT_SLOW;
+    use crate::config::{MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
 
     #[test]
     fn short_slow_slot_time_derived_from_sf_bw() {
@@ -66,6 +66,29 @@ mod tests {
 
     #[test]
     fn short_slow_contention_window_is_default_two_seconds() {
+        assert_eq!(contention_window_ms(MODEM_SHORT_SLOW), 2000);
+    }
+
+    #[test]
+    fn short_slow_to_short_fast_changes_spreading_factor() {
+        let slow = eu868_config_for_preset(MODEM_SHORT_SLOW);
+        let fast = eu868_config_for_preset(MODEM_SHORT_FAST);
+        assert_eq!(slow.modem_preset, MODEM_SHORT_SLOW);
+        assert_eq!(fast.modem_preset, MODEM_SHORT_FAST);
+        assert_eq!(slow.spreading_factor, 8);
+        assert_eq!(fast.spreading_factor, 7);
+        assert_eq!(slow.bandwidth_khz, 250.0);
+        assert_eq!(fast.bandwidth_khz, 250.0);
+        assert_eq!(slow.coding_rate, 5);
+        assert_eq!(fast.coding_rate, 5);
+        assert_eq!(slow.frequency_mhz, fast.frequency_mhz);
+        assert_eq!(slow.sync_word, fast.sync_word);
+        // Faster airtime at SF7 — soft-reinit must pick up the new SF.
+        assert!(
+            crate::packet_time::packet_time_ms(&fast, 32, false)
+                < crate::packet_time::packet_time_ms(&slow, 32, false)
+        );
+        assert_eq!(contention_window_ms(MODEM_SHORT_FAST), 1500);
         assert_eq!(contention_window_ms(MODEM_SHORT_SLOW), 2000);
     }
 }

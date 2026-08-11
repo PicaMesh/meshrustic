@@ -4,6 +4,12 @@ use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{is_direct_packet, PacketHeader, ParsedPacket, PACKET_HEADER_LEN, NODENUM_BROADCAST};
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
 
+use crate::admin::{
+    encode_admin_response, encode_owner_response, handle_admin, AdminState,
+    ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED, ROUTING_ERROR_PKI_FAILED,
+    ROUTING_ERROR_PKI_UNKNOWN_PUBKEY,
+};
+use crate::admin_codec::{AdminPayload, ADMIN_APP};
 use crate::coordinated_relay::{half_airtime_ms, slot_time_for_preset, tx_delay_ms_worst};
 use crate::neighbor_graph::{
     MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS,
@@ -25,8 +31,8 @@ use crate::reliable::{
     MAX_PENDING_RELIABLE,
 };
 use crate::routing_ack::{
-    build_ack_nak_frame, decode_routing_payload, hop_limit_for_response, ROUTING_APP,
-    ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
+    build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
+    ROUTING_APP, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
 };
 use crate::rx_decode::{summarize_decrypted, RxDecodeInfo};
 use crate::sr_log::{SrLog, SrLogEvent, SrSkipReason, T1CancelReason, MAX_SR_LOG};
@@ -168,6 +174,16 @@ struct PendingAck {
     bytes: [u8; MAX_WIRE_LEN],
 }
 
+const MAX_PENDING_ADMIN: usize = 4;
+
+#[derive(Clone, Copy)]
+struct PendingAdmin {
+    active: bool,
+    next_tx_ms: u32,
+    len: u8,
+    bytes: [u8; MAX_WIRE_LEN],
+}
+
 /// Shared static router state.
 pub struct Router {
     node_num: u32,
@@ -186,6 +202,8 @@ pub struct Router {
     pending_retransmits: [PendingRetransmit; MAX_PENDING_RETRANSMITS],
     pending_reliable: [PendingReliable; MAX_PENDING_RELIABLE],
     pending_ack: PendingAck,
+    pending_admin: [PendingAdmin; MAX_PENDING_ADMIN],
+    pending_admin_count: u8,
     nodeinfo_identity: NodeInfoIdentity,
     nodeinfo_cache: NodeInfoCache,
     last_nodeinfo_ms: u32,
@@ -201,6 +219,18 @@ pub struct Router {
     next_tx_id: u32,
     sr_log: SrLog,
     bridge_dedup: crate::bridge::BridgeDedupCache,
+    admin: AdminState,
+    /// Remote pubkey from last successful PKI admin decrypt (for reply encryption).
+    admin_reply_remote_pk: Option<[u8; 32]>,
+    /// True when last admin decrypt used PKI (vs channel).
+    admin_reply_use_pki: bool,
+    /// Pending PKI decrypt failure to NAK when addressed to us.
+    pending_pki_error: Option<u32>,
+    /// When an admin (or PKI) module reply is queued for this RX, skip a separate
+    /// WantAck ACK — the reply's `Data.request_id` already stops reliable retransmit.
+    admin_reply_suppresses_ack: bool,
+    /// LoRa preset changed; board must soft-reinit the radio (no sys_reset).
+    pending_radio_reinit: bool,
 }
 
 impl Router {
@@ -324,6 +354,13 @@ impl Router {
                 len: 0,
                 bytes: [0; MAX_WIRE_LEN],
             },
+            pending_admin: [PendingAdmin {
+                active: false,
+                next_tx_ms: 0,
+                len: 0,
+                bytes: [0; MAX_WIRE_LEN],
+            }; MAX_PENDING_ADMIN],
+            pending_admin_count: 0,
             nodeinfo_identity: NodeInfoIdentity::with_default_advert([0; 32]),
             nodeinfo_cache: NodeInfoCache::new(),
             last_nodeinfo_ms: 0,
@@ -339,6 +376,12 @@ impl Router {
             next_tx_id: 1,
             sr_log: SrLog::new(),
             bridge_dedup: crate::bridge::BridgeDedupCache::new(),
+            admin: AdminState::default(),
+            admin_reply_remote_pk: None,
+            admin_reply_use_pki: false,
+            pending_pki_error: None,
+            admin_reply_suppresses_ack: false,
+            pending_radio_reinit: false,
         }
     }
 
@@ -351,6 +394,102 @@ impl Router {
     pub fn set_node_identity(&mut self, identity: NodeInfoIdentity) {
         self.graph.set_device_role(identity.advert.role);
         self.nodeinfo_identity = identity;
+        self.admin.public_key = identity.public_key;
+    }
+
+    /// Load persisted NodeConfig into admin + channel/modem state.
+    pub fn load_node_config(&mut self, cfg: &mesh_store::NodeConfig) {
+        self.node_num = cfg.node_num;
+        self.graph.set_my_node(cfg.node_num);
+        self.admin.apply_node_config(cfg);
+        self.nodeinfo_identity = NodeInfoIdentity::for_node(cfg.node_num, cfg.public_key);
+        self.set_modem_preset(
+            "",
+            cfg.lora.modem_preset,
+            cfg.lora.use_preset,
+            cfg.channel_key,
+        );
+        self.hop_limit = cfg.lora.hop_limit;
+    }
+
+    /// Export admin-managed fields into a NodeConfig for flash save.
+    pub fn write_admin_into_config(&self, cfg: &mut mesh_store::NodeConfig) {
+        self.admin.export_to_node_config(cfg);
+        cfg.channel_key = self.channel_key;
+        cfg.node_num = self.node_num;
+    }
+
+    pub fn admin_config_dirty(&self) -> bool {
+        self.admin.config_dirty
+    }
+
+    pub fn clear_admin_config_dirty(&mut self) {
+        self.admin.config_dirty = false;
+    }
+
+    pub fn take_pending_reboot_seconds(&mut self) -> Option<i32> {
+        self.admin.pending_reboot_seconds.take()
+    }
+
+    /// True after a LoRa preset change — board should reinit SX1262 without sys_reset.
+    pub fn take_pending_radio_reinit(&mut self) -> bool {
+        core::mem::take(&mut self.pending_radio_reinit)
+    }
+
+    /// Host/unit-test only: run admin handler as if `remote_pk` completed PKI decrypt.
+    ///
+    /// Not compiled into firmware builds (no `std` / `test`). Prefer real PKI frames in
+    /// integration tests whenever a keypair is available.
+    #[cfg(any(test, feature = "std"))]
+    pub fn process_admin_as_pki_peer_for_test(
+        &mut self,
+        remote_pk: &[u8; 32],
+        from: u32,
+        request_id: u32,
+        inner: &[u8],
+        now_ms: u32,
+    ) {
+        self.admin_reply_remote_pk = Some(*remote_pk);
+        self.admin_reply_use_pki = true;
+        let parsed = ParsedPacket {
+            to: self.node_num,
+            from,
+            id: request_id,
+            channel: 0,
+            hop_limit: 3,
+            hop_start: 3,
+            want_ack: false,
+            via_mqtt: false,
+            next_hop: 0,
+            relay_node: 0,
+        };
+        self.process_admin_rx(&parsed, inner, now_ms);
+    }
+
+    /// Host/unit-test only: replace Appendix A builtin pubs with a known keypair set.
+    #[cfg(any(test, feature = "std"))]
+    pub fn set_builtin_admin_public_keys_for_test(&mut self, keys: [[u8; 32]; 2]) {
+        self.admin.set_builtin_admin_public_keys_for_test(keys);
+    }
+
+    /// Host/unit-test only: seed NODEINFO cache so PKI decrypt can try `public_key` for `node_num`.
+    #[cfg(any(test, feature = "std"))]
+    pub fn seed_nodeinfo_peer_for_test(
+        &mut self,
+        node_num: u32,
+        public_key: [u8; 32],
+        now_ms: u32,
+    ) {
+        let identity = NodeInfoIdentity::for_node(node_num, public_key);
+        let _ = self.nodeinfo_cache.upsert(node_num, identity, now_ms);
+    }
+
+    pub fn admin_state(&self) -> &AdminState {
+        &self.admin
+    }
+
+    pub fn admin_state_mut(&mut self) -> &mut AdminState {
+        &mut self.admin
     }
 
     /// Update cached device metrics before periodic telemetry broadcast.
@@ -482,6 +621,8 @@ impl Router {
         packet: &InboundPacket<'_>,
         now_ms: u32,
     ) -> Option<ProcessResult> {
+        // Per-RX: admin replies for this packet suppress a separate WantAck ACK.
+        self.admin_reply_suppresses_ack = false;
         let header = PacketHeader::decode(packet.bytes).ok()?;
         let parsed = header.parse();
         let payload_len = packet.bytes.len().saturating_sub(PACKET_HEADER_LEN);
@@ -685,8 +826,19 @@ impl Router {
                         now_ms,
                     );
                 }
+            } else if data.portnum == ADMIN_APP {
+                if parsed.to == self.node_num {
+                    if let Some(ref inner) = inner {
+                        self.process_admin_rx(&parsed, inner, now_ms);
+                    }
+                }
+            }
+        } else if parsed.to == self.node_num {
+            if let Some(err) = self.pending_pki_error.take() {
+                self.schedule_admin_routing_error(&parsed, err, now_ms);
             }
         }
+        self.pending_pki_error = None;
 
         self.process_reliable_rx(&parsed, decoded_data.as_ref(), inner.as_deref(), now_ms);
 
@@ -713,7 +865,7 @@ impl Router {
     }
 
     fn decode_payload(
-        &self,
+        &mut self,
         parsed: &ParsedPacket,
         wire: &[u8],
         payload_len: usize,
@@ -732,6 +884,10 @@ impl Router {
             parsed.channel,
             &mut cipher[..payload_len],
         ) {
+            // Channel path must not inherit a prior PKI peer for admin ACL.
+            self.admin_reply_remote_pk = None;
+            self.admin_reply_use_pki = false;
+            self.pending_pki_error = None;
             (
                 RxDecodeInfo {
                     portnum: Some(data.portnum),
@@ -741,12 +897,374 @@ impl Router {
                 Some(inner),
                 Some(data),
             )
+        } else if parsed.to == self.node_num {
+            self.try_pki_decrypt(parsed, wire, payload_len)
         } else {
+            self.admin_reply_remote_pk = None;
+            self.admin_reply_use_pki = false;
             (
                 RxDecodeInfo::encrypted(payload_len.min(u16::MAX as usize) as u16),
                 None,
                 None,
             )
+        }
+    }
+
+    fn try_pki_decrypt(
+        &mut self,
+        parsed: &ParsedPacket,
+        wire: &[u8],
+        payload_len: usize,
+    ) -> (
+        RxDecodeInfo,
+        Option<heapless::Vec<u8, 240>>,
+        Option<DecodedData>,
+    ) {
+        self.admin_reply_remote_pk = None;
+        self.admin_reply_use_pki = false;
+
+        #[cfg(feature = "pki")]
+        {
+            use mesh_crypto::CryptoEngine;
+            use crate::topology::decode_data_payload_full;
+
+            let mut candidates: heapless::Vec<[u8; 32], 8> = heapless::Vec::new();
+            if let Some(peer) = self.nodeinfo_cache.get(parsed.from) {
+                if peer.identity.public_key.iter().any(|&b| b != 0) {
+                    let _ = candidates.push(peer.identity.public_key);
+                }
+            }
+            for k in self.admin.candidate_pki_keys() {
+                if !candidates.iter().any(|c| c == &k) {
+                    let _ = candidates.push(k);
+                }
+            }
+
+            let had_candidates = !candidates.is_empty();
+            let mut engine = CryptoEngine::new();
+            engine.set_dh_private_key(&self.admin.private_key);
+            for remote_pk in candidates {
+                let mut plain = [0u8; MAX_PACKET_PAYLOAD];
+                let cipher = &wire[PACKET_HEADER_LEN..PACKET_HEADER_LEN + payload_len];
+                if !engine.decrypt_curve25519(
+                    parsed.from,
+                    &remote_pk,
+                    parsed.id as u64,
+                    cipher,
+                    &mut plain,
+                ) {
+                    continue;
+                }
+                // PKI plaintext length is cipher_len - 12 (MIC + extra nonce).
+                if payload_len < 12 {
+                    continue;
+                }
+                let plain_len = payload_len - 12;
+                if let Some((data, inner)) = decode_data_payload_full(&plain[..plain_len]) {
+                    self.admin_reply_remote_pk = Some(remote_pk);
+                    self.admin_reply_use_pki = true;
+                    self.pending_pki_error = None;
+                    return (
+                        RxDecodeInfo {
+                            portnum: Some(data.portnum),
+                            payload_len: inner.len().min(u16::MAX as usize) as u16,
+                            summary: summarize_decrypted(data.portnum, &inner),
+                        },
+                        Some(inner),
+                        Some(data),
+                    );
+                }
+            }
+            // Addressed decrypt failed: remember error for reply when a path exists.
+            self.pending_pki_error = Some(if had_candidates {
+                ROUTING_ERROR_PKI_FAILED
+            } else {
+                ROUTING_ERROR_PKI_UNKNOWN_PUBKEY
+            });
+        }
+        #[cfg(not(feature = "pki"))]
+        {
+            let _ = (parsed, wire, payload_len);
+            self.pending_pki_error = Some(ROUTING_ERROR_PKI_FAILED);
+        }
+        (
+            RxDecodeInfo::encrypted(payload_len.min(u16::MAX as usize) as u16),
+            None,
+            None,
+        )
+    }
+
+    fn process_admin_rx(&mut self, parsed: &ParsedPacket, payload: &[u8], now_ms: u32) {
+        // v1: admin is authorized only from this packet's successful PKI remote pubkey.
+        let Some(remote_pk) = self
+            .admin_reply_remote_pk
+            .filter(|_| self.admin_reply_use_pki)
+        else {
+            self.schedule_admin_routing_error(
+                parsed,
+                ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED,
+                now_ms,
+            );
+            return;
+        };
+
+        let outcome = handle_admin(
+            &mut self.admin,
+            &remote_pk,
+            &self.nodeinfo_identity,
+            self.node_num,
+            psk_bytes(&self.channel_key),
+            self.graph.device_role(),
+            payload,
+            now_ms,
+        );
+
+        if let Some(preset) = outcome.apply_modem_preset {
+            self.set_modem_preset("", preset, true, self.channel_key);
+            self.pending_radio_reinit = true;
+        }
+        if let Some(secs) = outcome.reboot_seconds {
+            self.admin.pending_reboot_seconds = Some(secs);
+        }
+
+        if let Some(err) = outcome.routing_error {
+            self.schedule_admin_routing_error(parsed, err, now_ms);
+            return;
+        }
+
+        if let Some(resp) = outcome.response {
+            self.schedule_admin_response(parsed, &resp, now_ms);
+        } else if outcome.routing_ok {
+            // Mutating admin ops complete with ROUTING_APP Error_NONE.
+            // This reply also serves as the WantAck ACK (no second ROUTING NONE).
+            // Always send — some clients omit Data.want_response on set.
+            self.schedule_admin_routing_error(parsed, ROUTING_ERROR_NONE, now_ms);
+        }
+    }
+
+    fn schedule_admin_routing_error(&mut self, parsed: &ParsedPacket, error: u32, now_ms: u32) {
+        let hop = hop_limit_for_response(parsed, self.hop_limit);
+        let id = self.alloc_tx_id(now_ms);
+        let routing = encode_routing_error(error);
+        // Mirror setReplyTo: request_id + reply_id, and copy WantAck so the reply
+        // alone can stop reliable retransmit (no second ACK).
+        let opts = DataEncodeOpts {
+            request_id: parsed.id,
+            reply_id: parsed.id,
+            want_response: false,
+        };
+        let frame = if let Some(remote_pk) = self.remote_pk_for_error_reply(parsed) {
+            self.build_pki_app_frame(
+                parsed.from,
+                id,
+                hop.max(1),
+                ROUTING_APP,
+                &routing,
+                opts,
+                &remote_pk,
+                parsed.want_ack,
+            )
+        } else {
+            build_app_wire_frame(
+                parsed.from,
+                self.node_num,
+                id,
+                self.channel_hash,
+                hop,
+                hop,
+                parsed.want_ack,
+                &self.channel_key,
+                ROUTING_APP,
+                &routing,
+                opts,
+            )
+        };
+        let Some((len, bytes)) = frame else {
+            return;
+        };
+        self.enqueue_admin_tx(now_ms, len, bytes);
+    }
+
+    /// Prefer the current PKI peer, else NODEINFO cache for `from`.
+    fn remote_pk_for_error_reply(&self, parsed: &ParsedPacket) -> Option<[u8; 32]> {
+        if let Some(pk) = self.admin_reply_remote_pk {
+            if pk.iter().any(|&b| b != 0) {
+                return Some(pk);
+            }
+        }
+        if let Some(peer) = self.nodeinfo_cache.get(parsed.from) {
+            if peer.identity.public_key.iter().any(|&b| b != 0) {
+                return Some(peer.identity.public_key);
+            }
+        }
+        None
+    }
+
+    fn schedule_admin_response(
+        &mut self,
+        parsed: &ParsedPacket,
+        resp: &crate::admin_codec::AdminMessage,
+        now_ms: u32,
+    ) {
+        let inner = match &resp.payload {
+            AdminPayload::GetOwnerResponse(_) if resp.has_session_passkey => {
+                encode_owner_response(self.node_num, &self.nodeinfo_identity, &resp.session_passkey)
+            }
+            _ => encode_admin_response(resp),
+        };
+        let hop = hop_limit_for_response(parsed, self.hop_limit).max(1);
+        let id = self.alloc_tx_id(now_ms);
+        // Clients correlate admin replies via Data.request_id (and sometimes reply_id).
+        let opts = DataEncodeOpts {
+            want_response: false,
+            reply_id: parsed.id,
+            request_id: parsed.id,
+        };
+        let frame = if self.admin_reply_use_pki {
+            match self.admin_reply_remote_pk {
+                Some(remote_pk) => self.build_pki_app_frame(
+                    parsed.from,
+                    id,
+                    hop,
+                    ADMIN_APP,
+                    &inner,
+                    opts,
+                    &remote_pk,
+                    parsed.want_ack,
+                ),
+                None => None,
+            }
+        } else {
+            build_app_wire_frame(
+                parsed.from,
+                self.node_num,
+                id,
+                self.channel_hash,
+                hop,
+                hop,
+                parsed.want_ack,
+                &self.channel_key,
+                ADMIN_APP,
+                &inner,
+                opts,
+            )
+        };
+        let Some((len, bytes)) = frame else {
+            return;
+        };
+        self.enqueue_admin_tx(now_ms, len, bytes);
+    }
+
+    fn enqueue_admin_tx(&mut self, now_ms: u32, len: u8, bytes: [u8; MAX_WIRE_LEN]) {
+        // Module reply serves as the WantAck ACK (skip separate first ACK).
+        self.admin_reply_suppresses_ack = true;
+        // Copy of request WantAck ⇒ reliable retx (~NUM_RELIABLE_RETX) until peer ACKs.
+        if let Ok(hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) {
+            let p = hdr.parse();
+            if p.want_ack {
+                let slot_ms = slot_time_for_preset(self.modem_preset).max(1);
+                let airtime_ms = half_airtime_ms(slot_ms).saturating_mul(2).max(slot_ms);
+                let _ = schedule_reliable(
+                    &mut self.pending_reliable,
+                    p.id,
+                    p.to,
+                    len,
+                    bytes,
+                    airtime_ms,
+                    slot_ms,
+                    now_ms,
+                );
+            }
+        }
+        for slot in &mut self.pending_admin {
+            if !slot.active {
+                *slot = PendingAdmin {
+                    active: true,
+                    next_tx_ms: now_ms,
+                    len,
+                    bytes,
+                };
+                self.pending_admin_count = self
+                    .pending_admin_count
+                    .saturating_add(1)
+                    .min(MAX_PENDING_ADMIN as u8);
+                return;
+            }
+        }
+        // Queue full: drop the oldest slot (lowest next_tx_ms) and enqueue.
+        let mut oldest = 0usize;
+        for i in 1..MAX_PENDING_ADMIN {
+            let a = self.pending_admin[i].next_tx_ms;
+            let b = self.pending_admin[oldest].next_tx_ms;
+            if a.wrapping_sub(b) < 0x8000_0000 && a < b {
+                oldest = i;
+            }
+        }
+        self.pending_admin[oldest] = PendingAdmin {
+            active: true,
+            next_tx_ms: now_ms,
+            len,
+            bytes,
+        };
+    }
+
+    fn build_pki_app_frame(
+        &self,
+        to: u32,
+        packet_id: u32,
+        hop_limit: u8,
+        portnum: u32,
+        inner: &[u8],
+        opts: DataEncodeOpts,
+        remote_pk: &[u8; 32],
+        want_ack: bool,
+    ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
+        #[cfg(feature = "pki")]
+        {
+            use mesh_crypto::CryptoEngine;
+            use crate::topology::encode_data_payload_opts;
+
+            let plaintext = encode_data_payload_opts(portnum, inner, opts);
+            if plaintext.len() + 12 > MAX_PACKET_PAYLOAD {
+                return None;
+            }
+            let mut engine = CryptoEngine::new();
+            engine.set_dh_private_key(&self.admin.private_key);
+            let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
+            let extra_nonce = packet_id;
+            if !engine.encrypt_curve25519(
+                remote_pk,
+                self.node_num,
+                packet_id as u64,
+                extra_nonce,
+                &plaintext,
+                &mut cipher,
+            ) {
+                return None;
+            }
+            let cipher_len = plaintext.len() + 12;
+            let header = PacketHeader::from_fields(
+                to,
+                self.node_num,
+                packet_id,
+                0, // PKI frames use channel 0 on the air header
+                hop_limit.min(SR_BROADCAST_MAX_HOPS),
+                hop_limit.min(SR_BROADCAST_MAX_HOPS),
+                want_ack,
+                false,
+                0,
+                0,
+            );
+            let mut bytes = [0u8; MAX_WIRE_LEN];
+            header.encode_to((&mut bytes[..PACKET_HEADER_LEN]).try_into().ok()?);
+            let len = PACKET_HEADER_LEN + cipher_len;
+            bytes[PACKET_HEADER_LEN..len].copy_from_slice(&cipher[..cipher_len]);
+            Some((len as u8, bytes))
+        }
+        #[cfg(not(feature = "pki"))]
+        {
+            let _ = (to, packet_id, hop_limit, portnum, inner, opts, remote_pk, want_ack);
+            None
         }
     }
 
@@ -1382,6 +1900,7 @@ impl Router {
             || self.pending_telemetry.active
             || self.pending_traceroute.active
             || self.pending_ack.active
+            || self.pending_admin.iter().any(|p| p.active)
             || self.pending_retransmits.iter().any(|p| p.active && !p.canceled)
             || self.pending_reliable.iter().any(|p| p.active)
             || self.graph.has_active_relay_commits()
@@ -1471,6 +1990,42 @@ impl Router {
         Some(RelayPlan {
             len: self.pending_ack.len,
             bytes: self.pending_ack.bytes,
+            delay_ms: 0,
+        })
+    }
+
+    pub fn poll_admin_tx(&mut self, now_ms: u32) -> Option<RelayPlan> {
+        let mut best: Option<usize> = None;
+        for (i, slot) in self.pending_admin.iter().enumerate() {
+            if !slot.active {
+                continue;
+            }
+            if now_ms.wrapping_sub(slot.next_tx_ms) >= 0x8000_0000 {
+                continue;
+            }
+            if now_ms < slot.next_tx_ms {
+                continue;
+            }
+            best = Some(match best {
+                None => i,
+                Some(j) => {
+                    if slot.next_tx_ms.wrapping_sub(self.pending_admin[j].next_tx_ms) < 0x8000_0000
+                        && slot.next_tx_ms < self.pending_admin[j].next_tx_ms
+                    {
+                        i
+                    } else {
+                        j
+                    }
+                }
+            });
+        }
+        let idx = best?;
+        let slot = &mut self.pending_admin[idx];
+        slot.active = false;
+        self.pending_admin_count = self.pending_admin_count.saturating_sub(1);
+        Some(RelayPlan {
+            len: slot.len,
+            bytes: slot.bytes,
             delay_ms: 0,
         })
     }
@@ -1596,33 +2151,44 @@ impl Router {
                 && parsed.want_ack
                 && data.request_id == 0
                 && data.reply_id == 0
+                && !self.admin_reply_suppresses_ack
             {
                 self.schedule_ack(parsed, parsed.channel, now_ms);
             }
         } else if parsed.from != self.node_num
             && parsed.from != 0
             && parsed.want_ack
+            && !self.admin_reply_suppresses_ack
         {
             self.schedule_nak(parsed, ROUTING_ERROR_NO_CHANNEL, now_ms);
         }
     }
 
     fn schedule_ack(&mut self, parsed: &ParsedPacket, channel_hash: u8, now_ms: u32) {
+        let hop = hop_limit_for_response(parsed, self.hop_limit);
+        self.schedule_ack_with_hop(parsed, channel_hash, hop, now_ms);
+    }
+
+    /// Original-sender WantAck retry (dupe, hopsAway==0): cheap hop_limit=0 re-ACK only.
+    /// Must not re-run admin/modules — those already ran on first delivery.
+    fn schedule_dupe_want_ack(&mut self, parsed: &ParsedPacket, channel_hash: u8, now_ms: u32) {
+        self.schedule_ack_with_hop(parsed, channel_hash, 0, now_ms);
+    }
+
+    fn schedule_ack_with_hop(
+        &mut self,
+        parsed: &ParsedPacket,
+        channel_hash: u8,
+        hop: u8,
+        now_ms: u32,
+    ) {
         if self.pending_ack.active {
             return;
         }
-        let hop = hop_limit_for_response(parsed, self.hop_limit);
         let packet_id = self.alloc_tx_id(now_ms);
-        let Some((len, frame)) = build_ack_nak_frame(
-            parsed.from,
-            self.node_num,
-            packet_id,
-            parsed.id,
-            channel_hash,
-            hop,
-            ROUTING_ERROR_NONE,
-            &self.channel_key,
-        ) else {
+        let Some((len, frame)) =
+            self.build_ack_nak_reply(parsed, packet_id, hop, ROUTING_ERROR_NONE, channel_hash)
+        else {
             return;
         };
         self.pending_ack = PendingAck {
@@ -1639,16 +2205,9 @@ impl Router {
         }
         let hop = hop_limit_for_response(parsed, self.hop_limit);
         let packet_id = self.alloc_tx_id(now_ms);
-        let Some((len, frame)) = build_ack_nak_frame(
-            parsed.from,
-            self.node_num,
-            packet_id,
-            parsed.id,
-            parsed.channel,
-            hop,
-            error,
-            &self.channel_key,
-        ) else {
+        let Some((len, frame)) =
+            self.build_ack_nak_reply(parsed, packet_id, hop, error, parsed.channel)
+        else {
             return;
         };
         self.pending_ack = PendingAck {
@@ -1657,6 +2216,49 @@ impl Router {
             len,
             bytes: frame,
         };
+    }
+
+    /// WantAck ACK/NAK must use the same crypto as the request: PKI when the inbound
+    /// packet was PKI-decrypted (Ch=0), otherwise channel PSK. Channel-encrypting a
+    /// PKI WantAck makes pure-PKI clients ignore the ACK and retransmit forever.
+    fn build_ack_nak_reply(
+        &self,
+        parsed: &ParsedPacket,
+        packet_id: u32,
+        hop: u8,
+        error_reason: u32,
+        channel_hash: u8,
+    ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
+        let routing = encode_routing_error(error_reason);
+        let opts = DataEncodeOpts {
+            request_id: parsed.id,
+            ..Default::default()
+        };
+        if self.admin_reply_use_pki {
+            if let Some(remote_pk) = self.remote_pk_for_error_reply(parsed) {
+                // hop may be 0 for original-sender WantAck dupe re-ACKs.
+                return self.build_pki_app_frame(
+                    parsed.from,
+                    packet_id,
+                    hop,
+                    ROUTING_APP,
+                    &routing,
+                    opts,
+                    &remote_pk,
+                    false,
+                );
+            }
+        }
+        build_ack_nak_frame(
+            parsed.from,
+            self.node_num,
+            packet_id,
+            parsed.id,
+            channel_hash,
+            hop,
+            error_reason,
+            &self.channel_key,
+        )
     }
 
     fn process_nodeinfo_rx(&mut self, parsed: &ParsedPacket, payload: &[u8], now_ms: u32) {
@@ -1929,10 +2531,10 @@ impl Router {
         dropped
     }
 
-    fn is_repeated_reliable_tx(parsed: &ParsedPacket, sr_active: bool) -> bool {
-        if sr_active {
-            return false;
-        }
+    /// hopsAway == 0 (hop_start == hop_limit): original transmitter, not a relayed copy.
+    /// Unicast WantAck retries use this to emit a hop_limit=0 re-ACK without re-running modules.
+    /// To-us DMs are never SR-suppressed for this check (SR is not used for packets to us).
+    fn is_repeated_reliable_tx(parsed: &ParsedPacket) -> bool {
         parsed.hop_start > 0 && parsed.hop_start == parsed.hop_limit
     }
 
@@ -1961,9 +2563,19 @@ impl Router {
             self.maybe_cancel_relay_for_foreign_ack(parsed, data);
         }
 
-        if Self::is_repeated_reliable_tx(parsed, self.graph.is_active_routing_role()) {
+        // Hearing our own frame (rebroadcast) is an implicit ACK — always cancel
+        // reliable retx before any early return for WantAck re-ACK handling.
+        if parsed.from == self.node_num {
+            let _ = stop_reliable(&mut self.pending_reliable, parsed.id);
+            self.perhaps_cancel_dupe(parsed, packet, now_ms);
+            return;
+        }
+
+        // Dupe path never re-enters rate_limit / admin / modules (history short-circuit).
+        // Original-sender WantAck retry → hop_limit=0 re-ACK only (airtime-cheap).
+        if Self::is_repeated_reliable_tx(parsed) {
             if parsed.to == self.node_num && parsed.want_ack {
-                self.schedule_ack(parsed, parsed.channel, now_ms);
+                self.schedule_dupe_want_ack(parsed, parsed.channel, now_ms);
             }
             return;
         }
@@ -2391,8 +3003,9 @@ mod tests {
         let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
         let _plan = router.evaluate_tx_plan(&result, 0.0, airtime, 1_000);
 
-        let fire_ms = coordinated_relay::tx_delay_ms_worst(coordinated_relay::DEFAULT_SLOT_MS)
-            .saturating_add(airtime);
+        // T1 uses preset slot time (`cw_slot_ms`), not DEFAULT_SLOT_MS.
+        let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW);
+        let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
         assert!(router.poll_t1_retransmit(1_000 + fire_ms - 1).is_none());
         assert!(router.poll_t1_retransmit(1_000 + fire_ms).is_some());
     }
@@ -2531,7 +3144,13 @@ mod tests {
             coordinated_relay::DEFAULT_SLOT_MS,
             0,
         );
-        assert!(plan.relay.is_some() || router.poll_ready_relay(u32::MAX).is_some());
+        // `u32::MAX` looks "before" a small tx_after under wrapping subtract; poll at due time.
+        let ready = plan.relay.is_some()
+            || router
+                .relay_tx_after(LAST_HOP_SOURCE, 43, 0)
+                .and_then(|tx| router.poll_ready_relay(tx))
+                .is_some();
+        assert!(ready);
     }
 
     #[test]
@@ -2566,6 +3185,11 @@ mod tests {
             coordinated_relay::DEFAULT_SLOT_MS,
             0,
         );
-        assert!(plan.relay.is_some() || router.poll_ready_relay(u32::MAX).is_some());
+        let ready = plan.relay.is_some()
+            || router
+                .relay_tx_after(LAST_HOP_SOURCE, 44, 0)
+                .and_then(|tx| router.poll_ready_relay(tx))
+                .is_some();
+        assert!(ready);
     }
 }

@@ -10,11 +10,13 @@ description = "MeshRustic routing core (static pools, unified Router)"
 mesh-crypto = { path = "../mesh-crypto" }
 mesh-protocol = { path = "../mesh-protocol" }
 mesh-radio = { path = "../mesh-radio" }
+mesh-store = { path = "../mesh-store", default-features = false }
 heapless = "0.8"
 
 [features]
-default = []
+default = ["pki"]
 std = []
+pki = ["mesh-crypto/pki", "mesh-store/pki"]
 
 [dev-dependencies]
 static_cell = "2"

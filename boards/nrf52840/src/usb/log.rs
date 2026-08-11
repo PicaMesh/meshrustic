@@ -185,7 +185,7 @@ fn push_freq_mhz(out: &mut [u8], freq_mhz: f32) -> usize {
 
 /// Boot and identity lines for USB CDC.
 pub mod mesh {
-    use super::{finish_line, line_prefix, push_hex_u32_8};
+    use super::{finish_line, line_prefix, push_hex_u32_8, push_u32};
 
     pub fn node_id(node_num: u32) {
         let mut line = [0u8; 64];
@@ -194,6 +194,33 @@ pub mod mesh {
         line[pos..pos + prefix.len()].copy_from_slice(prefix);
         pos += prefix.len();
         pos += push_hex_u32_8(&mut line[pos..], node_num);
+        finish_line(&mut line, pos);
+    }
+
+    /// Flash load result + configurable admin public-key count.
+    pub fn config_boot(from_flash: bool, admin_keys: u32) {
+        let mut line = [0u8; 96];
+        let mut pos = line_prefix(&mut line);
+        let prefix = b"[store] NodeConfig ";
+        line[pos..pos + prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        let src: &[u8] = if from_flash { b"flash" } else { b"defaults" };
+        line[pos..pos + src.len()].copy_from_slice(src);
+        pos += src.len();
+        let mid = b" admin_keys=";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        pos += push_u32(&mut line[pos..], admin_keys);
+        finish_line(&mut line, pos);
+    }
+
+    pub fn config_saved(admin_keys: u32) {
+        let mut line = [0u8; 64];
+        let mut pos = line_prefix(&mut line);
+        let prefix = b"[store] NodeConfig saved admin_keys=";
+        line[pos..pos + prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += push_u32(&mut line[pos..], admin_keys);
         finish_line(&mut line, pos);
     }
 }

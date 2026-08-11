@@ -1,15 +1,16 @@
 //! Embassy task driving radio 0 RX/TX and AirTime ticks.
 
 use embassy_time::{Duration, Instant, Timer};
-use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::PacketHeader;
-use mesh_radio::{packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868};
+use mesh_radio::{eu868_config_for_preset, packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868};
 use mesh_routing::{
     wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, InboundPacket, Router, RxDecodeInfo,
     SrLogEvent, MAX_SR_LOG,
 };
+use mesh_store::{ConfigStore, EMPTY_ADMIN_KEY};
 use static_cell::StaticCell;
 
+use crate::store::NvmcConfigStore;
 use super::sx1262::Sx1262Driver;
 
 static AIR_TIME: StaticCell<AirTime> = StaticCell::new();
@@ -22,6 +23,7 @@ pub fn air_time() -> &'static mut AirTime {
 pub async fn radio_task(
     slot: &'static mut RadioSlot<Sx1262Driver>,
     router: &'static mut Router,
+    store: &'static mut NvmcConfigStore,
     node_num: u32,
 ) {
     let air = air_time();
@@ -29,15 +31,10 @@ pub async fn radio_task(
 
     slot.init().expect("radio init failed");
     router.emit_startup_logs();
-    let cfg = slot.config();
-    router.set_modem_preset(
-        "",
-        cfg.modem_preset,
-        true,
-        CryptoKey::from_bytes(&DEFAULT_PSK),
-    );
+    // Modem preset + channel key already applied via Router::load_node_config in main.
     let boot_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
     router.ensure_boot_broadcasts(boot_ms, packet_time_ms(slot.config(), 64, true).max(1));
+    let cfg = slot.config();
     let preset = cfg.preset_log_name();
     defmt::info!(
         "[Radio0] nodeId !{:08x} SX1262 ({}) init OK, EU_868 {} @ {} MHz",
@@ -56,6 +53,9 @@ pub async fn radio_task(
     let mut last_duty_log = Instant::now();
     let boot_instant = Instant::now();
     let mut sr_log_buf: heapless::Vec<SrLogEvent, MAX_SR_LOG> = heapless::Vec::new();
+    let mut reboot_deadline: Option<Instant> = None;
+    // LoRa preset: persist + soft-reinit after completion reply TX (never sys_reset).
+    let mut radio_reinit_pending = false;
 
     const LOOP_ACTIVE_MS: u64 = 5;
     const LOOP_IDLE_MS: u64 = 100;
@@ -95,6 +95,34 @@ pub async fn radio_task(
 
         if let Some(ack) = router.poll_ack_tx(now_ms) {
             enqueue_tx(ack, slot, router, node_num, b"ack");
+        }
+
+        if let Some(admin) = router.poll_admin_tx(now_ms) {
+            enqueue_tx(admin, slot, router, node_num, b"admin");
+        }
+
+        if router.admin_config_dirty() {
+            persist_config(store, router);
+        }
+        if router.take_pending_radio_reinit() {
+            persist_config(store, router);
+            radio_reinit_pending = true;
+        }
+        // Explicit AdminMessage.reboot_seconds only (not LoRa preset apply).
+        if let Some(secs) = router.take_pending_reboot_seconds() {
+            persist_config(store, router);
+            let delay_ms = if secs <= 0 {
+                0u64
+            } else {
+                (secs as u64).saturating_mul(1000)
+            };
+            reboot_deadline = Some(Instant::now() + Duration::from_millis(delay_ms));
+        }
+        if let Some(deadline) = reboot_deadline {
+            if Instant::now() >= deadline {
+                defmt::info!("[meshrustic] reboot after admin reboot_seconds (UF2-skip)");
+                soft_reset_skip_uf2();
+            }
         }
 
         router.drain_sr_logs(&mut sr_log_buf);
@@ -153,6 +181,12 @@ pub async fn radio_task(
                 defmt::warn!("[Radio0] hardware error");
                 crate::usb_log::log::radio::warn("hardware error");
             }
+        }
+
+        // Soft-reinit after the completion reply has left the TX queue (old air params).
+        if radio_reinit_pending && slot.tx_queue_len() == 0 {
+            apply_modem_preset_soft(slot, router.modem_preset());
+            radio_reinit_pending = false;
         }
 
         if Instant::now().duration_since(last_second) >= Duration::from_secs(1) {
@@ -278,6 +312,10 @@ fn handle_rx_frame(
             enqueue_tx(ack, slot, router, node_num, b"ack");
         }
 
+        if let Some(admin) = router.poll_admin_tx(now_ms) {
+            enqueue_tx(admin, slot, router, node_num, b"admin");
+        }
+
         if let Some(tr) = router.poll_traceroute_tx(now_ms) {
             enqueue_tx(tr, slot, router, node_num, b"traceroute");
         }
@@ -333,4 +371,60 @@ fn enqueue_tx(
             }
         }
     }
+}
+
+fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) {
+    let mut cfg = store.load();
+    router.write_admin_into_config(&mut cfg);
+    match store.save(&cfg) {
+        Ok(()) => {
+            router.clear_admin_config_dirty();
+            let admin_keys = cfg
+                .admin_public_keys
+                .iter()
+                .filter(|k| *k != &EMPTY_ADMIN_KEY)
+                .count() as u32;
+            defmt::info!("[store] NodeConfig saved admin_keys={}", admin_keys);
+            crate::usb_log::log::mesh::config_saved(admin_keys);
+        }
+        Err(_) => {
+            defmt::warn!("[store] NodeConfig save failed");
+            crate::usb_log::log::radio::warn("config save failed");
+        }
+    }
+}
+
+/// Apply a new LoRa modem preset without MCU reset (UF2 boards enter upload mode on sys_reset).
+fn apply_modem_preset_soft(slot: &mut RadioSlot<Sx1262Driver>, preset: u8) {
+    let cfg = eu868_config_for_preset(preset);
+    let name = cfg.preset_log_name();
+    defmt::info!(
+        "[Radio0] soft-reinit preset {} @ {} MHz (no reboot)",
+        name,
+        cfg.frequency_mhz
+    );
+    slot.driver.set_radio_config(cfg);
+    match slot.init() {
+        Ok(()) => {
+            slot.driver.log_config();
+            let _ = slot.driver.log_chip_status();
+        }
+        Err(_) => {
+            defmt::error!("[Radio0] soft-reinit failed");
+            crate::usb_log::log::radio::warn("modem soft-reinit failed");
+        }
+    }
+}
+
+/// Soft-reset without entering Adafruit UF2 / CDC upload mode.
+fn soft_reset_skip_uf2() -> ! {
+    // Adafruit_nRF52_Bootloader: DFU_MAGIC_SKIP = 0x6d in GPREGRET.
+    const NRF_POWER_GPREGRET: *mut u32 = 0x4000_051C as *mut u32;
+    // Double-reset sentinel used by that bootloader (retained RAM).
+    const DFU_DBL_RESET_MEM: *mut u32 = 0x2000_7F7C as *mut u32;
+    unsafe {
+        core::ptr::write_volatile(NRF_POWER_GPREGRET, 0x6d);
+        core::ptr::write_volatile(DFU_DBL_RESET_MEM, 0);
+    }
+    cortex_m::peripheral::SCB::sys_reset()
 }

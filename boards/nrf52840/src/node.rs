@@ -1,9 +1,9 @@
-//! Stable per-device node identity until flash-backed NodeDB is wired.
+//! Stable per-device node identity (hardware DEVICEID + optional flash NodeConfig).
 
 use mesh_routing::NodeInfoIdentity;
-use mesh_store::generate_keypair;
+use mesh_store::{generate_keypair, NodeConfig};
 
-/// Mesh node number (`!xxxxxxxx` on other nodes) and PKI public key.
+/// Mesh node number (`!xxxxxxxx` on other nodes) and PKI keypair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeIdentity {
     pub node_num: u32,
@@ -29,8 +29,14 @@ impl NodeIdentity {
         }
     }
 
+    #[allow(dead_code)]
     pub fn nodeinfo_identity(&self) -> NodeInfoIdentity {
         NodeInfoIdentity::for_node(self.node_num, self.public_key)
+    }
+
+    /// First-boot defaults when flash config is missing or corrupt.
+    pub fn first_boot_config(&self) -> NodeConfig {
+        NodeConfig::first_boot(self.node_num, self.private_key, self.public_key)
     }
 }
 
