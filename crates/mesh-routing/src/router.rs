@@ -2,7 +2,7 @@
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{is_direct_packet, PacketHeader, ParsedPacket, PACKET_HEADER_LEN, NODENUM_BROADCAST};
-use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
+use mesh_radio::{primary_channel_hash, MODEM_DEFAULT_PRESET};
 
 use crate::admin::{
     encode_admin_response, encode_owner_response, handle_admin, AdminState,
@@ -238,7 +238,7 @@ impl Router {
         Self::with_modem_preset(
             node_num,
             "",
-            MODEM_SHORT_SLOW,
+            MODEM_DEFAULT_PRESET,
             true,
             CryptoKey::from_bytes(&DEFAULT_PSK),
             3,
@@ -276,7 +276,7 @@ impl Router {
             node_num,
             channel_key,
             mesh_crypto::channel_hash(channel_name, psk),
-            MODEM_SHORT_SLOW,
+            MODEM_DEFAULT_PRESET,
             true,
             hop_limit,
         )
@@ -640,6 +640,7 @@ impl Router {
                     self.handle_duplicate_rx(
                         &parsed,
                         decoded_data.as_ref(),
+                        inner.as_deref(),
                         packet,
                         now_ms,
                     );
@@ -661,6 +662,7 @@ impl Router {
                 self.handle_duplicate_rx(
                     &parsed,
                     decoded_data.as_ref(),
+                    inner.as_deref(),
                     packet,
                     now_ms,
                 );
@@ -929,14 +931,15 @@ impl Router {
             use crate::topology::decode_data_payload_full;
 
             let mut candidates: heapless::Vec<[u8; 32], 8> = heapless::Vec::new();
+            for k in self.admin.candidate_pki_keys() {
+                let _ = candidates.push(k);
+            }
             if let Some(peer) = self.nodeinfo_cache.get(parsed.from) {
                 if peer.identity.public_key.iter().any(|&b| b != 0) {
-                    let _ = candidates.push(peer.identity.public_key);
-                }
-            }
-            for k in self.admin.candidate_pki_keys() {
-                if !candidates.iter().any(|c| c == &k) {
-                    let _ = candidates.push(k);
+                    let pk = peer.identity.public_key;
+                    if !candidates.iter().any(|c| c == &pk) {
+                        let _ = candidates.push(pk);
+                    }
                 }
             }
 
@@ -1014,6 +1017,7 @@ impl Router {
             &self.nodeinfo_identity,
             self.node_num,
             psk_bytes(&self.channel_key),
+            self.channel_hash,
             self.graph.device_role(),
             payload,
             now_ms,
@@ -1046,12 +1050,12 @@ impl Router {
         let hop = hop_limit_for_response(parsed, self.hop_limit);
         let id = self.alloc_tx_id(now_ms);
         let routing = encode_routing_error(error);
-        // Mirror setReplyTo: request_id + reply_id, and copy WantAck so the reply
+        // Mirror setReplyTo: Data.request_id only (not reply_id), and copy WantAck so the reply
         // alone can stop reliable retransmit (no second ACK).
         let opts = DataEncodeOpts {
             request_id: parsed.id,
-            reply_id: parsed.id,
             want_response: false,
+            ..Default::default()
         };
         let frame = if let Some(remote_pk) = self.remote_pk_for_error_reply(parsed) {
             self.build_pki_app_frame(
@@ -1114,11 +1118,11 @@ impl Router {
         };
         let hop = hop_limit_for_response(parsed, self.hop_limit).max(1);
         let id = self.alloc_tx_id(now_ms);
-        // Clients correlate admin replies via Data.request_id (and sometimes reply_id).
+        // Clients correlate admin replies via Data.request_id (setReplyTo on the wire).
         let opts = DataEncodeOpts {
             want_response: false,
-            reply_id: parsed.id,
             request_id: parsed.id,
+            ..Default::default()
         };
         let frame = if self.admin_reply_use_pki {
             match self.admin_reply_remote_pk {
@@ -2556,6 +2560,7 @@ impl Router {
         &mut self,
         parsed: &ParsedPacket,
         decoded_data: Option<&DecodedData>,
+        inner: Option<&[u8]>,
         packet: &InboundPacket<'_>,
         now_ms: u32,
     ) {
@@ -2572,9 +2577,19 @@ impl Router {
         }
 
         // Dupe path never re-enters rate_limit / admin / modules (history short-circuit).
-        // Original-sender WantAck retry → hop_limit=0 re-ACK only (airtime-cheap).
+        // Original-sender WantAck retry: re-send idempotent admin GET replies, else hop_limit=0 re-ACK.
         if Self::is_repeated_reliable_tx(parsed) {
             if parsed.to == self.node_num && parsed.want_ack {
+                if let (Some(data), Some(payload)) = (decoded_data, inner) {
+                    if data.portnum == ADMIN_APP {
+                        if let Some(msg) = crate::admin_codec::decode_admin_message(payload) {
+                            if crate::admin::admin_request_is_idempotent_read(&msg.payload) {
+                                self.process_admin_rx(parsed, payload, now_ms);
+                                return;
+                            }
+                        }
+                    }
+                }
                 self.schedule_dupe_want_ack(parsed, parsed.channel, now_ms);
             }
             return;
@@ -3019,7 +3034,7 @@ mod tests {
         let _plan = router.evaluate_tx_plan(&result, 0.0, airtime, 1_000);
 
         // T1 uses preset slot time (`cw_slot_ms`), not DEFAULT_SLOT_MS.
-        let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW);
+        let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
         let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
         assert!(router.poll_t1_retransmit(1_000 + fire_ms - 1).is_none());
         assert!(router.poll_t1_retransmit(1_000 + fire_ms).is_some());

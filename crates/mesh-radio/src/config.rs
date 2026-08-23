@@ -3,9 +3,9 @@
 /// Region code for EU_868.
 pub const REGION_EU_868: u8 = 3;
 
-/// Modem preset LONG_FAST (Meshtastic EU_868 factory default).
+/// Modem preset LONG_FAST.
 pub const MODEM_LONG_FAST: u8 = 0;
-/// Modem preset LONG_SLOW (deprecated in Meshtastic 2.7).
+/// Modem preset LONG_SLOW (deprecated in mesh wire enum 2.7).
 pub const MODEM_LONG_SLOW: u8 = 1;
 /// Modem preset VERY_LONG_SLOW (deprecated).
 pub const MODEM_VERY_LONG_SLOW: u8 = 2;
@@ -23,6 +23,12 @@ pub const MODEM_LONG_MODERATE: u8 = 7;
 pub const MODEM_SHORT_TURBO: u8 = 8;
 /// Modem preset LONG_TURBO.
 pub const MODEM_LONG_TURBO: u8 = 9;
+
+/// Factory / first-boot modem preset for MeshRustic EU_868 deployments.
+///
+/// Change this single alias to retarget all `Router::new`, `NodeConfig::first_boot`,
+/// and related defaults — keep named `MODEM_*` constants for explicit presets.
+pub const MODEM_DEFAULT_PRESET: u8 = MODEM_LONG_FAST;
 
 /// Regulatory and band metadata for EU_868.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,7 +166,7 @@ pub struct RadioConfig {
 }
 
 impl RadioConfig {
-    /// Meshtastic EU_868 LONG_FAST (optional — not used in this deployment).
+    /// EU_868 LONG_FAST radio parameters (named preset; prefer [`Self::eu868_default`] for boot).
     pub const fn eu868_long_fast() -> Self {
         Self {
             region: EU_868,
@@ -173,6 +179,16 @@ impl RadioConfig {
             preamble_length: PREAMBLE_LENGTH,
             tx_power_dbm: 22,
             hop_limit: 3,
+        }
+    }
+
+    /// EU_868 factory default ([`MODEM_DEFAULT_PRESET`]).
+    pub const fn eu868_default() -> Self {
+        match MODEM_DEFAULT_PRESET {
+            MODEM_LONG_FAST => Self::eu868_long_fast(),
+            MODEM_SHORT_SLOW => Self::eu868_short_slow(),
+            // Named constructors cover current MODEM_DEFAULT_PRESET values only.
+            _ => Self::eu868_long_fast(),
         }
     }
 

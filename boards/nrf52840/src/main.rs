@@ -55,6 +55,11 @@ async fn main(spawner: Spawner) {
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
     usb_log::log::mesh::node_id(config.node_num);
     usb_log::log::mesh::config_boot(load_src == ConfigLoadSource::Flash, admin_keys);
+    defmt::info!(
+        "[store] boot preset={} from_flash={}",
+        config.lora.modem_preset,
+        load_src == ConfigLoadSource::Flash
+    );
 
     defmt::info!("meshrustic nrf52840");
     let _ = lora::dual_radio::SECOND_RADIO_ID;

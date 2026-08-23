@@ -64,7 +64,7 @@ impl Default for AdminState {
             admin_public_keys: [EMPTY_ADMIN_KEY; ADMIN_KEY_SLOTS],
             private_key: [0; 32],
             public_key: [0; 32],
-            modem_preset: mesh_radio::MODEM_SHORT_SLOW,
+            modem_preset: mesh_radio::MODEM_DEFAULT_PRESET,
             use_preset: true,
             hop_limit: 3,
             tx_power_dbm: 27,
@@ -211,6 +211,18 @@ impl Default for AdminOutcome {
     }
 }
 
+/// True for admin GET-style ops that may be safely re-run on WantAck dupe retries.
+pub fn admin_request_is_idempotent_read(payload: &AdminPayload) -> bool {
+    matches!(
+        payload,
+        AdminPayload::GetChannelRequest(_)
+            | AdminPayload::GetOwnerRequest
+            | AdminPayload::GetConfigRequest(_)
+            | AdminPayload::GetModuleConfigRequest(_)
+            | AdminPayload::GetDeviceMetadataRequest
+    )
+}
+
 /// Handle a decoded AdminMessage from an authorized-or-not remote peer.
 pub fn handle_admin(
     state: &mut AdminState,
@@ -218,6 +230,7 @@ pub fn handle_admin(
     identity: &NodeInfoIdentity,
     node_num: u32,
     channel_psk: &[u8],
+    channel_hash: u8,
     device_role: u32,
     payload: &[u8],
     now_ms: u32,
@@ -235,7 +248,7 @@ pub fn handle_admin(
     match msg.payload {
         AdminPayload::GetChannelRequest(index_plus_one) => {
             let passkey = state.issue_session(now_ms);
-            let ch = channel_for_request(index_plus_one, channel_psk);
+            let ch = channel_for_request(index_plus_one, channel_psk, channel_hash);
             let mut resp = AdminMessage::default();
             resp.payload = AdminPayload::GetChannelResponse(ch);
             resp.has_session_passkey = true;
@@ -395,7 +408,7 @@ pub fn handle_admin(
     outcome
 }
 
-fn channel_for_request(index_plus_one: u32, channel_psk: &[u8]) -> WireChannel {
+fn channel_for_request(index_plus_one: u32, channel_psk: &[u8], channel_hash: u8) -> WireChannel {
     if index_plus_one == 0 {
         // Invalid / unset — treat as disabled index 0.
         return WireChannel {
@@ -416,6 +429,8 @@ fn channel_for_request(index_plus_one: u32, channel_psk: &[u8]) -> WireChannel {
             settings.psk[..len].copy_from_slice(&channel_psk[..len]);
             settings.psk_len = len as u8;
         }
+        settings.id = channel_hash as u32;
+        settings.has_id = true;
         // Empty name: hash path uses modem preset display name when use_preset.
         WireChannel {
             index: 0,
@@ -564,6 +579,7 @@ mod tests {
             &identity(),
             0x11,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &bytes,
             1_000,
@@ -584,7 +600,7 @@ mod tests {
         let mut get = AdminMessage::default();
         get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
         let get_bytes = encode_admin_message(&get);
-        let out = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, DEVICE_ROLE_ROUTER, &get_bytes, 2_000);
+        let out = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &get_bytes, 2_000);
         let resp = out.response.unwrap();
         assert!(resp.has_session_passkey);
 
@@ -599,7 +615,7 @@ mod tests {
         set.has_session_passkey = true;
         set.session_passkey = resp.session_passkey;
         let set_bytes = encode_admin_message(&set);
-        let out2 = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, DEVICE_ROLE_ROUTER, &set_bytes, 2_100);
+        let out2 = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &set_bytes, 2_100);
         assert_eq!(out2.apply_modem_preset, Some(mesh_radio::MODEM_SHORT_FAST));
         assert!(out2.config_dirty);
         assert!(out2.routing_ok);
@@ -609,7 +625,7 @@ mod tests {
         let mut sget = AdminMessage::default();
         sget.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
         let sget_bytes = encode_admin_message(&sget);
-        let sout = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, DEVICE_ROLE_ROUTER, &sget_bytes, 2_200);
+        let sout = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &sget_bytes, 2_200);
         match sout.response.unwrap().payload {
             AdminPayload::GetConfigResponse(ConfigPayload::Security(sec)) => {
                 for i in 0..sec.admin_key_count as usize {
@@ -639,10 +655,10 @@ mod tests {
         set.has_session_passkey = true;
         set.session_passkey = passkey;
         let bytes = encode_admin_message(&set);
-        let out = handle_admin(&mut state, &remote, &identity(), 1, &DEFAULT_PSK, DEVICE_ROLE_ROUTER, &bytes, 9_000);
+        let out = handle_admin(&mut state, &remote, &identity(), 1, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &bytes, 9_000);
         assert_eq!(out.routing_error, Some(ROUTING_ERROR_BAD_REQUEST));
         assert!(out.response.is_none());
-        assert_eq!(state.modem_preset, mesh_radio::MODEM_SHORT_SLOW);
+        assert_eq!(state.modem_preset, mesh_radio::MODEM_DEFAULT_PRESET);
     }
 
     #[test]
@@ -668,7 +684,7 @@ mod tests {
         set.has_session_passkey = true;
         set.session_passkey = [0xFF; 8];
         let bytes = encode_admin_message(&set);
-        let out = handle_admin(&mut state, &remote, &identity(), 1, &DEFAULT_PSK, DEVICE_ROLE_ROUTER, &bytes, 5_000);
+        let out = handle_admin(&mut state, &remote, &identity(), 1, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &bytes, 5_000);
         assert_eq!(out.routing_error, Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY));
         assert!(!out.config_dirty);
     }
@@ -695,6 +711,7 @@ mod tests {
             &identity(),
             1,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &encode_admin_message(&set),
             1_000,
@@ -723,6 +740,7 @@ mod tests {
             &identity(),
             0x11,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &encode_admin_message(&get),
             1_000,
@@ -734,6 +752,8 @@ mod tests {
                 assert!(ch.has_settings);
                 assert_eq!(ch.settings.psk_len, 1);
                 assert_eq!(ch.settings.psk[0], 0x01);
+                assert!(ch.settings.has_id);
+                assert_eq!(ch.settings.id, 0x77);
             }
             other => panic!("{:?}", other),
         }
@@ -746,6 +766,7 @@ mod tests {
             &identity(),
             0x11,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &encode_admin_message(&get2),
             1_100,
@@ -773,6 +794,7 @@ mod tests {
             &identity(),
             0x11,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &encode_admin_message(&get),
             2_000,
@@ -792,6 +814,7 @@ mod tests {
             &identity(),
             0x11,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &encode_admin_message(&modreq),
             2_100,
@@ -817,6 +840,7 @@ mod tests {
             &identity(),
             0x11,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &encode_admin_message(&sget),
             3_000,
@@ -849,6 +873,7 @@ mod tests {
             &identity(),
             0x11,
             &DEFAULT_PSK,
+            0x77,
             DEVICE_ROLE_ROUTER,
             &encode_admin_message(&set),
             3_100,

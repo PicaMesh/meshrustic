@@ -1,7 +1,7 @@
 //! Topology graph and per-radio relay commit state (Phase 6 SR).
 
 use mesh_protocol::{is_direct_packet, NODENUM_BROADCAST};
-use mesh_radio::{RadioId, MODEM_SHORT_SLOW};
+use mesh_radio::{RadioId, MODEM_DEFAULT_PRESET};
 
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
@@ -128,7 +128,7 @@ impl NeighborGraph {
         Self {
             my_node: 0,
             device_role: DEVICE_ROLE_CLIENT,
-            modem_preset: MODEM_SHORT_SLOW,
+            modem_preset: MODEM_DEFAULT_PRESET,
             edges: EdgeStore::new(),
             downstream: DownstreamTable::new(),
             relay_states: [RelayCommit {

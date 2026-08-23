@@ -41,7 +41,7 @@ impl Default for WireLoRaConfig {
     fn default() -> Self {
         Self {
             use_preset: true,
-            modem_preset: mesh_radio::MODEM_SHORT_SLOW as u32,
+            modem_preset: mesh_radio::MODEM_DEFAULT_PRESET as u32,
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
@@ -241,8 +241,7 @@ pub fn encode_lora_config(lora: &WireLoRaConfig) -> heapless::Vec<u8, 64> {
     let mut out = heapless::Vec::new();
     if lora.use_preset {
         push_varint_field(&mut out, 1, 1);
-    }
-    if lora.modem_preset != 0 {
+        // Always emit preset id when use_preset (LONG_FAST = 0 must not be omitted).
         push_varint_field(&mut out, 2, lora.modem_preset);
     }
     if lora.region != 0 {
@@ -1045,6 +1044,23 @@ mod tests {
         // region=3 → field 7 varint 3: 38 03
         // hop_limit/tx_power omitted when zero
         assert_eq!(bytes.as_slice(), &[0x08, 0x01, 0x10, 0x05, 0x38, 0x03]);
+    }
+
+    #[test]
+    fn lora_long_fast_encodes_zero_preset() {
+        use mesh_radio::MODEM_LONG_FAST;
+        let lora = WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_LONG_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+        };
+        let bytes = encode_lora_config(&lora);
+        assert_eq!(bytes.as_slice(), &[0x08, 0x01, 0x10, 0x00, 0x38, 0x03, 0x40, 0x03, 0x58, 0x36]);
+        let decoded = decode_lora_config(&bytes).unwrap();
+        assert_eq!(decoded.modem_preset, MODEM_LONG_FAST as u32);
+        assert!(decoded.use_preset);
     }
 
     #[test]

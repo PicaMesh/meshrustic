@@ -51,7 +51,7 @@ impl Sx1262Driver {
         Self {
             id,
             profile,
-            config: RadioConfig::eu868_short_slow(),
+            config: RadioConfig::eu868_default(),
             chip,
         }
     }

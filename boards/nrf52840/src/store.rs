@@ -4,10 +4,15 @@ use embassy_nrf::nvmc::Nvmc;
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use mesh_store::{decode, encode, ConfigStore, NodeConfig, StoreError, STORE_RECORD_LEN};
 
-/// Absolute flash address of the config page (nRF52840 last 4 KiB page).
+/// Absolute flash address of the config page (one 4 KiB NVMC page).
 ///
-/// SoftDevice / UF2 layouts that truncate flash must relocate this constant so the
-/// page sits in unused flash after the application image and outside SoftDevice FDS.
+/// **nice!nano / Adafruit UF2** (`nicenano` feature): `0xF3000` — last free page before
+/// the bootloader at `0xF4000`. Do not use `0xFF000`; that page is BOOTLOADER_SETTINGS.
+///
+/// **Bare 1020K app** (no UF2 tail bootloader): last flash page at `0xFF000`.
+#[cfg(feature = "nicenano")]
+pub const CONFIG_FLASH_ADDR: u32 = 0x000F_3000;
+#[cfg(not(feature = "nicenano"))]
 pub const CONFIG_FLASH_ADDR: u32 = 0x000F_F000;
 pub const CONFIG_FLASH_PAGE_SIZE: u32 = 4096;
 

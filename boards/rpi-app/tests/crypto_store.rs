@@ -62,7 +62,7 @@ fn store_flash_round_trip() {
     let decoded = decode(&buf).unwrap();
     assert_eq!(decoded.node_num, config.node_num);
     assert_eq!(decoded.lora.region.code, mesh_radio::REGION_EU_868);
-    assert_eq!(decoded.lora.modem_preset, mesh_radio::MODEM_SHORT_SLOW);
+    assert_eq!(decoded.lora.modem_preset, mesh_radio::MODEM_DEFAULT_PRESET);
 }
 
 #[test]

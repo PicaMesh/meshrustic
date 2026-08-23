@@ -2,9 +2,9 @@
 
 use mesh_crypto::{channel_hash, DEFAULT_PSK};
 use mesh_radio::{
-    modem_preset_channel_name, primary_channel_hash, MODEM_LONG_FAST, MODEM_LONG_MODERATE,
-    MODEM_LONG_SLOW, MODEM_LONG_TURBO, MODEM_MEDIUM_FAST, MODEM_MEDIUM_SLOW, MODEM_SHORT_FAST,
-    MODEM_SHORT_SLOW, MODEM_SHORT_TURBO,
+    modem_preset_channel_name, primary_channel_hash, MODEM_DEFAULT_PRESET, MODEM_LONG_FAST,
+    MODEM_LONG_MODERATE, MODEM_LONG_SLOW, MODEM_LONG_TURBO, MODEM_MEDIUM_FAST, MODEM_MEDIUM_SLOW,
+    MODEM_SHORT_FAST, MODEM_SHORT_SLOW, MODEM_SHORT_TURBO,
 };
 
 #[test]
@@ -54,6 +54,6 @@ fn router_default_matches_short_slow_preset() {
     let router = ROUTER.init(Router::new(0x1234_5678));
     assert_eq!(
         router.channel_hash(),
-        primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK)
+        primary_channel_hash("", MODEM_DEFAULT_PRESET, true, &DEFAULT_PSK)
     );
 }

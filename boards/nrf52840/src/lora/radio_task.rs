@@ -101,11 +101,7 @@ pub async fn radio_task(
             enqueue_tx(admin, slot, router, node_num, b"admin");
         }
 
-        if router.admin_config_dirty() {
-            persist_config(store, router);
-        }
         if router.take_pending_radio_reinit() {
-            persist_config(store, router);
             radio_reinit_pending = true;
         }
         // Explicit AdminMessage.reboot_seconds only (not LoRa preset apply).
@@ -187,6 +183,10 @@ pub async fn radio_task(
         if radio_reinit_pending && slot.tx_queue_len() == 0 {
             apply_modem_preset_soft(slot, router.modem_preset());
             radio_reinit_pending = false;
+        }
+
+        if router.admin_config_dirty() {
+            persist_config(store, router);
         }
 
         if Instant::now().duration_since(last_second) >= Duration::from_secs(1) {
@@ -376,6 +376,7 @@ fn enqueue_tx(
 fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) {
     let mut cfg = store.load();
     router.write_admin_into_config(&mut cfg);
+    let preset = cfg.lora.modem_preset;
     match store.save(&cfg) {
         Ok(()) => {
             router.clear_admin_config_dirty();
@@ -384,7 +385,11 @@ fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) {
                 .iter()
                 .filter(|k| *k != &EMPTY_ADMIN_KEY)
                 .count() as u32;
-            defmt::info!("[store] NodeConfig saved admin_keys={}", admin_keys);
+            defmt::info!(
+                "[store] NodeConfig saved preset={} admin_keys={}",
+                preset,
+                admin_keys
+            );
             crate::usb_log::log::mesh::config_saved(admin_keys);
         }
         Err(_) => {

@@ -2,7 +2,7 @@
 
 use mesh_crypto::CryptoEngine;
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
-use mesh_radio::{MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
+use mesh_radio::{MODEM_DEFAULT_PRESET, MODEM_SHORT_FAST};
 use mesh_routing::{
     encode_admin_message, encode_data_payload_opts, AdminPayload, ConfigPayload, DataEncodeOpts,
     InboundPacket, NodeInfoIdentity, Router, WireLoRaConfig, ADMIN_APP, CONFIG_TYPE_LORA,
@@ -140,7 +140,7 @@ fn admin_get_lora_and_begin_commit() {
     );
     inbound(router, &frame, 2_000);
     assert!(router.poll_admin_tx(2_000).is_some());
-    assert_eq!(router.admin_state().modem_preset, MODEM_SHORT_SLOW);
+    assert_eq!(router.admin_state().modem_preset, MODEM_DEFAULT_PRESET);
     let passkey = router.admin_state().session_passkey;
 
     // ADMIN_APP is exempt from the OTHER 4/90s inbound limit (Phase I); spacing is
@@ -182,7 +182,7 @@ fn admin_get_lora_and_begin_commit() {
     );
     inbound(router, &frame, 2_000 + 2 * GAP);
     let _ = router.poll_admin_tx(2_000 + 2 * GAP);
-    assert_eq!(router.modem_preset(), MODEM_SHORT_SLOW);
+    assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
 
     let mut commit = mesh_routing::AdminMessage::default();
     commit.payload = AdminPayload::CommitEditSettings;
@@ -203,5 +203,6 @@ fn admin_get_lora_and_begin_commit() {
         router.take_pending_radio_reinit(),
         "commit LoRa preset must soft-reinit radio, not reboot"
     );
+    assert!(router.admin_config_dirty(), "commit must mark config dirty for flash save");
     assert!(router.take_pending_reboot_seconds().is_none());
 }

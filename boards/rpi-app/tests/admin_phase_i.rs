@@ -174,6 +174,8 @@ fn get_channel_primary_psk_and_disabled() {
             assert_eq!(ch.role, CHANNEL_ROLE_PRIMARY);
             assert_eq!(ch.settings.psk_len, 1);
             assert_eq!(ch.settings.psk[0], 0x01);
+            assert!(ch.settings.has_id);
+            assert_eq!(ch.settings.id, router.channel_hash() as u32);
         }
         other => panic!("{:?}", other),
     }
@@ -539,7 +541,7 @@ fn pki_want_ack_ack_is_pki_and_admin_sets_request_id() {
     assert!(hdr.want_ack, "admin reply copies request WantAck");
     let (meta, msg) = decrypt_pki_admin(&admin_tx, &b1_priv, &node_pub);
     assert_eq!(meta.request_id, req_id, "admin reply Data.request_id must echo request");
-    assert_eq!(meta.reply_id, req_id);
+    assert_eq!(meta.reply_id, 0, "admin reply must not set Data.reply_id (setReplyTo)");
     // Reply must be PKI (Ch=0) so pure-PKI clients accept it as the WantAck stop.
     assert_eq!(hdr.channel, 0);
     match msg.payload {
@@ -549,4 +551,61 @@ fn pki_want_ack_ack_is_pki_and_admin_sets_request_id() {
         }
         other => panic!("{:?}", other),
     }
+}
+
+#[test]
+fn pki_want_ack_dupe_resends_idempotent_admin_get() {
+    static ROUTER: StaticCell<Router> = StaticCell::new();
+    let our = 0xE006_0003u32;
+    let peer = 0xF006_0004u32;
+    let (node_priv, node_pub) = generate_keypair(Some(&[0x61; 16]), 61);
+    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x62; 16]), 62);
+    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x63; 16]), 63);
+    let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
+
+    let req_id = 0x8f8b_7002u32;
+    let mut get = AdminMessage::default();
+    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let frame = build_pki_admin_frame_opts(
+        our,
+        peer,
+        req_id,
+        &b1_priv,
+        &node_pub,
+        &encode_admin_message(&get),
+        true,
+    );
+    inbound(router, &frame, 7_000);
+    let first = router.poll_admin_tx(7_000).expect("first admin reply");
+    assert!(
+        router.poll_ack_tx(7_000).is_none(),
+        "admin reply suppresses separate WantAck ACK"
+    );
+
+    inbound(router, &frame, 7_050);
+    assert!(
+        router.poll_ack_tx(7_050).is_none(),
+        "idempotent admin GET dupe re-sends admin body, not routing ACK"
+    );
+    let second = router
+        .poll_admin_tx(7_050)
+        .expect("WantAck dupe must re-send idempotent admin GET reply");
+    let (meta, msg) = decrypt_pki_admin(&second, &b1_priv, &node_pub);
+    assert_eq!(meta.request_id, req_id);
+    assert_eq!(meta.reply_id, 0);
+    match msg.payload {
+        AdminPayload::GetConfigResponse(ConfigPayload::Lora(_)) => {}
+        other => panic!("{:?}", other),
+    }
+    assert_ne!(
+        PacketHeader::decode(&first.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse()
+            .id,
+        PacketHeader::decode(&second.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse()
+            .id,
+        "dupe admin resend allocates a fresh packet id"
+    );
 }

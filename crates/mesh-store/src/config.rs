@@ -1,6 +1,7 @@
 use mesh_crypto::CryptoKey;
 use mesh_radio::{
-    modem_preset_params, RegionInfo, EU_868, EU_868_DEFAULT_FREQ_MHZ, MODEM_SHORT_SLOW, SYNC_WORD,
+    modem_preset_params, RegionInfo, EU_868, EU_868_DEFAULT_FREQ_MHZ, MODEM_DEFAULT_PRESET,
+    MODEM_SHORT_SLOW, SYNC_WORD,
 };
 
 /// 16-byte default public-channel PSK (factory primary channel).
@@ -27,6 +28,24 @@ pub struct LoRaConfig {
 }
 
 impl LoRaConfig {
+    /// Factory / first-boot default: EU_868 [`MODEM_DEFAULT_PRESET`].
+    pub fn eu868_default() -> Self {
+        let mut cfg = Self {
+            region: EU_868,
+            modem_preset: MODEM_DEFAULT_PRESET,
+            frequency_mhz: EU_868_DEFAULT_FREQ_MHZ,
+            bandwidth_khz: 250.0,
+            spreading_factor: 11,
+            coding_rate: 5,
+            sync_word: SYNC_WORD,
+            hop_limit: 3,
+            tx_power_dbm: 27,
+            use_preset: true,
+        };
+        cfg.apply_modem_preset(MODEM_DEFAULT_PRESET);
+        cfg
+    }
+
     pub const fn eu868_short_slow() -> Self {
         Self {
             region: EU_868,
@@ -75,7 +94,7 @@ impl NodeConfig {
             private_key,
             public_key,
             channel_key: default_channel_key(),
-            lora: LoRaConfig::eu868_short_slow(),
+            lora: LoRaConfig::eu868_default(),
             admin_public_keys: [[0u8; 32]; ADMIN_KEY_SLOTS],
         }
     }
@@ -100,12 +119,16 @@ pub fn default_channel_key() -> CryptoKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_radio::{modem_preset_params, MODEM_SHORT_SLOW, REGION_EU_868};
+    use mesh_radio::{modem_preset_params, MODEM_DEFAULT_PRESET, MODEM_SHORT_SLOW, REGION_EU_868};
 
     #[test]
-    fn primary_channel_hash_matches_short_slow() {
+    fn primary_channel_hash_matches_default_preset() {
         let config = NodeConfig::first_boot(1, [0; 32], [0; 32]);
-        assert_eq!(config.primary_channel_hash(), 0x77);
+        assert_eq!(config.lora.modem_preset, MODEM_DEFAULT_PRESET);
+        assert_eq!(
+            config.primary_channel_hash(),
+            mesh_radio::primary_channel_hash("", MODEM_DEFAULT_PRESET, true, &DEFAULT_PSK)
+        );
     }
 
     #[test]

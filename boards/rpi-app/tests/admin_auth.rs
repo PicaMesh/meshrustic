@@ -2,7 +2,7 @@
 
 use mesh_crypto::{CryptoEngine, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
-use mesh_radio::{primary_channel_hash, MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
+use mesh_radio::{primary_channel_hash, MODEM_DEFAULT_PRESET, MODEM_SHORT_FAST};
 use mesh_routing::{
     build_app_wire_frame, decode_admin_message, decode_data_payload_full, decode_routing_payload,
     encode_admin_message, encode_data_payload_opts, try_decrypt_data_full, AdminPayload,
@@ -22,7 +22,7 @@ fn channel_key() -> CryptoKey {
 }
 
 fn channel_hash() -> u8 {
-    primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK)
+    primary_channel_hash("", MODEM_DEFAULT_PRESET, true, &DEFAULT_PSK)
 }
 
 fn channel_admin_frame(to: u32, from: u32, id: u32, inner: &[u8]) -> Vec<u8> {
@@ -173,7 +173,7 @@ fn unauthorized_cannot_change_config() {
         &encode_admin_message(&set),
     );
     pki_inbound(router, &frame, 100);
-    assert_eq!(router.modem_preset(), MODEM_SHORT_SLOW);
+    assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
     let tx = router.poll_admin_tx(100).unwrap();
     assert_eq!(
         decrypt_pki_routing_nak(&tx, &peer_priv, &node_pub),
@@ -287,6 +287,7 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
         &NodeInfoIdentity::for_node(our, node_pub),
         our,
         &DEFAULT_PSK,
+        channel_hash(),
         mesh_routing::DEVICE_ROLE_ROUTER,
         &encode_admin_message(&msg),
         3_250,
@@ -333,7 +334,7 @@ fn stale_pki_then_channel_admin_cannot_mutate() {
     set.session_passkey = passkey;
     let frame = channel_admin_frame(our, peer, 0x61, &encode_admin_message(&set));
     pki_inbound(router, &frame, 6_100);
-    assert_eq!(router.modem_preset(), MODEM_SHORT_SLOW);
+    assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
     let tx = router.poll_admin_tx(6_100).unwrap();
     // Channel-only path has no remote PKI peer → channel-encrypted NAK fallback.
     let mut cipher = tx.bytes[PACKET_HEADER_LEN..tx.len as usize].to_vec();
@@ -424,7 +425,7 @@ fn bad_session_key_rejects_set() {
         &encode_admin_message(&set),
     );
     pki_inbound(router, &frame, 5_100);
-    assert_eq!(router.modem_preset(), MODEM_SHORT_SLOW);
+    assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
     let tx = router.poll_admin_tx(5_100).unwrap();
     assert_eq!(
         decrypt_pki_routing_nak(&tx, &b1_priv, &node_pub),

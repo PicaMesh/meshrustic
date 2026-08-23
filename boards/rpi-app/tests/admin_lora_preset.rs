@@ -3,7 +3,8 @@
 use mesh_crypto::{CryptoEngine, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_radio::{
-    eu868_config_for_preset, primary_channel_hash, MODEM_SHORT_FAST, MODEM_SHORT_SLOW,
+    eu868_config_for_preset, primary_channel_hash, MODEM_DEFAULT_PRESET, MODEM_LONG_FAST,
+    MODEM_SHORT_FAST, MODEM_SHORT_SLOW,
 };
 use mesh_routing::{
     decode_data_payload_full, decode_routing_payload, encode_admin_message, encode_data_payload_opts,
@@ -102,7 +103,7 @@ fn set_lora_persists_and_reloads_channel_hash() {
 
     assert_eq!(
         router.channel_hash(),
-        primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK)
+        primary_channel_hash("", MODEM_DEFAULT_PRESET, true, &DEFAULT_PSK)
     );
 
     let mut get = mesh_routing::AdminMessage::default();
@@ -190,6 +191,79 @@ fn set_lora_persists_and_reloads_channel_hash() {
 }
 
 #[test]
+fn set_long_fast_persists_to_store() {
+    static ROUTER: StaticCell<Router> = StaticCell::new();
+    let our = 0xC003_0001u32;
+    let peer = 0xD003_0002u32;
+    let (node_priv, node_pub) = generate_keypair(Some(&[0x21; 16]), 21);
+    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x22; 16]), 22);
+    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x23; 16]), 23);
+    let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
+    let mut store = RamConfigStore::new(defaults);
+    let cfg = store.load();
+
+    let router = ROUTER.init(Router::new(our));
+    router.load_node_config(&cfg);
+    router.set_node_identity(NodeInfoIdentity::for_node(our, node_pub));
+    router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
+
+    let mut get = mesh_routing::AdminMessage::default();
+    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let frame = build_pki_admin_frame(
+        our,
+        peer,
+        1,
+        &b1_priv,
+        &node_pub,
+        &encode_admin_message(&get),
+    );
+    inbound(router, &frame, 1_000);
+    let _ = router.poll_admin_tx(1_000);
+    let passkey = router.admin_state().session_passkey;
+
+    let mut set = mesh_routing::AdminMessage::default();
+    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+        use_preset: true,
+        modem_preset: MODEM_LONG_FAST as u32,
+        region: REGION_EU_868,
+        hop_limit: 3,
+        tx_power: 27,
+    }));
+    set.has_session_passkey = true;
+    set.session_passkey = passkey;
+    let frame = build_pki_admin_frame(
+        our,
+        peer,
+        2,
+        &b1_priv,
+        &node_pub,
+        &encode_admin_message(&set),
+    );
+    inbound(router, &frame, 2_000);
+    let _ = router.poll_admin_tx(2_000);
+    assert_eq!(router.modem_preset(), MODEM_LONG_FAST);
+    assert!(router.admin_config_dirty());
+
+    let mut saved = store.load();
+    router.write_admin_into_config(&mut saved);
+    store.save(&saved).unwrap();
+    router.clear_admin_config_dirty();
+
+    let reloaded = store.load();
+    assert_eq!(reloaded.lora.modem_preset, MODEM_LONG_FAST);
+    assert_eq!(reloaded.lora.spreading_factor, 11);
+
+    static ROUTER2: StaticCell<Router> = StaticCell::new();
+    let router2 = ROUTER2.init(Router::new(our));
+    router2.load_node_config(&reloaded);
+    assert_eq!(router2.modem_preset(), MODEM_LONG_FAST);
+    let expected_hash = primary_channel_hash("", MODEM_LONG_FAST, true, &DEFAULT_PSK);
+    assert_eq!(router2.channel_hash(), expected_hash);
+    let boot_radio = eu868_config_for_preset(reloaded.lora.modem_preset);
+    assert_eq!(boot_radio.spreading_factor, 11);
+}
+
+#[test]
 fn get_lora_reports_current_preset_after_set() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC002_0001u32;
@@ -215,7 +289,7 @@ fn get_lora_reports_current_preset_after_set() {
     );
     inbound(router, &frame, 1_000);
     let _ = router.poll_admin_tx(1_000);
-    assert_eq!(router.admin_state().modem_preset, MODEM_SHORT_SLOW);
+    assert_eq!(router.admin_state().modem_preset, MODEM_DEFAULT_PRESET);
     let passkey = router.admin_state().session_passkey;
 
     let mut set = mesh_routing::AdminMessage::default();
