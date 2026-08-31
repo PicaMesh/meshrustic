@@ -21,6 +21,7 @@ pub mod routing_ack;
 pub mod router;
 pub mod rx_decode;
 pub mod sr_log;
+pub mod sr_role;
 pub mod telemetry;
 pub mod topology;
 pub mod traceroute;
@@ -49,6 +50,7 @@ pub use coordinated_relay::{
     cw_size_from_snr, half_airtime_ms, slot_time_for_preset, transmission_record_window_ms,
     tx_delay_ms_router, tx_delay_ms_worst, DEFAULT_SLOT_MS,
 };
+pub use sr_role::{role_is_active_routing, role_is_mute, role_is_passive};
 pub use graph::{
     calculate_etx, calculate_route, etx_to_fixed, etx_to_signal, fixed_to_etx,
     find_better_positioned_neighbor, DownstreamTable,
@@ -81,7 +83,8 @@ pub use sr_log::{SrLog, SrLogEvent, SrSkipReason, TopologyLogSink, T1CancelReaso
 pub use nodeinfo::{
     build_nodeinfo_reply_frame, build_nodeinfo_wire_frame, decode_user, encode_user,
     NodeInfoAdvert, NodeInfoCache, NodeInfoIdentity, NodeInfoPeerEntry, DEVICE_ROLE_CLIENT,
-    DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, HW_MODEL_NRF52_PROMICRO_DIY,
+    DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
+    DEVICE_ROLE_TRACKER, HW_MODEL_NRF52_PROMICRO_DIY,
     HW_MODEL_PRIVATE, MAX_NODEINFO_PEERS,
     NODEINFO_APP, NODEINFO_BROADCAST_MS, NODEINFO_REPLY_COOLDOWN_MS,
 };

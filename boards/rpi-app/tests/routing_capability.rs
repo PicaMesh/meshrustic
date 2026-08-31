@@ -5,7 +5,8 @@ use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER
 use mesh_routing::{
     coordinated_relay, write_packed_header, CapabilityStatus,
     InboundPacket, NeighborGraph, Router, TopologyMergeResult, CAPABILITY_TTL_MS,
-    DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, MAX_CAPABILITY_RECORDS,
+    DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER,
+    DEVICE_ROLE_TRACKER, MAX_CAPABILITY_RECORDS,
 };
 
 #[test]
@@ -199,5 +200,62 @@ fn local_node_capability_from_role() {
     assert_eq!(
         graph.capability_status(0xAA),
         CapabilityStatus::Passive
+    );
+}
+
+#[test]
+fn tracker_is_mute_no_rebroadcast() {
+    let mut graph = NeighborGraph::new();
+    graph.set_device_role(DEVICE_ROLE_TRACKER);
+    assert!(!graph.is_rebroadcaster());
+    assert!(graph.can_send_topology());
+}
+
+#[test]
+fn client_hidden_is_mute_no_rebroadcast() {
+    let mut graph = NeighborGraph::new();
+    graph.set_device_role(DEVICE_ROLE_CLIENT_HIDDEN);
+    assert!(!graph.is_rebroadcaster());
+    assert!(graph.can_send_topology());
+}
+
+#[test]
+fn tracker_role_skips_evaluate_tx_plan_relay() {
+    let mut router = Router::with_channel(
+        0xAA,
+        CryptoKey::from_bytes(&DEFAULT_PSK),
+        0x77,
+        mesh_radio::MODEM_SHORT_SLOW,
+        true,
+        3,
+    );
+    router.set_device_role(DEVICE_ROLE_TRACKER);
+
+    let header =
+        PacketHeader::from_fields(NODENUM_BROADCAST, 0xBB, 46, 0x77, 3, 3, false, false, 0, 0);
+    let mut hdr = [0u8; PACKET_HEADER_LEN];
+    header.encode_to(&mut hdr);
+    let wire = [hdr.as_slice(), &[0x01u8]].concat();
+    let result = router
+        .process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -70,
+                snr: 8,
+                bytes: &wire,
+            },
+            0,
+        )
+        .unwrap();
+    assert!(
+        router
+            .evaluate_tx_plan(
+                &result,
+                0.0,
+                coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
+                0,
+            )
+            .relay
+            .is_none()
     );
 }

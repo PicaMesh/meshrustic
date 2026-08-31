@@ -1,10 +1,12 @@
 //! Peer SR capability cache (Legacy / Passive / SR-active / Unknown).
 
 use crate::nodeinfo::{
-    DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE,
-    DEVICE_ROLE_LOST_AND_FOUND, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
-    DEVICE_ROLE_ROUTER_CLIENT, DEVICE_ROLE_ROUTER_LATE,
+    DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_BASE, DEVICE_ROLE_CLIENT_HIDDEN,
+    DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_LOST_AND_FOUND, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
+    DEVICE_ROLE_ROUTER_CLIENT, DEVICE_ROLE_ROUTER_LATE, DEVICE_ROLE_SENSOR, DEVICE_ROLE_TAK,
+    DEVICE_ROLE_TAK_TRACKER, DEVICE_ROLE_TRACKER,
 };
+use crate::sr_role::role_is_mute;
 
 pub const MAX_CAPABILITY_RECORDS: usize = 64;
 /// Three topology broadcast intervals plus margin (1810 s).
@@ -224,11 +226,10 @@ impl CapabilityCache {
 }
 
 pub fn capability_from_role(role: u32) -> CapabilityStatus {
-    match role {
-        DEVICE_ROLE_CLIENT_MUTE | DEVICE_ROLE_CLIENT_HIDDEN | DEVICE_ROLE_LOST_AND_FOUND => {
-            CapabilityStatus::Legacy
-        }
-        _ => CapabilityStatus::Unknown,
+    if role_is_mute(role) {
+        CapabilityStatus::Legacy
+    } else {
+        CapabilityStatus::Unknown
     }
 }
 
@@ -241,12 +242,13 @@ pub fn role_may_send_topology(role: u32) -> bool {
             | DEVICE_ROLE_ROUTER_CLIENT
             | DEVICE_ROLE_REPEATER
             | DEVICE_ROLE_ROUTER_LATE
-            | 6 // TRACKER
-            | 7 // SENSOR
-            | 8 // TAK
+            | DEVICE_ROLE_TRACKER
+            | DEVICE_ROLE_SENSOR
+            | DEVICE_ROLE_TAK
             | DEVICE_ROLE_CLIENT_HIDDEN
             | DEVICE_ROLE_LOST_AND_FOUND
-            | 12 // TAK_TRACKER
+            | DEVICE_ROLE_TAK_TRACKER
+            | DEVICE_ROLE_CLIENT_BASE
     )
 }
 
@@ -255,9 +257,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mute_role_is_legacy() {
+    fn mute_roles_are_legacy() {
         assert_eq!(
             capability_from_role(DEVICE_ROLE_CLIENT_MUTE),
+            CapabilityStatus::Legacy
+        );
+        assert_eq!(
+            capability_from_role(DEVICE_ROLE_TRACKER),
+            CapabilityStatus::Legacy
+        );
+        assert_eq!(
+            capability_from_role(DEVICE_ROLE_CLIENT_HIDDEN),
             CapabilityStatus::Legacy
         );
     }

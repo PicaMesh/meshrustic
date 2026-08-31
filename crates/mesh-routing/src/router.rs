@@ -1420,6 +1420,15 @@ impl Router {
             return plan;
         }
 
+        if !self.graph.is_rebroadcaster() {
+            self.pool.release(handle);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::WireGate,
+            });
+            return plan;
+        }
+
         if !self
             .qos
             .can_relay(result.decoded_portnum, parsed.channel, chutil_pct)

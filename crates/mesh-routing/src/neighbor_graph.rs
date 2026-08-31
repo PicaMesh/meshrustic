@@ -5,6 +5,7 @@ use mesh_radio::{RadioId, MODEM_DEFAULT_PRESET};
 
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
+use crate::sr_role::role_is_active_routing;
 use crate::graph::{
     calculate_etx, calculate_route,
     find_better_positioned_neighbor,
@@ -281,7 +282,7 @@ impl NeighborGraph {
 
     pub fn set_device_role(&mut self, role: u32) {
         self.device_role = role;
-        self.signal_routing_active = Self::role_is_active_routing(role);
+        self.signal_routing_active = role_is_active_routing(role);
     }
 
     pub fn device_role(&self) -> u32 {
@@ -301,7 +302,7 @@ impl NeighborGraph {
     }
 
     pub fn is_active_routing_role(&self) -> bool {
-        Self::role_is_active_routing(self.device_role)
+        role_is_active_routing(self.device_role)
     }
 
     pub fn can_send_topology(&self) -> bool {
@@ -345,10 +346,6 @@ impl NeighborGraph {
         } else {
             CapabilityStatus::Legacy
         }
-    }
-
-    fn role_is_active_routing(role: u32) -> bool {
-        matches!(role, DEVICE_ROLE_CLIENT | DEVICE_ROLE_ROUTER | 4 | 11 | 12)
     }
 
     pub fn record_our_transmission(&mut self, packet_id: u32, now_ms: u32) {
@@ -1910,7 +1907,7 @@ impl NeighborGraph {
     }
 
     pub fn is_rebroadcaster(&self) -> bool {
-        self.device_role != DEVICE_ROLE_CLIENT_MUTE
+        !crate::sr_role::role_is_mute(self.device_role)
     }
 
     pub fn confirm_direct_neighbor_hears_us(&mut self, neighbor: u32) {

@@ -15,9 +15,15 @@ pub const DEVICE_ROLE_CLIENT_MUTE: u32 = 1;
 pub const DEVICE_ROLE_ROUTER: u32 = 2;
 pub const DEVICE_ROLE_ROUTER_CLIENT: u32 = 3;
 pub const DEVICE_ROLE_REPEATER: u32 = 4;
-pub const DEVICE_ROLE_ROUTER_LATE: u32 = 5;
-pub const DEVICE_ROLE_CLIENT_HIDDEN: u32 = 9;
-pub const DEVICE_ROLE_LOST_AND_FOUND: u32 = 10;
+/// `Config.DeviceConfig.Role.TRACKER` — SR mute (no rebroadcast).
+pub const DEVICE_ROLE_TRACKER: u32 = 5;
+pub const DEVICE_ROLE_SENSOR: u32 = 6;
+pub const DEVICE_ROLE_TAK: u32 = 7;
+pub const DEVICE_ROLE_CLIENT_HIDDEN: u32 = 8;
+pub const DEVICE_ROLE_LOST_AND_FOUND: u32 = 9;
+pub const DEVICE_ROLE_TAK_TRACKER: u32 = 10;
+pub const DEVICE_ROLE_ROUTER_LATE: u32 = 11;
+pub const DEVICE_ROLE_CLIENT_BASE: u32 = 12;
 /// Pro Micro DIY + TCXO board (`NRF52_PROMICRO_DIY` in mesh.proto).
 pub const HW_MODEL_NRF52_PROMICRO_DIY: u32 = 63;
 /// Generic private / DIY hardware model id on the wire.
