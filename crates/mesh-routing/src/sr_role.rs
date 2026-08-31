@@ -3,8 +3,7 @@
 use crate::nodeinfo::{
     DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_BASE, DEVICE_ROLE_CLIENT_HIDDEN,
     DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_LOST_AND_FOUND, DEVICE_ROLE_REPEATER,
-    DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_CLIENT, DEVICE_ROLE_ROUTER_LATE, DEVICE_ROLE_SENSOR,
-    DEVICE_ROLE_TAK, DEVICE_ROLE_TAK_TRACKER, DEVICE_ROLE_TRACKER,
+    DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_CLIENT, DEVICE_ROLE_ROUTER_LATE, DEVICE_ROLE_TRACKER,
 };
 
 /// Mute: no packet rebroadcast; may still send topology to assist the mesh.
@@ -50,6 +49,7 @@ mod tests {
 
     #[test]
     fn sensor_is_passive_not_mute() {
+        use crate::nodeinfo::DEVICE_ROLE_SENSOR;
         assert!(role_is_passive(DEVICE_ROLE_SENSOR));
         assert!(!role_is_mute(DEVICE_ROLE_SENSOR));
     }

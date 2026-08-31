@@ -2,9 +2,7 @@
 
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{is_placeholder_node, DownstreamTable, EdgeStore, MAX_EDGES_PER_NODE};
-use crate::nodeinfo::{
-    DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_LOST_AND_FOUND,
-};
+use crate::sr_role::role_is_mute;
 
 /// ETX above this threshold is not treated as good pre-coverage from `heard_from`.
 pub const POOR_LINK_ETX_THRESHOLD: f32 = 7.0;
@@ -110,13 +108,10 @@ pub struct BroadcastRelayContext<'a> {
 }
 
 fn is_non_relaying_legacy(capability: &CapabilityCache, node_id: u32) -> bool {
-    let Some(role) = capability.role(node_id) else {
-        return false;
-    };
-    matches!(
-        role,
-        DEVICE_ROLE_CLIENT_MUTE | DEVICE_ROLE_CLIENT_HIDDEN | DEVICE_ROLE_LOST_AND_FOUND
-    )
+    capability
+        .role(node_id)
+        .map(role_is_mute)
+        .unwrap_or(false)
 }
 
 fn get_coverage_if_relays(
@@ -519,7 +514,7 @@ mod tests {
     use super::*;
     use crate::capability::CapabilityCache;
     use crate::graph::{DownstreamTable, EdgeSource, EdgeStore};
-    use crate::nodeinfo::DEVICE_ROLE_REPEATER;
+    use crate::nodeinfo::{DEVICE_ROLE_REPEATER, DEVICE_ROLE_TRACKER};
 
     const ME: u32 = 0xCC00_00CC;
     const BB: u32 = 0xBB00_00BB;
@@ -552,6 +547,13 @@ mod tests {
             capability,
             downstream,
         }
+    }
+
+    #[test]
+    fn mute_roles_count_as_non_relaying_legacy() {
+        let mut capability = CapabilityCache::new();
+        capability.track_role(BB, DEVICE_ROLE_TRACKER, 0);
+        assert!(is_non_relaying_legacy(&capability, BB));
     }
 
     #[test]

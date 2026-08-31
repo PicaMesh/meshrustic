@@ -14,8 +14,7 @@ use crate::graph::{
     EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
 use crate::nodeinfo::{
-    DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_ROUTER,
-    DEVICE_ROLE_ROUTER_LATE,
+    DEVICE_ROLE_CLIENT, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE,
 };
 use crate::topology::{
     write_packed_header, PackedHeader, PackedNeighbor, MAX_NEIGHBORS_PER_PACKET,
