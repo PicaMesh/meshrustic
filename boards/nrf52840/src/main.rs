@@ -84,7 +84,16 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(usb_log::usb_task(p.USBD)).unwrap();
     let saadc_config = saadc::Config::default();
-    let saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
+    let mut saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
+    // Internal 0.6 V reference with gain 1/6 -> 3.6 V full scale; keep it explicit so
+    // battery::AREF_VOLTAGE cannot drift away from the hardware setting.
+    saadc_channel.reference = saadc::Reference::INTERNAL;
+    saadc_channel.gain = saadc::Gain::GAIN1_6;
+    // The 1M + 1M VBAT divider is a ~500 kOhm source; the nRF52840 needs 40 us of
+    // acquisition above 400 kOhm. At the 10 us default the sample-and-hold cap never
+    // charges and the reading droops below MIN_BATTERY_MV, which makes the node fall
+    // back to the "USB powered" (101) telemetry level.
+    saadc_channel.time = saadc::Time::_40US;
     let saadc = saadc::Saadc::new(p.SAADC, Irqs, saadc_config, [saadc_channel]);
     spawner.spawn(battery::battery_task(saadc)).unwrap();
     spawner

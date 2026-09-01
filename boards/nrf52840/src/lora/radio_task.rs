@@ -214,16 +214,18 @@ pub async fn radio_task(
         }
 
         if Instant::now().duration_since(last_maintenance) >= Duration::from_secs(60) {
+            // Publish every cycle, including an invalid reading: keeping the previous
+            // snapshot would latch a stale "USB powered" 101 into every later broadcast
+            // once the pack reading goes away. An invalid reading drops the battery
+            // fields only — chutil/air util/uptime still go out.
             let batt = crate::battery::latest();
-            if batt.valid {
-                router.update_device_metrics(DeviceMetricsSnapshot {
-                    battery_level: batt.battery_level,
-                    voltage_v: batt.voltage_mv as f32 / 1000.0,
-                    channel_utilization: air.channel_utilization_percent() as f32,
-                    air_util_tx: air.utilization_tx_percent() as f32,
-                    uptime_seconds: boot_instant.elapsed().as_secs() as u32,
-                });
-            }
+            router.update_device_metrics(DeviceMetricsSnapshot {
+                battery_level: batt.valid.then_some(batt.battery_level),
+                voltage_v: batt.valid.then(|| batt.voltage_mv as f32 / 1000.0),
+                channel_utilization: air.channel_utilization_percent() as f32,
+                air_util_tx: air.utilization_tx_percent() as f32,
+                uptime_seconds: boot_instant.elapsed().as_secs() as u32,
+            });
             let report = router.run_maintenance(now_ms, slot_ms);
             if report.graph_log_due {
                 crate::usb_log::log::sr::emit_topology_dump(router);

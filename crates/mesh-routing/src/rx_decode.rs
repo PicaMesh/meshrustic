@@ -259,11 +259,14 @@ fn decode_traceroute(payload: &[u8]) -> Option<RxPayloadSummary> {
 fn decode_device_telemetry(payload: &[u8]) -> Option<RxPayloadSummary> {
     let nested = extract_device_metrics(payload)?;
     let dm = decode_device_metrics(nested)?;
-    let voltage_v = dm.voltage_v?;
-    let battery_level = dm.battery_level.unwrap_or(0);
+    // Battery fields are optional on the wire (a sender with no usable pack reading
+    // omits them), so summarize whatever arrived instead of dropping the packet.
+    if dm.voltage_v.is_none() && dm.battery_level.is_none() && dm.uptime_seconds.is_none() {
+        return None;
+    }
     Some(RxPayloadSummary::DeviceTelemetry {
-        battery_level,
-        voltage_mv: (voltage_v * 1000.0) as u32,
+        battery_level: dm.battery_level.unwrap_or(0),
+        voltage_mv: (dm.voltage_v.unwrap_or(0.0) * 1000.0) as u32,
     })
 }
 

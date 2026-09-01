@@ -15,8 +15,8 @@ fn telemetry_wire_decrypt_and_summary() {
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
     let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
     let metrics = DeviceMetricsSnapshot {
-        battery_level: 85,
-        voltage_v: 3.92,
+        battery_level: Some(85),
+        voltage_v: Some(3.92),
         channel_utilization: 6.0,
         air_util_tx: 2.0,
         uptime_seconds: 120,
@@ -66,8 +66,8 @@ fn router_schedules_periodic_device_telemetry() {
         3,
     ));
     router.update_device_metrics(DeviceMetricsSnapshot {
-        battery_level: MAGIC_USB_BATTERY_LEVEL,
-        voltage_v: 0.0,
+        battery_level: Some(MAGIC_USB_BATTERY_LEVEL),
+        voltage_v: Some(0.0),
         channel_utilization: 0.0,
         air_util_tx: 0.0,
         uptime_seconds: 0,
@@ -103,4 +103,52 @@ fn router_schedules_periodic_device_telemetry() {
     let decoded = decode_device_metrics(nested).unwrap();
     assert_eq!(decoded.battery_level, Some(MAGIC_USB_BATTERY_LEVEL));
     assert!((decoded.voltage_v.unwrap()).abs() < 0.001);
+}
+
+/// A node whose ADC gives no usable pack reading must still broadcast the rest of the
+/// device metrics; only the two battery fields drop off the wire.
+#[test]
+fn telemetry_without_battery_still_carries_utilization() {
+    static ROUTER: StaticCell<Router> = StaticCell::new();
+    let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+    let router = ROUTER.init(Router::with_modem_preset(
+        0x677a_1caf,
+        "",
+        MODEM_SHORT_SLOW,
+        true,
+        key,
+        3,
+    ));
+    router.update_device_metrics(DeviceMetricsSnapshot {
+        battery_level: None,
+        voltage_v: None,
+        channel_utilization: 7.5,
+        air_util_tx: 1.25,
+        uptime_seconds: 900,
+    });
+
+    router.run_maintenance(1_000, 100);
+    let tx = router
+        .poll_telemetry_tx(1_000)
+        .expect("telemetry queued without a battery reading");
+    let mut cipher = tx.bytes[mesh_protocol::PACKET_HEADER_LEN..tx.len as usize].to_vec();
+    let (portnum, payload) = try_decrypt_data(
+        &key,
+        0x677a_1caf,
+        PacketHeader::decode(&tx.bytes[..tx.len as usize])
+            .unwrap()
+            .id,
+        router.channel_hash(),
+        router.channel_hash(),
+        &mut cipher,
+    )
+    .unwrap();
+    assert_eq!(portnum, TELEMETRY_APP);
+    let nested = extract_device_metrics(&payload).unwrap();
+    let decoded = decode_device_metrics(nested).unwrap();
+    assert_eq!(decoded.battery_level, None);
+    assert_eq!(decoded.voltage_v, None);
+    assert!((decoded.channel_utilization.unwrap() - 7.5).abs() < 0.001);
+    assert!((decoded.air_util_tx.unwrap() - 1.25).abs() < 0.001);
+    assert_eq!(decoded.uptime_seconds, Some(900));
 }

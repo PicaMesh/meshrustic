@@ -20,8 +20,12 @@ pub const ADC_SATURATED_RAW: u32 = 3950;
 /// Fields advertised in `Telemetry.device_metrics` (port 67).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DeviceMetricsSnapshot {
-    pub battery_level: u32,
-    pub voltage_v: f32,
+    /// `None` while the pack reading is unknown. Both battery fields then stay off the
+    /// wire (they have explicit presence in `DeviceMetrics`), so clients render "no
+    /// battery info" rather than a fabricated 0% or a stale PWR. The rest of the
+    /// metrics still go out.
+    pub battery_level: Option<u32>,
+    pub voltage_v: Option<f32>,
     pub channel_utilization: f32,
     pub air_util_tx: f32,
     pub uptime_seconds: u32,
@@ -33,8 +37,12 @@ pub fn encode_device_telemetry(
     out: &mut heapless::Vec<u8, 128>,
 ) -> bool {
     let mut device_metrics = heapless::Vec::<u8, 64>::new();
-    push_varint_field(&mut device_metrics, 1, metrics.battery_level);
-    push_f32_field(&mut device_metrics, 2, metrics.voltage_v);
+    if let Some(level) = metrics.battery_level {
+        push_varint_field(&mut device_metrics, 1, level);
+    }
+    if let Some(voltage_v) = metrics.voltage_v {
+        push_f32_field(&mut device_metrics, 2, voltage_v);
+    }
     push_f32_field(&mut device_metrics, 3, metrics.channel_utilization);
     push_f32_field(&mut device_metrics, 4, metrics.air_util_tx);
     push_varint_field(&mut device_metrics, 5, metrics.uptime_seconds);
@@ -307,8 +315,8 @@ mod tests {
     #[test]
     fn encode_decode_device_metrics_round_trip() {
         let metrics = DeviceMetricsSnapshot {
-            battery_level: 72,
-            voltage_v: 3.85,
+            battery_level: Some(72),
+            voltage_v: Some(3.85),
             channel_utilization: 12.5,
             air_util_tx: 4.0,
             uptime_seconds: 3600,
@@ -329,8 +337,8 @@ mod tests {
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
         let metrics = DeviceMetricsSnapshot {
-            battery_level: 101,
-            voltage_v: 4.12,
+            battery_level: Some(MAGIC_USB_BATTERY_LEVEL),
+            voltage_v: Some(4.12),
             channel_utilization: 0.0,
             air_util_tx: 1.5,
             uptime_seconds: 42,

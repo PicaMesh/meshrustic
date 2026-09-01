@@ -38,7 +38,6 @@ use crate::rx_decode::{summarize_decrypted, RxDecodeInfo};
 use crate::sr_log::{SrLog, SrLogEvent, SrSkipReason, T1CancelReason, MAX_SR_LOG};
 use crate::telemetry::{
     build_device_telemetry_wire_frame, DeviceMetricsSnapshot, DEVICE_TELEMETRY_BROADCAST_MS,
-    MAGIC_USB_BATTERY_LEVEL,
 };
 use crate::topology::{
     build_app_wire_frame, build_topology_wire_frame, extract_packed_neighbors, try_decrypt_data_full,
@@ -1801,15 +1800,14 @@ impl Router {
                 self.schedule_nodeinfo_broadcast(now_ms);
             }
         }
-        if self.device_metrics.voltage_v > 0.0
-            || self.device_metrics.battery_level == MAGIC_USB_BATTERY_LEVEL
+        // Channel utilization, air util and uptime are always worth broadcasting, so this
+        // is deliberately not gated on having a battery reading: an unknown pack voltage
+        // only drops fields 1-2 from the encoded DeviceMetrics.
+        if self.last_telemetry_ms == 0
+            || now_ms.wrapping_sub(self.last_telemetry_ms) >= DEVICE_TELEMETRY_BROADCAST_MS
         {
-            if self.last_telemetry_ms == 0
-                || now_ms.wrapping_sub(self.last_telemetry_ms) >= DEVICE_TELEMETRY_BROADCAST_MS
-            {
-                if !self.pending_telemetry.active {
-                    self.schedule_telemetry_broadcast(now_ms);
-                }
+            if !self.pending_telemetry.active {
+                self.schedule_telemetry_broadcast(now_ms);
             }
         }
         report
