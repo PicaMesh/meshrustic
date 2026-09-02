@@ -19,11 +19,32 @@ pub struct RoutingDecode {
     pub error_reason: Option<u32>,
 }
 
-/// Delay before the next reliable retransmit (simplified contention-window model).
-pub fn retransmission_delay_ms(packet_airtime_ms: u32, slot_ms: u32) -> u32 {
+/// Contention-window bounds (Meshtastic `RadioInterface::CWmin` / `CWmax`).
+pub const RETX_CW_MIN: u8 = 3;
+pub const RETX_CW_MAX: u8 = 8;
+/// Peer-side time to receive, process and answer a packet (Meshtastic `PROCESSING_TIME_MSEC`).
+pub const RETX_PROCESSING_TIME_MS: u32 = 4_500;
+
+/// Contention-window size for a channel utilization, `map(util, 0, 100, CWmin, CWmax)`.
+fn contention_window_size(channel_util_pct: f32) -> u8 {
+    let pct = if channel_util_pct.is_finite() { channel_util_pct.clamp(0.0, 100.0) } else { 0.0 };
+    let span = (RETX_CW_MAX - RETX_CW_MIN) as f32;
+    RETX_CW_MIN + ((pct * span) / 100.0) as u8
+}
+
+/// Delay before the next reliable retransmit, mirroring Meshtastic `getRetransmissionMsec`:
+/// two packet airtimes (ours plus the peer's ACK), a contention window that grows with
+/// channel utilization (worst-case own CW, twice the max CW for the peer, and a mid-range CW
+/// for a relayer at half SNR), plus the peer's processing margin. Retransmitting earlier than
+/// this collides with the ACK we are waiting for.
+pub fn retransmission_delay_ms(packet_airtime_ms: u32, slot_ms: u32, channel_util_pct: f32) -> u32 {
+    let cw = contention_window_size(channel_util_pct);
+    let mid_cw = (RETX_CW_MAX + RETX_CW_MIN) / 2;
+    let slots = (1u32 << cw) + 2 * RETX_CW_MAX as u32 + (1u32 << mid_cw);
     packet_airtime_ms
         .saturating_mul(2)
-        .saturating_add(slot_ms.saturating_mul(4))
+        .saturating_add(slots.saturating_mul(slot_ms))
+        .saturating_add(RETX_PROCESSING_TIME_MS)
 }
 
 /// Hop limit for an ACK/NAK routed back toward the original sender.
@@ -161,6 +182,21 @@ mod tests {
         let encoded = encode_routing_error(ROUTING_ERROR_NONE);
         let decoded = decode_routing_payload(&encoded).unwrap();
         assert_eq!(decoded.error_reason, Some(ROUTING_ERROR_NONE));
+    }
+
+    #[test]
+    fn retransmission_delay_matches_meshtastic_formula() {
+        // 0 % utilization: CW=3 -> (8 + 16 + 32) slots.
+        assert_eq!(retransmission_delay_ms(730, 28, 0.0), 2 * 730 + 56 * 28 + RETX_PROCESSING_TIME_MS);
+        // 100 % utilization: CW=8 -> (256 + 16 + 32) slots.
+        assert_eq!(retransmission_delay_ms(730, 28, 100.0), 2 * 730 + 304 * 28 + RETX_PROCESSING_TIME_MS);
+        // Monotonic in utilization; out-of-range and NaN inputs clamp instead of panicking.
+        assert!(retransmission_delay_ms(100, 10, 50.0) > retransmission_delay_ms(100, 10, 0.0));
+        assert_eq!(retransmission_delay_ms(100, 10, -5.0), retransmission_delay_ms(100, 10, 0.0));
+        assert_eq!(retransmission_delay_ms(100, 10, 250.0), retransmission_delay_ms(100, 10, 100.0));
+        assert_eq!(retransmission_delay_ms(100, 10, f32::NAN), retransmission_delay_ms(100, 10, 0.0));
+        // Never shorter than the peer's processing margin plus two airtimes.
+        assert!(retransmission_delay_ms(730, 28, 0.0) > 2 * 730 + RETX_PROCESSING_TIME_MS);
     }
 
     #[test]

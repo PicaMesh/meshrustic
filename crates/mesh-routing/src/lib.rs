@@ -74,6 +74,7 @@ pub use relay_identity::{RelayIdentityCache, RELAY_ID_CACHE_TTL_MS, MAX_RELAY_ID
 pub use reliable::{PendingReliable, MAX_PENDING_RELIABLE};
 pub use routing_ack::{
     build_ack_nak_frame, decode_routing_payload, hop_limit_for_response, retransmission_delay_ms,
+    RETX_PROCESSING_TIME_MS,
     RoutingDecode, ROUTING_APP, ROUTING_ERROR_MAX_RETRANSMIT, ROUTING_ERROR_NONE,
     ROUTING_ERROR_NO_CHANNEL, NUM_RELIABLE_RETX,
 };

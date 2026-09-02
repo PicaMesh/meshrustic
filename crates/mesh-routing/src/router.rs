@@ -2,7 +2,7 @@
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{is_direct_packet, PacketHeader, ParsedPacket, PACKET_HEADER_LEN, NODENUM_BROADCAST};
-use mesh_radio::{primary_channel_hash, MODEM_DEFAULT_PRESET};
+use mesh_radio::{eu868_config_for_preset, packet_time_ms, primary_channel_hash, MODEM_DEFAULT_PRESET};
 
 use crate::admin::{
     encode_admin_response, encode_owner_response, handle_admin, AdminState,
@@ -30,7 +30,7 @@ use crate::reliable::{
     bump_reliable_delays, due_retransmit, schedule_reliable, stop_reliable, PendingReliable,
     MAX_PENDING_RELIABLE,
 };
-use crate::routing_ack::{
+use crate::routing_ack::{retransmission_delay_ms, 
     build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
     ROUTING_APP, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
 };
@@ -200,6 +200,8 @@ pub struct Router {
     pending_traceroute: PendingTraceroute,
     pending_retransmits: [PendingRetransmit; MAX_PENDING_RETRANSMITS],
     pending_reliable: [PendingReliable; MAX_PENDING_RELIABLE],
+    /// Latest channel utilization reported by the radio task (drives retransmit backoff).
+    channel_util_pct: f32,
     pending_ack: PendingAck,
     pending_admin: [PendingAdmin; MAX_PENDING_ADMIN],
     pending_admin_count: u8,
@@ -347,6 +349,7 @@ impl Router {
                 bytes: [0; MAX_WIRE_LEN],
             }; MAX_PENDING_RETRANSMITS],
             pending_reliable: [PendingReliable::inactive(); MAX_PENDING_RELIABLE],
+            channel_util_pct: 0.0,
             pending_ack: PendingAck {
                 active: false,
                 next_tx_ms: 0,
@@ -772,9 +775,10 @@ impl Router {
         }
 
         let decoded_portnum = decode.portnum;
-        if self
-            .rate_limit
-            .should_drop(
+        // Packets addressed to us are always processed (admin, DMs, requests); the
+        // per-source rate limiter only guards relay and graph work for other traffic.
+        if parsed.to != self.node_num
+            && self.rate_limit.should_drop(
                 parsed.from,
                 decoded_portnum,
                 parsed.hop_start,
@@ -1165,16 +1169,14 @@ impl Router {
         if let Ok(hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) {
             let p = hdr.parse();
             if p.want_ack {
-                let slot_ms = slot_time_for_preset(self.modem_preset).max(1);
-                let airtime_ms = half_airtime_ms(slot_ms).saturating_mul(2).max(slot_ms);
+                let delay = self.reliable_retx_delay_ms(len);
                 let _ = schedule_reliable(
                     &mut self.pending_reliable,
                     p.id,
                     p.to,
                     len,
                     bytes,
-                    airtime_ms,
-                    slot_ms,
+                    delay,
                     now_ms,
                 );
             }
@@ -1540,20 +1542,6 @@ impl Router {
                 return plan;
             }
         };
-
-        if parsed.to == NODENUM_BROADCAST
-            && relay_hdr.hop_limit() == 0
-            && !self
-                .graph
-                .is_downstream_relay_for(self.node_num, parsed.from, now_ms)
-        {
-            self.pool.release(handle);
-            self.sr_log.push(SrLogEvent::RelaySkip {
-                from: parsed.from,
-                reason: SrSkipReason::LastHop,
-            });
-            return plan;
-        }
 
         let mut staging = PacketSlot::empty();
         {
@@ -1927,7 +1915,6 @@ impl Router {
         hop_limit: u8,
         now_ms: u32,
         airtime_ms: u32,
-        slot_ms: u32,
     ) -> Option<RelayPlan> {
         let packet_id = self.alloc_tx_id(now_ms);
         let hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
@@ -1947,14 +1934,14 @@ impl Router {
             return None;
         };
         if want_ack {
+            let delay = self.reliable_retx_delay_ms(len);
             let _ = schedule_reliable(
                 &mut self.pending_reliable,
                 packet_id,
                 to,
                 len,
                 frame,
-                airtime_ms,
-                slot_ms,
+                delay,
                 now_ms,
             );
         }
@@ -1972,14 +1959,29 @@ impl Router {
         bump_reliable_delays(&mut self.pending_reliable, airtime_ms);
     }
 
-    pub fn poll_reliable_retransmit(
-        &mut self,
-        now_ms: u32,
-        airtime_ms: u32,
-        slot_ms: u32,
-    ) -> Option<RelayPlan> {
-        let (len, bytes) =
-            due_retransmit(&mut self.pending_reliable, now_ms, airtime_ms, slot_ms)?;
+    /// Record the radio's current channel utilization; widens the reliable retransmit backoff.
+    pub fn set_channel_utilization(&mut self, pct: f32) {
+        self.channel_util_pct = pct;
+    }
+
+    /// Reliable retransmit delay for a frame of `wire_len` bytes on the current preset
+    /// (Meshtastic `getRetransmissionMsec`: real airtime, contention window, processing margin).
+    pub fn reliable_retx_delay_ms(&self, wire_len: u8) -> u32 {
+        let cfg = eu868_config_for_preset(self.modem_preset);
+        let airtime_ms = packet_time_ms(&cfg, wire_len as usize, false).max(1);
+        let slot_ms = slot_time_for_preset(self.modem_preset).max(1);
+        retransmission_delay_ms(airtime_ms, slot_ms, self.channel_util_pct)
+    }
+
+    pub fn poll_reliable_retransmit(&mut self, now_ms: u32) -> Option<RelayPlan> {
+        let preset = self.modem_preset;
+        let util = self.channel_util_pct;
+        let delay_for = |len: u8| {
+            let cfg = eu868_config_for_preset(preset);
+            let airtime_ms = packet_time_ms(&cfg, len as usize, false).max(1);
+            retransmission_delay_ms(airtime_ms, slot_time_for_preset(preset).max(1), util)
+        };
+        let (len, bytes) = due_retransmit(&mut self.pending_reliable, now_ms, delay_for)?;
         Some(RelayPlan {
             len,
             bytes,
@@ -3104,7 +3106,7 @@ mod tests {
     }
 
     #[test]
-    fn last_hop_broadcast_skipped_without_downstream_gateway() {
+    fn last_hop_broadcast_relayed_with_zero_hop_limit() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(LAST_HOP_ME));
         router.graph_mut().downstream_mut().update(
@@ -3135,18 +3137,85 @@ mod tests {
             coordinated_relay::DEFAULT_SLOT_MS,
             0,
         );
-        assert!(plan.relay.is_none());
-        assert!(router.poll_ready_relay(u32::MAX).is_none());
+        // Stock Meshtastic semantics: hop_limit 1 is relayed once more with hop_limit 0.
+        let relay = plan
+            .relay
+            .or_else(|| {
+                router
+                    .relay_tx_after(LAST_HOP_SOURCE, 42, 0)
+                    .and_then(|tx| router.poll_ready_relay(tx))
+            })
+            .expect("hop_limit=1 broadcast must be relayed");
+        let header = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN]).unwrap();
+        assert_eq!(header.hop_limit(), 0);
+        assert_eq!(header.hop_start(), 3);
+    }
 
-        let mut logs = heapless::Vec::new();
-        router.drain_sr_logs(&mut logs);
-        assert!(logs.iter().any(|event| matches!(
-            event,
-            SrLogEvent::RelaySkip {
-                from: LAST_HOP_SOURCE,
-                reason: SrSkipReason::LastHop,
-            }
-        )));
+    #[test]
+    fn packets_addressed_to_us_bypass_rate_limit() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(LAST_HOP_ME));
+        // Undecodable payload lands in the OTHER bucket (4 per window).
+        for id in 1..=8u32 {
+            let header = PacketHeader::from_fields(
+                LAST_HOP_ME,
+                LAST_HOP_SOURCE,
+                id,
+                0,
+                3,
+                3,
+                false,
+                false,
+                0,
+                0,
+            );
+            let wire = encode_wire(header, &[0xDE, 0xAD]);
+            let result = router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -80,
+                        snr: 8,
+                        bytes: &wire,
+                    },
+                    0,
+                )
+                .unwrap();
+            assert!(
+                !result.rate_limited,
+                "packet {id} addressed to us must not be rate limited"
+            );
+        }
+        // Control: the same burst addressed elsewhere is throttled by the same bucket.
+        let mut limited = false;
+        for id in 100..=108u32 {
+            let header = PacketHeader::from_fields(
+                0xDD00_00DD,
+                LAST_HOP_SOURCE,
+                id,
+                0,
+                3,
+                3,
+                false,
+                false,
+                0,
+                0,
+            );
+            let wire = encode_wire(header, &[0xDE, 0xAD]);
+            let result = router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -80,
+                        snr: 8,
+                        bytes: &wire,
+                    },
+                    0,
+                )
+                .unwrap();
+            limited |= result.rate_limited;
+        }
+        assert!(limited, "rate limiter must still apply to traffic not addressed to us");
     }
 
     #[test]

@@ -3,8 +3,8 @@
 use mesh_crypto::{encrypt_packet, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{portnum::num, PacketHeader, PACKET_HEADER_LEN, NODENUM_BROADCAST};
 use mesh_routing::{
-    build_ack_nak_frame, coordinated_relay, encode_data_payload, retransmission_delay_ms,
-    try_decrypt_data_full, InboundPacket, Router, ROUTING_APP, ROUTING_ERROR_NONE,
+    build_ack_nak_frame, encode_data_payload, try_decrypt_data_full, InboundPacket, Router,
+    ROUTING_APP, ROUTING_ERROR_NONE,
 };
 fn make_router() -> Router {
     Router::with_channel(
@@ -28,7 +28,6 @@ fn encrypt_payload(from: u32, packet_id: u32, portnum: u32, inner: &[u8]) -> Vec
 #[test]
 fn send_local_schedules_reliable_retransmit() {
     let mut router = make_router();
-    let slot_ms = coordinated_relay::DEFAULT_SLOT_MS;
     let airtime_ms = 200;
     let plan = router
         .send_local(
@@ -39,20 +38,17 @@ fn send_local_schedules_reliable_retransmit() {
             3,
             1_000,
             airtime_ms,
-            slot_ms,
         )
         .expect("send_local");
     assert!(usize::from(plan.len) > PACKET_HEADER_LEN);
     let header = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN]).unwrap();
     assert!(header.parse().want_ack);
 
-    let fire_ms = retransmission_delay_ms(airtime_ms, slot_ms);
-    assert!(router
-        .poll_reliable_retransmit(1_000 + fire_ms - 1, airtime_ms, slot_ms)
-        .is_none());
-    assert!(router
-        .poll_reliable_retransmit(1_000 + fire_ms, airtime_ms, slot_ms)
-        .is_some());
+    let fire_ms = router.reliable_retx_delay_ms(plan.len);
+    // Meshtastic-style backoff: never before the peer could have ACKed (two airtimes + margin).
+    assert!(fire_ms >= mesh_routing::RETX_PROCESSING_TIME_MS);
+    assert!(router.poll_reliable_retransmit(1_000 + fire_ms - 1).is_none());
+    assert!(router.poll_reliable_retransmit(1_000 + fire_ms).is_some());
 }
 
 #[test]
@@ -111,7 +107,6 @@ fn incoming_want_ack_schedules_routing_ack() {
 #[test]
 fn implicit_ack_cancels_reliable_on_own_rebroadcast_dupe() {
     let mut router = make_router();
-    let slot_ms = coordinated_relay::DEFAULT_SLOT_MS;
     let airtime_ms = 200;
     let plan = router
         .send_local(
@@ -122,7 +117,6 @@ fn implicit_ack_cancels_reliable_on_own_rebroadcast_dupe() {
             3,
             1_000,
             airtime_ms,
-            slot_ms,
         )
         .expect("send");
     let parsed = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN])
@@ -140,16 +134,13 @@ fn implicit_ack_cancels_reliable_on_own_rebroadcast_dupe() {
     assert!(dupe.duplicate);
     assert!(!router.has_pending_reliable(parsed.id));
 
-    let fire_ms = retransmission_delay_ms(airtime_ms, slot_ms);
-    assert!(router
-        .poll_reliable_retransmit(1_000 + fire_ms, airtime_ms, slot_ms)
-        .is_none());
+    let fire_ms = router.reliable_retx_delay_ms(plan.len);
+    assert!(router.poll_reliable_retransmit(1_000 + fire_ms).is_none());
 }
 
 #[test]
 fn routing_ack_stops_pending_retransmit() {
     let mut router = make_router();
-    let slot_ms = coordinated_relay::DEFAULT_SLOT_MS;
     let airtime_ms = 200;
     let plan = router
         .send_local(
@@ -160,7 +151,6 @@ fn routing_ack_stops_pending_retransmit() {
             3,
             1_000,
             airtime_ms,
-            slot_ms,
         )
         .expect("send");
     let orig_id = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN])

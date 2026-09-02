@@ -44,15 +44,18 @@ pub struct Sx1262Driver {
     profile: Sx1262ModuleProfile,
     config: RadioConfig,
     chip: RadioChip,
+    /// Result of the boot-time BUSY probe (see [`probe_module_ready`]).
+    module_ready: bool,
 }
 
 impl Sx1262Driver {
-    pub fn new(id: RadioId, profile: Sx1262ModuleProfile, chip: RadioChip) -> Self {
+    pub fn new(id: RadioId, profile: Sx1262ModuleProfile, chip: RadioChip, module_ready: bool) -> Self {
         Self {
             id,
             profile,
             config: RadioConfig::eu868_default(),
             chip,
+            module_ready,
         }
     }
 
@@ -239,12 +242,63 @@ impl Sx1262Driver {
             .map_err(|_| RadioError::Hardware)?;
         self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
         let status = self.chip.get_status().map_err(|_| RadioError::Hardware)?;
-        if status.chip_mode() != Some(sx126x::op::status::ChipMode::RX) {
-            defmt::warn!("[Radio0] set_rx failed, not in RX mode");
-            crate::usb_log::log::radio::warn("set_rx failed (not in RX mode)");
+        if status.chip_mode() != Some(ChipMode::RX) {
+            self.log_set_rx_failure(status);
             return Err(RadioError::Hardware);
         }
         Ok(())
+    }
+
+    /// Explain why SetRx did not land in RX: chip mode + command status from the status
+    /// byte, plus the SX126x device-error flags. `mode=none` means the status byte was
+    /// not a valid SX126x status at all, which points at MISO/SPI wiring rather than the
+    /// radio; `xosc_start` points at a TCXO/crystal mismatch with the module profile.
+    fn log_set_rx_failure(&mut self, status: sx126x::op::status::Status) {
+        use core::fmt::Write;
+        let mode = match status.chip_mode() {
+            Some(ChipMode::StbyRC) => "StbyRC",
+            Some(ChipMode::StbyXOSC) => "StbyXOSC",
+            Some(ChipMode::FS) => "FS",
+            Some(ChipMode::RX) => "RX",
+            Some(ChipMode::TX) => "TX",
+            None => "none",
+        };
+        let cmd = match status.command_status() {
+            Some(sx126x::op::status::CommandStatus::DataAvailable) => "data",
+            Some(sx126x::op::status::CommandStatus::CommandTimeout) => "timeout",
+            Some(sx126x::op::status::CommandStatus::CommandProcessingError) => "proc_err",
+            Some(sx126x::op::status::CommandStatus::FailureToExecute) => "exec_fail",
+            Some(sx126x::op::status::CommandStatus::CommandTxDone) => "tx_done",
+            None => "none",
+        };
+        let mut msg: heapless::String<160> = heapless::String::new();
+        let _ = write!(msg, "set_rx failed: mode={} cmd={}", mode, cmd);
+        let errs = self
+            .chip
+            .wait_on_busy()
+            .ok()
+            .and_then(|_| self.chip.get_device_errors().ok());
+        match errs {
+            Some(e) => {
+                let _ = write!(
+                    msg,
+                    " errs[xosc_start={} pll_lock={} pll_calib={} img_calib={} rc64k={} rc13m={} adc={} pa_ramp={}]",
+                    e.xosc_start_err() as u8,
+                    e.pll_lock_err() as u8,
+                    e.pll_calib_err() as u8,
+                    e.img_calib_err() as u8,
+                    e.rc64k_calib_err() as u8,
+                    e.rc13m_calib_err() as u8,
+                    e.adc_calib_err() as u8,
+                    e.pa_ramp_err() as u8
+                );
+            }
+            None => {
+                let _ = write!(msg, " errs=unreadable");
+            }
+        }
+        defmt::warn!("[Radio0] {}", msg.as_str());
+        crate::usb_log::log::radio::warn(msg.as_str());
     }
 
     /// Semtech packet counters — useful to see if the modem sees any RF activity.
@@ -319,6 +373,13 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn init(&mut self) -> Result<(), RadioError> {
+        // The sx126x crate busy-waits on BUSY with no timeout. On a module that is
+        // unpowered, unwired or held in reset, BUSY never drops and `chip.init` would
+        // spin forever inside the cooperative executor, starving every other task
+        // (USB CDC included, so the node never even enumerates). Refuse up front.
+        if !self.module_ready {
+            return Err(RadioError::InitFailed);
+        }
         self.chip
             .init(Self::sx126x_config(self.profile, &self.config))
             .map_err(|_| RadioError::InitFailed)?;
@@ -443,14 +504,37 @@ impl RadioInterface for Sx1262Driver {
     }
 }
 
+/// Longest we wait for BUSY to drop after releasing NRST. The SX126x datasheet puts the
+/// post-reset BUSY window at a few milliseconds; a healthy module clears it well inside this.
+const BUSY_PROBE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(50);
+
+/// Pulse NRST and wait (bounded) for BUSY to go low.
+///
+/// Returns `false` when the module never signals ready, which means it is unpowered,
+/// not wired (BUSY floats high — the input has no pull), or still held in reset.
+fn probe_module_ready(pins: &mut LoRaPins) -> bool {
+    pins.reset.set_low();
+    // 8.1: hold NRST low for at least 100 us.
+    embassy_time::block_for(embassy_time::Duration::from_micros(200));
+    pins.reset.set_high();
+    let deadline = embassy_time::Instant::now() + BUSY_PROBE_TIMEOUT;
+    while pins.busy.is_high() {
+        if embassy_time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+    true
+}
+
 /// Build SPI + SX1262 for the Pro Micro DIY pinout.
 pub fn create_radio(
     spim: Spim<'static, embassy_nrf::peripherals::SPI3>,
     cs: Output<'static>,
-    pins: LoRaPins,
+    mut pins: LoRaPins,
     profile: Sx1262ModuleProfile,
 ) -> Sx1262Driver {
+    let module_ready = probe_module_ready(&mut pins);
     let spi_dev = ExclusiveDevice::new(spim, cs, embassy_time::Delay);
     let chip = SX126x::new(spi_dev, (pins.reset, pins.busy, pins.ant_en, pins.dio1));
-    Sx1262Driver::new(0, profile, chip)
+    Sx1262Driver::new(0, profile, chip, module_ready)
 }

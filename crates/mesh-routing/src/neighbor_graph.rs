@@ -1014,6 +1014,13 @@ impl NeighborGraph {
             );
             self.edges
                 .set_edge_hears_us(sender, neighbor.node_id, neighbor.hears_us);
+            // The sender lists us as a neighbor it hears directly. That is positive
+            // evidence the sender hears us. SR-passive nodes broadcast topology but
+            // never relay, so this is their only way to earn `hears_us` (SR-mute nodes
+            // send no topology at all and are unaffected).
+            if neighbor.node_id == self.my_node {
+                self.edges.set_edge_hears_us(self.my_node, sender, true);
+            }
 
             let has_direct_connection = neighbor.node_id == self.my_node
                 || self
@@ -1263,7 +1270,6 @@ impl NeighborGraph {
         let etx = calculate_etx(rssi as i32, snr as f32);
 
         let is_new_gateway = self.observe_relay_gateway_signal(gateway, rssi, snr, now_ms, heard_on);
-        let hears_us = self.maybe_confirm_hears_us_from_relay(gateway, from, packet_id);
 
         let single_hop = hop_start.saturating_sub(hop_limit) == 1;
         let source_sr_active =
@@ -1300,6 +1306,11 @@ impl NeighborGraph {
         if result_us_to_relay == EDGE_NEW || result_us_to_relay == EDGE_SIGNIFICANT_CHANGE {
             self.route_cache.clear();
         }
+
+        // Only now does the us -> gateway edge exist for a first-time placeholder relay
+        // (observe_relay_gateway_signal skips placeholders), so confirm hears_us here rather
+        // than before the edge update, where the flag was logged but never stored.
+        let hears_us = self.maybe_confirm_hears_us_from_relay(gateway, from, packet_id);
 
         let can_infer_downstream = self.edges.has_direct_reported_edge_to(self.my_node, gateway)
             || is_placeholder_node(gateway);
@@ -2418,6 +2429,30 @@ mod tests {
     }
 
     #[test]
+    fn passive_sender_listing_us_confirms_hears_us() {
+        const ME: u32 = 0xAA00_00AA;
+        const PASSIVE: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PASSIVE, -70, 8, 100, 0);
+        assert!(!graph.edge_hears_us(PASSIVE));
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, false); // passive SR sender
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let us = PackedNeighbor {
+            node_id: ME,
+            rssi: -72,
+            snr: 7,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let result = graph.merge_topology(PASSIVE, &header, &[us], true, 200, 0);
+        assert!(matches!(result, TopologyMergeResult::Applied { .. }));
+        assert!(graph.edge_hears_us(PASSIVE));
+    }
+
+    #[test]
     fn rebroadcast_cancels_commit() {
         let mut graph = NeighborGraph::new();
         graph.commit_relay(1, 2, 0, 8, 1, 100, 20, DEFAULT_SLOT_MS, 0xAA, None);
@@ -2467,6 +2502,25 @@ mod tests {
         graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
         let placeholder = placeholder_node_id(0xCD);
         assert!(graph.test_has_edge(placeholder, 0xBB00_00BB));
+    }
+
+    #[test]
+    fn first_relay_of_our_packet_by_unknown_relayer_stores_hears_us() {
+        const ME: u32 = 0xAA00_00AA;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        // Our own packet comes back relayed by a never-seen relay byte: the placeholder edge
+        // is created and confirmed in the same observation.
+        let observed = graph.observe_packet(ME, 3, 2, 0xCD, -70, 8, 100, 0, None, 0x42);
+        let placeholder = placeholder_node_id(0xCD);
+        let (gateway, _, _, _, hears_us) = observed.expect("relayed observation");
+        assert_eq!(gateway, placeholder);
+        assert!(hears_us, "confirmation must be reported on the first relay");
+        assert!(graph.edge_hears_us(placeholder), "flag must be stored on the new us->relay edge");
+        // Resolving the placeholder to the real node keeps the confirmed flag.
+        assert!(graph.resolve_placeholder(placeholder, 0xBEEF_00CD, 200));
+        assert!(graph.edge_hears_us(0xBEEF_00CD));
     }
 
     #[test]

@@ -175,7 +175,6 @@ pub enum SrSkipReason {
     OwnRebroadcast,
     UnknownDestination,
     BetterNeighbor,
-    LastHop,
 }
 
 /// Sink for periodic topology graph dumps (may emit many lines).

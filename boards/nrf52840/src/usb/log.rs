@@ -93,8 +93,6 @@ fn line_prefix(line: &mut [u8]) -> usize {
 }
 
 fn finish_line(line: &mut [u8], mut pos: usize) {
-    line[pos] = b'\r';
-    pos += 1;
     line[pos] = b'\n';
     pos += 1;
     push_bytes(&line[..pos]);
@@ -1126,7 +1124,6 @@ pub mod sr {
                     SrSkipReason::OwnRebroadcast => b"own rebroadcast",
                     SrSkipReason::UnknownDestination => b"unknown dest",
                     SrSkipReason::BetterNeighbor => b"better neighbor",
-                    SrSkipReason::LastHop => b"last hop",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

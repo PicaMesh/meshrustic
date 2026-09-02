@@ -37,7 +37,12 @@ static CONFIG_STORE: StaticCell<NvmcConfigStore> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let mut hw_config = embassy_nrf::config::Config::default();
+    // The nRF52840 USBD needs HFCLK from the external 32 MHz crystal: full-speed USB
+    // tolerates 0.25 % clock error and the internal RC is only good to ~1.5 %, so on the
+    // RC some units enumerate and others never show up on the host.
+    hw_config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+    let p = embassy_nrf::init(hw_config);
     // Adafruit UF2 bootloader leaves RESETREAS set; clear so a later soft-reset
     // is not mistaken for a pin double-reset into upload mode.
     clear_resetreas();

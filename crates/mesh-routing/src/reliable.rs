@@ -1,7 +1,7 @@
 //! Reliable send retransmit slots (want_ack originated packets).
 
 use crate::router::MAX_WIRE_LEN;
-use crate::routing_ack::{retransmission_delay_ms, NUM_RELIABLE_RETX};
+use crate::routing_ack::NUM_RELIABLE_RETX;
 
 pub const MAX_PENDING_RELIABLE: usize = 4;
 
@@ -36,21 +36,19 @@ pub fn schedule_reliable(
     to: u32,
     len: u8,
     bytes: [u8; MAX_WIRE_LEN],
-    airtime_ms: u32,
-    slot_ms: u32,
+    retx_delay_ms: u32,
     now_ms: u32,
 ) -> bool {
     let idx = match slots.iter().position(|s| !s.active) {
         Some(i) => i,
         None => return false,
     };
-    let delay = retransmission_delay_ms(airtime_ms, slot_ms);
     slots[idx] = PendingReliable {
         active: true,
         packet_id,
         to,
         num_retx: NUM_RELIABLE_RETX,
-        next_tx_ms: now_ms.wrapping_add(delay),
+        next_tx_ms: now_ms.wrapping_add(retx_delay_ms),
         len,
         bytes,
     };
@@ -79,11 +77,12 @@ pub fn bump_reliable_delays(
     }
 }
 
+/// Pop the next due retransmit. `retx_delay_for(len)` yields the delay until the following
+/// attempt for a frame of that wire length (airtime depends on the frame, not on a constant).
 pub fn due_retransmit(
     slots: &mut [PendingReliable; MAX_PENDING_RELIABLE],
     now_ms: u32,
-    airtime_ms: u32,
-    slot_ms: u32,
+    retx_delay_for: impl Fn(u8) -> u32,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     for slot in slots.iter_mut() {
         if !slot.active {
@@ -100,8 +99,7 @@ pub fn due_retransmit(
             continue;
         }
         slot.num_retx -= 1;
-        let delay = retransmission_delay_ms(airtime_ms, slot_ms);
-        slot.next_tx_ms = now_ms.wrapping_add(delay);
+        slot.next_tx_ms = now_ms.wrapping_add(retx_delay_for(slot.len));
         return Some((slot.len, slot.bytes));
     }
     None

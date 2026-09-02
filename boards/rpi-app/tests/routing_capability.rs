@@ -88,7 +88,6 @@ fn send_local_broadcast_schedules_t1() {
     router.confirm_direct_neighbor_hears_us(0xBB);
 
     let airtime = 200;
-    let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW);
     let plan = router
         .send_local(
             NODENUM_BROADCAST,
@@ -98,11 +97,11 @@ fn send_local_broadcast_schedules_t1() {
             3,
             1_000,
             airtime,
-            slot_ms,
         )
         .expect("send");
     assert!(usize::from(plan.len) > PACKET_HEADER_LEN);
 
+    let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW);
     let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
     assert!(router.poll_t1_retransmit(1_000 + fire_ms - 1).is_none());
     assert!(router.poll_t1_retransmit(1_000 + fire_ms).is_some());

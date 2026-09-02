@@ -29,7 +29,23 @@ pub async fn radio_task(
     let air = air_time();
     let profile = slot.driver.profile();
 
-    slot.init().expect("radio init failed");
+    if let Err(err) = slot.init() {
+        // Do not panic: a panic halts the executor and takes USB logging down with it,
+        // leaving a node that never enumerates and gives no hint why. Park this task
+        // and keep repeating the reason so it is visible on the CDC log.
+        let reason = match err {
+            RadioError::InitFailed => "init FAILED: SX1262 not responding (BUSY stuck high after reset) - check module power/wiring",
+            RadioError::Busy => "init FAILED: radio busy",
+            RadioError::Timeout => "init FAILED: timeout",
+            RadioError::InvalidLength => "init FAILED: invalid length",
+            RadioError::Hardware => "init FAILED: hardware/SPI error",
+        };
+        loop {
+            defmt::error!("[Radio0] {}", reason);
+            crate::usb_log::log::radio::warn(reason);
+            Timer::after_secs(10).await;
+        }
+    }
     router.emit_startup_logs();
     // Modem preset + channel key already applied via Router::load_node_config in main.
     let boot_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
@@ -88,8 +104,8 @@ pub async fn radio_task(
             enqueue_tx(t1, slot, router, node_num, b"t1");
         }
 
-        let airtime_ms = packet_time_ms(slot.config(), 64, false).max(1);
-        if let Some(retx) = router.poll_reliable_retransmit(now_ms, airtime_ms, slot_ms) {
+        router.set_channel_utilization(air.channel_utilization_percent());
+        if let Some(retx) = router.poll_reliable_retransmit(now_ms) {
             enqueue_tx(retx, slot, router, node_num, b"retx");
         }
 
@@ -259,6 +275,8 @@ fn handle_rx_frame(
         bytes: frame.payload(),
     };
 
+    // Admin replies scheduled inside process_inbound size their retransmit backoff from this.
+    router.set_channel_utilization(air.channel_utilization_percent());
     if let Some(result) = router.process_inbound(&inbound, now_ms) {
         crate::usb_log::log::radio::rx_packet(
             &result.parsed,
