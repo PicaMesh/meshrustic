@@ -126,6 +126,11 @@ pub enum SrLogEvent {
         destination: u32,
     },
     TopologyLoggingComplete,
+    /// The radio was re-initialised for a new preset; queued transmissions timed for the old
+    /// air parameters (and addressed to nodes still on them) were dropped.
+    RadioReconfigured {
+        dropped: u8,
+    },
     GraphAged {
         before: u8,
         after: u8,

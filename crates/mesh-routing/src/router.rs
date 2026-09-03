@@ -446,6 +446,53 @@ impl Router {
         core::mem::take(&mut self.pending_radio_reinit)
     }
 
+    /// The board applied a new modem preset. Everything still queued was heard on, timed for
+    /// and addressed to nodes on the old air parameters: relays and T1 insurance of packets
+    /// nobody on the new preset saw, reliable retries and routing ACKs the requester (who
+    /// stays on its preset) can no longer hear, and admin replies to that requester. Periodic
+    /// topology, NodeInfo and telemetry broadcasts stay: they introduce us on the new preset.
+    pub fn radio_reconfigured(&mut self) {
+        let mut dropped = 0usize;
+        for p in &mut self.pending {
+            if p.active {
+                p.active = false;
+                dropped += 1;
+            }
+        }
+        for p in &mut self.pending_retransmits {
+            if p.active {
+                p.active = false;
+                dropped += 1;
+            }
+        }
+        for p in &mut self.pending_reliable {
+            if p.active {
+                p.active = false;
+                dropped += 1;
+            }
+        }
+        if self.pending_ack.active {
+            self.pending_ack.active = false;
+            dropped += 1;
+        }
+        for p in &mut self.pending_admin {
+            if p.active {
+                p.active = false;
+                dropped += 1;
+            }
+        }
+        self.pending_admin_count = 0;
+        if self.pending_traceroute.active {
+            self.pending_traceroute.active = false;
+            dropped += 1;
+        }
+        self.pending_topology_reply = false;
+        dropped += self.graph.clear_relays();
+        self.sr_log.push(SrLogEvent::RadioReconfigured {
+            dropped: dropped.min(u8::MAX as usize) as u8,
+        });
+    }
+
     /// Host/unit-test only: run admin handler as if `remote_pk` completed PKI decrypt.
     ///
     /// Not compiled into firmware builds (no `std` / `test`). Prefer real PKI frames in
@@ -3938,6 +3985,55 @@ mod tests {
             .any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
     }
 
+    /// After a preset switch the requester stays on its preset: retries, T1 insurance, ACKs
+    /// and committed relays timed for the old air parameters must not go out on the new one.
+    #[test]
+    fn preset_switch_drops_stale_retransmits_and_relays() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // A forwarded want_ack unicast arms relayed retries once its relay leaves.
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x801, true);
+        let (_, released_at) = forward_unicast(router, &wire, 0);
+        assert!(router.has_pending_reliable(0x801));
+        // A second unicast still sits in its relay slot.
+        let wire2 = unicast_wire(3, 3, 0, 0xDD, 0x802);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire2,
+                },
+                released_at + 10,
+            )
+            .unwrap();
+        let _ = router.evaluate_tx_plan(
+            &result,
+            0.0,
+            coordinated_relay::DEFAULT_SLOT_MS,
+            released_at + 10,
+        );
+        assert!(router.relay_tx_after(UNI_SOURCE, 0x802, 0).is_some());
+
+        router.radio_reconfigured();
+
+        assert!(!router.has_pending_reliable(0x801));
+        assert!(router.relay_tx_after(UNI_SOURCE, 0x802, 0).is_none());
+        let far = released_at + 600_000;
+        assert!(router.poll_reliable_retransmit(far).is_none());
+        assert!(router.poll_ready_relay(far).is_none());
+        assert!(router.poll_t1_retransmit(far).is_none());
+        assert!(router.poll_ack_tx(far).is_none());
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::RadioReconfigured { dropped } if *dropped >= 2
+        )));
+    }
+
     /// Field case of 2026-09-03: the relayer that actually reaches the destination must own
     /// slot 0 even when our node id is lower; we follow only after its relay would have
     /// cleared the air, and stand down when its copy arrives.
@@ -4115,9 +4211,10 @@ mod tests {
                 "packet {id} addressed to us must not be rate limited"
             );
         }
-        // Control: the same burst addressed elsewhere is throttled by the same bucket.
+        // Control: the same burst addressed elsewhere is throttled by the same bucket
+        // (undecodable frames count against UNKNOWN, 12 per window).
         let mut limited = false;
-        for id in 100..=108u32 {
+        for id in 100..=115u32 {
             let header = PacketHeader::from_fields(
                 0xDD00_00DD,
                 LAST_HOP_SOURCE,
@@ -4143,6 +4240,8 @@ mod tests {
                 )
                 .unwrap();
             limited |= result.rate_limited;
+            // Release the pool slot as the radio task would.
+            let _ = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         }
         assert!(
             limited,

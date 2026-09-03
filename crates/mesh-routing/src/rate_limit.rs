@@ -1,8 +1,9 @@
-//! Per-node inbound rate limiting (16 slots, 368 B).
+//! Per-node inbound rate limiting (16 slots).
 //!
-//! Each tracked node keeps three independent buckets (TEXT, ROUTING, OTHER). A limit
-//! on one bucket does not affect the others; each bucket has its own window, count, and
-//! limited flag.
+//! Each tracked node keeps four independent buckets (TEXT, ROUTING, OTHER, UNKNOWN). A
+//! limit on one bucket does not affect the others; each bucket has its own window, count,
+//! and limited flag. Undecodable packets (no key for their channel, or PKI traffic for
+//! another node) count against UNKNOWN, whose threshold sits between OTHER and TEXT.
 
 use mesh_protocol::{rate_limit_bucket, RateLimitBucket};
 
@@ -12,6 +13,9 @@ const WINDOW_MS: u32 = 90_000;
 const THRESHOLD_TEXT: u8 = 30;
 const THRESHOLD_ROUTING: u8 = 10;
 const THRESHOLD_OTHER: u8 = 4;
+/// Undecodable traffic. Sized so a relayed remote-admin Channels screen (channel 0, LoRa
+/// config, then channels 1..7 one at a time: nine requests, nine replies) loads in one window.
+const THRESHOLD_UNKNOWN: u8 = 12;
 
 #[derive(Clone, Copy, Default)]
 struct Bucket {
@@ -26,12 +30,13 @@ struct Slot {
     text: Bucket,
     routing: Bucket,
     other: Bucket,
+    unknown: Bucket,
     max_hop_seen: u8,
 }
 
 impl Slot {
     fn any_limited(&self) -> bool {
-        self.text.limited || self.routing.limited || self.other.limited
+        self.text.limited || self.routing.limited || self.other.limited || self.unknown.limited
     }
 
     fn oldest_window_start(&self) -> u32 {
@@ -39,6 +44,7 @@ impl Slot {
             .window_start_ms
             .min(self.routing.window_start_ms)
             .min(self.other.window_start_ms)
+            .min(self.unknown.window_start_ms)
     }
 
     fn bucket_mut(&mut self, kind: RateLimitBucket) -> &mut Bucket {
@@ -46,6 +52,7 @@ impl Slot {
             RateLimitBucket::Text => &mut self.text,
             RateLimitBucket::Routing => &mut self.routing,
             RateLimitBucket::Other => &mut self.other,
+            RateLimitBucket::Unknown => &mut self.unknown,
         }
     }
 }
@@ -60,6 +67,7 @@ fn fresh_slot(from: u32, now_ms: u32, hops: u8) -> Slot {
         text: bucket,
         routing: bucket,
         other: bucket,
+        unknown: bucket,
         max_hop_seen: hops,
     }
 }
@@ -109,6 +117,11 @@ impl NodeRateLimiter {
                     count: 0,
                     limited: false,
                 },
+                unknown: Bucket {
+                    window_start_ms: 0,
+                    count: 0,
+                    limited: false,
+                },
                 max_hop_seen: 0,
             }; MAX_SLOTS],
         }
@@ -137,6 +150,7 @@ impl NodeRateLimiter {
             RateLimitBucket::Text => THRESHOLD_TEXT,
             RateLimitBucket::Routing => THRESHOLD_ROUTING,
             RateLimitBucket::Other => THRESHOLD_OTHER,
+            RateLimitBucket::Unknown => THRESHOLD_UNKNOWN,
         };
 
         let hops = hops_away(hop_start, hop_limit);
@@ -235,7 +249,33 @@ mod tests {
     use mesh_protocol::num;
 
     fn drop_other(limiter: &mut NodeRateLimiter, from: u32, now_ms: u32) -> bool {
+        limiter.should_drop(from, Some(num::POSITION_APP), 3, 3, now_ms)
+    }
+
+    fn drop_undecodable(limiter: &mut NodeRateLimiter, from: u32, now_ms: u32) -> bool {
         limiter.should_drop(from, None, 3, 3, now_ms)
+    }
+
+    #[test]
+    fn undecodable_packets_have_their_own_bucket() {
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0xE0E0_0001;
+        // Past the OTHER threshold of 4: a private group's chat must pass a relay without
+        // the key, but not at chat rates (encrypted admin and DMs for others land here too).
+        for i in 0..THRESHOLD_UNKNOWN - 1 {
+            assert!(
+                !drop_undecodable(&mut limiter, from, i as u32 * 100),
+                "undecodable packet {i} must not trip the OTHER threshold"
+            );
+        }
+        assert!(
+            drop_undecodable(&mut limiter, from, 5_000),
+            "12th undecodable packet drops"
+        );
+        // Decodable traffic from the same node is judged on its own buckets.
+        assert!(!drop_other(&mut limiter, from, 5_100));
+        assert!(!drop_text(&mut limiter, from, 5_200));
+        assert!(!drop_routing(&mut limiter, from, 5_300));
     }
 
     fn drop_routing(limiter: &mut NodeRateLimiter, from: u32, now_ms: u32) -> bool {

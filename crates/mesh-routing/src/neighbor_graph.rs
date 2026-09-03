@@ -1420,6 +1420,18 @@ impl NeighborGraph {
             .map(|idx| self.relay_states[idx].tx_after_ms)
     }
 
+    /// Drop every committed relay. Returns how many were active.
+    pub fn clear_relays(&mut self) -> usize {
+        let mut n = 0;
+        for slot in &mut self.relay_states {
+            if slot.active {
+                slot.active = false;
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn cancel_relay(&mut self, from: u32, id: u32) {
         for slot in &mut self.relay_states {
             if slot.active && slot.from == from && slot.id == id {

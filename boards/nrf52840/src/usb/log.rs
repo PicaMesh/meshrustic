@@ -1369,6 +1369,18 @@ pub mod sr {
             | SrLogEvent::NetworkTopologyDownstreamHeader { .. }
             | SrLogEvent::NetworkTopologyDownstreamGroup { .. }
             | SrLogEvent::TopologyLoggingComplete) => emit_topology_event(event),
+            SrLogEvent::RadioReconfigured { dropped } => {
+                let mut line = [0u8; 96];
+                let mut pos = line_prefix(&mut line);
+                let msg = b"[SR] Preset applied: dropped ";
+                line[pos..pos + msg.len()].copy_from_slice(msg);
+                pos += msg.len();
+                pos += push_u32(&mut line[pos..], dropped as u32);
+                let tail = b" pending TX timed for the old preset";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::GraphAged { before, after } => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);

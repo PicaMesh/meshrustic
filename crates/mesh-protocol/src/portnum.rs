@@ -17,6 +17,8 @@ pub enum RateLimitBucket {
     Text,
     Routing,
     Other,
+    /// Undecodable: a channel we hold no key for, or a PKI packet for someone else.
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,10 +31,15 @@ pub enum QosTier {
 
 /// Rate-limit bucket for inbound classification.
 ///
-/// `None` = decode failed / no portnum → **OTHER** bucket.
+/// `None` = decode failed / no portnum (a channel we hold no key for, or a PKI packet for
+/// another node) → **UNKNOWN** bucket. A relay without the key cannot tell chat from
+/// telemetry; with the OTHER threshold a private group chatting normally flowed through
+/// key-holding relays and died at the first relay without the key, while the TEXT
+/// threshold would let encrypted admin and DM traffic for others run at chat rates. The
+/// UNKNOWN bucket sits between the two; key holders judge the same packets by their port.
 pub fn rate_limit_bucket(decoded_portnum: Option<u32>) -> RateLimitBucket {
     let Some(portnum) = decoded_portnum else {
-        return RateLimitBucket::Other;
+        return RateLimitBucket::Unknown;
     };
     match portnum {
         num::TEXT_MESSAGE_APP | num::TEXT_MESSAGE_COMPRESSED_APP => RateLimitBucket::Text,

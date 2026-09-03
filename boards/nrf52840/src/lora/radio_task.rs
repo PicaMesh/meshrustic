@@ -203,6 +203,7 @@ pub async fn radio_task(
         // Soft-reinit after the completion reply has left the TX queue (old air params).
         if radio_reinit_pending && slot.tx_queue_len() == 0 {
             apply_modem_preset_soft(slot, router.modem_preset());
+            router.radio_reconfigured();
             radio_reinit_pending = false;
         }
 

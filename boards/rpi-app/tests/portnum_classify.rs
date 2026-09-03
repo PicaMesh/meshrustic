@@ -32,8 +32,9 @@ fn routing_ports_high_tier_and_routing_bucket() {
 }
 
 #[test]
-fn undecoded_uses_other_and_low() {
-    assert_eq!(rate_limit_bucket(None), RateLimitBucket::Other);
+fn undecoded_uses_unknown_and_low() {
+    // No key for the channel: its own rate-limit bucket, still the lowest QoS tier.
+    assert_eq!(rate_limit_bucket(None), RateLimitBucket::Unknown);
     assert_eq!(qos_tier(None, 0), QosTier::Low);
 }
 
