@@ -1055,6 +1055,13 @@ impl NeighborGraph {
             // send no topology at all and are unaffected).
             if neighbor.node_id == self.my_node {
                 self.edges.set_edge_hears_us(self.my_node, sender, true);
+            } else {
+                // The same evidence proves the sender hears every other listed node: mark the
+                // listed node's own edge to the sender (if it has reported one) as heard, so we
+                // model our peers' coverage of the sender the way they model it themselves.
+                // Without this, two nodes that both just learned a passive neighbour each saw
+                // the other as not covering it and both took slot 0 for its packets.
+                self.edges.set_edge_hears_us(neighbor.node_id, sender, true);
             }
 
             let has_direct_connection = neighbor.node_id == self.my_node
@@ -2563,6 +2570,130 @@ mod tests {
         let result = graph.merge_topology(PASSIVE, &header, &[us], true, 200, 0);
         assert!(matches!(result, TopologyMergeResult::Applied { .. }));
         assert!(graph.edge_hears_us(PASSIVE));
+    }
+
+    #[test]
+    fn passive_sender_listing_a_peer_confirms_the_peer_hears_it() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const PASSIVE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        graph.observe_direct_neighbor(PASSIVE, -70, 8, 100, 0);
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (active, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        // The peer reports the passive node before the passive node has listed it.
+        let listed = PackedNeighbor {
+            node_id: PASSIVE,
+            rssi: -60,
+            snr: 10,
+            signal_routing_active: false,
+            hears_us: false,
+            etx_variance: 0,
+        };
+        graph.merge_topology(PEER, &active, &[listed], true, 200, 0);
+        let peer_edge = |g: &NeighborGraph| {
+            g.edges()
+                .find_node(PEER)
+                .and_then(|n| n.find_edge(PASSIVE))
+                .map(|e| e.hears_us)
+        };
+        assert_eq!(peer_edge(&graph), Some(false));
+        // The passive node lists the peer: that proves it hears the peer.
+        write_packed_header(&mut packed, 1, false);
+        let (passive, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let lists_peer = PackedNeighbor {
+            node_id: PEER,
+            ..listed
+        };
+        graph.merge_topology(PASSIVE, &passive, &[lists_peer], true, 300, 0);
+        assert_eq!(peer_edge(&graph), Some(true));
+        // A node the peer never reported gets no edge invented for it.
+        assert!(graph
+            .edges()
+            .find_node(PASSIVE)
+            .map(|n| n.find_edge(0xDD00_00DD).is_none())
+            .unwrap_or(true));
+    }
+
+    /// Field case of 2026-09-03 19:43: the gateway hears the phone poorly, so the phone is the
+    /// one uncovered neighbour and both nicenanos compete to relay for it. Each had just learned
+    /// the phone from its topology listing, and each modelled the other as not covering it, so
+    /// both took slot 0. With the listing applied to the peer's edge too, the costs tie and the
+    /// packet-parity tie-break picks one relayer on both nodes.
+    #[test]
+    fn peers_that_both_cover_a_passive_neighbour_agree_on_one_relayer() {
+        const A: u32 = 0xbdac_ce55;
+        const B: u32 = 0x046b_553a;
+        const PH: u32 = 0x979e_d146;
+        const GW: u32 = 0x63dc_8f8c;
+        const SRC: u32 = 0xda73_f34c;
+        let nb = |id: u32, rssi: i8, snr: i8, hears_us: bool| PackedNeighbor {
+            node_id: id,
+            rssi,
+            snr,
+            signal_routing_active: true,
+            hears_us,
+            etx_variance: 0,
+        };
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(A);
+        for (n, rssi, snr) in [(B, -1i16, 13i8), (GW, -73, 12), (PH, -48, 14)] {
+            graph.observe_direct_neighbor(n, rssi, snr, 100, 0);
+            graph.confirm_direct_neighbor_hears_us(n);
+        }
+        graph.capability_mut().track_topology(B, true, 100);
+        graph.capability_mut().track_topology(GW, true, 100);
+        graph.capability_mut().track_topology(PH, false, 100);
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 6, true);
+        let (active, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        // B's report: it hears the phone as well as we do, but has no proof the phone hears it.
+        graph.merge_topology(
+            B,
+            &active,
+            &[nb(PH, -46, 12, false), nb(A, -1, 13, true)],
+            true,
+            150,
+            0,
+        );
+        // The gateway hears both of us well and the phone barely (ETX far above 7).
+        graph.merge_topology(
+            GW,
+            &active,
+            &[
+                nb(A, -73, 12, true),
+                nb(B, -73, 12, true),
+                nb(PH, -105, -3, true),
+            ],
+            true,
+            160,
+            0,
+        );
+        // The phone's passive listing names both of us.
+        write_packed_header(&mut packed, 3, false);
+        let (passive, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(
+            PH,
+            &passive,
+            &[nb(A, -50, 12, false), nb(B, -50, 12, false)],
+            true,
+            170,
+            0,
+        );
+
+        let even = graph.plan_broadcast_relay(0xcc21_2ebc, SRC, GW, 0xffff_ffff, 200, 91);
+        assert_eq!(
+            &even.ranked[..1],
+            &[B],
+            "even packet id: lower node id relays"
+        );
+        assert!(!even.should_relay);
+        let odd = graph.plan_broadcast_relay(0xcc21_2ebd, SRC, GW, 0xffff_ffff, 200, 91);
+        assert!(odd.should_relay, "odd packet id: higher node id relays");
+        assert_eq!(odd.slot_index, 0);
     }
 
     #[test]
