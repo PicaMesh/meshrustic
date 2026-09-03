@@ -28,4 +28,11 @@ pub trait RadioInterface {
 
     /// Return to continuous RX after TX.
     fn start_rx(&mut self) -> Result<(), RadioError>;
+
+    /// True while a frame is being received (preamble seen, payload not yet complete).
+    /// Transmitting now would destroy that frame and the copy we send. Backends that cannot
+    /// tell report `false`.
+    fn rx_in_progress(&mut self) -> Result<bool, RadioError> {
+        Ok(false)
+    }
 }

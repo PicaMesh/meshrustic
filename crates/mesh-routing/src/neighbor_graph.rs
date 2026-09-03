@@ -4,7 +4,7 @@ use mesh_protocol::{is_direct_packet, NODENUM_BROADCAST};
 use mesh_radio::{RadioId, MODEM_DEFAULT_PRESET};
 
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
-use crate::coordinated_relay::tx_delay_ms_router;
+use crate::coordinated_relay::slot_tie_break_ms;
 use crate::graph::{
     calculate_etx, calculate_route, find_better_positioned_neighbor, is_node_routable,
     is_placeholder_node, placeholder_node_id, verified_connectivity, DownstreamTable, EdgeSource,
@@ -1344,7 +1344,7 @@ impl NeighborGraph {
         heard_from: u32,
         now_ms: u32,
         half_airtime_ms: u32,
-        cw_slot_ms: u32,
+        _cw_slot_ms: u32,
         node_num: u32,
         broadcast_plan: Option<&crate::broadcast_relay::BroadcastRelayPlan>,
     ) -> (u32, u8, u8) {
@@ -1355,8 +1355,11 @@ impl NeighborGraph {
             let (idx, count) = self.relay_slot_index(id, heard_from, now_ms);
             (idx, count, idx as u32 * half)
         };
-        let snr_delay = tx_delay_ms_router(snr, cw_slot_ms, from, id, node_num);
-        let delay = spacing.saturating_add(snr_delay);
+        // The slot already encodes the coordinated order. Only a small deterministic tie-break
+        // is added; the router-style SNR contention delay (up to 2·CW slots, several times a
+        // half-airtime) used to be added here and randomised the order, which is how two
+        // colocated nodes in slots 1 and 4 ended up keying up 50 ms apart.
+        let delay = (spacing as i64 + slot_tie_break_ms(half, id, node_num) as i64).max(0) as u32;
         let tx_after_ms = now_ms.wrapping_add(delay);
         if let Some(idx) = self.find_relay(from, id, radio_id) {
             let commit = &mut self.relay_states[idx];

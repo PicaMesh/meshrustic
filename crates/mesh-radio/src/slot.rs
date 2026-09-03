@@ -17,6 +17,8 @@ pub struct ServiceReport {
     pub tx_to: Option<u32>,
     /// TX queue had a frame but hourly duty cycle blocked dequeue.
     pub duty_cycle_blocked: bool,
+    /// TX queue had a frame but a reception was in progress; retried on the next poll.
+    pub tx_deferred_rx_busy: bool,
     /// Frames waiting in the TX queue after this poll.
     pub tx_queue_len: u8,
 }
@@ -68,7 +70,11 @@ where
             let _ = self.rx_queue.push(frame);
         }
 
-        if air_time.is_tx_allowed_duty_cycle() {
+        if !self.tx_queue.is_empty() && self.driver.rx_in_progress()? {
+            // Listen before talk: a packet is arriving. Keying up now collides with it, and
+            // SR's half-airtime slots assume an earlier slot's copy is heard, not trampled.
+            report.tx_deferred_rx_busy = true;
+        } else if air_time.is_tx_allowed_duty_cycle() {
             if let Ok(tx) = self.tx_queue.pop() {
                 let len = tx.len;
                 if let Some((id, to)) = mesh_header_id_to(tx.payload()) {
@@ -98,5 +104,70 @@ impl<D, const RX: usize, const TX: usize> RadioSlot<D, RX, TX> {
 
     pub fn tx_queue_len(&self) -> usize {
         self.tx_queue.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AirTime, RadioConfig, RadioError, RadioInterface, RxFrame, TxFrame, EU_868};
+
+    struct MockRadio {
+        busy: bool,
+        sent: usize,
+        cfg: RadioConfig,
+    }
+
+    impl RadioInterface for MockRadio {
+        fn radio_id(&self) -> RadioId {
+            0
+        }
+        fn config(&self) -> &RadioConfig {
+            &self.cfg
+        }
+        fn init(&mut self) -> Result<(), RadioError> {
+            Ok(())
+        }
+        fn poll_recv(&mut self) -> Result<Option<RxFrame>, RadioError> {
+            Ok(None)
+        }
+        fn send(&mut self, _frame: &TxFrame) -> Result<(), RadioError> {
+            self.sent += 1;
+            Ok(())
+        }
+        fn start_rx(&mut self) -> Result<(), RadioError> {
+            Ok(())
+        }
+        fn rx_in_progress(&mut self) -> Result<bool, RadioError> {
+            Ok(self.busy)
+        }
+    }
+
+    #[test]
+    fn tx_waits_while_a_frame_is_being_received() {
+        let mut slot = RadioSlot::<MockRadio>::new(
+            0,
+            MockRadio {
+                busy: true,
+                sent: 0,
+                cfg: RadioConfig::eu868_default(),
+            },
+        );
+        let mut air = AirTime::new(EU_868);
+        slot.enqueue_tx(TxFrame::new(0, &[0u8; 20]).unwrap())
+            .unwrap();
+
+        let report = slot.service(&mut air).unwrap();
+        assert!(report.tx_deferred_rx_busy);
+        assert!(report.tx_len.is_none());
+        assert_eq!(slot.tx_queue_len(), 1, "frame stays queued");
+        assert_eq!(slot.driver.sent, 0);
+
+        slot.driver.busy = false;
+        let report = slot.service(&mut air).unwrap();
+        assert!(!report.tx_deferred_rx_busy);
+        assert_eq!(report.tx_len, Some(20));
+        assert_eq!(slot.driver.sent, 1);
+        assert_eq!(slot.tx_queue_len(), 0);
     }
 }

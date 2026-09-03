@@ -44,7 +44,11 @@ fn send_local_schedules_reliable_retransmit() {
     let header = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN]).unwrap();
     assert!(header.parse().want_ack);
 
-    let fire_ms = router.reliable_retx_delay_ms(plan.len);
+    let sent_id = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN])
+        .unwrap()
+        .parse()
+        .id;
+    let fire_ms = router.reliable_retx_delay_ms(plan.len, router.node_num(), sent_id);
     // Meshtastic-style backoff: never before the peer could have ACKed (two airtimes + margin).
     assert!(fire_ms >= mesh_routing::RETX_PROCESSING_TIME_MS);
     assert!(router
@@ -138,7 +142,7 @@ fn implicit_ack_cancels_reliable_on_own_rebroadcast_dupe() {
     assert!(dupe.duplicate);
     assert!(!router.has_pending_reliable(parsed.id));
 
-    let fire_ms = router.reliable_retx_delay_ms(plan.len);
+    let fire_ms = router.reliable_retx_delay_ms(plan.len, router.node_num(), parsed.id);
     assert!(router.poll_reliable_retransmit(1_000 + fire_ms).is_none());
 }
 

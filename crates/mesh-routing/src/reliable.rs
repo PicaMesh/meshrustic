@@ -126,7 +126,7 @@ pub struct DueRetransmit {
 pub fn due_retransmit(
     slots: &mut [PendingReliable; MAX_PENDING_RELIABLE],
     now_ms: u32,
-    retx_delay_for: impl Fn(u8) -> u32,
+    retx_delay_for: impl Fn(u32, u32, u8) -> u32,
 ) -> Option<DueRetransmit> {
     for slot in slots.iter_mut() {
         if !slot.active {
@@ -143,7 +143,7 @@ pub fn due_retransmit(
             continue;
         }
         slot.num_retx -= 1;
-        slot.next_tx_ms = now_ms.wrapping_add(retx_delay_for(slot.len));
+        slot.next_tx_ms = now_ms.wrapping_add(retx_delay_for(slot.from, slot.packet_id, slot.len));
         let mut fallback = false;
         if slot.relayed && slot.num_retx == 0 {
             // Last try: release the packet to flooding so any neighbour may carry it.

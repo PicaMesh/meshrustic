@@ -1176,7 +1176,7 @@ impl Router {
         if let Ok(hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) {
             let p = hdr.parse();
             if p.want_ack {
-                let delay = self.reliable_retx_delay_ms(len);
+                let delay = self.reliable_retx_delay_ms(len, self.node_num, p.id);
                 let _ = schedule_reliable(
                     &mut self.pending_reliable,
                     self.node_num,
@@ -2066,7 +2066,7 @@ impl Router {
             DataEncodeOpts::default(),
         )?;
         if want_ack {
-            let delay = self.reliable_retx_delay_ms(len);
+            let delay = self.reliable_retx_delay_ms(len, self.node_num, packet_id);
             let _ = schedule_reliable(
                 &mut self.pending_reliable,
                 self.node_num,
@@ -2100,20 +2100,39 @@ impl Router {
 
     /// Reliable retransmit delay for a frame of `wire_len` bytes on the current preset
     /// (Meshtastic `getRetransmissionMsec`: real airtime, contention window, processing margin).
-    pub fn reliable_retx_delay_ms(&self, wire_len: u8) -> u32 {
-        let cfg = eu868_config_for_preset(self.modem_preset);
+    pub fn reliable_retx_delay_ms(&self, wire_len: u8, from: u32, id: u32) -> u32 {
+        Self::retx_delay_for(
+            self.modem_preset,
+            self.channel_util_pct,
+            self.node_num,
+            from,
+            id,
+            wire_len,
+        )
+    }
+
+    /// Backoff before a retry plus a per-node contention offset. Two relayers that armed
+    /// retries for the same packet at the same instant would otherwise fire in lockstep and
+    /// collide on every attempt.
+    fn retx_delay_for(
+        preset: u8,
+        util: f32,
+        node_num: u32,
+        from: u32,
+        id: u32,
+        wire_len: u8,
+    ) -> u32 {
+        let cfg = eu868_config_for_preset(preset);
         let airtime_ms = packet_time_ms(&cfg, wire_len as usize, false).max(1);
-        let slot_ms = slot_time_for_preset(self.modem_preset).max(1);
-        retransmission_delay_ms(airtime_ms, slot_ms, self.channel_util_pct)
+        let slot_ms = slot_time_for_preset(preset).max(1);
+        retransmission_delay_ms(airtime_ms, slot_ms, util)
+            .saturating_add(tx_delay_ms_contention(util, slot_ms, from, id, node_num))
     }
 
     pub fn poll_reliable_retransmit(&mut self, now_ms: u32) -> Option<RelayPlan> {
-        let preset = self.modem_preset;
-        let util = self.channel_util_pct;
-        let delay_for = |len: u8| {
-            let cfg = eu868_config_for_preset(preset);
-            let airtime_ms = packet_time_ms(&cfg, len as usize, false).max(1);
-            retransmission_delay_ms(airtime_ms, slot_time_for_preset(preset).max(1), util)
+        let (preset, util, node_num) = (self.modem_preset, self.channel_util_pct, self.node_num);
+        let delay_for = |from: u32, id: u32, len: u8| {
+            Self::retx_delay_for(preset, util, node_num, from, id, len)
         };
         let due = due_retransmit(&mut self.pending_reliable, now_ms, delay_for)?;
         if due.relayed {
@@ -2142,7 +2161,7 @@ impl Router {
         if p.to == NODENUM_BROADCAST || p.from == self.node_num || !p.want_ack || p.next_hop == 0 {
             return;
         }
-        let delay = self.reliable_retx_delay_ms(len);
+        let delay = self.reliable_retx_delay_ms(len, p.from, p.id);
         if schedule_reliable(
             &mut self.pending_reliable,
             p.from,
@@ -3615,7 +3634,7 @@ mod tests {
             }
         )));
 
-        let step = router.reliable_retx_delay_ms(sent_len(&wire));
+        let step = router.reliable_retx_delay_ms(sent_len(&wire), UNI_SOURCE, 0x601);
         let mut t = armed_at;
         assert!(router.poll_reliable_retransmit(t + step - 1).is_none());
         // Retries 1 and 2 keep the designated next hop.

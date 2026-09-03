@@ -5,8 +5,8 @@ use embassy_nrf::spim::Spim;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use mesh_protocol::PacketHeader;
 use mesh_radio::{
-    sync_word_sx126x, RadioConfig, RadioError, RadioId, RadioInterface, RxFrame, TxFrame,
-    MAX_LORA_PAYLOAD,
+    packet_time_ms, sync_word_sx126x, RadioConfig, RadioError, RadioId, RadioInterface, RxFrame,
+    TxFrame, MAX_LORA_PAYLOAD,
 };
 use sx126x::conf::Config;
 use sx126x::op::calib::CalibParam;
@@ -46,6 +46,8 @@ pub struct Sx1262Driver {
     chip: RadioChip,
     /// Result of the boot-time BUSY probe (see [`probe_module_ready`]).
     module_ready: bool,
+    /// When the current reception (preamble/sync/header seen, no RxDone yet) was first noticed.
+    rx_active_since: Option<embassy_time::Instant>,
 }
 
 impl Sx1262Driver {
@@ -61,7 +63,20 @@ impl Sx1262Driver {
             config: RadioConfig::eu868_default(),
             chip,
             module_ready,
+            rx_active_since: None,
         }
+    }
+
+    /// Reception-in-progress flags: the modem has seen a preamble, sync word or header of a
+    /// frame that has not finished yet. Mirrors Meshtastic `isActivelyReceiving`.
+    fn irq_rx_active(irq: IrqStatus) -> bool {
+        irq.preamble_detected() || irq.syncword_valid() || irq.header_valid()
+    }
+
+    /// Longest a genuine reception can stay in progress: preamble plus the largest frame.
+    fn max_rx_in_progress(&self) -> embassy_time::Duration {
+        let ms = packet_time_ms(&self.config, MAX_LORA_PAYLOAD, true) as u64;
+        embassy_time::Duration::from_millis(ms.saturating_mul(2))
     }
 
     /// Set LoRa modem parameters before [`RadioInterface::init`].
@@ -426,6 +441,7 @@ impl RadioInterface for Sx1262Driver {
             if irq.header_error() {
                 crate::usb_log::log::radio::warn("RX header error");
             }
+            self.rx_active_since = None;
             self.clear_irqs()?;
             self.reenter_rx()?;
             return Ok(None);
@@ -433,6 +449,7 @@ impl RadioInterface for Sx1262Driver {
 
         if irq.timeout() {
             crate::usb_log::log::radio::warn("RX timeout");
+            self.rx_active_since = None;
             self.clear_irqs()?;
             self.reenter_rx()?;
             return Ok(None);
@@ -444,10 +461,28 @@ impl RadioInterface for Sx1262Driver {
         }
 
         if !irq.rx_done() {
+            if Self::irq_rx_active(irq) {
+                // A frame is arriving: keep the flags so `rx_in_progress` can see them, but
+                // never forever. A false preamble detect or a frame we lost mid-air would
+                // otherwise block our transmitter indefinitely.
+                let now = embassy_time::Instant::now();
+                match self.rx_active_since {
+                    None => {
+                        self.rx_active_since = Some(now);
+                        return Ok(None);
+                    }
+                    Some(since) if now - since < self.max_rx_in_progress() => return Ok(None),
+                    Some(_) => {
+                        defmt::trace!("[Radio0] stale RX-in-progress flags cleared");
+                        self.rx_active_since = None;
+                    }
+                }
+            }
             self.clear_irqs()?;
             return Ok(None);
         }
 
+        self.rx_active_since = None;
         self.clear_irqs()?;
 
         let status = self
@@ -505,7 +540,24 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn start_rx(&mut self) -> Result<(), RadioError> {
+        self.rx_active_since = None;
         self.reenter_rx()
+    }
+
+    fn rx_in_progress(&mut self) -> Result<bool, RadioError> {
+        // `poll_recv` runs first in every service pass and leaves the in-progress flags set
+        // (aging them out if they go stale), so a fresh read here is authoritative.
+        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        let irq = self
+            .chip
+            .get_irq_status()
+            .map_err(|_| RadioError::Hardware)?;
+        Ok(!irq.rx_done()
+            && !irq.header_error()
+            && !irq.crc_err()
+            && !irq.timeout()
+            && Self::irq_rx_active(irq)
+            && self.rx_active_since.is_some())
     }
 }
 

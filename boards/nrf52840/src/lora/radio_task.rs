@@ -159,6 +159,9 @@ pub async fn radio_task(
                     );
                     crate::usb_log::log::radio::tx_done(report.tx_id, report.tx_to, len);
                 }
+                if report.tx_deferred_rx_busy {
+                    defmt::trace!("[Radio0] TX deferred: reception in progress");
+                }
                 if report.duty_cycle_blocked
                     && Instant::now().duration_since(last_duty_log) >= Duration::from_secs(10)
                 {

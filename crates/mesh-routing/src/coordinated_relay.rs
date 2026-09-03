@@ -49,6 +49,15 @@ pub fn tx_delay_ms_router(snr: i8, slot_ms: u32, from: u32, id: u32, node_num: u
     jitter_slots(from, id, node_num, span) * slot_ms
 }
 
+/// Tie-breaker added to an SR relay slot: deterministic per (packet, node), within
+/// ±¼ half-airtime (fork: `±halfAirtime/4`). Small enough that two candidates in adjacent slots
+/// can never swap order, large enough that two nodes computing the same slot do not key up in
+/// the same instant. Returns the signed offset in ms.
+pub fn slot_tie_break_ms(half_airtime_ms: u32, id: u32, node_num: u32) -> i32 {
+    let range = (half_airtime_ms / 2).max(20);
+    ((node_num ^ id) % range) as i32 - (range / 2) as i32
+}
+
 /// Meshtastic `getTxDelayMsec`: `random(0, 2^CWsize) * slotTime`, CWsize from channel
 /// utilization. Used for module replies (NodeInfo answers, dirty topology broadcasts) that
 /// several nodes may fire in response to the same packet. Deterministic per (seeds, node) so
@@ -89,6 +98,29 @@ pub fn transmission_record_window_ms(modem_preset: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_tie_break_never_reorders_adjacent_slots() {
+        for half in [50u32, 81, 150] {
+            let range = (half / 2).max(20) as i32;
+            for id in [0x1u32, 0x1234_5678, 0xe23d_7d52, 0xffff_ffff] {
+                for node in [0xbdac_ce55u32, 0x046b_553a, 0x63dc_8f8c] {
+                    let j = slot_tie_break_ms(half, id, node);
+                    assert!(
+                        j >= -(range / 2) && j < range - range / 2,
+                        "jitter {j} outside ±{range}/2"
+                    );
+                    // Worst case: earlier slot maximally late, next slot maximally early.
+                    let earliest_next = half as i32 - range / 2;
+                    let latest_this = range - range / 2 - 1;
+                    assert!(
+                        earliest_next > latest_this,
+                        "adjacent slots overlap at half={half}"
+                    );
+                }
+            }
+        }
+    }
     use mesh_radio::{RadioConfig, MODEM_SHORT_SLOW};
 
     #[test]
