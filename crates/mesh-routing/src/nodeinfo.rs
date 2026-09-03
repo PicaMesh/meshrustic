@@ -251,6 +251,12 @@ pub struct NodeInfoCache {
     count: u8,
 }
 
+impl Default for NodeInfoCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodeInfoCache {
     pub const fn new() -> Self {
         Self {
@@ -460,7 +466,7 @@ fn push_bytes_field(out: &mut heapless::Vec<u8, 240>, field: u32, data: &[u8]) {
 }
 
 fn push_varint_field(out: &mut heapless::Vec<u8, 240>, field: u32, value: u32) {
-    let _ = out.push(((field << 3) | 0) as u8);
+    let _ = out.push((field << 3) as u8);
     push_varint(out, value);
 }
 

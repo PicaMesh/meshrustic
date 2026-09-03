@@ -120,6 +120,12 @@ pub struct NeighborGraph {
     merge_asymmetric_skip_count: u8,
 }
 
+impl Default for NeighborGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NeighborGraph {
     pub const fn new() -> Self {
         Self {
@@ -203,9 +209,7 @@ impl NeighborGraph {
         if destination == 0 || destination == NODENUM_BROADCAST {
             return None;
         }
-        let Some(my_edges) = self.edges.find_node(self.my_node) else {
-            return None;
-        };
+        let my_edges = self.edges.find_node(self.my_node)?;
 
         let mut dest_etx = None;
         for i in 0..my_edges.edge_count as usize {
@@ -563,13 +567,10 @@ impl NeighborGraph {
         let stock_n = self.fill_stock_relay_candidates(packet_id, heard_from, now_ms, &mut stock);
         let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
         let sr_n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
-        let mut sr_index = 0u8;
-        for i in 0..sr_n as usize {
-            if sr[i] == self.my_node {
-                sr_index = i as u8;
-                break;
-            }
-        }
+        let sr_index = sr[..sr_n as usize]
+            .iter()
+            .position(|&n| n == self.my_node)
+            .map_or(0, |i| i as u8);
         let total = stock_n.saturating_add(sr_n).max(1);
         (stock_n.saturating_add(sr_index), total)
     }
@@ -578,16 +579,14 @@ impl NeighborGraph {
     pub fn find_best_relay_candidate(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> u32 {
         let mut stock = [0u32; MAX_EDGES_PER_NODE];
         let stock_n = self.fill_stock_relay_candidates(packet_id, heard_from, now_ms, &mut stock);
-        for i in 0..stock_n as usize {
-            let candidate = stock[i];
+        for &candidate in &stock[..stock_n as usize] {
             if !self.has_node_transmitted(candidate, packet_id, now_ms) {
                 return candidate;
             }
         }
         let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
         let sr_n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
-        for i in 0..sr_n as usize {
-            let candidate = sr[i];
+        for &candidate in &sr[..sr_n as usize] {
             if !self.has_node_transmitted(candidate, packet_id, now_ms) {
                 return candidate;
             }
@@ -636,8 +635,7 @@ impl NeighborGraph {
         }
         let mut ids = [0u32; MAX_EDGES_PER_NODE];
         let n = self.edges.direct_neighbor_ids(self.my_node, &mut ids);
-        for i in 0..n as usize {
-            let neighbor = ids[i];
+        for &neighbor in &ids[..n as usize] {
             if neighbor == heard_from {
                 continue;
             }
@@ -675,8 +673,7 @@ impl NeighborGraph {
         }
         let mut ids = [0u32; MAX_EDGES_PER_NODE];
         let n = self.edges.direct_neighbor_ids(self.my_node, &mut ids);
-        for i in 0..n as usize {
-            let id = ids[i];
+        for &id in &ids[..n as usize] {
             if id == heard_from {
                 continue;
             }
@@ -940,7 +937,7 @@ impl NeighborGraph {
         if total == 0 {
             1
         } else {
-            ((total + MAX_NEIGHBORS_PER_PACKET - 1) / MAX_NEIGHBORS_PER_PACKET) as u8
+            total.div_ceil(MAX_NEIGHBORS_PER_PACKET) as u8
         }
     }
 
@@ -1325,12 +1322,13 @@ impl NeighborGraph {
             .edges
             .has_direct_reported_edge_to(self.my_node, gateway)
             || is_placeholder_node(gateway);
-        if can_infer_downstream && (single_hop || !source_sr_active) {
-            if !self.is_downstream_relay_for(gateway, from, now_ms) {
-                self.downstream
-                    .update(self.my_node, from, gateway, etx, now_ms, false, heard_on);
-                self.route_cache.clear();
-            }
+        if can_infer_downstream
+            && (single_hop || !source_sr_active)
+            && !self.is_downstream_relay_for(gateway, from, now_ms)
+        {
+            self.downstream
+                .update(self.my_node, from, gateway, etx, now_ms, false, heard_on);
+            self.route_cache.clear();
         }
 
         self.record_heard_transmissions(from, packet_id, Some(gateway), now_ms);
@@ -1964,9 +1962,8 @@ impl NeighborGraph {
         let downstream_aged = self.downstream.age(now_ms, NEIGHBOR_TTL_MS, relay_in_graph);
         self.clear_expired_commits(now_ms);
         let (clear_hears_us, clear_hears_us_count) = self.capability.prune(now_ms, self.my_node);
-        for i in 0..clear_hears_us_count as usize {
-            self.edges
-                .set_edge_hears_us(self.my_node, clear_hears_us[i], false);
+        for &expired in &clear_hears_us[..clear_hears_us_count as usize] {
+            self.edges.set_edge_hears_us(self.my_node, expired, false);
         }
 
         let after = self.neighbor_count();
@@ -2055,8 +2052,7 @@ impl NeighborGraph {
             direct_ids[i] = entries[i].node_id;
         }
 
-        for i in 0..direct as usize {
-            let entry = entries[i];
+        for (i, entry) in entries[..direct as usize].iter().copied().enumerate() {
             sink.emit(SrLogEvent::NetworkTopologyNeighbor {
                 node_id: entry.node_id,
                 rssi: entry.rssi,
@@ -2136,6 +2132,16 @@ impl NeighborGraph {
 
     fn alloc_relay_slot(&self) -> Option<usize> {
         self.relay_states.iter().position(|s| !s.active)
+    }
+}
+
+#[cfg(test)]
+impl NeighborGraph {
+    fn test_has_edge(&self, from: u32, to: u32) -> bool {
+        self.edges
+            .find_node(from)
+            .and_then(|n| n.find_edge(to))
+            .is_some()
     }
 }
 
@@ -2884,15 +2890,5 @@ mod tests {
         let report = graph.run_maintenance(400_000);
         assert!(!report.topology_dirty_send);
         assert!(!report.topology_due);
-    }
-}
-
-#[cfg(test)]
-impl NeighborGraph {
-    fn test_has_edge(&self, from: u32, to: u32) -> bool {
-        self.edges
-            .find_node(from)
-            .and_then(|n| n.find_edge(to))
-            .is_some()
     }
 }

@@ -140,21 +140,11 @@ pub enum ConfigPayload {
     Sessionkey,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DeviceMetadata {
     pub firmware_version: [u8; 32],
     pub firmware_version_len: u8,
     pub hw_model: u32,
-}
-
-impl Default for DeviceMetadata {
-    fn default() -> Self {
-        Self {
-            firmware_version: [0; 32],
-            firmware_version_len: 0,
-            hw_model: 0,
-        }
-    }
 }
 
 impl DeviceMetadata {
@@ -387,12 +377,14 @@ pub fn decode_device_config(payload: &[u8]) -> Option<WireDeviceConfig> {
 }
 
 pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
-    let mut lora = WireLoRaConfig::default();
-    lora.use_preset = false;
-    lora.modem_preset = 0;
-    lora.region = 0;
-    lora.hop_limit = 0;
-    lora.tx_power = 0;
+    // Fields absent from the wire decode as zero/false, not as the firmware defaults.
+    let mut lora = WireLoRaConfig {
+        use_preset: false,
+        modem_preset: 0,
+        region: 0,
+        hop_limit: 0,
+        tx_power: 0,
+    };
     let mut idx = 0usize;
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;

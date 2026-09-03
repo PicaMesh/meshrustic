@@ -18,6 +18,12 @@ pub struct DownstreamTable {
     count: u16,
 }
 
+impl Default for DownstreamTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DownstreamTable {
     pub const fn new() -> Self {
         Self {
@@ -300,12 +306,8 @@ impl DownstreamTable {
         let mut i = 0u16;
         while i < self.count {
             let entry = self.entries[i as usize];
-            if now_ms.wrapping_sub(entry.last_update_ms) > ttl_ms {
-                if i < self.count - 1 {
-                    self.entries[i as usize] = self.entries[(self.count - 1) as usize];
-                }
-                self.count -= 1;
-            } else if !relay_in_graph(entry.relay) {
+            let expired = now_ms.wrapping_sub(entry.last_update_ms) > ttl_ms;
+            if expired || !relay_in_graph(entry.relay) {
                 if i < self.count - 1 {
                     self.entries[i as usize] = self.entries[(self.count - 1) as usize];
                 }

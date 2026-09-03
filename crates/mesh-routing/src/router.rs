@@ -601,10 +601,9 @@ impl Router {
         if self.graph.can_send_topology()
             && self.graph.last_topology_ms() == 0
             && !self.pending_topology.active
+            && self.schedule_topology_broadcast(now_ms, slot_ms, false)
         {
-            if self.schedule_topology_broadcast(now_ms, slot_ms, false) {
-                self.graph.commit_topology_broadcast(now_ms, false);
-            }
+            self.graph.commit_topology_broadcast(now_ms, false);
         }
         if self.last_nodeinfo_ms == 0 && !self.pending_nodeinfo.active {
             self.schedule_nodeinfo_broadcast(now_ms);
@@ -750,14 +749,14 @@ impl Router {
                     total: self.graph.neighbor_count(),
                 });
                 // Immediate dirty topology when a new direct neighbor appears.
-                if !self.pending_topology.active {
-                    if self.schedule_topology_broadcast(
+                if !self.pending_topology.active
+                    && self.schedule_topology_broadcast(
                         now_ms,
                         crate::coordinated_relay::DEFAULT_SLOT_MS,
                         true,
-                    ) {
-                        self.graph.commit_topology_broadcast(now_ms, true);
-                    }
+                    )
+                {
+                    self.graph.commit_topology_broadcast(now_ms, true);
                 }
             }
         }
@@ -839,11 +838,9 @@ impl Router {
                         &parsed, &data, inner, packet.snr, now_ms,
                     );
                 }
-            } else if data.portnum == ADMIN_APP {
-                if parsed.to == self.node_num {
-                    if let Some(ref inner) = inner {
-                        self.process_admin_rx(&parsed, inner, now_ms);
-                    }
+            } else if data.portnum == ADMIN_APP && parsed.to == self.node_num {
+                if let Some(ref inner) = inner {
+                    self.process_admin_rx(&parsed, inner, now_ms);
                 }
             }
         } else if parsed.to == self.node_num {
@@ -1837,28 +1834,28 @@ impl Router {
                 self.sr_log.push(SrLogEvent::DirectNeighborLostDirty);
             }
         }
-        if report.topology_due && self.graph.can_send_topology() && !self.pending_topology.active {
-            if self.schedule_topology_broadcast(now_ms, slot_ms, report.topology_dirty_send) {
-                self.graph
-                    .commit_topology_broadcast(now_ms, report.topology_dirty_send);
-            }
-        }
-        if self.last_nodeinfo_ms == 0
-            || now_ms.wrapping_sub(self.last_nodeinfo_ms) >= NODEINFO_BROADCAST_MS
+        if report.topology_due
+            && self.graph.can_send_topology()
+            && !self.pending_topology.active
+            && self.schedule_topology_broadcast(now_ms, slot_ms, report.topology_dirty_send)
         {
-            if !self.pending_nodeinfo.active {
-                self.schedule_nodeinfo_broadcast(now_ms);
-            }
+            self.graph
+                .commit_topology_broadcast(now_ms, report.topology_dirty_send);
+        }
+        if (self.last_nodeinfo_ms == 0
+            || now_ms.wrapping_sub(self.last_nodeinfo_ms) >= NODEINFO_BROADCAST_MS)
+            && !self.pending_nodeinfo.active
+        {
+            self.schedule_nodeinfo_broadcast(now_ms);
         }
         // Channel utilization, air util and uptime are always worth broadcasting, so this
         // is deliberately not gated on having a battery reading: an unknown pack voltage
         // only drops fields 1-2 from the encoded DeviceMetrics.
-        if self.last_telemetry_ms == 0
-            || now_ms.wrapping_sub(self.last_telemetry_ms) >= DEVICE_TELEMETRY_BROADCAST_MS
+        if (self.last_telemetry_ms == 0
+            || now_ms.wrapping_sub(self.last_telemetry_ms) >= DEVICE_TELEMETRY_BROADCAST_MS)
+            && !self.pending_telemetry.active
         {
-            if !self.pending_telemetry.active {
-                self.schedule_telemetry_broadcast(now_ms);
-            }
+            self.schedule_telemetry_broadcast(now_ms);
         }
         report
     }
@@ -2055,7 +2052,7 @@ impl Router {
     ) -> Option<RelayPlan> {
         let packet_id = self.alloc_tx_id(now_ms);
         let hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
-        let Some((len, frame)) = build_app_wire_frame(
+        let (len, frame) = build_app_wire_frame(
             to,
             self.node_num,
             packet_id,
@@ -2067,9 +2064,7 @@ impl Router {
             portnum,
             payload,
             DataEncodeOpts::default(),
-        ) else {
-            return None;
-        };
+        )?;
         if want_ack {
             let delay = self.reliable_retx_delay_ms(len);
             let _ = schedule_reliable(
@@ -2339,10 +2334,8 @@ impl Router {
         if let Some(data) = data {
             if data.portnum == ROUTING_APP {
                 if let Some(inner) = inner {
-                    if data.request_id != 0 {
-                        if decode_routing_payload(inner).is_some() {
-                            let _ = stop_reliable(&mut self.pending_reliable, data.request_id);
-                        }
+                    if data.request_id != 0 && decode_routing_payload(inner).is_some() {
+                        let _ = stop_reliable(&mut self.pending_reliable, data.request_id);
                     }
                 }
                 return;

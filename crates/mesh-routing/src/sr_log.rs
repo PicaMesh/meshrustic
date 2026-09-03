@@ -237,6 +237,12 @@ impl TopologyLogSink for SrLog {
     }
 }
 
+impl Default for SrLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SrLog {
     pub const fn new() -> Self {
         Self {

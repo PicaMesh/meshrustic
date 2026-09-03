@@ -70,7 +70,7 @@ pub fn hop_limit_for_response(parsed: &ParsedPacket, configured_hop_limit: u8) -
 
 pub fn encode_routing_error(reason: u32) -> heapless::Vec<u8, 16> {
     let mut out = heapless::Vec::new();
-    let _ = out.push((3 << 3) | 0);
+    let _ = out.push(3 << 3);
     push_varint(&mut out, reason);
     out
 }

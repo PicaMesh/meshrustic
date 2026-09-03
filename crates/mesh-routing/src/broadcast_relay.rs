@@ -174,8 +174,7 @@ where
             get_coverage_if_relays(ctx.edges, ctx.my_node, candidate, &mut coverage_buf);
         let mut unique = [0u32; MAX_EDGES_PER_NODE];
         let mut unique_count = 0u8;
-        for j in 0..coverage_n as usize {
-            let node = coverage_buf[j];
+        for &node in &coverage_buf[..coverage_n as usize] {
             if !already_covered.contains(node) {
                 unique[unique_count as usize] = node;
                 unique_count += 1;
@@ -193,8 +192,7 @@ where
 
         let mut total_cost = 0f32;
         let mut valid_costs = 0u8;
-        for j in 0..unique_count as usize {
-            let target = unique[j as usize];
+        for &target in &unique[..unique_count as usize] {
             if let Some(edge) = candidate_edges.find_edge(target) {
                 total_cost += edge.etx();
                 valid_costs += 1;
@@ -335,10 +333,9 @@ fn should_relay_for_stock_neighbors(
         if ctx.capability.status(neighbor) != CapabilityStatus::Legacy {
             continue;
         }
-        if is_non_relaying_legacy(ctx.capability, neighbor) {
-            stock[stock_count as usize] = neighbor;
-            stock_count += 1;
-        } else if my_edges.edges[i].hears_us {
+        // Mute legacy nodes count regardless (they never relay, so hears_us can never be
+        // confirmed); relaying legacy nodes only once they proved they hear us.
+        if is_non_relaying_legacy(ctx.capability, neighbor) || my_edges.edges[i].hears_us {
             stock[stock_count as usize] = neighbor;
             stock_count += 1;
         }
@@ -351,8 +348,7 @@ fn should_relay_for_stock_neighbors(
     let mut best_neighbor = 0u32;
     let mut best_cost = f32::MAX;
 
-    for i in 0..stock_count as usize {
-        let stock_neighbor = stock[i as usize];
+    for &stock_neighbor in &stock[..stock_count as usize] {
         if stock_neighbor == heard_from || stock_neighbor == source {
             continue;
         }
@@ -487,11 +483,9 @@ where
         my_delay = slot_delay;
     }
 
-    let slot_index = if half > 0 {
-        (my_delay / half).min(u8::MAX as u32) as u8
-    } else {
-        0
-    };
+    let slot_index = my_delay
+        .checked_div(half)
+        .map_or(0, |slots| slots.min(u8::MAX as u32) as u8);
 
     BroadcastRelayPlan {
         should_relay,

@@ -1,5 +1,9 @@
 //! Static routing infrastructure — zero heap.
 #![no_std]
+// Wire builders and graph observers take every header field as a plain argument (no heap,
+// no allocation-free parameter structs worth the churn); the 8-11 argument signatures are
+// intentional here.
+#![allow(clippy::too_many_arguments)]
 
 pub mod admin;
 pub mod admin_codec;

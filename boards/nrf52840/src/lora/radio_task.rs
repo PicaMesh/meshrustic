@@ -240,8 +240,8 @@ pub async fn radio_task(
             router.update_device_metrics(DeviceMetricsSnapshot {
                 battery_level: batt.valid.then_some(batt.battery_level),
                 voltage_v: batt.valid.then(|| batt.voltage_mv as f32 / 1000.0),
-                channel_utilization: air.channel_utilization_percent() as f32,
-                air_util_tx: air.utilization_tx_percent() as f32,
+                channel_utilization: air.channel_utilization_percent(),
+                air_util_tx: air.utilization_tx_percent(),
                 uptime_seconds: boot_instant.elapsed().as_secs() as u32,
             });
             let report = router.run_maintenance(now_ms, slot_ms);

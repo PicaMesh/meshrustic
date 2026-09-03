@@ -242,7 +242,7 @@ impl RelayIdentityCache {
         }
         if rssi != 0 {
             let packet_etx = calculate_etx(rssi as i32, snr as f32);
-            let packet_etx_fixed = (packet_etx * 100.0).min(65535.0).max(1.0) as u16;
+            let packet_etx_fixed = (packet_etx * 100.0).clamp(1.0, 65535.0) as u16;
             let mut best = direct[0];
             let mut best_diff = u16::MAX;
             for (i, &node) in direct.iter().enumerate() {

@@ -62,7 +62,7 @@ impl NodeEdges {
     pub fn find_edge_mut(&mut self, to: u32) -> Option<&mut Edge> {
         (0..self.edge_count as usize)
             .find(|&i| self.edges[i].to == to)
-            .map(move |i| &mut self.edges[i as usize])
+            .map(move |i| &mut self.edges[i])
     }
 
     pub fn find_edge(&self, to: u32) -> Option<&Edge> {
@@ -76,6 +76,12 @@ pub struct EdgeStore {
     nodes: [NodeEdges; super::MAX_GRAPH_NODES],
     node_count: u8,
     etx_change_threshold: f32,
+}
+
+impl Default for EdgeStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EdgeStore {
@@ -324,7 +330,7 @@ impl EdgeStore {
             if node_id == sender {
                 continue;
             }
-            let listed_here = listed_ids.iter().any(|&id| id == node_id);
+            let listed_here = listed_ids.contains(&node_id);
             for e in 0..self.nodes[i].edge_count as usize {
                 if self.nodes[i].edges[e].to == sender
                     && self.nodes[i].edges[e].hears_us

@@ -58,6 +58,12 @@ pub struct RouteCache {
     count: u8,
 }
 
+impl Default for RouteCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RouteCache {
     pub const fn new() -> Self {
         Self {
@@ -124,10 +130,8 @@ fn find_or_add_node(
     nodes: &mut [DNode; MAX_GRAPH_NODES],
     node_count: &mut usize,
 ) -> Option<usize> {
-    for i in 0..*node_count {
-        if nodes[i].id == id {
-            return Some(i);
-        }
+    if let Some(i) = nodes[..*node_count].iter().position(|n| n.id == id) {
+        return Some(i);
     }
     if *node_count >= MAX_GRAPH_NODES {
         return None;
@@ -143,12 +147,10 @@ fn find_or_add_node(
 }
 
 fn prev_of(nodes: &[DNode; MAX_GRAPH_NODES], node_count: usize, id: u32) -> u32 {
-    for i in 0..node_count {
-        if nodes[i].id == id {
-            return nodes[i].prev;
-        }
-    }
-    0
+    nodes[..node_count]
+        .iter()
+        .find(|n| n.id == id)
+        .map_or(0, |n| n.prev)
 }
 
 pub fn calculate_route(
@@ -202,9 +204,9 @@ pub fn calculate_route(
     loop {
         let mut u_idx = None;
         let mut u_cost = ROUTE_COST_UNKNOWN;
-        for i in 0..node_count {
-            if !nodes[i].visited && nodes[i].cost < u_cost {
-                u_cost = nodes[i].cost;
+        for (i, node) in nodes[..node_count].iter().enumerate() {
+            if !node.visited && node.cost < u_cost {
+                u_cost = node.cost;
                 u_idx = Some(i);
             }
         }

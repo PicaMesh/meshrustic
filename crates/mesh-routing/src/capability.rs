@@ -34,6 +34,12 @@ pub struct CapabilityCache {
     count: u8,
 }
 
+impl Default for CapabilityCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CapabilityCache {
     pub const fn new() -> Self {
         Self {

@@ -161,7 +161,7 @@ pub fn encode_data_payload_opts(
     opts: DataEncodeOpts,
 ) -> heapless::Vec<u8, 240> {
     let mut out = heapless::Vec::new();
-    let _ = out.push((1 << 3) | 0);
+    let _ = out.push(1 << 3);
     push_varint(&mut out, portnum);
     let _ = out.push((2 << 3) | 2);
     push_varint(&mut out, inner.len() as u32);
@@ -233,7 +233,7 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
     let mut idx = 0usize;
     while idx < data.len() {
         let (tag, mut i) = read_varint(data, idx)?;
-        let field = (tag >> 3) as u32;
+        let field = tag >> 3;
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
@@ -381,7 +381,7 @@ pub fn extract_packed_neighbors(
 }
 
 fn push_varint_field(out: &mut heapless::Vec<u8, 240>, field: u32, value: u32) {
-    let _ = out.push(((field << 3) | 0) as u8);
+    let _ = out.push((field << 3) as u8);
     push_varint(out, value);
 }
 

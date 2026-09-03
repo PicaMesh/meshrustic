@@ -149,13 +149,8 @@ fn text_preview(payload: &[u8]) -> ([u8; RX_TEXT_PREVIEW], u8) {
     let mut preview = [0u8; RX_TEXT_PREVIEW];
     let mut len = 0u8;
     for (i, &byte) in payload.iter().take(RX_TEXT_PREVIEW).enumerate() {
-        preview[i] = if byte >= 0x20 && byte <= 0x7E {
-            byte
-        } else if byte == b'\n' || byte == b'\r' || byte == b'\t' {
-            byte
-        } else {
-            b'.'
-        };
+        let printable = (0x20..=0x7E).contains(&byte) || matches!(byte, b'\n' | b'\r' | b'\t');
+        preview[i] = if printable { byte } else { b'.' };
         len += 1;
     }
     (preview, len)
@@ -356,7 +351,7 @@ mod tests {
     #[test]
     fn routing_error_reason() {
         let mut payload = heapless::Vec::<u8, 8>::new();
-        payload.push((1 << 3) | 0).unwrap();
+        payload.push(1 << 3).unwrap();
         payload.push(3).unwrap(); // NONE or similar enum value
         match summarize_decrypted(num::ROUTING_APP, &payload) {
             RxPayloadSummary::Routing { error_reason } => assert_eq!(error_reason, 3),

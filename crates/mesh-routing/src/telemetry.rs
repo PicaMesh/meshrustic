@@ -116,7 +116,7 @@ pub fn battery_level_from_mv(voltage_mv: u32) -> u32 {
 
 /// Reject floating divider / ADC rail readings when no pack is connected.
 pub fn is_plausible_battery_reading(voltage_mv: u32, raw_adc: u32) -> bool {
-    raw_adc < ADC_SATURATED_RAW && voltage_mv >= MIN_BATTERY_MV && voltage_mv <= MAX_BATTERY_MV
+    raw_adc < ADC_SATURATED_RAW && (MIN_BATTERY_MV..=MAX_BATTERY_MV).contains(&voltage_mv)
 }
 
 /// Map raw SAADC average to reported mV, level, and whether telemetry should run.
@@ -238,7 +238,7 @@ pub fn extract_device_metrics(payload: &[u8]) -> Option<&[u8]> {
 }
 
 fn push_varint_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, value: u32) {
-    let _ = out.push(((field << 3) | 0) as u8);
+    let _ = out.push((field << 3) as u8);
     push_varint(out, value);
 }
 

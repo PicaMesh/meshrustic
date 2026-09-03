@@ -183,7 +183,7 @@ impl AdminState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct AdminOutcome {
     pub response: Option<AdminMessage>,
     pub routing_error: Option<u32>,
@@ -194,19 +194,6 @@ pub struct AdminOutcome {
     pub apply_modem_preset: Option<u8>,
     pub config_dirty: bool,
     pub reboot_seconds: Option<i32>,
-}
-
-impl Default for AdminOutcome {
-    fn default() -> Self {
-        Self {
-            response: None,
-            routing_error: None,
-            routing_ok: false,
-            apply_modem_preset: None,
-            config_dirty: false,
-            reboot_seconds: None,
-        }
-    }
 }
 
 /// True for admin GET-style ops that may be safely re-run on WantAck dupe retries.
@@ -247,37 +234,41 @@ pub fn handle_admin(
         AdminPayload::GetChannelRequest(index_plus_one) => {
             let passkey = state.issue_session(now_ms);
             let ch = channel_for_request(index_plus_one, channel_psk, channel_hash);
-            let mut resp = AdminMessage::default();
-            resp.payload = AdminPayload::GetChannelResponse(ch);
-            resp.has_session_passkey = true;
-            resp.session_passkey = passkey;
+            let resp = AdminMessage {
+                payload: AdminPayload::GetChannelResponse(ch),
+                has_session_passkey: true,
+                session_passkey: passkey,
+            };
             outcome.response = Some(resp);
         }
         AdminPayload::GetOwnerRequest => {
             let passkey = state.issue_session(now_ms);
-            let mut resp = AdminMessage::default();
-            resp.payload = AdminPayload::GetOwnerResponse(*identity);
-            resp.has_session_passkey = true;
-            resp.session_passkey = passkey;
+            let resp = AdminMessage {
+                payload: AdminPayload::GetOwnerResponse(*identity),
+                has_session_passkey: true,
+                session_passkey: passkey,
+            };
             let _ = node_num;
             outcome.response = Some(resp);
         }
         AdminPayload::GetDeviceMetadataRequest => {
             let passkey = state.issue_session(now_ms);
-            let mut resp = AdminMessage::default();
-            resp.payload = AdminPayload::GetDeviceMetadataResponse(
-                DeviceMetadata::meshrustic_default(HW_MODEL_NRF52_PROMICRO_DIY),
-            );
-            resp.has_session_passkey = true;
-            resp.session_passkey = passkey;
+            let resp = AdminMessage {
+                payload: AdminPayload::GetDeviceMetadataResponse(
+                    DeviceMetadata::meshrustic_default(HW_MODEL_NRF52_PROMICRO_DIY),
+                ),
+                has_session_passkey: true,
+                session_passkey: passkey,
+            };
             outcome.response = Some(resp);
         }
         AdminPayload::GetModuleConfigRequest(_) => {
             let passkey = state.issue_session(now_ms);
-            let mut resp = AdminMessage::default();
-            resp.payload = AdminPayload::GetModuleConfigResponse;
-            resp.has_session_passkey = true;
-            resp.session_passkey = passkey;
+            let resp = AdminMessage {
+                payload: AdminPayload::GetModuleConfigResponse,
+                has_session_passkey: true,
+                session_passkey: passkey,
+            };
             outcome.response = Some(resp);
         }
         AdminPayload::GetConfigRequest(config_type) => {
@@ -301,10 +292,11 @@ pub fn handle_admin(
                 CONFIG_TYPE_SESSIONKEY => ConfigPayload::Sessionkey,
                 _ => ConfigPayload::Empty,
             };
-            let mut resp = AdminMessage::default();
-            resp.payload = AdminPayload::GetConfigResponse(config);
-            resp.has_session_passkey = true;
-            resp.session_passkey = passkey;
+            let resp = AdminMessage {
+                payload: AdminPayload::GetConfigResponse(config),
+                has_session_passkey: true,
+                session_passkey: passkey,
+            };
             outcome.response = Some(resp);
         }
         AdminPayload::BeginEditSettings => {
@@ -447,13 +439,17 @@ fn channel_for_request(index_plus_one: u32, channel_psk: &[u8], channel_hash: u8
 }
 
 fn security_get(state: &AdminState) -> WireSecurityConfig {
-    let mut sec = WireSecurityConfig::default();
-    sec.has_public_key = state.public_key.iter().any(|&b| b != 0);
-    if sec.has_public_key {
+    let has_public_key = state.public_key.iter().any(|&b| b != 0);
+    let has_private_key = state.private_key.iter().any(|&b| b != 0);
+    let mut sec = WireSecurityConfig {
+        has_public_key,
+        has_private_key,
+        ..Default::default()
+    };
+    if has_public_key {
         sec.public_key = state.public_key;
     }
-    sec.has_private_key = state.private_key.iter().any(|&b| b != 0);
-    if sec.has_private_key {
+    if has_private_key {
         sec.private_key = state.private_key;
     }
     // Configurable slots only — never inject built-ins.

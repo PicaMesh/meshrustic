@@ -263,7 +263,7 @@ fn parse_fixed32_packed(
 ) -> Option<usize> {
     let mut i = 0usize;
     while i + 4 <= data.len() {
-        let _ = push_u32(
+        push_u32(
             out,
             u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]),
         )?;
@@ -293,7 +293,7 @@ fn push_fixed32_field(out: &mut heapless::Vec<u8, 128>, field: u32, value: u32) 
 }
 
 fn push_signed_varint_field(out: &mut heapless::Vec<u8, 128>, field: u32, v: i32) {
-    let _ = out.push(((field << 3) | 0) as u8);
+    let _ = out.push((field << 3) as u8);
     push_varint_u32(out, v as u32);
 }
 

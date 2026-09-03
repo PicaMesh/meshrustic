@@ -261,6 +261,8 @@ pub mod radio {
         finish_line(&mut line, pos);
     }
 
+    // One log line per modem parameter set; the argument list mirrors the printed fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn config_modem(
         sf: u8,
         bw_khz: u32,

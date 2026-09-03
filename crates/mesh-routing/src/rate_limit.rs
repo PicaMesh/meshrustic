@@ -181,11 +181,10 @@ impl NodeRateLimiter {
                 Some(c) => {
                     let s = &slots[i];
                     let cur = &slots[c];
-                    if s.max_hop_seen > cur.max_hop_seen {
-                        i
-                    } else if s.max_hop_seen == cur.max_hop_seen
-                        && s.oldest_window_start() < cur.oldest_window_start()
-                    {
+                    let farther = s.max_hop_seen > cur.max_hop_seen;
+                    let same_hops_but_staler = s.max_hop_seen == cur.max_hop_seen
+                        && s.oldest_window_start() < cur.oldest_window_start();
+                    if farther || same_hops_but_staler {
                         i
                     } else {
                         c

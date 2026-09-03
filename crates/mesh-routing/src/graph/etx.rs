@@ -16,13 +16,11 @@ pub fn calculate_etx(rssi: i32, snr: f32) -> f32 {
     } else if rssi >= RSSI_BREAK[5] {
         PROB_BREAK[5]
     } else {
-        let mut seg = 0usize;
-        for i in 1..6 {
-            if rssi < RSSI_BREAK[i] {
-                seg = i - 1;
-                break;
-            }
-        }
+        let seg = RSSI_BREAK
+            .iter()
+            .skip(1)
+            .position(|&brk| rssi < brk)
+            .unwrap_or(0);
         let t = (rssi - RSSI_BREAK[seg]) as f32 / (RSSI_BREAK[seg + 1] - RSSI_BREAK[seg]) as f32;
         PROB_BREAK[seg] + t * (PROB_BREAK[seg + 1] - PROB_BREAK[seg])
     };
@@ -32,7 +30,7 @@ pub fn calculate_etx(rssi: i32, snr: f32) -> f32 {
     } else if snr >= 10.0 {
         1.0
     } else {
-        0.5 + snr as f32 * 0.05
+        0.5 + snr * 0.05
     };
 
     let prob = delivery_prob * snr_factor;
@@ -44,7 +42,7 @@ pub fn calculate_etx(rssi: i32, snr: f32) -> f32 {
 }
 
 pub fn etx_to_fixed(etx: f32) -> EtxFixed {
-    let scaled = (etx * 100.0).min(65535.0).max(1.0) as u16;
+    let scaled = (etx * 100.0).clamp(1.0, 65535.0) as u16;
     scaled.max(ETX_MIN_FIXED)
 }
 
@@ -61,13 +59,11 @@ pub fn etx_to_signal(etx: f32) -> (i8, i8) {
     } else if prob >= PROB_BREAK[5] {
         RSSI_BREAK[5]
     } else {
-        let mut seg = 0usize;
-        for i in 1..6 {
-            if prob < PROB_BREAK[i] {
-                seg = i - 1;
-                break;
-            }
-        }
+        let seg = PROB_BREAK
+            .iter()
+            .skip(1)
+            .position(|&brk| prob < brk)
+            .unwrap_or(0);
         let t = (prob - PROB_BREAK[seg]) / (PROB_BREAK[seg + 1] - PROB_BREAK[seg]);
         RSSI_BREAK[seg] + (t * (RSSI_BREAK[seg + 1] - RSSI_BREAK[seg]) as f32) as i32
     };
