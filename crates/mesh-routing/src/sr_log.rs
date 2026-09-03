@@ -145,6 +145,19 @@ pub enum SrLogEvent {
         id: u32,
         reason: T1CancelReason,
     },
+    /// Unicast carrying a designated next hop: that byte owns slot 0, we take rank+1.
+    UnicastDesignated {
+        next_hop: u8,
+        is_us: bool,
+        sr_active: bool,
+        slot: u8,
+        slot_delay_ms: u32,
+    },
+    /// A copy of a unicast we were about to relay was heard: our copy is redundant.
+    UnicastDupeCancel {
+        id: u32,
+        from: u32,
+    },
     TracerouteAppended {
         towards: bool,
         route_len: u8,
@@ -175,8 +188,6 @@ pub enum SrSkipReason {
     OwnRebroadcast,
     UnknownDestination,
     BetterNeighbor,
-    /// Unicast already steered at another node's relay byte.
-    NotNextHop,
     /// Unicast whose next hop is the node we just heard it from.
     NextHopIsRelayer,
     /// Unicast that would leave us with hop_limit 0 without a direct link to the target.

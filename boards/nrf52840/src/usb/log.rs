@@ -1124,7 +1124,6 @@ pub mod sr {
                     SrSkipReason::OwnRebroadcast => b"own rebroadcast",
                     SrSkipReason::UnknownDestination => b"unknown dest",
                     SrSkipReason::BetterNeighbor => b"better neighbor",
-                    SrSkipReason::NotNextHop => b"not next hop",
                     SrSkipReason::NextHopIsRelayer => b"next hop is relayer",
                     SrSkipReason::DeadEndHop => b"dead end hop",
                 };
@@ -1416,6 +1415,50 @@ pub mod sr {
                 line[pos..pos + tail.len()].copy_from_slice(tail);
                 pos += tail.len();
                 pos += push_u32(&mut line[pos..], cost_x100 as u32);
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::UnicastDesignated { next_hop, is_us, sr_active, slot, slot_delay_ms } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Unicast next hop 0x";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u8_2(&mut line[pos..], next_hop);
+                let who: &[u8] = if is_us {
+                    b" (us) slot 0"
+                } else if sr_active {
+                    b" (SR peer) owns slot 0, ours="
+                } else {
+                    b" (stock/unknown) owns slot 0, ours="
+                };
+                line[pos..pos + who.len()].copy_from_slice(who);
+                pos += who.len();
+                if !is_us {
+                    pos += push_u32(&mut line[pos..], slot as u32);
+                    let mid = b" after ";
+                    line[pos..pos + mid.len()].copy_from_slice(mid);
+                    pos += mid.len();
+                    pos += push_u32(&mut line[pos..], slot_delay_ms);
+                    let tail = b"ms";
+                    line[pos..pos + tail.len()].copy_from_slice(tail);
+                    pos += tail.len();
+                }
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::UnicastDupeCancel { id, from } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Unicast dupe pkt=0x";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], id);
+                let mid = b" from !";
+                line[pos..pos + mid.len()].copy_from_slice(mid);
+                pos += mid.len();
+                pos += push_hex_u32_8(&mut line[pos..], from);
+                let tail = b" - canceling relay";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
                 finish_line(&mut line, pos);
             }
             SrLogEvent::T1Scheduled { id, delay_ms } => {

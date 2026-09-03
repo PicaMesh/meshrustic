@@ -1493,20 +1493,6 @@ impl Router {
             }
         }
 
-        // 6. A unicast already steered at another node's relay byte is that node's job; the
-        // origin falls back to flooding on its own if that node never forwards it.
-        if parsed.to != NODENUM_BROADCAST
-            && parsed.next_hop != 0
-            && parsed.next_hop != (self.node_num & 0xFF) as u8
-        {
-            self.pool.release(handle);
-            self.sr_log.push(SrLogEvent::RelaySkip {
-                from: parsed.from,
-                reason: SrSkipReason::NotNextHop,
-            });
-            return plan;
-        }
-
         if parsed.to != NODENUM_BROADCAST
             && parsed.to != self.node_num
             && !self.graph.topology_healthy_for_unicast(parsed.to, now_ms)
@@ -1545,6 +1531,22 @@ impl Router {
             });
             return plan;
         }
+
+        // A unicast that already names a next hop keeps SR coordination: the designated node
+        // owns slot 0 and every other candidate shifts down one slot, cancelling on any heard copy.
+        let designated_plan = if parsed.to != NODENUM_BROADCAST && parsed.next_hop != 0 {
+            Some(self.plan_designated_unicast(
+                &parsed,
+                heard_from,
+                result.rssi,
+                result.snr,
+                half_airtime,
+                slot_ms,
+                now_ms,
+            ))
+        } else {
+            None
+        };
 
         let direct_hop_limit = if parsed.to != NODENUM_BROADCAST {
             self.graph.unicast_hop_limit_for_direct_neighbor(parsed.to)
@@ -1693,7 +1695,7 @@ impl Router {
             half_airtime,
             cw_slot,
             self.node_num,
-            broadcast_plan.as_ref(),
+            broadcast_plan.as_ref().or(designated_plan.as_ref()),
         );
         let delay_ms = tx_after_ms.wrapping_sub(now_ms);
         self.sr_log.push(SrLogEvent::SlotScheduling {
@@ -1874,6 +1876,79 @@ impl Router {
     pub fn remember_relay_identity(&mut self, node_id: u32, relay_byte: u8, now_ms: u32) {
         self.relay_identity
             .remember_relay_identity(node_id, relay_byte, now_ms);
+    }
+
+    /// Slot plan for a unicast whose header already names a next hop.
+    ///
+    /// The designated node owns slot 0. If that is us we relay at once. Otherwise we keep our
+    /// normal unicast rank shifted by one slot, behind a slot-0 wait sized for the designated
+    /// node: one half-airtime for an SR peer (deterministic), the worst-case stock contention
+    /// window plus one airtime for a stock or unknown node. Any copy heard before our slot
+    /// cancels us (see `perhaps_cancel_dupe`). Bystanders therefore recover a failed designated
+    /// hop within a slot instead of staying silent, and duplicates are bounded by the same
+    /// cancel-on-hear rule broadcasts use.
+    fn plan_designated_unicast(
+        &mut self,
+        parsed: &ParsedPacket,
+        heard_from: u32,
+        rssi: i16,
+        snr: i8,
+        half_airtime: u32,
+        airtime_ms: u32,
+        now_ms: u32,
+    ) -> crate::broadcast_relay::BroadcastRelayPlan {
+        use crate::broadcast_relay::BroadcastRelayPlan;
+        let our_byte = (self.node_num & 0xFF) as u8;
+        if parsed.next_hop == our_byte {
+            self.sr_log.push(SrLogEvent::UnicastDesignated {
+                next_hop: parsed.next_hop,
+                is_us: true,
+                sr_active: true,
+                slot: 0,
+                slot_delay_ms: 0,
+            });
+            return BroadcastRelayPlan {
+                should_relay: true,
+                slot_delay_ms: 0,
+                slot_index: 0,
+                candidate_count: 1,
+            };
+        }
+        let designated = self
+            .relay_identity
+            .resolve_relay_identity(
+                parsed.next_hop,
+                rssi,
+                snr,
+                self.graph.edges(),
+                self.node_num,
+                now_ms,
+            )
+            .or_else(|| self.graph.match_relay_byte_on_outgoing_edges(parsed.next_hop));
+        let sr_active = designated
+            .map(|n| self.graph.capability_status(n) == crate::capability::CapabilityStatus::SrActive)
+            .unwrap_or(false);
+        let slot0_wait = if sr_active {
+            half_airtime
+        } else {
+            tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
+        };
+        let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+        let slot = rank.saturating_add(1);
+        let slot_delay_ms = slot0_wait.saturating_add((rank as u32).saturating_mul(half_airtime));
+        self.sr_log.push(SrLogEvent::UnicastDesignated {
+            next_hop: parsed.next_hop,
+            is_us: false,
+            sr_active,
+            slot,
+            slot_delay_ms,
+        });
+        BroadcastRelayPlan {
+            should_relay: true,
+            slot_delay_ms,
+            slot_index: slot,
+            candidate_count: count.saturating_add(1),
+        }
     }
 
     fn try_resolve_placeholder(&mut self, parsed: &ParsedPacket, now_ms: u32) -> bool {
@@ -2691,6 +2766,23 @@ impl Router {
             }
         }
 
+        // A unicast copy heard from anyone means the packet is moving, whether the designated
+        // next hop or an earlier slot carried it: our pending copy is redundant. Broadcast
+        // coverage reasoning below does not apply to unicasts.
+        if parsed.to != NODENUM_BROADCAST && (committed || has_pending) {
+            if self.graph.role_allows_canceling_dupe() {
+                self.graph.cancel_relay(parsed.from, parsed.id);
+                let canceled_pending = self.cancel_pending(parsed.from, parsed.id);
+                if canceled_pending || has_pending {
+                    self.sr_log.push(SrLogEvent::UnicastDupeCancel {
+                        id: parsed.id,
+                        from: parsed.from,
+                    });
+                }
+            }
+            return;
+        }
+
         if committed {
             if !has_pending {
                 self.cancel_t1_retransmit(parsed.id, T1CancelReason::RelayHeard);
@@ -3242,15 +3334,78 @@ mod tests {
     }
 
     #[test]
-    fn unicast_steered_at_another_node_is_left_alone() {
+    fn unicast_designated_to_us_takes_slot_zero() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // next_hop 0x99 is neither our byte (0xCC) nor unset.
-        let wire = unicast_wire(3, 3, 0x99, 0xDD, 0x502);
+        // Heard from SOURCE with our byte (0xCC) as next hop; DEST is downstream via RELAYER.
+        let wire = unicast_wire(3, 3, 0xCC, 0xDD, 0x502);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
-        assert!(!scheduled);
-        assert_eq!(reason, Some(SrSkipReason::NotNextHop));
+        assert!(scheduled);
+        assert_eq!(reason, None);
+        assert!(router.relay_tx_after(UNI_SOURCE, 0x502, 0).is_some());
+    }
+
+    #[test]
+    fn unicast_designated_elsewhere_takes_a_later_slot_and_cancels_on_copy() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // next_hop 0x99 names an unknown (treated as stock) node: it owns slot 0, we wait at
+        // least the worst-case stock delay plus one airtime before our own slot.
+        let wire = unicast_wire(3, 3, 0x99, 0xDD, 0x503);
+        let result = router
+            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &wire }, 0)
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        assert!(plan.relay.is_none(), "must not relay immediately");
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x503, 0)
+            .expect("relay pending in a later slot");
+        let slot0_wait = coordinated_relay::tx_delay_ms_worst(coordinated_relay::DEFAULT_SLOT_MS)
+            + coordinated_relay::DEFAULT_SLOT_MS;
+        assert!(tx_after >= slot0_wait, "tx_after {tx_after} < slot-0 wait {slot0_wait}");
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::UnicastDesignated { next_hop: 0x99, is_us: false, sr_active: false, slot, .. } if *slot >= 1
+        )));
+
+        // The designated node relays (copy with one hop used, relay byte 0x99): we stand down.
+        let copy = unicast_wire(2, 3, 0, 0x99, 0x503);
+        let dupe = router
+            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &copy }, 100)
+            .unwrap();
+        assert!(dupe.duplicate);
+        assert!(router.relay_tx_after(UNI_SOURCE, 0x503, 0).is_none(), "pending relay must be cancelled");
+        assert!(router.poll_ready_relay(tx_after + 1).is_none());
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
+    }
+
+    #[test]
+    fn unicast_designated_sr_peer_uses_half_airtime_slot() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // RELAYER (byte 0xBB) is a known SR-active direct neighbour and the designated next hop.
+        router.graph_mut().capability_mut().track_topology(UNI_RELAYER, true, 0);
+        let wire = unicast_wire(3, 3, 0xBB, 0xDD, 0x505);
+        let result = router
+            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &wire }, 0)
+            .unwrap();
+        let _ = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        let designated = logs.iter().find_map(|e| match e {
+            SrLogEvent::UnicastDesignated { sr_active, slot_delay_ms, .. } => Some((*sr_active, *slot_delay_ms)),
+            _ => None,
+        });
+        let (sr_active, delay) = designated.expect("designated plan logged");
+        assert!(sr_active);
+        let stock_wait = coordinated_relay::tx_delay_ms_worst(coordinated_relay::DEFAULT_SLOT_MS);
+        assert!(delay < stock_wait, "SR peer slot-0 wait {delay} should be far below stock {stock_wait}");
     }
 
     #[test]
