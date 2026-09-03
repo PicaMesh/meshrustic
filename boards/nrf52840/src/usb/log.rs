@@ -1124,6 +1124,9 @@ pub mod sr {
                     SrSkipReason::OwnRebroadcast => b"own rebroadcast",
                     SrSkipReason::UnknownDestination => b"unknown dest",
                     SrSkipReason::BetterNeighbor => b"better neighbor",
+                    SrSkipReason::NotNextHop => b"not next hop",
+                    SrSkipReason::NextHopIsRelayer => b"next hop is relayer",
+                    SrSkipReason::DeadEndHop => b"dead end hop",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

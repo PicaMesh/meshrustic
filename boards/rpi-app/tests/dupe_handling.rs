@@ -213,8 +213,10 @@ fn router_role_repeated_want_ack_still_re_acks() {
 }
 
 #[test]
-fn want_ack_dupe_does_not_bypass_rate_limit_on_new_packets() {
-    // Dupes short-circuit before rate_limit; new packets from a limited node still drop.
+fn want_ack_to_us_is_never_rate_limited_even_from_a_limited_node() {
+    // Packets addressed to us are processed and ACKed regardless of the sender's bucket state:
+    // they are never relayed, and dropping them silently breaks admin/DM delivery. The bucket
+    // still fills up (the TEXT burst below), it just never applies to traffic for us.
     const US: u32 = 0xCCCC_CCCF;
     const FROM: u32 = 0x1111_1113;
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
@@ -243,7 +245,16 @@ fn want_ack_dupe_does_not_bypass_rate_limit_on_new_packets() {
             snr: 8,
             bytes: &frame[..usize::from(len)],
         };
-        let _ = router.process_inbound(&inbound, id * 10);
+        // Mirror the radio task: every processed packet goes through evaluate_tx_plan, which
+        // is what returns its packet-pool slot.
+        if let Some(result) = router.process_inbound(&inbound, id * 10) {
+            let _ = router.evaluate_tx_plan(
+                &result,
+                0.0,
+                mesh_routing::coordinated_relay::DEFAULT_SLOT_MS,
+                id * 10,
+            );
+        }
     }
 
     let (len, frame) = build_app_wire_frame(
@@ -268,12 +279,12 @@ fn want_ack_dupe_does_not_bypass_rate_limit_on_new_packets() {
     };
     let result = router.process_inbound(&inbound, 1_000).expect("rx");
     assert!(
-        result.rate_limited,
-        "new WantAck from a rate-limited node must still be dropped"
+        !result.rate_limited,
+        "a WantAck addressed to us must never be rate limited"
     );
     assert!(
-        router.poll_ack_tx(1_000).is_none(),
-        "rate-limited WantAck must not schedule ACK"
+        router.poll_ack_tx(1_000).is_some(),
+        "WantAck addressed to us must still be ACKed"
     );
 }
 

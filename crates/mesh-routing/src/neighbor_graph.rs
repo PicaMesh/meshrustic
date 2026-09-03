@@ -1689,7 +1689,7 @@ impl NeighborGraph {
         0
     }
 
-    fn has_direct_edge(&self, peer: u32) -> bool {
+    pub(crate) fn has_direct_edge(&self, peer: u32) -> bool {
         self.edges
             .find_node(self.my_node)
             .and_then(|n| n.find_edge(peer))

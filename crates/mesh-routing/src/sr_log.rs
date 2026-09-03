@@ -175,6 +175,12 @@ pub enum SrSkipReason {
     OwnRebroadcast,
     UnknownDestination,
     BetterNeighbor,
+    /// Unicast already steered at another node's relay byte.
+    NotNextHop,
+    /// Unicast whose next hop is the node we just heard it from.
+    NextHopIsRelayer,
+    /// Unicast that would leave us with hop_limit 0 without a direct link to the target.
+    DeadEndHop,
 }
 
 /// Sink for periodic topology graph dumps (may emit many lines).

@@ -1493,6 +1493,20 @@ impl Router {
             }
         }
 
+        // 6. A unicast already steered at another node's relay byte is that node's job; the
+        // origin falls back to flooding on its own if that node never forwards it.
+        if parsed.to != NODENUM_BROADCAST
+            && parsed.next_hop != 0
+            && parsed.next_hop != (self.node_num & 0xFF) as u8
+        {
+            self.pool.release(handle);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::NotNextHop,
+            });
+            return plan;
+        }
+
         if parsed.to != NODENUM_BROADCAST
             && parsed.to != self.node_num
             && !self.graph.topology_healthy_for_unicast(parsed.to, now_ms)
@@ -1521,6 +1535,17 @@ impl Router {
             0
         };
 
+        // 1. The relayer we heard this from already holds the packet; handing it back only
+        // produces a duplicate there.
+        if parsed.to != NODENUM_BROADCAST && next_hop != 0 && next_hop == heard_from {
+            self.pool.release(handle);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::NextHopIsRelayer,
+            });
+            return plan;
+        }
+
         let direct_hop_limit = if parsed.to != NODENUM_BROADCAST {
             self.graph.unicast_hop_limit_for_direct_neighbor(parsed.to)
         } else {
@@ -1542,6 +1567,20 @@ impl Router {
                 return plan;
             }
         };
+
+        // 2. A unicast leaving us with hop_limit 0 can only still be delivered by a node that
+        // is the destination itself; without a direct link to the target it is dead airtime.
+        if parsed.to != NODENUM_BROADCAST
+            && relay_hdr.hop_limit() == 0
+            && !self.graph.has_direct_edge(parsed.to)
+        {
+            self.pool.release(handle);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::DeadEndHop,
+            });
+            return plan;
+        }
 
         let mut staging = PacketSlot::empty();
         {
@@ -3149,6 +3188,94 @@ mod tests {
         let header = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN]).unwrap();
         assert_eq!(header.hop_limit(), 0);
         assert_eq!(header.hop_start(), 3);
+    }
+
+    const UNI_ME: u32 = 0xCC00_00CC;
+    const UNI_RELAYER: u32 = 0xBB00_00BB;
+    const UNI_SOURCE: u32 = 0xDD00_00DD;
+    const UNI_DEST: u32 = 0xEE00_00EE;
+
+    /// Graph: we hear RELAYER directly, DEST is only reachable downstream through RELAYER.
+    fn setup_unicast_graph(router: &mut Router) {
+        router.graph_mut().observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .downstream_mut()
+            .update(UNI_ME, UNI_DEST, UNI_RELAYER, 2.0, 0, false, 0);
+    }
+
+    fn unicast_wire(hop_limit: u8, hop_start: u8, next_hop: u8, relay: u8, id: u32) -> heapless::Vec<u8, 128> {
+        let header = PacketHeader::from_fields(
+            UNI_DEST, UNI_SOURCE, id, 0x77, hop_limit, hop_start, false, false, next_hop, relay,
+        );
+        encode_wire(header, &[0xDE, 0xAD, 0xBE, 0xEF])
+    }
+
+    fn unicast_skip_reason(router: &mut Router, wire: &[u8]) -> (bool, Option<SrSkipReason>) {
+        let result = router
+            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: wire }, 0)
+            .unwrap();
+        let (from, id) = (result.parsed.from, result.parsed.id);
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        // Only the relay of this packet counts; a directly heard source also queues a
+        // topology broadcast, which is unrelated pending work.
+        let scheduled = plan.relay.is_some() || router.relay_tx_after(from, id, 0).is_some();
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        let reason = logs.iter().rev().find_map(|e| match e {
+            SrLogEvent::RelaySkip { reason, .. } => Some(*reason),
+            _ => None,
+        });
+        (scheduled, reason)
+    }
+
+    #[test]
+    fn unicast_not_relayed_back_to_the_relayer() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // Heard from RELAYER (relay byte 0xBB), and RELAYER is also our route to DEST.
+        let wire = unicast_wire(2, 3, 0, 0xBB, 0x501);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled);
+        assert_eq!(reason, Some(SrSkipReason::NextHopIsRelayer));
+    }
+
+    #[test]
+    fn unicast_steered_at_another_node_is_left_alone() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // next_hop 0x99 is neither our byte (0xCC) nor unset.
+        let wire = unicast_wire(3, 3, 0x99, 0xDD, 0x502);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled);
+        assert_eq!(reason, Some(SrSkipReason::NotNextHop));
+    }
+
+    #[test]
+    fn unicast_last_hop_needs_direct_link_to_target() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // Heard directly from SOURCE with one hop left: relaying would leave hop_limit 0 and
+        // DEST is not our direct neighbour.
+        let wire = unicast_wire(1, 1, 0, 0xDD, 0x503);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled);
+        assert_eq!(reason, Some(SrSkipReason::DeadEndHop));
+    }
+
+    #[test]
+    fn unicast_last_hop_relayed_when_target_is_direct_neighbour() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        router.graph_mut().observe_direct_neighbor(UNI_DEST, -75, 6, 0, 0);
+        let wire = unicast_wire(1, 1, 0, 0xDD, 0x504);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(scheduled, "hop_limit 0 is fine when the next hop is the destination");
+        assert_eq!(reason, None);
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub fn is_node_routable(filter: &RoutableFilter<'_>, node_id: u32) -> bool {
     }
     match filter.capability.status(node_id) {
         CapabilityStatus::Legacy => filter.capability.is_legacy_router(node_id),
+        // SR-passive nodes broadcast topology but never relay: routing through one is a dead end.
+        CapabilityStatus::Passive => false,
         _ => true,
     }
 }
@@ -479,6 +481,32 @@ mod tests {
             ),
             0xCC
         );
+    }
+
+    #[test]
+    fn passive_sr_node_is_not_routable_but_stays_reachable_as_destination() {
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(0xAA, 0);
+        const P: u32 = 0x0200_0002;
+        edges.update_edge(0xAA, 0xAA, P, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, P, 0xCC, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(0xAA, 0xAA, 0xBB, 3.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xBB, 0xCC, 3.0, 0, EdgeSource::Mirrored, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(P, false, 0); // passive: sends topology, never relays
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: 0xAA,
+            device_role: DEVICE_ROLE_CLIENT,
+        };
+        assert!(!is_node_routable(&filter, P));
+        let downstream = DownstreamTable::new();
+        // Cheaper path via the passive node must be rejected in favour of the relaying one.
+        let route = calculate_route(&edges, &downstream, 0xAA, 0xCC, 0, Some(&filter));
+        assert_eq!(route.next_hop, 0xBB);
+        // The passive node itself is still a valid destination.
+        let to_p = calculate_route(&edges, &downstream, 0xAA, P, 0, Some(&filter));
+        assert_eq!(to_p.next_hop, P);
     }
 
     #[test]

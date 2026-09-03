@@ -136,7 +136,10 @@ fn rate_limited_packet_does_not_merge_topology() {
 }
 
 #[test]
-fn rate_limited_nodeinfo_request_gets_no_reply() {
+fn nodeinfo_request_to_us_is_answered_even_from_a_limited_node() {
+    // Packets addressed to us bypass the per-source limiter: they are never relayed and the
+    // reply path has its own per-requester cooldown, so a flooded OTHER bucket must not
+    // silence a direct NodeInfo request.
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our_node = 0x1111_1111;
     let requester = 0x2222_2222;
@@ -171,8 +174,11 @@ fn rate_limited_nodeinfo_request_gets_no_reply() {
     let result = router
         .process_inbound(&inbound(&wire), 2_000)
         .expect("nodeinfo request rx");
-    assert!(result.rate_limited);
-    assert!(router.poll_nodeinfo_tx(2_000).is_none());
+    assert!(!result.rate_limited, "requests addressed to us are never rate limited");
+    assert!(
+        router.poll_nodeinfo_tx(2_000).is_some(),
+        "a direct NodeInfo request must still be answered"
+    );
 }
 
 #[test]
