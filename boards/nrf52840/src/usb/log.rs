@@ -783,7 +783,7 @@ pub mod battery {
 /// Signal-routing decision logs (`[SR]` prefix).
 pub mod sr {
     use super::{finish_line, line_prefix, push_hex_u32_8, push_hex_u8_2, push_i32, push_u32};
-    use mesh_routing::{Router, SrLogEvent, SrSkipReason, T1CancelReason, TopologyLogSink};
+    use mesh_routing::{Router, SrLogEvent, SrSkipReason, RelayRetxCancelReason, T1CancelReason, TopologyLogSink};
 
     fn emit_topology_event(event: SrLogEvent) {
         match event {
@@ -1457,6 +1457,50 @@ pub mod sr {
                 pos += mid.len();
                 pos += push_hex_u32_8(&mut line[pos..], from);
                 let tail = b" - canceling relay";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RelayRetxArmed { id, next_hop } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Relay retx armed for 0x";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], id);
+                let mid = b" via next hop 0x";
+                line[pos..pos + mid.len()].copy_from_slice(mid);
+                pos += mid.len();
+                pos += push_hex_u8_2(&mut line[pos..], next_hop);
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RelayRetxFired { id, fallback } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Relay retx for 0x";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], id);
+                let tail: &[u8] = if fallback {
+                    b" (last try, next hop cleared - flooding)"
+                } else {
+                    b" (designated next hop silent)"
+                };
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RelayRetxCanceled { id, reason } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Relay retx canceled for 0x";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], id);
+                let tail: &[u8] = match reason {
+                    RelayRetxCancelReason::CopyHeard => b" reason=copy heard",
+                    RelayRetxCancelReason::ReplyHeard => b" reason=reply heard",
+                };
                 line[pos..pos + tail.len()].copy_from_slice(tail);
                 pos += tail.len();
                 finish_line(&mut line, pos);

@@ -80,7 +80,7 @@ pub use routing_ack::{
 };
 pub use router::{InboundPacket, ProcessResult, RelayPlan, Router, TxPlan, MAX_WIRE_LEN};
 pub use rx_decode::{summarize_decrypted, RxDecodeInfo, RxPayloadSummary};
-pub use sr_log::{SrLog, SrLogEvent, SrSkipReason, TopologyLogSink, T1CancelReason, MAX_SR_LOG};
+pub use sr_log::{RelayRetxCancelReason, SrLog, SrLogEvent, SrSkipReason, TopologyLogSink, T1CancelReason, MAX_SR_LOG};
 pub use nodeinfo::{
     build_nodeinfo_reply_frame, build_nodeinfo_wire_frame, decode_user, encode_user,
     NodeInfoAdvert, NodeInfoCache, NodeInfoIdentity, NodeInfoPeerEntry, DEVICE_ROLE_CLIENT,

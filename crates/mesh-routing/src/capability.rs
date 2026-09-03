@@ -2,7 +2,7 @@
 
 use crate::nodeinfo::{
     DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_BASE, DEVICE_ROLE_CLIENT_HIDDEN,
-    DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_LOST_AND_FOUND, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
+    DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
     DEVICE_ROLE_ROUTER_CLIENT, DEVICE_ROLE_ROUTER_LATE, DEVICE_ROLE_SENSOR, DEVICE_ROLE_TAK,
     DEVICE_ROLE_TAK_TRACKER, DEVICE_ROLE_TRACKER,
 };
@@ -233,6 +233,10 @@ pub fn capability_from_role(role: u32) -> CapabilityStatus {
     }
 }
 
+/// Roles that broadcast SR topology. Every role does except LOST_AND_FOUND (and unknown
+/// roles): CLIENT_MUTE, TRACKER, SENSOR, TAK, TAK_TRACKER and CLIENT_HIDDEN announce their
+/// direct neighbours as SR-passive even though they never relay (mirrors the fork's
+/// `canSendTopology`).
 pub fn role_may_send_topology(role: u32) -> bool {
     matches!(
         role,
@@ -246,7 +250,6 @@ pub fn role_may_send_topology(role: u32) -> bool {
             | DEVICE_ROLE_SENSOR
             | DEVICE_ROLE_TAK
             | DEVICE_ROLE_CLIENT_HIDDEN
-            | DEVICE_ROLE_LOST_AND_FOUND
             | DEVICE_ROLE_TAK_TRACKER
             | DEVICE_ROLE_CLIENT_BASE
     )

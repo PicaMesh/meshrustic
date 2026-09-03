@@ -158,6 +158,20 @@ pub enum SrLogEvent {
         id: u32,
         from: u32,
     },
+    /// We forwarded a want_ack unicast with a designated next hop and will retry it.
+    RelayRetxArmed {
+        id: u32,
+        next_hop: u8,
+    },
+    /// A retry went out; `fallback` marks the last one, sent with next_hop cleared.
+    RelayRetxFired {
+        id: u32,
+        fallback: bool,
+    },
+    RelayRetxCanceled {
+        id: u32,
+        reason: RelayRetxCancelReason,
+    },
     TracerouteAppended {
         towards: bool,
         route_len: u8,
@@ -171,6 +185,14 @@ pub enum SrLogEvent {
         dst_radio: u8,
         delay_ms: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayRetxCancelReason {
+    /// Someone relayed the packet on: the designated hop or a later slot.
+    CopyHeard,
+    /// The destination answered (ACK, NAK or application reply).
+    ReplyHeard,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
