@@ -13,13 +13,12 @@ fn wire_bytes(header: PacketHeader, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn ready_relay(router: &mut Router, result: &mesh_routing::ProcessResult, now_ms: u32) -> mesh_routing::RelayPlan {
-    let plan = router.evaluate_tx_plan(
-        result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        now_ms,
-    );
+fn ready_relay(
+    router: &mut Router,
+    result: &mesh_routing::ProcessResult,
+    now_ms: u32,
+) -> mesh_routing::RelayPlan {
+    let plan = router.evaluate_tx_plan(result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, now_ms);
     if let Some(relay) = plan.relay {
         return relay;
     }

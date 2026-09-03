@@ -1,9 +1,9 @@
 //! Graph topology merge, ETX, and downstream tests.
 
 use mesh_routing::{
-    calculate_etx, etx_to_signal, decode_packed_neighbors, write_packed_header,
+    calculate_etx, decode_packed_neighbors, etx_to_signal, write_packed_header, NeighborEntry,
     NeighborGraph, PackedNeighbor, SrLog, SrLogEvent, TopologyMergeResult, MAX_EDGES_PER_NODE,
-    NeighborEntry, PACKED_NEIGHBOR_HEADER_SIZE,
+    PACKED_NEIGHBOR_HEADER_SIZE,
 };
 
 #[test]
@@ -142,7 +142,7 @@ fn direct_neighbor_survives_maintenance_before_topology_merge() {
 
 #[test]
 fn relayed_packet_creates_placeholder_edge_to_transmitter() {
-    use mesh_routing::{DEVICE_ROLE_CLIENT, placeholder_node_id};
+    use mesh_routing::{placeholder_node_id, DEVICE_ROLE_CLIENT};
 
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
@@ -308,7 +308,10 @@ fn direct_neighbor_count_uses_reported_to_us() {
         0,
     );
     assert_eq!(graph.neighbor_count(), 1);
-    assert_eq!(graph.fill_neighbor_entries(&mut [NeighborEntry::default(); MAX_EDGES_PER_NODE]), 0);
+    assert_eq!(
+        graph.fill_neighbor_entries(&mut [NeighborEntry::default(); MAX_EDGES_PER_NODE]),
+        0
+    );
 }
 
 #[test]

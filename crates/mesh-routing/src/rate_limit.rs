@@ -286,7 +286,10 @@ mod tests {
                 return;
             }
             t += 1;
-            assert!(t <= base_ms + 16, "failed to trip OTHER bucket limit for {from:#x}");
+            assert!(
+                t <= base_ms + 16,
+                "failed to trip OTHER bucket limit for {from:#x}"
+            );
         }
     }
 
@@ -432,7 +435,10 @@ mod tests {
         assert!(!drop_other(&mut limiter, 0x2000, 200));
 
         assert!(limiter.is_tracking(0x2000));
-        assert!(!limiter.is_tracking(0x1008), "farthest non-limited slot evicted");
+        assert!(
+            !limiter.is_tracking(0x1008),
+            "farthest non-limited slot evicted"
+        );
         assert!(limiter.is_tracking(0x1002));
     }
 
@@ -448,7 +454,10 @@ mod tests {
         assert!(!drop_other(&mut limiter, 0x2000, 3_000));
 
         assert!(limiter.is_tracking(0x1000), "limited entry kept");
-        assert!(!limiter.is_tracking(0x100F), "farthest unlimited entry evicted");
+        assert!(
+            !limiter.is_tracking(0x100F),
+            "farthest unlimited entry evicted"
+        );
         assert!(limiter.is_tracking(0x2000));
     }
 
@@ -464,7 +473,10 @@ mod tests {
 
         assert!(!drop_other(&mut limiter, 0x2000, 50_000));
 
-        assert!(!limiter.is_tracking(0x1000), "oldest limited window evicted");
+        assert!(
+            !limiter.is_tracking(0x1000),
+            "oldest limited window evicted"
+        );
         assert!(limiter.is_tracking(0x2000));
         assert!(limiter.is_tracking(0x100F));
     }

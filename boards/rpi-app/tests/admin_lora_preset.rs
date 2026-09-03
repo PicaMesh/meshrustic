@@ -7,9 +7,10 @@ use mesh_radio::{
     MODEM_SHORT_FAST, MODEM_SHORT_SLOW,
 };
 use mesh_routing::{
-    decode_data_payload_full, decode_routing_payload, encode_admin_message, encode_data_payload_opts,
-    AdminPayload, ConfigPayload, DataEncodeOpts, InboundPacket, NodeInfoIdentity, RelayPlan, Router,
-    WireLoRaConfig, ADMIN_APP, CONFIG_TYPE_LORA, REGION_EU_868, ROUTING_APP, ROUTING_ERROR_NONE,
+    decode_data_payload_full, decode_routing_payload, encode_admin_message,
+    encode_data_payload_opts, AdminPayload, ConfigPayload, DataEncodeOpts, InboundPacket,
+    NodeInfoIdentity, RelayPlan, Router, WireLoRaConfig, ADMIN_APP, CONFIG_TYPE_LORA,
+    REGION_EU_868, ROUTING_APP, ROUTING_ERROR_NONE,
 };
 use mesh_store::{generate_keypair, ConfigStore, NodeConfig, RamConfigStore};
 use static_cell::StaticCell;
@@ -62,11 +63,7 @@ fn inbound(router: &mut Router, frame: &[u8], now: u32) {
         .unwrap();
 }
 
-fn decrypt_pki_routing_error(
-    tx: &RelayPlan,
-    peer_priv: &[u8; 32],
-    node_pub: &[u8; 32],
-) -> u32 {
+fn decrypt_pki_routing_error(tx: &RelayPlan, peer_priv: &[u8; 32], node_pub: &[u8; 32]) -> u32 {
     let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
         .parse();
@@ -81,7 +78,10 @@ fn decrypt_pki_routing_error(
     let plain_len = cipher.len() - 12;
     let (decoded, payload) = decode_data_payload_full(&plain[..plain_len]).unwrap();
     assert_eq!(decoded.portnum, ROUTING_APP);
-    decode_routing_payload(&payload).unwrap().error_reason.unwrap()
+    decode_routing_payload(&payload)
+        .unwrap()
+        .error_reason
+        .unwrap()
 }
 
 #[test]
@@ -139,7 +139,9 @@ fn set_lora_persists_and_reloads_channel_hash() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 2_000);
-    let set_tx = router.poll_admin_tx(2_000).expect("LoRa set completion reply");
+    let set_tx = router
+        .poll_admin_tx(2_000)
+        .expect("LoRa set completion reply");
     assert_eq!(
         decrypt_pki_routing_error(&set_tx, &b1_priv, &node_pub),
         ROUTING_ERROR_NONE,
@@ -157,7 +159,10 @@ fn set_lora_persists_and_reloads_channel_hash() {
 
     // Board soft-reinit uses eu868_config_for_preset(router.modem_preset()).
     let radio = eu868_config_for_preset(router.modem_preset());
-    assert_eq!(radio.spreading_factor, 7, "SHORT_FAST must be SF7 (was SF8 on SHORT_SLOW)");
+    assert_eq!(
+        radio.spreading_factor, 7,
+        "SHORT_FAST must be SF7 (was SF8 on SHORT_SLOW)"
+    );
     assert_eq!(radio.bandwidth_khz, 250.0);
     assert_eq!(radio.coding_rate, 5);
     assert_eq!(radio.modem_preset, MODEM_SHORT_FAST);

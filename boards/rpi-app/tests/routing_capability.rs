@@ -3,10 +3,9 @@
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
-    coordinated_relay, write_packed_header, CapabilityStatus,
-    InboundPacket, NeighborGraph, Router, TopologyMergeResult, CAPABILITY_TTL_MS,
-    DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER,
-    DEVICE_ROLE_TRACKER, MAX_CAPABILITY_RECORDS,
+    coordinated_relay, write_packed_header, CapabilityStatus, InboundPacket, NeighborGraph, Router,
+    TopologyMergeResult, CAPABILITY_TTL_MS, DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE,
+    DEVICE_ROLE_REPEATER, DEVICE_ROLE_TRACKER, MAX_CAPABILITY_RECORDS,
 };
 
 #[test]
@@ -70,7 +69,8 @@ fn send_local_broadcast_schedules_t1() {
         3,
     );
 
-    let header = PacketHeader::from_fields(NODENUM_BROADCAST, 0xBB, 1, 0x77, 3, 3, false, false, 0, 0);
+    let header =
+        PacketHeader::from_fields(NODENUM_BROADCAST, 0xBB, 1, 0x77, 3, 3, false, false, 0, 0);
     let mut hdr = [0u8; PACKET_HEADER_LEN];
     header.encode_to(&mut hdr);
     let wire = [hdr.as_slice(), &[0x01u8]].concat();
@@ -191,15 +191,9 @@ fn local_node_capability_from_role() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.set_device_role(DEVICE_ROLE_REPEATER);
-    assert_eq!(
-        graph.capability_status(0xAA),
-        CapabilityStatus::SrActive
-    );
+    assert_eq!(graph.capability_status(0xAA), CapabilityStatus::SrActive);
     graph.set_device_role(DEVICE_ROLE_CLIENT_MUTE);
-    assert_eq!(
-        graph.capability_status(0xAA),
-        CapabilityStatus::Passive
-    );
+    assert_eq!(graph.capability_status(0xAA), CapabilityStatus::Passive);
 }
 
 #[test]
@@ -246,15 +240,13 @@ fn tracker_role_skips_evaluate_tx_plan_relay() {
             0,
         )
         .unwrap();
-    assert!(
-        router
-            .evaluate_tx_plan(
-                &result,
-                0.0,
-                coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
-                0,
-            )
-            .relay
-            .is_none()
-    );
+    assert!(router
+        .evaluate_tx_plan(
+            &result,
+            0.0,
+            coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
+            0,
+        )
+        .relay
+        .is_none());
 }

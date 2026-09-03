@@ -1,8 +1,8 @@
 //! Host three-node SR bench — line topology without hardware.
 
 use mesh_routing::{
-    decode_packed_neighbors, write_packed_header, NeighborGraph,
-    PackedNeighbor, TopologyMergeResult, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, MAX_DOWNSTREAM,
+    decode_packed_neighbors, write_packed_header, NeighborGraph, PackedNeighbor,
+    TopologyMergeResult, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, MAX_DOWNSTREAM,
 };
 
 #[test]
@@ -49,10 +49,26 @@ fn three_node_middle_node_defers_to_stock_router() {
     const B: u32 = 0xB000_0002;
     const D: u32 = 0xD000_0004;
     c.edges_mut().ensure_local_node(0xC000_0003, 0);
-    c.edges_mut()
-        .update_edge(0xC000_0003, 0xC000_0003, B, 2.0, 0, EdgeSource::Reported, true, 0);
-    c.edges_mut()
-        .update_edge(0xC000_0003, 0xC000_0003, D, 2.0, 0, EdgeSource::Reported, true, 0);
+    c.edges_mut().update_edge(
+        0xC000_0003,
+        0xC000_0003,
+        B,
+        2.0,
+        0,
+        EdgeSource::Reported,
+        true,
+        0,
+    );
+    c.edges_mut().update_edge(
+        0xC000_0003,
+        0xC000_0003,
+        D,
+        2.0,
+        0,
+        EdgeSource::Reported,
+        true,
+        0,
+    );
     c.edges_mut().set_edge_hears_us(0xC000_0003, B, true);
     c.edges_mut().set_edge_hears_us(0xC000_0003, D, true);
     c.edges_mut()

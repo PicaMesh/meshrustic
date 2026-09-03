@@ -78,13 +78,7 @@ impl DownstreamTable {
         count
     }
 
-    pub fn nodes_for_relay(
-        &self,
-        relay: u32,
-        out: &mut [u32],
-        now_ms: u32,
-        ttl_ms: u32,
-    ) -> usize {
+    pub fn nodes_for_relay(&self, relay: u32, out: &mut [u32], now_ms: u32, ttl_ms: u32) -> usize {
         let mut count = 0usize;
         for i in 0..self.count as usize {
             if count >= out.len() {
@@ -332,15 +326,7 @@ mod tests {
     fn stores_up_to_max_downstream_entries() {
         let mut table = DownstreamTable::new();
         for i in 0..MAX_DOWNSTREAM {
-            table.update(
-                0xAA,
-                0x1_0000 + i as u32,
-                0xBB,
-                2.0,
-                i as u32,
-                false,
-                0,
-            );
+            table.update(0xAA, 0x1_0000 + i as u32, 0xBB, 2.0, i as u32, false, 0);
         }
         assert_eq!(table.count(), MAX_DOWNSTREAM as u16);
     }
@@ -367,11 +353,17 @@ mod tests {
         let mut table = DownstreamTable::new();
         table.update(0xAA, 0xD1, 0x0100_0001, 2.0, 1_000, false, 0);
         table.update(0xAA, 0xD2, 0x0100_0001, 3.0, 1_000, false, 0);
-        assert_eq!(table.transfer_downstream(0x0100_0001, 0x0200_0002, 2_000), 2);
+        assert_eq!(
+            table.transfer_downstream(0x0100_0001, 0x0200_0002, 2_000),
+            2
+        );
         assert_eq!(table.count_for_relay(0x0100_0001, 2_000, 10_000), 0);
         assert_eq!(table.count_for_relay(0x0200_0002, 2_000, 10_000), 2);
         let mut nodes = [0u32; 4];
-        assert_eq!(table.nodes_for_relay(0x0200_0002, &mut nodes, 2_000, 10_000), 2);
+        assert_eq!(
+            table.nodes_for_relay(0x0200_0002, &mut nodes, 2_000, 10_000),
+            2
+        );
         assert!(nodes[..2].contains(&0xD1));
         assert!(nodes[..2].contains(&0xD2));
     }

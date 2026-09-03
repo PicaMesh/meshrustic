@@ -27,9 +27,7 @@ mod tests {
     use super::*;
     use mesh_crypto::DEFAULT_PSK;
 
-    use crate::config::{
-        MODEM_LONG_FAST, MODEM_MEDIUM_FAST, MODEM_SHORT_FAST, MODEM_SHORT_SLOW,
-    };
+    use crate::config::{MODEM_LONG_FAST, MODEM_MEDIUM_FAST, MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
 
     #[test]
     fn empty_name_uses_preset_display_name() {

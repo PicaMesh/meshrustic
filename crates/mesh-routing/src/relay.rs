@@ -159,8 +159,7 @@ mod tests {
         let parsed =
             PacketHeader::from_fields(0xDD00_00DD, 0xBB00_00BB, 1, 0, 5, 3, false, false, 0, 0)
                 .parse();
-        let hdr =
-            relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(0)).expect("relay");
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(0)).expect("relay");
         assert_eq!(hdr.hop_limit(), 0);
         assert_eq!(hdr.hop_start(), 3);
         assert_eq!(hdr.hop_start().saturating_sub(hdr.hop_limit()), 3);
@@ -171,8 +170,7 @@ mod tests {
         let parsed =
             PacketHeader::from_fields(0xDD00_00DD, 0xBB00_00BB, 1, 0, 5, 3, false, false, 0, 0)
                 .parse();
-        let hdr =
-            relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(1)).expect("relay");
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(1)).expect("relay");
         assert_eq!(hdr.hop_limit(), 1);
         assert_eq!(hdr.hop_start(), 4);
         assert_eq!(hdr.hop_start().saturating_sub(hdr.hop_limit()), 3);

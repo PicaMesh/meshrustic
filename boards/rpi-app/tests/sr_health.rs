@@ -22,16 +22,9 @@ fn setup_stock_relay_topology(router: &mut Router, healthy: bool) {
     if !healthy {
         graph.capability_mut().track_topology(STOCK, false, 0);
     }
-    graph.edges_mut().update_edge(
-        ME,
-        STOCK,
-        NEIGHBOR,
-        2.0,
-        0,
-        EdgeSource::Reported,
-        true,
-        0,
-    );
+    graph
+        .edges_mut()
+        .update_edge(ME, STOCK, NEIGHBOR, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
 }
 

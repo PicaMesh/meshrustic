@@ -108,10 +108,7 @@ pub struct BroadcastRelayContext<'a> {
 }
 
 fn is_non_relaying_legacy(capability: &CapabilityCache, node_id: u32) -> bool {
-    capability
-        .role(node_id)
-        .map(role_is_mute)
-        .unwrap_or(false)
+    capability.role(node_id).map(role_is_mute).unwrap_or(false)
 }
 
 fn get_coverage_if_relays(
@@ -173,7 +170,8 @@ where
         }
 
         let mut coverage_buf = [0u32; MAX_EDGES_PER_NODE];
-        let coverage_n = get_coverage_if_relays(ctx.edges, ctx.my_node, candidate, &mut coverage_buf);
+        let coverage_n =
+            get_coverage_if_relays(ctx.edges, ctx.my_node, candidate, &mut coverage_buf);
         let mut unique = [0u32; MAX_EDGES_PER_NODE];
         let mut unique_count = 0u8;
         for j in 0..coverage_n as usize {
@@ -251,11 +249,7 @@ where
     best
 }
 
-fn build_already_covered(
-    edges: &EdgeStore,
-    source: u32,
-    heard_from: u32,
-) -> CoveredSet {
+fn build_already_covered(edges: &EdgeStore, source: u32, heard_from: u32) -> CoveredSet {
     let mut covered = CoveredSet::new();
     covered.insert(source);
     covered.insert(heard_from);
@@ -270,11 +264,7 @@ fn build_already_covered(
     covered
 }
 
-fn build_candidates(
-    ctx: &BroadcastRelayContext<'_>,
-    source: u32,
-    heard_from: u32,
-) -> NodeSet {
+fn build_candidates(ctx: &BroadcastRelayContext<'_>, source: u32, heard_from: u32) -> NodeSet {
     let mut candidates = NodeSet::new();
     candidates.insert(ctx.my_node);
 
@@ -289,7 +279,9 @@ fn build_candidates(
             continue;
         }
         let status = ctx.capability.status(neighbor);
-        if status == CapabilityStatus::SrActive || ctx.capability.is_immediate_relay_router(neighbor) {
+        if status == CapabilityStatus::SrActive
+            || ctx.capability.is_immediate_relay_router(neighbor)
+        {
             candidates.insert(neighbor);
         }
     }
@@ -475,16 +467,16 @@ where
 
     if !should_relay {
         let relay_for_source = ctx.downstream.get_relay(source, now_ms, DOWNSTREAM_TTL_MS);
-        let relay_for_dest = ctx.downstream.get_relay(broadcast_dest, now_ms, DOWNSTREAM_TTL_MS);
+        let relay_for_dest = ctx
+            .downstream
+            .get_relay(broadcast_dest, now_ms, DOWNSTREAM_TTL_MS);
         if relay_for_source == Some(ctx.my_node) || relay_for_dest == Some(ctx.my_node) {
             should_relay = true;
             my_delay = slot_delay;
         }
     }
 
-    if !should_relay
-        && should_relay_for_stock_neighbors(ctx, source, heard_from)
-    {
+    if !should_relay && should_relay_for_stock_neighbors(ctx, source, heard_from) {
         should_relay = true;
         my_delay = slot_delay;
     }
@@ -565,16 +557,7 @@ mod tests {
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, A, 2.0, 0, EdgeSource::Reported, true, 0);
         let ctx = ctx(&edges, &capability, &downstream);
-        let plan = plan_broadcast_relay(
-            &ctx,
-            0x77,
-            A,
-            A,
-            0xFFFF_FFFF,
-            0,
-            100,
-            |_| false,
-        );
+        let plan = plan_broadcast_relay(&ctx, 0x77, A, A, 0xFFFF_FFFF, 0, 100, |_| false);
         assert!(plan.should_relay);
     }
 
@@ -673,8 +656,7 @@ mod tests {
         assert!(
             !plan.should_relay,
             "got should_relay delay={} cands={}",
-            plan.slot_delay_ms,
-            plan.candidate_count
+            plan.slot_delay_ms, plan.candidate_count
         );
     }
 

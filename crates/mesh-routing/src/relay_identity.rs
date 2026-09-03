@@ -291,7 +291,14 @@ mod tests {
 
         cache.prune_relay_identity_cache(RELAY_ID_CACHE_TTL_MS + 2_001);
         assert_eq!(
-            cache.resolve_relay_identity(0xCD, -70, 8, graph.edges(), 0xAA, RELAY_ID_CACHE_TTL_MS + 2_001),
+            cache.resolve_relay_identity(
+                0xCD,
+                -70,
+                8,
+                graph.edges(),
+                0xAA,
+                RELAY_ID_CACHE_TTL_MS + 2_001
+            ),
             None
         );
     }

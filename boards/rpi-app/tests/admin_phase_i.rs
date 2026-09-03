@@ -32,7 +32,9 @@ fn build_pki_admin_frame_opts(
     inner: &[u8],
     want_ack: bool,
 ) -> Vec<u8> {
-    build_pki_admin_frame_full(to, from, packet_id, from_priv, to_pub, inner, want_ack, true)
+    build_pki_admin_frame_full(
+        to, from, packet_id, from_priv, to_pub, inner, want_ack, true,
+    )
 }
 
 fn build_pki_admin_frame_full(
@@ -71,11 +73,7 @@ fn build_pki_admin_frame_full(
     out
 }
 
-fn decrypt_pki_routing_error(
-    tx: &RelayPlan,
-    peer_priv: &[u8; 32],
-    node_pub: &[u8; 32],
-) -> u32 {
+fn decrypt_pki_routing_error(tx: &RelayPlan, peer_priv: &[u8; 32], node_pub: &[u8; 32]) -> u32 {
     let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
         .parse();
@@ -90,7 +88,10 @@ fn decrypt_pki_routing_error(
     let plain_len = cipher.len() - 12;
     let (decoded, payload) = decode_data_payload_full(&plain[..plain_len]).unwrap();
     assert_eq!(decoded.portnum, ROUTING_APP);
-    decode_routing_payload(&payload).unwrap().error_reason.unwrap()
+    decode_routing_payload(&payload)
+        .unwrap()
+        .error_reason
+        .unwrap()
 }
 
 fn inbound(router: &mut Router, frame: &[u8], now: u32) {
@@ -251,7 +252,10 @@ fn field_log_channel_then_lora_both_admin_replies() {
             other => panic!("unexpected admin reply: {other:?}"),
         }
     }
-    assert!(saw_channel && saw_lora, "both channel and LoRa AdminMessage replies required");
+    assert!(
+        saw_channel && saw_lora,
+        "both channel and LoRa AdminMessage replies required"
+    );
     let _ = &mut payloads;
 }
 
@@ -351,7 +355,9 @@ fn security_get_set_persist_and_identity_immutable() {
         router.poll_admin_tx(3_150).is_none(),
         "WantAck dupe must not re-run admin / enqueue another completion"
     );
-    let dupe_ack = router.poll_ack_tx(3_150).expect("WantAck dupe re-ACK on router");
+    let dupe_ack = router
+        .poll_ack_tx(3_150)
+        .expect("WantAck dupe re-ACK on router");
     let dupe_hdr = PacketHeader::decode(&dupe_ack.bytes[..PACKET_HEADER_LEN])
         .unwrap()
         .parse();
@@ -540,8 +546,14 @@ fn pki_want_ack_ack_is_pki_and_admin_sets_request_id() {
         .parse();
     assert!(hdr.want_ack, "admin reply copies request WantAck");
     let (meta, msg) = decrypt_pki_admin(&admin_tx, &b1_priv, &node_pub);
-    assert_eq!(meta.request_id, req_id, "admin reply Data.request_id must echo request");
-    assert_eq!(meta.reply_id, 0, "admin reply must not set Data.reply_id (setReplyTo)");
+    assert_eq!(
+        meta.request_id, req_id,
+        "admin reply Data.request_id must echo request"
+    );
+    assert_eq!(
+        meta.reply_id, 0,
+        "admin reply must not set Data.reply_id (setReplyTo)"
+    );
     // Reply must be PKI (Ch=0) so pure-PKI clients accept it as the WantAck stop.
     assert_eq!(hdr.channel, 0);
     match msg.payload {

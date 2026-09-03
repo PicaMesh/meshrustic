@@ -42,7 +42,9 @@ impl PacketHistory {
     }
 
     fn find(&self, from: u32, id: u32) -> Option<&HistoryEntry> {
-        self.entries.iter().find(|e| e.from == from && e.id == id && e.from != 0)
+        self.entries
+            .iter()
+            .find(|e| e.from == from && e.id == id && e.from != 0)
     }
 
     fn find_mut(&mut self, from: u32, id: u32) -> Option<&mut HistoryEntry> {

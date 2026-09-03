@@ -23,8 +23,7 @@ pub fn calculate_etx(rssi: i32, snr: f32) -> f32 {
                 break;
             }
         }
-        let t = (rssi - RSSI_BREAK[seg]) as f32
-            / (RSSI_BREAK[seg + 1] - RSSI_BREAK[seg]) as f32;
+        let t = (rssi - RSSI_BREAK[seg]) as f32 / (RSSI_BREAK[seg + 1] - RSSI_BREAK[seg]) as f32;
         PROB_BREAK[seg] + t * (PROB_BREAK[seg + 1] - PROB_BREAK[seg])
     };
 

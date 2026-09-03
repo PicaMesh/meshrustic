@@ -1,8 +1,8 @@
 //! Broadcast dupe coverage via accumulated transmitters + unique coverage.
 
 use mesh_routing::{
-    decode_packed_neighbors, write_packed_header, NeighborGraph,
-    PackedNeighbor, TopologyMergeResult, DEFAULT_SLOT_MS,
+    decode_packed_neighbors, write_packed_header, NeighborGraph, PackedNeighbor,
+    TopologyMergeResult, DEFAULT_SLOT_MS,
 };
 
 const ME: u32 = 0x1000_0001;
@@ -83,7 +83,10 @@ fn all_covered_cancels_relay() {
 fn heard_transmitters_accumulate_distinct() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(ME);
-    hears_us_neighbors(&mut graph, &[NEIGHBOR_A, NEIGHBOR_B, NEIGHBOR_D, NEIGHBOR_C]);
+    hears_us_neighbors(
+        &mut graph,
+        &[NEIGHBOR_A, NEIGHBOR_B, NEIGHBOR_D, NEIGHBOR_C],
+    );
     graph.observe_direct_neighbor(NEIGHBOR_E, -70, 8, 0, 0);
     merge_remote_neighbor(&mut graph, NEIGHBOR_A, NEIGHBOR_B, 100);
     merge_remote_neighbor(&mut graph, NEIGHBOR_E, NEIGHBOR_D, 100);

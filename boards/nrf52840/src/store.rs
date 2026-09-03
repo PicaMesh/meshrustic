@@ -60,7 +60,10 @@ impl ConfigStore for NvmcConfigStore {
         let mut buf = [0u8; STORE_RECORD_LEN];
         encode(config, &mut buf)?;
         self.nvmc
-            .erase(CONFIG_FLASH_ADDR, CONFIG_FLASH_ADDR + CONFIG_FLASH_PAGE_SIZE)
+            .erase(
+                CONFIG_FLASH_ADDR,
+                CONFIG_FLASH_ADDR + CONFIG_FLASH_PAGE_SIZE,
+            )
             .map_err(|_| StoreError::BadCrc)?;
         self.nvmc
             .write(CONFIG_FLASH_ADDR, &buf)

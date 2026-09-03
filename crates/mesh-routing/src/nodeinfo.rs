@@ -83,7 +83,10 @@ impl NodeInfoAdvert {
         }
         advert.long_name[long_len] = b' ';
         long_len += 1;
-        push_hex_u16(&mut advert.long_name[long_len..long_len + 4], (node_num & 0xffff) as u16);
+        push_hex_u16(
+            &mut advert.long_name[long_len..long_len + 4],
+            (node_num & 0xffff) as u16,
+        );
         long_len += 4;
         advert.long_name_len = long_len as u8;
 
@@ -92,7 +95,10 @@ impl NodeInfoAdvert {
             advert.short_name[short_len] = b;
             short_len += 1;
         }
-        push_hex_u8(&mut advert.short_name[short_len..short_len + 2], (node_num & 0xff) as u8);
+        push_hex_u8(
+            &mut advert.short_name[short_len..short_len + 2],
+            (node_num & 0xff) as u8,
+        );
         short_len += 2;
         advert.short_name_len = short_len as u8;
     }
@@ -497,9 +503,9 @@ fn push_hex_u8(out: &mut [u8], value: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topology::try_decrypt_data_full;
     use mesh_crypto::{CryptoKey, DEFAULT_PSK};
     use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
-    use crate::topology::try_decrypt_data_full;
 
     const TEST_PUBKEY: [u8; 32] = [0xAB; 32];
 
@@ -538,15 +544,8 @@ mod tests {
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
         let identity = NodeInfoIdentity::for_node(0x677a_1caf, TEST_PUBKEY);
-        let (len, frame) = build_nodeinfo_wire_frame(
-            0x677a_1caf,
-            42,
-            channel_hash,
-            3,
-            &key,
-            &identity,
-        )
-        .unwrap();
+        let (len, frame) =
+            build_nodeinfo_wire_frame(0x677a_1caf, 42, channel_hash, 3, &key, &identity).unwrap();
         let mut cipher = frame[PACKET_HEADER_LEN..len as usize].to_vec();
         let (decoded, payload) = try_decrypt_data_full(
             &key,
@@ -559,7 +558,10 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.portnum, NODEINFO_APP);
         assert!(!decoded.want_response);
-        assert_eq!(payload.as_slice(), encode_user(0x677a_1caf, &identity).as_slice());
+        assert_eq!(
+            payload.as_slice(),
+            encode_user(0x677a_1caf, &identity).as_slice()
+        );
     }
 
     #[test]
@@ -567,7 +569,10 @@ mod tests {
         let identity = NodeInfoIdentity::for_node(0x677a_1caf, TEST_PUBKEY);
         let encoded = encode_user(0x677a_1caf, &identity);
         let decoded = decode_user(&encoded).expect("decode");
-        assert_eq!(decoded.advert.short_name_len, identity.advert.short_name_len);
+        assert_eq!(
+            decoded.advert.short_name_len,
+            identity.advert.short_name_len
+        );
         assert_eq!(
             &decoded.advert.short_name[..decoded.advert.short_name_len as usize],
             &identity.advert.short_name[..identity.advert.short_name_len as usize]

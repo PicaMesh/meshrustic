@@ -7,9 +7,9 @@ use mesh_routing::{
     build_app_wire_frame, decode_admin_message, decode_data_payload_full, decode_routing_payload,
     encode_admin_message, encode_data_payload_opts, try_decrypt_data_full, AdminPayload,
     ConfigPayload, DataEncodeOpts, InboundPacket, NodeInfoIdentity, Router, WireLoRaConfig,
-    WireSecurityConfig, ADMIN_APP, CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY,
-    REGION_EU_868, ROUTING_APP, ROUTING_ERROR_ADMIN_BAD_SESSION_KEY,
-    ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED, ROUTING_ERROR_PKI_FAILED,
+    WireSecurityConfig, ADMIN_APP, CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, REGION_EU_868,
+    ROUTING_APP, ROUTING_ERROR_ADMIN_BAD_SESSION_KEY, ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED,
+    ROUTING_ERROR_PKI_FAILED,
 };
 use mesh_store::{
     generate_keypair, ConfigStore, NodeConfig, RamConfigStore, BUILTIN_ADMIN_PUBLIC_KEYS,
@@ -133,7 +133,10 @@ fn decrypt_pki_routing_nak(
     let plain_len = cipher.len() - 12;
     let (decoded, payload) = decode_data_payload_full(&plain[..plain_len]).unwrap();
     assert_eq!(decoded.portnum, ROUTING_APP);
-    decode_routing_payload(&payload).unwrap().error_reason.unwrap()
+    decode_routing_payload(&payload)
+        .unwrap()
+        .error_reason
+        .unwrap()
 }
 
 #[test]
@@ -208,8 +211,8 @@ fn builtin1_and_builtin2_can_set_lora() {
             use_preset: true,
             modem_preset: MODEM_SHORT_FAST as u32,
             region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
+            hop_limit: 3,
+            tx_power: 27,
         }));
         set.has_session_passkey = true;
         set.session_passkey = passkey;

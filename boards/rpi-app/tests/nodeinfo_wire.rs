@@ -1,11 +1,11 @@
 //! NODEINFO wire-format tests (port 4 User payload and request/reply).
 
-use mesh_crypto::{CryptoKey, DEFAULT_PSK, encrypt_packet};
+use mesh_crypto::{encrypt_packet, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, User, PACKET_HEADER_LEN};
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
 use mesh_routing::{
-    build_nodeinfo_reply_frame, build_nodeinfo_wire_frame, encode_data_payload_opts,
-    encode_user, summarize_decrypted, DataEncodeOpts, NodeInfoIdentity, Router, NODEINFO_APP,
+    build_nodeinfo_reply_frame, build_nodeinfo_wire_frame, encode_data_payload_opts, encode_user,
+    summarize_decrypted, DataEncodeOpts, NodeInfoIdentity, Router, NODEINFO_APP,
 };
 use prost::Message;
 use static_cell::StaticCell;
@@ -35,15 +35,8 @@ fn nodeinfo_wire_decrypt_and_summary() {
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
     let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
     let identity = NodeInfoIdentity::for_node(0x677a_1caf, TEST_PUBKEY);
-    let (len, frame) = build_nodeinfo_wire_frame(
-        0x677a_1caf,
-        99,
-        channel_hash,
-        3,
-        &key,
-        &identity,
-    )
-    .unwrap();
+    let (len, frame) =
+        build_nodeinfo_wire_frame(0x677a_1caf, 99, channel_hash, 3, &key, &identity).unwrap();
     let mut cipher = frame[PACKET_HEADER_LEN..len as usize].to_vec();
     let (portnum, payload) = mesh_routing::try_decrypt_data(
         &key,
@@ -119,7 +112,8 @@ fn build_nodeinfo_request_wire(
     );
     let mut cipher = plaintext.clone();
     encrypt_packet(key, from, request_id as u64, &mut cipher);
-    let header = PacketHeader::from_fields(to, from, request_id, channel_hash, 3, 3, false, false, 0, 0);
+    let header =
+        PacketHeader::from_fields(to, from, request_id, channel_hash, 3, 3, false, false, 0, 0);
     let mut out = Vec::with_capacity(PACKET_HEADER_LEN + cipher.len());
     let mut hdr = [0u8; PACKET_HEADER_LEN];
     header.encode_to(&mut hdr);
@@ -166,7 +160,9 @@ fn router_replies_to_nodeinfo_request() {
     if delay > 0 {
         assert!(router.poll_nodeinfo_tx(1_000 + delay - 1).is_none());
     }
-    let reply = router.poll_nodeinfo_tx(1_000 + delay).expect("nodeinfo reply queued");
+    let reply = router
+        .poll_nodeinfo_tx(1_000 + delay)
+        .expect("nodeinfo reply queued");
     let header = PacketHeader::decode(&reply.bytes[..reply.len as usize]).unwrap();
     assert_eq!(header.from, our_node);
     assert_eq!(header.to, requester);
@@ -177,10 +173,18 @@ fn router_caches_received_nodeinfo() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let peer = 0x3333_4444;
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
-    let router = ROUTER.init(Router::with_modem_preset(0x1111_1111, "", MODEM_SHORT_SLOW, true, key, 3));
+    let router = ROUTER.init(Router::with_modem_preset(
+        0x1111_1111,
+        "",
+        MODEM_SHORT_SLOW,
+        true,
+        key,
+        3,
+    ));
     let channel_hash = router.channel_hash();
     let identity = NodeInfoIdentity::for_node(peer, TEST_PUBKEY);
-    let (len, frame) = build_nodeinfo_wire_frame(peer, 55, channel_hash, 3, &key, &identity).unwrap();
+    let (len, frame) =
+        build_nodeinfo_wire_frame(peer, 55, channel_hash, 3, &key, &identity).unwrap();
 
     let inbound = mesh_routing::InboundPacket {
         radio_id: 0,

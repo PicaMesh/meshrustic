@@ -12,8 +12,18 @@ fn evaluate_bridge_targets_empty_with_one_radio() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let router = ROUTER.init(Router::new(0x677a_1caf));
 
-    let header =
-        PacketHeader::from_fields(NODENUM_BROADCAST, 0x979e_d146, 7, 0x77, 3, 3, false, false, 0, 0);
+    let header = PacketHeader::from_fields(
+        NODENUM_BROADCAST,
+        0x979e_d146,
+        7,
+        0x77,
+        3,
+        3,
+        false,
+        false,
+        0,
+        0,
+    );
     let mut wire = heapless::Vec::<u8, 64>::new();
     let mut hdr = [0u8; PACKET_HEADER_LEN];
     header.encode_to(&mut hdr);
@@ -32,12 +42,7 @@ fn evaluate_bridge_targets_empty_with_one_radio() {
         )
         .expect("accepted");
 
-    let plan = router.evaluate_tx_plan(
-        &result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        0,
-    );
+    let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
     assert_eq!(plan.bridge_count, 0);
 }
 
@@ -123,12 +128,7 @@ fn cross_preset_unicast_bridges_to_long_fast_segment() {
         )
         .expect("accepted");
 
-    let plan = router.evaluate_tx_plan(
-        &result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        100,
-    );
+    let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 100);
 
     assert_eq!(plan.bridge_count, 1);
     assert_eq!(plan.bridge[0].target_radio, 1);

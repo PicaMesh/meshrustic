@@ -729,8 +729,9 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
                 if end > payload.len() {
                     return None;
                 }
-                msg.payload =
-                    AdminPayload::GetDeviceMetadataResponse(decode_device_metadata(&payload[ni..end])?);
+                msg.payload = AdminPayload::GetDeviceMetadataResponse(decode_device_metadata(
+                    &payload[ni..end],
+                )?);
                 i = end;
             }
             (34, 2) => {
@@ -925,7 +926,10 @@ mod tests {
         msg.session_passkey = [1, 2, 3, 4, 5, 6, 7, 8];
         let encoded = encode_admin_message(&msg);
         let decoded = decode_admin_message(&encoded).unwrap();
-        assert_eq!(decoded.payload, AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA));
+        assert_eq!(
+            decoded.payload,
+            AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA)
+        );
         assert!(decoded.has_session_passkey);
         assert_eq!(decoded.session_passkey, msg.session_passkey);
 
@@ -1026,7 +1030,10 @@ mod tests {
         push_varint_field(&mut bytes, 99, 42);
         push_varint_field(&mut bytes, 5, CONFIG_TYPE_LORA);
         let decoded = decode_admin_message(&bytes).unwrap();
-        assert_eq!(decoded.payload, AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA));
+        assert_eq!(
+            decoded.payload,
+            AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA)
+        );
     }
 
     #[test]
@@ -1057,7 +1064,10 @@ mod tests {
             tx_power: 27,
         };
         let bytes = encode_lora_config(&lora);
-        assert_eq!(bytes.as_slice(), &[0x08, 0x01, 0x10, 0x00, 0x38, 0x03, 0x40, 0x03, 0x58, 0x36]);
+        assert_eq!(
+            bytes.as_slice(),
+            &[0x08, 0x01, 0x10, 0x00, 0x38, 0x03, 0x40, 0x03, 0x58, 0x36]
+        );
         let decoded = decode_lora_config(&bytes).unwrap();
         assert_eq!(decoded.modem_preset, MODEM_LONG_FAST as u32);
         assert!(decoded.use_preset);

@@ -19,16 +19,9 @@ fn setup_router(router: &mut Router, dest_etx: f32) {
     graph.confirm_direct_neighbor_hears_us(DEST);
     graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
     if dest_etx >= 3.0 {
-        graph.edges_mut().update_edge(
-            ME,
-            ME,
-            DEST,
-            dest_etx,
-            0,
-            EdgeSource::Reported,
-            true,
-            0,
-        );
+        graph
+            .edges_mut()
+            .update_edge(ME, ME, DEST, dest_etx, 0, EdgeSource::Reported, true, 0);
     }
 }
 
@@ -84,7 +77,10 @@ fn hop_start_preserves_hops_away_after_relay() {
 fn all_sr_neighbors_skips_limit() {
     let mut router = Router::new(ME);
     setup_router(&mut router, 2.0);
-    router.graph_mut().capability_mut().track_topology(STOCK, true, 0);
+    router
+        .graph_mut()
+        .capability_mut()
+        .track_topology(STOCK, true, 0);
     assert_eq!(
         router
             .graph_mut()

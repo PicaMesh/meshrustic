@@ -27,7 +27,11 @@ pub const RETX_PROCESSING_TIME_MS: u32 = 4_500;
 
 /// Contention-window size for a channel utilization, `map(util, 0, 100, CWmin, CWmax)`.
 pub(crate) fn contention_window_size(channel_util_pct: f32) -> u8 {
-    let pct = if channel_util_pct.is_finite() { channel_util_pct.clamp(0.0, 100.0) } else { 0.0 };
+    let pct = if channel_util_pct.is_finite() {
+        channel_util_pct.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
     let span = (RETX_CW_MAX - RETX_CW_MIN) as f32;
     RETX_CW_MIN + ((pct * span) / 100.0) as u8
 }
@@ -187,14 +191,29 @@ mod tests {
     #[test]
     fn retransmission_delay_matches_meshtastic_formula() {
         // 0 % utilization: CW=3 -> (8 + 16 + 32) slots.
-        assert_eq!(retransmission_delay_ms(730, 28, 0.0), 2 * 730 + 56 * 28 + RETX_PROCESSING_TIME_MS);
+        assert_eq!(
+            retransmission_delay_ms(730, 28, 0.0),
+            2 * 730 + 56 * 28 + RETX_PROCESSING_TIME_MS
+        );
         // 100 % utilization: CW=8 -> (256 + 16 + 32) slots.
-        assert_eq!(retransmission_delay_ms(730, 28, 100.0), 2 * 730 + 304 * 28 + RETX_PROCESSING_TIME_MS);
+        assert_eq!(
+            retransmission_delay_ms(730, 28, 100.0),
+            2 * 730 + 304 * 28 + RETX_PROCESSING_TIME_MS
+        );
         // Monotonic in utilization; out-of-range and NaN inputs clamp instead of panicking.
         assert!(retransmission_delay_ms(100, 10, 50.0) > retransmission_delay_ms(100, 10, 0.0));
-        assert_eq!(retransmission_delay_ms(100, 10, -5.0), retransmission_delay_ms(100, 10, 0.0));
-        assert_eq!(retransmission_delay_ms(100, 10, 250.0), retransmission_delay_ms(100, 10, 100.0));
-        assert_eq!(retransmission_delay_ms(100, 10, f32::NAN), retransmission_delay_ms(100, 10, 0.0));
+        assert_eq!(
+            retransmission_delay_ms(100, 10, -5.0),
+            retransmission_delay_ms(100, 10, 0.0)
+        );
+        assert_eq!(
+            retransmission_delay_ms(100, 10, 250.0),
+            retransmission_delay_ms(100, 10, 100.0)
+        );
+        assert_eq!(
+            retransmission_delay_ms(100, 10, f32::NAN),
+            retransmission_delay_ms(100, 10, 0.0)
+        );
         // Never shorter than the peer's processing margin plus two airtimes.
         assert!(retransmission_delay_ms(730, 28, 0.0) > 2 * 730 + RETX_PROCESSING_TIME_MS);
     }

@@ -1,16 +1,14 @@
 //! Remote admin handler (ADMIN_APP): ACL, session passkey, get/set LoRa + Security.
 
 use mesh_crypto::sha256_in_place;
-use mesh_store::{
-    BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_ADMIN_KEY, NodeConfig, ADMIN_KEY_SLOTS,
-};
+use mesh_store::{NodeConfig, ADMIN_KEY_SLOTS, BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_ADMIN_KEY};
 
 use crate::admin_codec::{
     decode_admin_message, encode_admin_message, AdminMessage, AdminPayload, ConfigPayload,
     DeviceMetadata, WireChannel, WireChannelSettings, WireDeviceConfig, WireLoRaConfig,
     WireSecurityConfig, CHANNEL_ROLE_DISABLED, CHANNEL_ROLE_PRIMARY, CONFIG_TYPE_DEVICE,
-    CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS,
-    REGION_EU_868, SESSION_PASSKEY_LEN,
+    CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS, REGION_EU_868,
+    SESSION_PASSKEY_LEN,
 };
 use crate::nodeinfo::{NodeInfoIdentity, DEVICE_ROLE_ROUTER, HW_MODEL_NRF52_PROMICRO_DIY};
 use mesh_crypto::DEFAULT_PSK;
@@ -267,9 +265,9 @@ pub fn handle_admin(
         AdminPayload::GetDeviceMetadataRequest => {
             let passkey = state.issue_session(now_ms);
             let mut resp = AdminMessage::default();
-            resp.payload = AdminPayload::GetDeviceMetadataResponse(DeviceMetadata::meshrustic_default(
-                HW_MODEL_NRF52_PROMICRO_DIY,
-            ));
+            resp.payload = AdminPayload::GetDeviceMetadataResponse(
+                DeviceMetadata::meshrustic_default(HW_MODEL_NRF52_PROMICRO_DIY),
+            );
             resp.has_session_passkey = true;
             resp.session_passkey = passkey;
             outcome.response = Some(resp);
@@ -474,7 +472,9 @@ fn security_get(state: &AdminState) -> WireSecurityConfig {
 
 fn security_keys_from_wire(sec: &WireSecurityConfig) -> [[u8; 32]; ADMIN_KEY_SLOTS] {
     let mut keys = [EMPTY_ADMIN_KEY; ADMIN_KEY_SLOTS];
-    let n = (sec.admin_key_count as usize).min(ADMIN_KEY_SLOTS).min(MAX_ADMIN_KEYS);
+    let n = (sec.admin_key_count as usize)
+        .min(ADMIN_KEY_SLOTS)
+        .min(MAX_ADMIN_KEYS);
     let mut out = 0usize;
     for i in 0..n {
         let k = sec.admin_keys[i];
@@ -600,7 +600,17 @@ mod tests {
         let mut get = AdminMessage::default();
         get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
         let get_bytes = encode_admin_message(&get);
-        let out = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &get_bytes, 2_000);
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_ROUTER,
+            &get_bytes,
+            2_000,
+        );
         let resp = out.response.unwrap();
         assert!(resp.has_session_passkey);
 
@@ -615,7 +625,17 @@ mod tests {
         set.has_session_passkey = true;
         set.session_passkey = resp.session_passkey;
         let set_bytes = encode_admin_message(&set);
-        let out2 = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &set_bytes, 2_100);
+        let out2 = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_ROUTER,
+            &set_bytes,
+            2_100,
+        );
         assert_eq!(out2.apply_modem_preset, Some(mesh_radio::MODEM_SHORT_FAST));
         assert!(out2.config_dirty);
         assert!(out2.routing_ok);
@@ -625,7 +645,17 @@ mod tests {
         let mut sget = AdminMessage::default();
         sget.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
         let sget_bytes = encode_admin_message(&sget);
-        let sout = handle_admin(&mut state, &remote, &identity(), 0x11, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &sget_bytes, 2_200);
+        let sout = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_ROUTER,
+            &sget_bytes,
+            2_200,
+        );
         match sout.response.unwrap().payload {
             AdminPayload::GetConfigResponse(ConfigPayload::Security(sec)) => {
                 for i in 0..sec.admin_key_count as usize {
@@ -655,7 +685,17 @@ mod tests {
         set.has_session_passkey = true;
         set.session_passkey = passkey;
         let bytes = encode_admin_message(&set);
-        let out = handle_admin(&mut state, &remote, &identity(), 1, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &bytes, 9_000);
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            1,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_ROUTER,
+            &bytes,
+            9_000,
+        );
         assert_eq!(out.routing_error, Some(ROUTING_ERROR_BAD_REQUEST));
         assert!(out.response.is_none());
         assert_eq!(state.modem_preset, mesh_radio::MODEM_DEFAULT_PRESET);
@@ -684,7 +724,17 @@ mod tests {
         set.has_session_passkey = true;
         set.session_passkey = [0xFF; 8];
         let bytes = encode_admin_message(&set);
-        let out = handle_admin(&mut state, &remote, &identity(), 1, &DEFAULT_PSK, 0x77, DEVICE_ROLE_ROUTER, &bytes, 5_000);
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            1,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_ROUTER,
+            &bytes,
+            5_000,
+        );
         assert_eq!(out.routing_error, Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY));
         assert!(!out.config_dirty);
     }

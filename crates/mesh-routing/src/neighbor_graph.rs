@@ -5,17 +5,14 @@ use mesh_radio::{RadioId, MODEM_DEFAULT_PRESET};
 
 use crate::capability::{role_may_send_topology, CapabilityCache, CapabilityStatus};
 use crate::coordinated_relay::tx_delay_ms_router;
-use crate::sr_role::role_is_active_routing;
 use crate::graph::{
-    calculate_etx, calculate_route,
-    find_better_positioned_neighbor,
-    is_node_routable, verified_connectivity, is_placeholder_node, placeholder_node_id,
-    EdgeSource, EdgeStore, DownstreamTable, Route, RouteCache, RoutableFilter, EDGE_NEW,
-    EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
+    calculate_etx, calculate_route, find_better_positioned_neighbor, is_node_routable,
+    is_placeholder_node, placeholder_node_id, verified_connectivity, DownstreamTable, EdgeSource,
+    EdgeStore, RoutableFilter, Route, RouteCache, EDGE_NEW, EDGE_SIGNIFICANT_CHANGE,
+    MAX_EDGES_PER_NODE,
 };
-use crate::nodeinfo::{
-    DEVICE_ROLE_CLIENT, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE,
-};
+use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE};
+use crate::sr_role::role_is_active_routing;
 use crate::topology::{
     write_packed_header, PackedHeader, PackedNeighbor, MAX_NEIGHBORS_PER_PACKET,
     PACKED_NEIGHBOR_ENTRY_SIZE, PACKED_NEIGHBOR_FLAG_HEARS_US, PACKED_NEIGHBOR_FLAG_SR_ACTIVE,
@@ -333,8 +330,7 @@ impl NeighborGraph {
         if node_id == self.my_node && self.my_node != 0 {
             return self.local_capability_status();
         }
-        self.capability
-            .status_at(node_id, self.my_node, now_ms)
+        self.capability.status_at(node_id, self.my_node, now_ms)
     }
 
     fn local_capability_status(&self) -> CapabilityStatus {
@@ -445,10 +441,7 @@ impl NeighborGraph {
             self.record_node_transmission(source, packet_id, now_ms);
         }
         if let Some(relay) = relayer {
-            if relay != 0
-                && relay != self.my_node
-                && relay != source
-                && !is_placeholder_node(relay)
+            if relay != 0 && relay != self.my_node && relay != source && !is_placeholder_node(relay)
             {
                 self.record_node_transmission(relay, packet_id, now_ms);
             }
@@ -559,7 +552,9 @@ impl NeighborGraph {
     }
 
     pub fn notify_originated_packet_sent(&mut self, now_ms: u32) {
-        self.last_topology_ms = self.last_topology_ms.saturating_sub(TOPOLOGY_BROADCAST_MS / 2);
+        self.last_topology_ms = self
+            .last_topology_ms
+            .saturating_sub(TOPOLOGY_BROADCAST_MS / 2);
         let _ = now_ms;
     }
 
@@ -709,7 +704,9 @@ impl NeighborGraph {
     }
 
     pub fn relay_candidate_count(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> u8 {
-        self.relay_slot_index(packet_id, heard_from, now_ms).1.max(1)
+        self.relay_slot_index(packet_id, heard_from, now_ms)
+            .1
+            .max(1)
     }
 
     fn clamp_topology_rssi(rssi: i16) -> i8 {
@@ -859,8 +856,12 @@ impl NeighborGraph {
                         .edges
                         .find_node(self.my_node)
                         .and_then(|node| node.find_edge(b.node_id));
-                    let a_reported = a_edge.map(|e| e.source == EdgeSource::Reported).unwrap_or(false);
-                    let b_reported = b_edge.map(|e| e.source == EdgeSource::Reported).unwrap_or(false);
+                    let a_reported = a_edge
+                        .map(|e| e.source == EdgeSource::Reported)
+                        .unwrap_or(false);
+                    let b_reported = b_edge
+                        .map(|e| e.source == EdgeSource::Reported)
+                        .unwrap_or(false);
                     if a_reported != b_reported {
                         b_reported
                     } else {
@@ -920,7 +921,11 @@ impl NeighborGraph {
                 flags |= PACKED_NEIGHBOR_FLAG_HEARS_US;
             }
             out[base + 6] = flags;
-            if let Some(edge) = self.edges.find_node(self.my_node).and_then(|n| n.find_edge(entry.node_id)) {
+            if let Some(edge) = self
+                .edges
+                .find_node(self.my_node)
+                .and_then(|n| n.find_edge(entry.node_id))
+            {
                 out[base + 7] = edge.etx_variance;
             } else {
                 out[base + 7] = 0;
@@ -991,8 +996,12 @@ impl NeighborGraph {
             }
             if passive_local
                 && neighbor.node_id != self.my_node
-                && !self.edges.has_direct_reported_edge_to(self.my_node, neighbor.node_id)
-                && !self.edges.has_direct_reported_edge_to(neighbor.node_id, self.my_node)
+                && !self
+                    .edges
+                    .has_direct_reported_edge_to(self.my_node, neighbor.node_id)
+                && !self
+                    .edges
+                    .has_direct_reported_edge_to(neighbor.node_id, self.my_node)
             {
                 continue;
             }
@@ -1269,11 +1278,11 @@ impl NeighborGraph {
         self.edges.ensure_local_node(self.my_node, now_ms);
         let etx = calculate_etx(rssi as i32, snr as f32);
 
-        let is_new_gateway = self.observe_relay_gateway_signal(gateway, rssi, snr, now_ms, heard_on);
+        let is_new_gateway =
+            self.observe_relay_gateway_signal(gateway, rssi, snr, now_ms, heard_on);
 
         let single_hop = hop_start.saturating_sub(hop_limit) == 1;
-        let source_sr_active =
-            matches!(self.capability.status(from), CapabilityStatus::SrActive);
+        let source_sr_active = matches!(self.capability.status(from), CapabilityStatus::SrActive);
 
         if !source_sr_active || single_hop {
             let result_relay_to_dest = self.edges.update_edge_from_observation(
@@ -1312,19 +1321,14 @@ impl NeighborGraph {
         // than before the edge update, where the flag was logged but never stored.
         let hears_us = self.maybe_confirm_hears_us_from_relay(gateway, from, packet_id);
 
-        let can_infer_downstream = self.edges.has_direct_reported_edge_to(self.my_node, gateway)
+        let can_infer_downstream = self
+            .edges
+            .has_direct_reported_edge_to(self.my_node, gateway)
             || is_placeholder_node(gateway);
         if can_infer_downstream && (single_hop || !source_sr_active) {
             if !self.is_downstream_relay_for(gateway, from, now_ms) {
-                self.downstream.update(
-                    self.my_node,
-                    from,
-                    gateway,
-                    etx,
-                    now_ms,
-                    false,
-                    heard_on,
-                );
+                self.downstream
+                    .update(self.my_node, from, gateway, etx, now_ms, false, heard_on);
                 self.route_cache.clear();
             }
         }
@@ -1451,7 +1455,12 @@ impl NeighborGraph {
     /// Call only after a **directly-heard** frame from `real_node_id` (see
     /// [`mesh_protocol::is_direct_packet`]): originator and relay byte in sync,
     /// hop budget not yet consumed.
-    pub fn resolve_placeholder(&mut self, placeholder_id: u32, real_node_id: u32, now_ms: u32) -> bool {
+    pub fn resolve_placeholder(
+        &mut self,
+        placeholder_id: u32,
+        real_node_id: u32,
+        now_ms: u32,
+    ) -> bool {
         if !is_placeholder_node(placeholder_id) || is_placeholder_node(real_node_id) {
             return false;
         }
@@ -1575,7 +1584,8 @@ impl NeighborGraph {
             let route_cost = route.cost();
             let mut next_hop_can_hear = true;
             if heard_from != 0 && route.next_hop != heard_from {
-                let (verified, _unknown) = self.has_verified_connectivity(heard_from, route.next_hop);
+                let (verified, _unknown) =
+                    self.has_verified_connectivity(heard_from, route.next_hop);
                 next_hop_can_hear = verified;
             }
 
@@ -1630,10 +1640,7 @@ impl NeighborGraph {
                 relay_can_hear = verified;
                 connectivity_unknown = unknown;
             }
-            if relay_can_hear
-                && !connectivity_unknown
-                && self.has_direct_edge(relay_for_dest)
-            {
+            if relay_can_hear && !connectivity_unknown && self.has_direct_edge(relay_for_dest) {
                 return relay_for_dest;
             }
         }
@@ -1805,7 +1812,12 @@ impl NeighborGraph {
         relay.heard_transmitter_count = relay.heard_transmitter_count.saturating_add(1);
     }
 
-    fn build_coverage_transmitters(&self, from: u32, id: u32, out: &mut [u32; 1 + MAX_HEARD_TRANSMITTERS]) -> u8 {
+    fn build_coverage_transmitters(
+        &self,
+        from: u32,
+        id: u32,
+        out: &mut [u32; 1 + MAX_HEARD_TRANSMITTERS],
+    ) -> u8 {
         let mut count = 0u8;
         let Some(idx) = self.find_relay_commit(from, id) else {
             return 0;
@@ -1870,7 +1882,9 @@ impl NeighborGraph {
     }
 
     pub fn is_committed_relay(&self, from: u32, packet_id: u32) -> bool {
-        self.relay_states.iter().any(|s| s.active && s.from == from && s.id == packet_id)
+        self.relay_states
+            .iter()
+            .any(|s| s.active && s.from == from && s.id == packet_id)
     }
 
     pub fn is_committed_relay_for_id(&self, packet_id: u32) -> bool {
@@ -1939,14 +1953,15 @@ impl NeighborGraph {
     pub fn run_maintenance(&mut self, now_ms: u32) -> MaintenanceReport {
         self.edges.ensure_local_node(self.my_node, now_ms);
         let before = self.neighbor_count();
-        let edges_aged = self
-            .edges
-            .age_edges(self.my_node, now_ms, NEIGHBOR_TTL_MS, Some(&mut self.downstream));
+        let edges_aged = self.edges.age_edges(
+            self.my_node,
+            now_ms,
+            NEIGHBOR_TTL_MS,
+            Some(&mut self.downstream),
+        );
         self.prune_direct_signals(now_ms);
         let relay_in_graph = |relay: u32| self.edges.find_node(relay).is_some();
-        let downstream_aged = self
-            .downstream
-            .age(now_ms, NEIGHBOR_TTL_MS, relay_in_graph);
+        let downstream_aged = self.downstream.age(now_ms, NEIGHBOR_TTL_MS, relay_in_graph);
         self.clear_expired_commits(now_ms);
         let (clear_hears_us, clear_hears_us_count) = self.capability.prune(now_ms, self.my_node);
         for i in 0..clear_hears_us_count as usize {
@@ -2004,7 +2019,11 @@ impl NeighborGraph {
         }
     }
 
-    pub fn emit_topology_log<S: crate::sr_log::TopologyLogSink>(&self, node_num: u32, sink: &mut S) {
+    pub fn emit_topology_log<S: crate::sr_log::TopologyLogSink>(
+        &self,
+        node_num: u32,
+        sink: &mut S,
+    ) {
         use crate::sr_log::SrLogEvent;
 
         let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
@@ -2110,9 +2129,9 @@ impl NeighborGraph {
     }
 
     fn find_relay(&self, from: u32, id: u32, radio_id: u8) -> Option<usize> {
-        self.relay_states.iter().position(|s| {
-            s.active && s.from == from && s.id == id && s.radio_id == radio_id
-        })
+        self.relay_states
+            .iter()
+            .position(|s| s.active && s.from == from && s.id == id && s.radio_id == radio_id)
     }
 
     fn alloc_relay_slot(&self) -> Option<usize> {
@@ -2123,9 +2142,11 @@ impl NeighborGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{calculate_etx, etx_to_fixed};
-    use crate::coordinated_relay::{transmission_record_window_ms, DEFAULT_SLOT_MS, tx_delay_ms_worst, slot_time_for_preset};
+    use crate::coordinated_relay::{
+        slot_time_for_preset, transmission_record_window_ms, tx_delay_ms_worst, DEFAULT_SLOT_MS,
+    };
     use crate::decode_packed_neighbors;
+    use crate::graph::{calculate_etx, etx_to_fixed};
     use crate::nodeinfo::DEVICE_ROLE_REPEATER;
     use crate::topology::{write_packed_header, PackedNeighbor};
     use mesh_radio::{MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
@@ -2274,7 +2295,10 @@ mod tests {
         assert_eq!(graph.neighbor_count(), 0);
 
         let observed = graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, Some(RELAY), 0);
-        assert_eq!(observed.map(|(id, _, _, is_new, _)| (id, is_new)), Some((RELAY, true)));
+        assert_eq!(
+            observed.map(|(id, _, _, is_new, _)| (id, is_new)),
+            Some((RELAY, true))
+        );
         assert_eq!(graph.neighbor_count(), 1);
 
         let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
@@ -2481,7 +2505,10 @@ mod tests {
             etx_variance: 0,
         };
         graph.merge_topology(0xDD00_00DD, &header, &[neighbor], true, 0, 0);
-        assert_eq!(graph.find_best_relay_candidate(99, 0xBB00_00BB, 0), 0xDD00_00DD);
+        assert_eq!(
+            graph.find_best_relay_candidate(99, 0xBB00_00BB, 0),
+            0xDD00_00DD
+        );
     }
 
     #[test]
@@ -2490,7 +2517,10 @@ mod tests {
         graph.set_my_node(0xCC00_00CC);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 0, 0);
-        assert_eq!(graph.find_best_relay_candidate(99, 0xBB00_00BB, 0), 0xCC00_00CC);
+        assert_eq!(
+            graph.find_best_relay_candidate(99, 0xBB00_00BB, 0),
+            0xCC00_00CC
+        );
     }
 
     #[test]
@@ -2517,7 +2547,10 @@ mod tests {
         let (gateway, _, _, _, hears_us) = observed.expect("relayed observation");
         assert_eq!(gateway, placeholder);
         assert!(hears_us, "confirmation must be reported on the first relay");
-        assert!(graph.edge_hears_us(placeholder), "flag must be stored on the new us->relay edge");
+        assert!(
+            graph.edge_hears_us(placeholder),
+            "flag must be stored on the new us->relay edge"
+        );
         // Resolving the placeholder to the real node keeps the confirmed flag.
         assert!(graph.resolve_placeholder(placeholder, 0xBEEF_00CD, 200));
         assert!(graph.edge_hears_us(0xBEEF_00CD));
@@ -2597,7 +2630,10 @@ mod tests {
         // Relayed frame must not resolve even when the real relay is already known.
         graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 200, 0, Some(relay), 0);
         assert!(graph.has_graph_node(placeholder));
-        assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 300), Some(placeholder));
+        assert_eq!(
+            graph.get_downstream_relay(0xBB00_00BB, 300),
+            Some(placeholder)
+        );
     }
 
     #[test]
@@ -2612,7 +2648,10 @@ mod tests {
             .update(0xAA00_00AA, 0xDD00_00DD, placeholder, 2.0, 100, false, 0);
         assert!(graph.resolve_placeholder(placeholder, 0xBEEF_00CD, 200));
         assert!(!graph.has_graph_node(placeholder));
-        assert_eq!(graph.get_downstream_relay(0xDD00_00DD, 200), Some(0xBEEF_00CD));
+        assert_eq!(
+            graph.get_downstream_relay(0xDD00_00DD, 200),
+            Some(0xBEEF_00CD)
+        );
     }
 
     #[test]
@@ -2749,7 +2788,10 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(0xDD00_00DD);
         graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
         graph.capability_mut().track_topology(0xEE00_00EE, true, 0);
-        assert_eq!(graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD), None);
+        assert_eq!(
+            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
+            None
+        );
     }
 
     #[test]
@@ -2758,7 +2800,10 @@ mod tests {
         graph.set_my_node(0xCC00_00CC);
         graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
         graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
-        assert_eq!(graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD), None);
+        assert_eq!(
+            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
+            None
+        );
     }
 
     #[test]
@@ -2782,16 +2827,9 @@ mod tests {
     fn fill_neighbor_entries_skips_without_side_table() {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA);
-        graph.edges_mut().update_edge(
-            0xAA,
-            0xAA,
-            0xBB,
-            2.0,
-            100,
-            EdgeSource::Reported,
-            true,
-            0,
-        );
+        graph
+            .edges_mut()
+            .update_edge(0xAA, 0xAA, 0xBB, 2.0, 100, EdgeSource::Reported, true, 0);
         assert_eq!(
             graph.fill_neighbor_entries(&mut [NeighborEntry::default(); MAX_NEIGHBORS]),
             0

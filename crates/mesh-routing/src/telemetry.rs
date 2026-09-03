@@ -74,7 +74,12 @@ pub fn build_device_telemetry_wire_frame(
     }
     let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
     cipher[..plaintext.len()].copy_from_slice(&plaintext);
-    encrypt_packet(key, node_num, packet_id as u64, &mut cipher[..plaintext.len()]);
+    encrypt_packet(
+        key,
+        node_num,
+        packet_id as u64,
+        &mut cipher[..plaintext.len()],
+    );
 
     let hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
     let header = PacketHeader::from_fields(
@@ -287,9 +292,9 @@ fn varint_len(mut v: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topology::try_decrypt_data_full;
     use mesh_crypto::{CryptoKey, DEFAULT_PSK};
     use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
-    use crate::topology::try_decrypt_data_full;
 
     #[test]
     fn saturated_adc_is_not_plausible() {
@@ -343,15 +348,9 @@ mod tests {
             air_util_tx: 1.5,
             uptime_seconds: 42,
         };
-        let (len, mut frame) = build_device_telemetry_wire_frame(
-            0x677a_1caf,
-            88,
-            channel_hash,
-            3,
-            &key,
-            &metrics,
-        )
-        .unwrap();
+        let (len, mut frame) =
+            build_device_telemetry_wire_frame(0x677a_1caf, 88, channel_hash, 3, &key, &metrics)
+                .unwrap();
         let mut cipher = frame[mesh_protocol::PACKET_HEADER_LEN..len as usize].to_vec();
         let (portnum, payload) = crate::topology::try_decrypt_data(
             &key,

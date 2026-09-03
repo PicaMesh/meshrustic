@@ -2,8 +2,8 @@
 
 use mesh_radio::RadioId;
 
-use super::{DownstreamTable, EdgeStore, MAX_GRAPH_NODES};
 use super::is_placeholder_node;
+use super::{DownstreamTable, EdgeStore, MAX_GRAPH_NODES};
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE;
 
@@ -412,8 +412,8 @@ pub fn find_better_positioned_neighbor(
 mod tests {
     use super::*;
     use crate::capability::CapabilityCache;
+    use crate::graph::{DownstreamTable, EdgeSource, EdgeStore};
     use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE};
-    use crate::graph::{EdgeSource, EdgeStore, DownstreamTable};
 
     #[test]
     fn direct_neighbor_is_next_hop() {

@@ -34,15 +34,42 @@ fn empty_stored_name_hashes_preset_name_not_empty_string() {
 
 #[test]
 fn preset_hashes_golden_vectors() {
-    assert_eq!(primary_channel_hash("", MODEM_LONG_FAST, true, &DEFAULT_PSK), 0x08);
-    assert_eq!(primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK), 0x77);
-    assert_eq!(primary_channel_hash("", MODEM_SHORT_FAST, true, &DEFAULT_PSK), 0x70);
-    assert_eq!(primary_channel_hash("", MODEM_MEDIUM_FAST, true, &DEFAULT_PSK), 0x1f);
-    assert_eq!(primary_channel_hash("", MODEM_MEDIUM_SLOW, true, &DEFAULT_PSK), 0x18);
-    assert_eq!(primary_channel_hash("", MODEM_LONG_SLOW, true, &DEFAULT_PSK), 0x0f);
-    assert_eq!(primary_channel_hash("", MODEM_LONG_MODERATE, true, &DEFAULT_PSK), 0x6e);
-    assert_eq!(primary_channel_hash("", MODEM_SHORT_TURBO, true, &DEFAULT_PSK), 0x0e);
-    assert_eq!(primary_channel_hash("", MODEM_LONG_TURBO, true, &DEFAULT_PSK), 0x76);
+    assert_eq!(
+        primary_channel_hash("", MODEM_LONG_FAST, true, &DEFAULT_PSK),
+        0x08
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK),
+        0x77
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_SHORT_FAST, true, &DEFAULT_PSK),
+        0x70
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_MEDIUM_FAST, true, &DEFAULT_PSK),
+        0x1f
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_MEDIUM_SLOW, true, &DEFAULT_PSK),
+        0x18
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_LONG_SLOW, true, &DEFAULT_PSK),
+        0x0f
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_LONG_MODERATE, true, &DEFAULT_PSK),
+        0x6e
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_SHORT_TURBO, true, &DEFAULT_PSK),
+        0x0e
+    );
+    assert_eq!(
+        primary_channel_hash("", MODEM_LONG_TURBO, true, &DEFAULT_PSK),
+        0x76
+    );
 }
 
 #[test]

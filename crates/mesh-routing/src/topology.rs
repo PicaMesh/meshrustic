@@ -59,7 +59,8 @@ pub struct PackedNeighbor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TopologyChunk {
     pub packed_len: u8,
-    pub packed: [u8; PACKED_NEIGHBOR_HEADER_SIZE + MAX_NEIGHBORS_PER_PACKET * PACKED_NEIGHBOR_ENTRY_SIZE],
+    pub packed:
+        [u8; PACKED_NEIGHBOR_HEADER_SIZE + MAX_NEIGHBORS_PER_PACKET * PACKED_NEIGHBOR_ENTRY_SIZE],
 }
 
 pub fn write_packed_header(out: &mut [u8], topology_version: u8, signal_routing_active: bool) {
@@ -87,7 +88,10 @@ pub fn decode_packed_header(data: &[u8]) -> Option<PackedHeader> {
     })
 }
 
-pub fn decode_packed_neighbors(data: &[u8], max_entries: usize) -> Option<(PackedHeader, heapless::Vec<PackedNeighbor, 32>)> {
+pub fn decode_packed_neighbors(
+    data: &[u8],
+    max_entries: usize,
+) -> Option<(PackedHeader, heapless::Vec<PackedNeighbor, 32>)> {
     let header = decode_packed_header(data)?;
     if header.format_version != PACKED_NEIGHBOR_FORMAT_VERSION {
         return None;
@@ -258,11 +262,13 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
                 i += 4;
             }
             (6, 5) if i + 4 <= data.len() => {
-                decoded.request_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                decoded.request_id =
+                    u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
             }
             (7, 5) if i + 4 <= data.len() => {
-                decoded.reply_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                decoded.reply_id =
+                    u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
             }
             _ => {
@@ -285,7 +291,9 @@ pub fn build_topology_wire_frame(
     key: &CryptoKey,
     packed: &[u8],
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
-    if packed.len() > PACKED_NEIGHBOR_HEADER_SIZE + MAX_NEIGHBORS_PER_PACKET * PACKED_NEIGHBOR_ENTRY_SIZE {
+    if packed.len()
+        > PACKED_NEIGHBOR_HEADER_SIZE + MAX_NEIGHBORS_PER_PACKET * PACKED_NEIGHBOR_ENTRY_SIZE
+    {
         return None;
     }
     let sr_info = encode_signal_routing_info(packed);
@@ -295,7 +303,12 @@ pub fn build_topology_wire_frame(
     }
     let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
     cipher[..plaintext.len()].copy_from_slice(&plaintext);
-    encrypt_packet(key, node_num, packet_id as u64, &mut cipher[..plaintext.len()]);
+    encrypt_packet(
+        key,
+        node_num,
+        packet_id as u64,
+        &mut cipher[..plaintext.len()],
+    );
 
     let header = PacketHeader::from_fields(
         NODENUM_BROADCAST,
@@ -324,7 +337,8 @@ pub fn try_decrypt_data(
     header_channel: u8,
     cipher: &mut [u8],
 ) -> Option<(u32, heapless::Vec<u8, 240>)> {
-    let (decoded, payload) = try_decrypt_data_full(key, from, packet_id, channel_hash, header_channel, cipher)?;
+    let (decoded, payload) =
+        try_decrypt_data_full(key, from, packet_id, channel_hash, header_channel, cipher)?;
     Some((decoded.portnum, payload))
 }
 
@@ -344,7 +358,9 @@ pub fn try_decrypt_data_full(
     Some((decoded, payload))
 }
 
-pub fn extract_packed_neighbors(payload: &[u8]) -> Option<(PackedHeader, heapless::Vec<PackedNeighbor, 32>)> {
+pub fn extract_packed_neighbors(
+    payload: &[u8],
+) -> Option<(PackedHeader, heapless::Vec<PackedNeighbor, 32>)> {
     let mut idx = 0usize;
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
@@ -506,15 +522,8 @@ mod tests {
         let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 3, true);
-        let (len, frame) = build_topology_wire_frame(
-            0x1234_5678,
-            99,
-            channel_hash,
-            3,
-            &key,
-            &packed,
-        )
-        .unwrap();
+        let (len, frame) =
+            build_topology_wire_frame(0x1234_5678, 99, channel_hash, 3, &key, &packed).unwrap();
         let mut cipher = frame[PACKET_HEADER_LEN..len as usize].to_vec();
         let (portnum, payload) = try_decrypt_data(
             &key,

@@ -16,8 +16,8 @@ mod pki;
 
 pub use channel::{decrypt_packet, encrypt_packet};
 pub use channel_hash::{
-    channel_hash, default_primary_channel_hash, short_slow_channel_hash, xor_hash,
-    DEFAULT_PSK, SHORT_SLOW_CHANNEL_NAME,
+    channel_hash, default_primary_channel_hash, short_slow_channel_hash, xor_hash, DEFAULT_PSK,
+    SHORT_SLOW_CHANNEL_NAME,
 };
 pub use hash::sha256_in_place;
 pub use key::CryptoKey;

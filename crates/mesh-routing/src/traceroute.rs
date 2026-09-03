@@ -1,6 +1,6 @@
 //! TRACEROUTE_APP (port 70) — append node id + SNR on rebroadcast.
 
-use mesh_protocol::{NODENUM_BROADCAST, ParsedPacket};
+use mesh_protocol::{ParsedPacket, NODENUM_BROADCAST};
 
 pub const TRACEROUTE_APP: u32 = 70;
 pub const ROUTE_SIZE: usize = 8;
@@ -24,18 +24,20 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 5) if i + 4 <= data.len() => {
-                push_u32(&mut out.route, u32::from_le_bytes([
-                    data[i],
-                    data[i + 1],
-                    data[i + 2],
-                    data[i + 3],
-                ]))?;
+                push_u32(
+                    &mut out.route,
+                    u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]),
+                )?;
                 i += 4;
             }
             (1, 2) => {
                 let (len, ni) = read_varint(data, i)?;
-                i = parse_fixed32_packed(&data[ni..ni + len as usize], &mut out.route, ni + len as usize)
-                    .unwrap_or(ni + len as usize);
+                i = parse_fixed32_packed(
+                    &data[ni..ni + len as usize],
+                    &mut out.route,
+                    ni + len as usize,
+                )
+                .unwrap_or(ni + len as usize);
             }
             (2, 0) => {
                 let (v, ni) = read_signed_varint(data, i)?;
@@ -44,16 +46,18 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
             }
             (2, 2) => {
                 let (len, ni) = read_varint(data, i)?;
-                i = parse_int32_packed(&data[ni..ni + len as usize], &mut out.snr_towards, ni + len as usize)
-                    .unwrap_or(ni + len as usize);
+                i = parse_int32_packed(
+                    &data[ni..ni + len as usize],
+                    &mut out.snr_towards,
+                    ni + len as usize,
+                )
+                .unwrap_or(ni + len as usize);
             }
             (3, 5) if i + 4 <= data.len() => {
-                push_u32(&mut out.route_back, u32::from_le_bytes([
-                    data[i],
-                    data[i + 1],
-                    data[i + 2],
-                    data[i + 3],
-                ]))?;
+                push_u32(
+                    &mut out.route_back,
+                    u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]),
+                )?;
                 i += 4;
             }
             (3, 2) => {
@@ -72,8 +76,12 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
             }
             (4, 2) => {
                 let (len, ni) = read_varint(data, i)?;
-                i = parse_int32_packed(&data[ni..ni + len as usize], &mut out.snr_back, ni + len as usize)
-                    .unwrap_or(ni + len as usize);
+                i = parse_int32_packed(
+                    &data[ni..ni + len as usize],
+                    &mut out.snr_back,
+                    ni + len as usize,
+                )
+                .unwrap_or(ni + len as usize);
             }
             _ => {
                 i = skip_field(data, i, wire)?;
@@ -186,7 +194,12 @@ pub fn rebuild_relay_ciphertext(
     if cipher_len == 0 || cipher_len > cipher.len() {
         return None;
     }
-    decrypt_packet(key, parsed.from, parsed.id as u64, &mut cipher[..cipher_len]);
+    decrypt_packet(
+        key,
+        parsed.from,
+        parsed.id as u64,
+        &mut cipher[..cipher_len],
+    );
     let (data, inner) = crate::topology::decode_data_payload_full(&cipher[..cipher_len])?;
     if data.portnum != TRACEROUTE_APP {
         return None;
@@ -215,7 +228,12 @@ pub fn rebuild_relay_ciphertext(
     }
     let mut out = heapless::Vec::<u8, 240>::new();
     let _ = out.extend_from_slice(&plaintext);
-    mesh_crypto::encrypt_packet(key, parsed.from, parsed.id as u64, &mut out[..plaintext.len()]);
+    mesh_crypto::encrypt_packet(
+        key,
+        parsed.from,
+        parsed.id as u64,
+        &mut out[..plaintext.len()],
+    );
     out.truncate(plaintext.len());
     Some((out, route_len.min(u8::MAX as usize) as u8))
 }
@@ -344,7 +362,8 @@ mod tests {
     #[test]
     fn append_id_and_snr_on_request_path() {
         let mut rd = RouteDiscovery::default();
-        let parsed = PacketHeader::from_fields(0xAA, 0xBB, 1, 0x77, 3, 3, false, false, 0, 0).parse();
+        let parsed =
+            PacketHeader::from_fields(0xAA, 0xBB, 1, 0x77, 3, 3, false, false, 0, 0).parse();
         alter_on_relay(&mut rd, &parsed, 0xCC, 10, 0);
         assert_eq!(rd.route.as_slice(), &[0xCC]);
         assert_eq!(rd.snr_towards.as_slice(), &[40]);
@@ -364,7 +383,8 @@ mod tests {
     #[test]
     fn reply_path_uses_route_back() {
         let mut rd = RouteDiscovery::default();
-        let parsed = PacketHeader::from_fields(0xBB, 0xAA, 1, 0x77, 3, 3, false, false, 0, 0).parse();
+        let parsed =
+            PacketHeader::from_fields(0xBB, 0xAA, 1, 0x77, 3, 3, false, false, 0, 0).parse();
         alter_on_relay(&mut rd, &parsed, 0xCC, 6, 0x1234);
         assert_eq!(rd.route_back.as_slice(), &[0xCC]);
         assert_eq!(rd.snr_back.as_slice(), &[24]);

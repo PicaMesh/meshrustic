@@ -15,12 +15,7 @@ fn ready_relay(
     result: &mesh_routing::ProcessResult,
     now_ms: u32,
 ) -> mesh_routing::RelayPlan {
-    let plan = router.evaluate_tx_plan(
-        result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        now_ms,
-    );
+    let plan = router.evaluate_tx_plan(result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, now_ms);
     if let Some(relay) = plan.relay {
         return relay;
     }
@@ -85,7 +80,13 @@ fn field_traceroute_three_node_chain() {
         )
         .expect("node B accepts");
     let relay_b = ready_relay(&mut router_b, &result_b, 0);
-    let rd_b = decrypt_traceroute_route(&key, A, PACKET_ID, CHANNEL, &relay_b.bytes[..relay_b.len as usize]);
+    let rd_b = decrypt_traceroute_route(
+        &key,
+        A,
+        PACKET_ID,
+        CHANNEL,
+        &relay_b.bytes[..relay_b.len as usize],
+    );
     assert_eq!(rd_b.route.as_slice(), &[B]);
 
     let mut router_c = Router::with_channel(C, key, CHANNEL, MODEM_SHORT_SLOW, true, 3);
@@ -101,7 +102,13 @@ fn field_traceroute_three_node_chain() {
         )
         .expect("node C accepts");
     let relay_c = ready_relay(&mut router_c, &result_c, 50);
-    let rd_c = decrypt_traceroute_route(&key, A, PACKET_ID, CHANNEL, &relay_c.bytes[..relay_c.len as usize]);
+    let rd_c = decrypt_traceroute_route(
+        &key,
+        A,
+        PACKET_ID,
+        CHANNEL,
+        &relay_c.bytes[..relay_c.len as usize],
+    );
     assert_eq!(rd_c.route.as_slice(), &[B, C]);
 }
 

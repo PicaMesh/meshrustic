@@ -21,15 +21,9 @@ fn telemetry_wire_decrypt_and_summary() {
         air_util_tx: 2.0,
         uptime_seconds: 120,
     };
-    let (len, frame) = build_device_telemetry_wire_frame(
-        0x677a_1caf,
-        42,
-        channel_hash,
-        3,
-        &key,
-        &metrics,
-    )
-    .unwrap();
+    let (len, frame) =
+        build_device_telemetry_wire_frame(0x677a_1caf, 42, channel_hash, 3, &key, &metrics)
+            .unwrap();
     let mut cipher = frame[mesh_protocol::PACKET_HEADER_LEN..len as usize].to_vec();
     let (portnum, payload) = try_decrypt_data(
         &key,
@@ -74,13 +68,17 @@ fn router_schedules_periodic_device_telemetry() {
     });
 
     router.run_maintenance(1_000, 100);
-    let first = router.poll_telemetry_tx(1_000).expect("first telemetry queued");
+    let first = router
+        .poll_telemetry_tx(1_000)
+        .expect("first telemetry queued");
     let header = PacketHeader::decode(&first.bytes[..first.len as usize]).unwrap();
     assert_eq!(header.from, 0x677a_1caf);
     assert_eq!(header.to, mesh_protocol::NODENUM_BROADCAST);
 
     router.run_maintenance(1_000 + DEVICE_TELEMETRY_BROADCAST_MS - 1, 100);
-    assert!(router.poll_telemetry_tx(1_000 + DEVICE_TELEMETRY_BROADCAST_MS - 1).is_none());
+    assert!(router
+        .poll_telemetry_tx(1_000 + DEVICE_TELEMETRY_BROADCAST_MS - 1)
+        .is_none());
 
     router.run_maintenance(1_000 + DEVICE_TELEMETRY_BROADCAST_MS, 100);
     let second = router

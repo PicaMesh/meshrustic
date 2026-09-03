@@ -1,7 +1,7 @@
 //! Reliable want_ack: originate, ACK reply, implicit cancel on rebroadcast dupe.
 
 use mesh_crypto::{encrypt_packet, CryptoKey, DEFAULT_PSK};
-use mesh_protocol::{portnum::num, PacketHeader, PACKET_HEADER_LEN, NODENUM_BROADCAST};
+use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
     build_ack_nak_frame, encode_data_payload, try_decrypt_data_full, InboundPacket, Router,
     ROUTING_APP, ROUTING_ERROR_NONE,
@@ -47,7 +47,9 @@ fn send_local_schedules_reliable_retransmit() {
     let fire_ms = router.reliable_retx_delay_ms(plan.len);
     // Meshtastic-style backoff: never before the peer could have ACKed (two airtimes + margin).
     assert!(fire_ms >= mesh_routing::RETX_PROCESSING_TIME_MS);
-    assert!(router.poll_reliable_retransmit(1_000 + fire_ms - 1).is_none());
+    assert!(router
+        .poll_reliable_retransmit(1_000 + fire_ms - 1)
+        .is_none());
     assert!(router.poll_reliable_retransmit(1_000 + fire_ms).is_some());
 }
 
@@ -129,7 +131,9 @@ fn implicit_ack_cancels_reliable_on_own_rebroadcast_dupe() {
         snr: 5,
         bytes: &plan.bytes[..plan.len as usize],
     };
-    router.process_inbound(&rebroadcast, 2_000).expect("first hear");
+    router
+        .process_inbound(&rebroadcast, 2_000)
+        .expect("first hear");
     let dupe = router.process_inbound(&rebroadcast, 2_100).unwrap();
     assert!(dupe.duplicate);
     assert!(!router.has_pending_reliable(parsed.id));

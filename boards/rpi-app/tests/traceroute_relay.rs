@@ -1,7 +1,7 @@
 //! TRACEROUTE_APP relay integration — append node id + SNR on rebroadcast.
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
-use mesh_protocol::{NODENUM_BROADCAST, PacketHeader, PACKET_HEADER_LEN};
+use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_radio::MODEM_SHORT_SLOW;
 use mesh_routing::{
     build_app_wire_frame, coordinated_relay, decode_route_discovery, encode_route_discovery,
@@ -13,12 +13,7 @@ fn ready_relay(
     result: &mesh_routing::ProcessResult,
     now_ms: u32,
 ) -> mesh_routing::RelayPlan {
-    let plan = router.evaluate_tx_plan(
-        result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        now_ms,
-    );
+    let plan = router.evaluate_tx_plan(result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, now_ms);
     if let Some(relay) = plan.relay {
         return relay;
     }
@@ -76,15 +71,9 @@ fn router_appends_traceroute_hop_on_rebroadcast() {
     let mut cipher = vec![0u8; payload_len];
     cipher.copy_from_slice(&relay.bytes[PACKET_HEADER_LEN..relay.len as usize]);
 
-    let (decoded, inner) = try_decrypt_data_full(
-        &key,
-        FROM,
-        PACKET_ID,
-        CHANNEL,
-        CHANNEL,
-        &mut cipher[..],
-    )
-    .expect("decrypt relay");
+    let (decoded, inner) =
+        try_decrypt_data_full(&key, FROM, PACKET_ID, CHANNEL, CHANNEL, &mut cipher[..])
+            .expect("decrypt relay");
     assert_eq!(decoded.portnum, TRACEROUTE_APP);
 
     let rd = decode_route_discovery(&inner).expect("route discovery");
@@ -144,15 +133,9 @@ fn router_appends_traceroute_reply_on_route_back() {
     let mut cipher = vec![0u8; payload_len];
     cipher.copy_from_slice(&relay.bytes[PACKET_HEADER_LEN..relay.len as usize]);
 
-    let (_decoded, inner) = try_decrypt_data_full(
-        &key,
-        FROM,
-        PACKET_ID,
-        CHANNEL,
-        CHANNEL,
-        &mut cipher[..],
-    )
-    .expect("decrypt relay");
+    let (_decoded, inner) =
+        try_decrypt_data_full(&key, FROM, PACKET_ID, CHANNEL, CHANNEL, &mut cipher[..])
+            .expect("decrypt relay");
 
     let rd = decode_route_discovery(&inner).expect("route discovery");
     assert!(rd.route.is_empty());
@@ -211,15 +194,9 @@ fn traceroute_to_us_sends_response_with_request_id() {
     let payload_len = response.len as usize - PACKET_HEADER_LEN;
     let mut cipher = vec![0u8; payload_len];
     cipher.copy_from_slice(&response.bytes[PACKET_HEADER_LEN..response.len as usize]);
-    let (decoded, inner) = try_decrypt_data_full(
-        &key,
-        TARGET,
-        parsed.id,
-        CHANNEL,
-        CHANNEL,
-        &mut cipher[..],
-    )
-    .expect("decrypt response");
+    let (decoded, inner) =
+        try_decrypt_data_full(&key, TARGET, parsed.id, CHANNEL, CHANNEL, &mut cipher[..])
+            .expect("decrypt response");
     assert_eq!(decoded.portnum, TRACEROUTE_APP);
     assert_eq!(decoded.request_id, REQUEST_ID);
     let rd = decode_route_discovery(&inner).expect("route discovery");

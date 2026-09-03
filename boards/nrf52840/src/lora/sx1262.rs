@@ -49,7 +49,12 @@ pub struct Sx1262Driver {
 }
 
 impl Sx1262Driver {
-    pub fn new(id: RadioId, profile: Sx1262ModuleProfile, chip: RadioChip, module_ready: bool) -> Self {
+    pub fn new(
+        id: RadioId,
+        profile: Sx1262ModuleProfile,
+        chip: RadioChip,
+        module_ready: bool,
+    ) -> Self {
         Self {
             id,
             profile,

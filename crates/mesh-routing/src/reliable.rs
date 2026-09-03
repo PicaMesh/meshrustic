@@ -51,7 +51,10 @@ pub fn schedule_reliable(
     retx_delay_ms: u32,
     now_ms: u32,
 ) -> bool {
-    if slots.iter().any(|s| s.active && s.from == from && s.packet_id == packet_id) {
+    if slots
+        .iter()
+        .any(|s| s.active && s.from == from && s.packet_id == packet_id)
+    {
         return true; // already armed for this packet
     }
     let idx = match slots.iter().position(|s| !s.active) {
@@ -99,10 +102,7 @@ pub fn stop_reliable(slots: &mut [PendingReliable; MAX_PENDING_RELIABLE], packet
     stopped
 }
 
-pub fn bump_reliable_delays(
-    slots: &mut [PendingReliable; MAX_PENDING_RELIABLE],
-    airtime_ms: u32,
-) {
+pub fn bump_reliable_delays(slots: &mut [PendingReliable; MAX_PENDING_RELIABLE], airtime_ms: u32) {
     for slot in slots.iter_mut() {
         if slot.active {
             slot.next_tx_ms = slot.next_tx_ms.wrapping_add(airtime_ms);

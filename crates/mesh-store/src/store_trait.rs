@@ -78,10 +78,7 @@ mod tests {
         let loaded = store.load();
         assert_eq!(loaded.lora.modem_preset, MODEM_SHORT_FAST);
         assert_eq!(loaded.admin_public_keys[0], [0xAB; 32]);
-        assert_eq!(
-            loaded.primary_channel_hash(),
-            cfg.primary_channel_hash()
-        );
+        assert_eq!(loaded.primary_channel_hash(), cfg.primary_channel_hash());
     }
 
     #[test]

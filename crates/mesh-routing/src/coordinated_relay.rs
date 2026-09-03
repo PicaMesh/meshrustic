@@ -43,13 +43,7 @@ fn jitter_slots(from: u32, id: u32, node_num: u32, slot_span: u32) -> u32 {
 }
 
 /// Meshtastic ROUTER early rebroadcast: `random(0, 2 * CWsize) * slotTimeMsec`.
-pub fn tx_delay_ms_router(
-    snr: i8,
-    slot_ms: u32,
-    from: u32,
-    id: u32,
-    node_num: u32,
-) -> u32 {
+pub fn tx_delay_ms_router(snr: i8, slot_ms: u32, from: u32, id: u32, node_num: u32) -> u32 {
     let cw = cw_size_from_snr(snr) as u32;
     let span = 2 * cw;
     jitter_slots(from, id, node_num, span) * slot_ms

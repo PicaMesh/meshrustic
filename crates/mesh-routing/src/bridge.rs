@@ -1,6 +1,6 @@
 //! Cross-preset bridge decisions (Phase 9).
 
-use mesh_protocol::{NODENUM_BROADCAST, ParsedPacket};
+use mesh_protocol::{ParsedPacket, NODENUM_BROADCAST};
 use mesh_radio::{RadioId, MAX_BRIDGE_TARGETS, MAX_RADIOS};
 
 use crate::graph::Route;
@@ -120,11 +120,7 @@ pub fn should_bridge_to(
     if !wire_may_relay(eval.parsed, eval.from_us, eval.to_us) {
         return false;
     }
-    if !qos.can_relay(
-        eval.decoded_portnum,
-        eval.parsed.channel,
-        eval.chutil_pct,
-    ) {
+    if !qos.can_relay(eval.decoded_portnum, eval.parsed.channel, eval.chutil_pct) {
         return false;
     }
     routing_need(eval, dst_radio, graph)

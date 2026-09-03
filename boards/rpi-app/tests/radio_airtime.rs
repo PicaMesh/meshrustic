@@ -1,6 +1,9 @@
 //! AirTime duty-cycle and packet-time tests (host).
 
-use mesh_radio::{contention_window_ms, packet_time_ms, slot_time_ms, AirTime, RadioConfig, EU_868, MODEM_SHORT_SLOW, REGION_EU_868};
+use mesh_radio::{
+    contention_window_ms, packet_time_ms, slot_time_ms, AirTime, RadioConfig, EU_868,
+    MODEM_SHORT_SLOW, REGION_EU_868,
+};
 
 #[test]
 fn packet_time_short_slow_nonzero() {

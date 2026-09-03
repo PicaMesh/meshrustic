@@ -1,8 +1,12 @@
 //! Unified routing core — RX pipeline, graph maintenance, coordinated relay (Phase 6).
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
-use mesh_protocol::{is_direct_packet, PacketHeader, ParsedPacket, PACKET_HEADER_LEN, NODENUM_BROADCAST};
-use mesh_radio::{eu868_config_for_preset, packet_time_ms, primary_channel_hash, MODEM_DEFAULT_PRESET};
+use mesh_protocol::{
+    is_direct_packet, PacketHeader, ParsedPacket, NODENUM_BROADCAST, PACKET_HEADER_LEN,
+};
+use mesh_radio::{
+    eu868_config_for_preset, packet_time_ms, primary_channel_hash, MODEM_DEFAULT_PRESET,
+};
 
 use crate::admin::{
     encode_admin_response, encode_owner_response, handle_admin, AdminState,
@@ -14,8 +18,8 @@ use crate::coordinated_relay::{
     half_airtime_ms, slot_time_for_preset, tx_delay_ms_contention, tx_delay_ms_worst,
 };
 use crate::neighbor_graph::{
-    MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS,
-    TOPOLOGY_BROADCAST_MS, TOPOLOGY_DIRTY_MIN_MS,
+    MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS, TOPOLOGY_BROADCAST_MS,
+    TOPOLOGY_DIRTY_MIN_MS,
 };
 use crate::nodeinfo::{
     build_nodeinfo_reply_frame, build_nodeinfo_wire_frame, decode_user, NodeInfoCache,
@@ -26,26 +30,27 @@ use crate::packet_history::{ObserveResult, PacketHistory};
 use crate::pool::{PacketHandle, PacketPool, PacketSlot, MAX_PACKET_PAYLOAD};
 use crate::qos::ChannelQoS;
 use crate::rate_limit::NodeRateLimiter;
-use crate::relay_identity::RelayIdentityCache;
 use crate::relay::{copy_opaque_payload, relay_header_with_next_hop_opts, wire_may_relay};
+use crate::relay_identity::RelayIdentityCache;
 use crate::reliable::{
     bump_reliable_delays, due_retransmit, schedule_reliable, stop_reliable, stop_reliable_for,
-    PendingReliable,
-    MAX_PENDING_RELIABLE,
+    PendingReliable, MAX_PENDING_RELIABLE,
 };
-use crate::routing_ack::{retransmission_delay_ms, 
+use crate::routing_ack::{
     build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
-    ROUTING_APP, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
+    retransmission_delay_ms, ROUTING_APP, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
 };
 use crate::rx_decode::{summarize_decrypted, RxDecodeInfo};
-use crate::sr_log::{RelayRetxCancelReason, SrLog, SrLogEvent, SrSkipReason, T1CancelReason, MAX_SR_LOG};
+use crate::sr_log::{
+    RelayRetxCancelReason, SrLog, SrLogEvent, SrSkipReason, T1CancelReason, MAX_SR_LOG,
+};
 use crate::telemetry::{
     build_device_telemetry_wire_frame, DeviceMetricsSnapshot, DEVICE_TELEMETRY_BROADCAST_MS,
 };
 use crate::topology::{
-    build_app_wire_frame, build_topology_wire_frame, extract_packed_neighbors, try_decrypt_data_full,
-    DecodedData, DataEncodeOpts, MAX_TOPOLOGY_PACKETS, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
-    SR_BROADCAST_MAX_HOPS,
+    build_app_wire_frame, build_topology_wire_frame, extract_packed_neighbors,
+    try_decrypt_data_full, DataEncodeOpts, DecodedData, MAX_TOPOLOGY_PACKETS, SIGNAL_ROUTING_APP,
+    SIGNAL_ROUTING_VERSION, SR_BROADCAST_MAX_HOPS,
 };
 use crate::traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,
@@ -514,8 +519,12 @@ impl Router {
         self.modem_preset = modem_preset;
         self.use_preset = use_preset;
         self.graph.set_modem_preset(modem_preset);
-        self.channel_hash =
-            primary_channel_hash(stored_channel_name, modem_preset, use_preset, psk_bytes(&channel_key));
+        self.channel_hash = primary_channel_hash(
+            stored_channel_name,
+            modem_preset,
+            use_preset,
+            psk_bytes(&channel_key),
+        );
     }
 
     pub fn channel_hash(&self) -> u8 {
@@ -827,11 +836,7 @@ impl Router {
             } else if data.portnum == TRACEROUTE_APP {
                 if let Some(ref inner) = inner {
                     self.maybe_schedule_traceroute_response(
-                        &parsed,
-                        &data,
-                        inner,
-                        packet.snr,
-                        now_ms,
+                        &parsed, &data, inner, packet.snr, now_ms,
                     );
                 }
             } else if data.portnum == ADMIN_APP {
@@ -933,8 +938,8 @@ impl Router {
 
         #[cfg(feature = "pki")]
         {
-            use mesh_crypto::CryptoEngine;
             use crate::topology::decode_data_payload_full;
+            use mesh_crypto::CryptoEngine;
 
             let mut candidates: heapless::Vec<[u8; 32], 8> = heapless::Vec::new();
             for k in self.admin.candidate_pki_keys() {
@@ -1117,9 +1122,11 @@ impl Router {
         now_ms: u32,
     ) {
         let inner = match &resp.payload {
-            AdminPayload::GetOwnerResponse(_) if resp.has_session_passkey => {
-                encode_owner_response(self.node_num, &self.nodeinfo_identity, &resp.session_passkey)
-            }
+            AdminPayload::GetOwnerResponse(_) if resp.has_session_passkey => encode_owner_response(
+                self.node_num,
+                &self.nodeinfo_identity,
+                &resp.session_passkey,
+            ),
             _ => encode_admin_response(resp),
         };
         let hop = hop_limit_for_response(parsed, self.hop_limit).max(1);
@@ -1231,8 +1238,8 @@ impl Router {
     ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
         #[cfg(feature = "pki")]
         {
-            use mesh_crypto::CryptoEngine;
             use crate::topology::encode_data_payload_opts;
+            use mesh_crypto::CryptoEngine;
 
             let plaintext = encode_data_payload_opts(portnum, inner, opts);
             if plaintext.len() + 12 > MAX_PACKET_PAYLOAD {
@@ -1273,7 +1280,9 @@ impl Router {
         }
         #[cfg(not(feature = "pki"))]
         {
-            let _ = (to, packet_id, hop_limit, portnum, inner, opts, remote_pk, want_ack);
+            let _ = (
+                to, packet_id, hop_limit, portnum, inner, opts, remote_pk, want_ack,
+            );
             None
         }
     }
@@ -1286,9 +1295,7 @@ impl Router {
         parsed.from != our_node
             && data.portnum == NODEINFO_APP
             && data.want_response
-            && (parsed.to == our_node
-                || parsed.to == NODENUM_BROADCAST
-                || data.dest == our_node)
+            && (parsed.to == our_node || parsed.to == NODENUM_BROADCAST || data.dest == our_node)
     }
 
     fn maybe_schedule_nodeinfo_reply(&mut self, to: u32, request_id: u32, now_ms: u32) {
@@ -1366,9 +1373,8 @@ impl Router {
             TopologyMergeResult::IgnoredFormat => {}
         }
         if neighbor_list.is_empty() && is_direct && header.signal_routing_active {
-            self.sr_log.push(SrLogEvent::TopologyDirtyFromNeighbor {
-                from: parsed.from,
-            });
+            self.sr_log
+                .push(SrLogEvent::TopologyDirtyFromNeighbor { from: parsed.from });
             self.pending_topology_reply = true;
         }
     }
@@ -1512,7 +1518,9 @@ impl Router {
         }
 
         let next_hop = if parsed.to != NODENUM_BROADCAST {
-            let hop = self.graph.get_next_hop(parsed.to, parsed.from, heard_from, now_ms);
+            let hop = self
+                .graph
+                .get_next_hop(parsed.to, parsed.from, heard_from, now_ms);
             if hop != 0 {
                 let route = self.graph.get_route(parsed.to, now_ms);
                 self.sr_log.push(SrLogEvent::RouteNextHop {
@@ -1529,7 +1537,11 @@ impl Router {
         // must not go on the air as next_hop = our byte: receivers would treat us as the
         // designated forwarder and wait for a second copy that never comes. Leave it clear so
         // they coordinate by slot, and so we never arm retries waiting for ourselves.
-        let next_hop = if next_hop == self.node_num { 0 } else { next_hop };
+        let next_hop = if next_hop == self.node_num {
+            0
+        } else {
+            next_hop
+        };
 
         // 1. The relayer we heard this from already holds the packet; handing it back only
         // produces a duplicate there.
@@ -1622,8 +1634,7 @@ impl Router {
                     &self.channel_key,
                 ) {
                     let n = new_cipher.len();
-                    bytes[PACKET_HEADER_LEN..PACKET_HEADER_LEN + n]
-                        .copy_from_slice(&new_cipher);
+                    bytes[PACKET_HEADER_LEN..PACKET_HEADER_LEN + n].copy_from_slice(&new_cipher);
                     let towards = decoded.request_id == 0;
                     self.sr_log.push(SrLogEvent::TracerouteAppended {
                         towards,
@@ -1826,10 +1837,7 @@ impl Router {
                 self.sr_log.push(SrLogEvent::DirectNeighborLostDirty);
             }
         }
-        if report.topology_due
-            && self.graph.can_send_topology()
-            && !self.pending_topology.active
-        {
+        if report.topology_due && self.graph.can_send_topology() && !self.pending_topology.active {
             if self.schedule_topology_broadcast(now_ms, slot_ms, report.topology_dirty_send) {
                 self.graph
                     .commit_topology_broadcast(now_ms, report.topology_dirty_send);
@@ -1874,14 +1882,8 @@ impl Router {
         snr: i8,
         now_ms: u32,
     ) -> u32 {
-        self.relay_identity.resolve_heard_from(
-            relay_node,
-            source,
-            rssi,
-            snr,
-            &self.graph,
-            now_ms,
-        )
+        self.relay_identity
+            .resolve_heard_from(relay_node, source, rssi, snr, &self.graph, now_ms)
     }
 
     /// Record a relay-byte mapping (host tests and topology learning paths).
@@ -1937,9 +1939,14 @@ impl Router {
                 self.node_num,
                 now_ms,
             )
-            .or_else(|| self.graph.match_relay_byte_on_outgoing_edges(parsed.next_hop));
+            .or_else(|| {
+                self.graph
+                    .match_relay_byte_on_outgoing_edges(parsed.next_hop)
+            });
         let sr_active = designated
-            .map(|n| self.graph.capability_status(n) == crate::capability::CapabilityStatus::SrActive)
+            .map(|n| {
+                self.graph.capability_status(n) == crate::capability::CapabilityStatus::SrActive
+            })
             .unwrap_or(false);
         let slot0_wait = if sr_active {
             half_airtime
@@ -2027,7 +2034,10 @@ impl Router {
             || self.pending_traceroute.active
             || self.pending_ack.active
             || self.pending_admin.iter().any(|p| p.active)
-            || self.pending_retransmits.iter().any(|p| p.active && !p.canceled)
+            || self
+                .pending_retransmits
+                .iter()
+                .any(|p| p.active && !p.canceled)
             || self.pending_reliable.iter().any(|p| p.active)
             || self.graph.has_active_relay_commits()
     }
@@ -2158,7 +2168,8 @@ impl Router {
 
     fn cancel_relayed_retx(&mut self, from: u32, id: u32, reason: RelayRetxCancelReason) {
         if stop_reliable_for(&mut self.pending_reliable, from, id) {
-            self.sr_log.push(SrLogEvent::RelayRetxCanceled { id, reason });
+            self.sr_log
+                .push(SrLogEvent::RelayRetxCanceled { id, reason });
         }
     }
 
@@ -2195,7 +2206,10 @@ impl Router {
             best = Some(match best {
                 None => i,
                 Some(j) => {
-                    if slot.next_tx_ms.wrapping_sub(self.pending_admin[j].next_tx_ms) < 0x8000_0000
+                    if slot
+                        .next_tx_ms
+                        .wrapping_sub(self.pending_admin[j].next_tx_ms)
+                        < 0x8000_0000
                         && slot.next_tx_ms < self.pending_admin[j].next_tx_ms
                     {
                         i
@@ -2297,7 +2311,8 @@ impl Router {
         if self.pending_topology.next_idx >= self.pending_topology.count {
             self.pending_topology.active = false;
         } else {
-            self.pending_topology.next_tx_ms = now_ms.wrapping_add(self.pending_topology.spacing_ms);
+            self.pending_topology.next_tx_ms =
+                now_ms.wrapping_add(self.pending_topology.spacing_ms);
         }
         Some(RelayPlan {
             len,
@@ -2460,12 +2475,10 @@ impl Router {
         let advert = identity.advert;
         let mut short_name = [0u8; 5];
         let short_len = advert.short_name_len.min(NODEINFO_SHORT_NAME_MAX as u8);
-        short_name[..short_len as usize]
-            .copy_from_slice(&advert.short_name[..short_len as usize]);
+        short_name[..short_len as usize].copy_from_slice(&advert.short_name[..short_len as usize]);
         let role = advert.role;
         let is_new = self.nodeinfo_cache.upsert(parsed.from, identity, now_ms);
-        self.graph
-            .track_node_role(parsed.from, advert.role, now_ms);
+        self.graph.track_node_role(parsed.from, advert.role, now_ms);
         self.sr_log.push(SrLogEvent::NodeInfoReceived {
             from: parsed.from,
             short_len,
@@ -2519,7 +2532,8 @@ impl Router {
             return;
         };
         let delay_ms = self.reply_tx_delay_ms(to, reply_id);
-        self.sr_log.push(SrLogEvent::NodeInfoReplyDelayed { delay_ms });
+        self.sr_log
+            .push(SrLogEvent::NodeInfoReplyDelayed { delay_ms });
         self.queue_nodeinfo_tx(now_ms.wrapping_add(delay_ms), len, frame);
     }
 
@@ -2633,7 +2647,10 @@ impl Router {
         let mut packed_buf = [0u8; 256];
         let mut built = 0u8;
         for chunk in 0..packet_count {
-            let Some(packed_len) = self.graph.build_topology_chunk(chunk, topo_v, &mut packed_buf) else {
+            let Some(packed_len) = self
+                .graph
+                .build_topology_chunk(chunk, topo_v, &mut packed_buf)
+            else {
                 continue;
             };
             let packet_id = self.alloc_tx_id(now_ms);
@@ -2841,18 +2858,15 @@ impl Router {
         };
 
         if let Some(heard_from) = heard_relayer {
-            self.graph.record_heard_transmissions(
-                parsed.from,
-                parsed.id,
-                Some(heard_from),
-                now_ms,
-            );
+            self.graph
+                .record_heard_transmissions(parsed.from, parsed.id, Some(heard_from), now_ms);
             if self
                 .graph
                 .maybe_confirm_hears_us_from_relay(heard_from, parsed.from, parsed.id)
             {
-                self.sr_log
-                    .push(SrLogEvent::RelayConfirmedHearsUs { node_id: heard_from });
+                self.sr_log.push(SrLogEvent::RelayConfirmedHearsUs {
+                    node_id: heard_from,
+                });
             }
         }
 
@@ -3046,7 +3060,10 @@ impl Router {
             if slot.active && !slot.canceled && slot.packet_id == packet_id {
                 slot.active = false;
                 slot.canceled = true;
-                self.sr_log.push(SrLogEvent::T1Canceled { id: packet_id, reason });
+                self.sr_log.push(SrLogEvent::T1Canceled {
+                    id: packet_id,
+                    reason,
+                });
                 return;
             }
         }
@@ -3056,11 +3073,11 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinated_relay;
     use crate::routing_ack::{build_ack_nak_frame, ROUTING_ERROR_NONE};
     use crate::sr_log::RelayRetxCancelReason;
     use crate::topology::{decode_packed_neighbors, write_packed_header, PackedNeighbor};
     use mesh_crypto::{CryptoKey, DEFAULT_PSK};
-    use crate::coordinated_relay;
     use mesh_protocol::PacketHeader;
     use static_cell::StaticCell;
 
@@ -3075,9 +3092,11 @@ mod tests {
 
     #[test]
     fn empty_peer_topology_replies_on_next_maintenance() {
+        use crate::topology::{
+            build_topology_wire_frame, write_packed_header, PACKED_NEIGHBOR_HEADER_SIZE,
+        };
         use mesh_crypto::{CryptoKey, DEFAULT_PSK};
         use mesh_radio::MODEM_SHORT_SLOW;
-        use crate::topology::{build_topology_wire_frame, write_packed_header, PACKED_NEIGHBOR_HEADER_SIZE};
 
         const ME: u32 = 0x677a_1caf;
         const PEER: u32 = 0x63dc_8f8c;
@@ -3146,11 +3165,30 @@ mod tests {
         router.drain_sr_logs(&mut logs);
 
         let direct_wire = encode_wire(
-            PacketHeader::from_fields(NODENUM_BROADCAST, PEER, 7, 0x77, 3, 3, false, false, 0, (PEER & 0xFF) as u8),
+            PacketHeader::from_fields(
+                NODENUM_BROADCAST,
+                PEER,
+                7,
+                0x77,
+                3,
+                3,
+                false,
+                false,
+                0,
+                (PEER & 0xFF) as u8,
+            ),
             &[0x01],
         );
         router
-            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &direct_wire }, 500)
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &direct_wire,
+                },
+                500,
+            )
             .unwrap();
         router.drain_sr_logs(&mut logs);
         let delay = logs
@@ -3163,7 +3201,10 @@ mod tests {
         let max = coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
         assert!(delay <= max, "delay {delay} exceeds contention bound {max}");
         if delay > 0 {
-            assert!(router.poll_topology_tx(500 + delay - 1).is_none(), "must not fire early");
+            assert!(
+                router.poll_topology_tx(500 + delay - 1).is_none(),
+                "must not fire early"
+            );
         }
         assert!(router.poll_topology_tx(500 + delay).is_some());
     }
@@ -3240,19 +3281,14 @@ mod tests {
         };
 
         let result = router.process_inbound(&inbound, 1_000).unwrap();
-        let plan = router.evaluate_tx_plan(
-            &result,
-            0.0,
-            coordinated_relay::DEFAULT_SLOT_MS,
-            1_000,
-        );
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 1_000);
         if plan.relay.is_some() {
             return;
         }
-        let tx_after = router
-            .relay_tx_after(0xAABB_CCDD, 7, 0)
-            .expect("commit");
-        assert!(router.poll_ready_relay(tx_after.saturating_sub(1)).is_none());
+        let tx_after = router.relay_tx_after(0xAABB_CCDD, 7, 0).expect("commit");
+        assert!(router
+            .poll_ready_relay(tx_after.saturating_sub(1))
+            .is_none());
         assert!(router.poll_ready_relay(tx_after).is_some());
     }
 
@@ -3333,12 +3369,8 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        let _plan = router.evaluate_tx_plan(
-            &result,
-            0.0,
-            coordinated_relay::DEFAULT_SLOT_MS,
-            1_000,
-        );
+        let _plan =
+            router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 1_000);
         assert!(router.has_pending_work());
     }
 
@@ -3394,12 +3426,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let plan = router.evaluate_tx_plan(
-            &result,
-            0.0,
-            coordinated_relay::DEFAULT_SLOT_MS,
-            0,
-        );
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         // Stock Meshtastic semantics: hop_limit 1 is relayed once more with hop_limit 0.
         let relay = plan
             .relay
@@ -3422,7 +3449,9 @@ mod tests {
     /// Graph: we hear RELAYER directly, DEST is only known as downstream of RELAYER (no
     /// verified two-hop route).
     fn setup_downstream_only_graph(router: &mut Router) {
-        router.graph_mut().observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
         router
             .graph_mut()
             .downstream_mut()
@@ -3433,8 +3462,13 @@ mod tests {
     /// hears us and reports DEST as a neighbour that hears it.
     fn setup_unicast_graph(router: &mut Router) {
         setup_downstream_only_graph(router);
-        router.graph_mut().capability_mut().track_topology(UNI_RELAYER, true, 0);
-        router.graph_mut().confirm_direct_neighbor_hears_us(UNI_RELAYER);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_RELAYER, true, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_RELAYER);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
@@ -3447,7 +3481,10 @@ mod tests {
             etx_variance: 0,
         };
         // RELAYER must list us too, otherwise its report clears our hears_us flag on it.
-        let us = PackedNeighbor { node_id: UNI_ME, ..dest };
+        let us = PackedNeighbor {
+            node_id: UNI_ME,
+            ..dest
+        };
         router
             .graph_mut()
             .merge_topology(UNI_RELAYER, &header, &[dest, us], true, 0, 0);
@@ -3462,10 +3499,19 @@ mod tests {
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x600, true);
         let (sent, _) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0);
-        assert!(!router.has_pending_reliable(0x600), "no designated hop, nothing to retry");
+        assert!(
+            !router.has_pending_reliable(0x600),
+            "no designated hop, nothing to retry"
+        );
     }
 
-    fn unicast_wire(hop_limit: u8, hop_start: u8, next_hop: u8, relay: u8, id: u32) -> heapless::Vec<u8, 128> {
+    fn unicast_wire(
+        hop_limit: u8,
+        hop_start: u8,
+        next_hop: u8,
+        relay: u8,
+        id: u32,
+    ) -> heapless::Vec<u8, 128> {
         let header = PacketHeader::from_fields(
             UNI_DEST, UNI_SOURCE, id, 0x77, hop_limit, hop_start, false, false, next_hop, relay,
         );
@@ -3474,7 +3520,15 @@ mod tests {
 
     fn unicast_skip_reason(router: &mut Router, wire: &[u8]) -> (bool, Option<SrSkipReason>) {
         let result = router
-            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: wire }, 0)
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: wire,
+                },
+                0,
+            )
             .unwrap();
         let (from, id) = (result.parsed.from, result.parsed.id);
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
@@ -3502,7 +3556,14 @@ mod tests {
         assert_eq!(reason, Some(SrSkipReason::NextHopIsRelayer));
     }
 
-    fn unicast_wire_ack(hop_limit: u8, hop_start: u8, next_hop: u8, relay: u8, id: u32, want_ack: bool) -> heapless::Vec<u8, 128> {
+    fn unicast_wire_ack(
+        hop_limit: u8,
+        hop_start: u8,
+        next_hop: u8,
+        relay: u8,
+        id: u32,
+        want_ack: bool,
+    ) -> heapless::Vec<u8, 128> {
         let header = PacketHeader::from_fields(
             UNI_DEST, UNI_SOURCE, id, 0x77, hop_limit, hop_start, want_ack, false, next_hop, relay,
         );
@@ -3514,10 +3575,19 @@ mod tests {
     /// Returns the transmitted header and the time the relay left (retries are armed then).
     fn forward_unicast(router: &mut Router, wire: &[u8], now_ms: u32) -> (ParsedPacket, u32) {
         let result = router
-            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: wire }, now_ms)
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: wire,
+                },
+                now_ms,
+            )
             .unwrap();
         let (from, id) = (result.parsed.from, result.parsed.id);
-        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, now_ms);
+        let plan =
+            router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, now_ms);
         let (relay, released_at) = match plan.relay {
             Some(r) => (r, now_ms),
             None => {
@@ -3525,7 +3595,12 @@ mod tests {
                 (router.poll_ready_relay(tx).expect("relay released"), tx)
             }
         };
-        (PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN]).unwrap().parse(), released_at)
+        (
+            PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
+                .unwrap()
+                .parse(),
+            released_at,
+        )
     }
 
     #[test]
@@ -3539,7 +3614,13 @@ mod tests {
         assert!(router.has_pending_reliable(0x601), "retries armed");
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
-        assert!(logs.iter().any(|e| matches!(e, SrLogEvent::RelayRetxArmed { id: 0x601, next_hop: 0xBB })));
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::RelayRetxArmed {
+                id: 0x601,
+                next_hop: 0xBB
+            }
+        )));
 
         let step = router.reliable_retx_delay_ms(sent_len(&wire));
         let mut t = armed_at;
@@ -3548,16 +3629,28 @@ mod tests {
         for _ in 0..2 {
             t += step;
             let retx = router.poll_reliable_retransmit(t + 1).expect("retry due");
-            let hdr = PacketHeader::decode(&retx.bytes[..PACKET_HEADER_LEN]).unwrap().parse();
+            let hdr = PacketHeader::decode(&retx.bytes[..PACKET_HEADER_LEN])
+                .unwrap()
+                .parse();
             assert_eq!(hdr.next_hop, 0xBB);
         }
         // Retry 3 is the fallback: next hop cleared, then nothing more.
         t += step;
-        let last = router.poll_reliable_retransmit(t + 1).expect("final retry due");
-        let hdr = PacketHeader::decode(&last.bytes[..PACKET_HEADER_LEN]).unwrap().parse();
+        let last = router
+            .poll_reliable_retransmit(t + 1)
+            .expect("final retry due");
+        let hdr = PacketHeader::decode(&last.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
         assert_eq!(hdr.next_hop, 0, "last retry must be released to flooding");
         router.drain_sr_logs(&mut logs);
-        assert!(logs.iter().any(|e| matches!(e, SrLogEvent::RelayRetxFired { id: 0x601, fallback: true })));
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::RelayRetxFired {
+                id: 0x601,
+                fallback: true
+            }
+        )));
         t += step;
         assert!(router.poll_reliable_retransmit(t + 1).is_none());
         assert!(!router.has_pending_reliable(0x601));
@@ -3589,7 +3682,15 @@ mod tests {
         // RELAYER carries it on (one more hop used, its relay byte).
         let copy = unicast_wire_ack(1, 3, 0, 0xBB, 0x603, true);
         let dupe = router
-            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &copy }, 500)
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy,
+                },
+                500,
+            )
             .unwrap();
         assert!(dupe.duplicate);
         assert!(!router.has_pending_reliable(0x603));
@@ -3597,7 +3698,10 @@ mod tests {
         router.drain_sr_logs(&mut logs);
         assert!(logs.iter().any(|e| matches!(
             e,
-            SrLogEvent::RelayRetxCanceled { id: 0x603, reason: RelayRetxCancelReason::CopyHeard }
+            SrLogEvent::RelayRetxCanceled {
+                id: 0x603,
+                reason: RelayRetxCancelReason::CopyHeard
+            }
         )));
     }
 
@@ -3612,11 +3716,23 @@ mod tests {
         // DEST acks SOURCE for 0x604 on the primary channel.
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let (len, ack) = build_ack_nak_frame(
-            UNI_SOURCE, UNI_DEST, 0x7001, 0x604, router.channel_hash(), 3, ROUTING_ERROR_NONE, &key,
+            UNI_SOURCE,
+            UNI_DEST,
+            0x7001,
+            0x604,
+            router.channel_hash(),
+            3,
+            ROUTING_ERROR_NONE,
+            &key,
         )
         .unwrap();
         let _ = router.process_inbound(
-            &InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &ack[..len as usize] },
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -70,
+                snr: 8,
+                bytes: &ack[..len as usize],
+            },
             700,
         );
         assert!(!router.has_pending_reliable(0x604));
@@ -3624,7 +3740,10 @@ mod tests {
         router.drain_sr_logs(&mut logs);
         assert!(logs.iter().any(|e| matches!(
             e,
-            SrLogEvent::RelayRetxCanceled { id: 0x604, reason: RelayRetxCancelReason::ReplyHeard }
+            SrLogEvent::RelayRetxCanceled {
+                id: 0x604,
+                reason: RelayRetxCancelReason::ReplyHeard
+            }
         )));
     }
 
@@ -3650,7 +3769,15 @@ mod tests {
         // least the worst-case stock delay plus one airtime before our own slot.
         let wire = unicast_wire(3, 3, 0x99, 0xDD, 0x503);
         let result = router
-            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &wire }, 0)
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         assert!(plan.relay.is_none(), "must not relay immediately");
@@ -3659,7 +3786,10 @@ mod tests {
             .expect("relay pending in a later slot");
         let slot0_wait = coordinated_relay::tx_delay_ms_worst(coordinated_relay::DEFAULT_SLOT_MS)
             + coordinated_relay::DEFAULT_SLOT_MS;
-        assert!(tx_after >= slot0_wait, "tx_after {tx_after} < slot-0 wait {slot0_wait}");
+        assert!(
+            tx_after >= slot0_wait,
+            "tx_after {tx_after} < slot-0 wait {slot0_wait}"
+        );
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
         assert!(logs.iter().any(|e| matches!(
@@ -3670,13 +3800,26 @@ mod tests {
         // The designated node relays (copy with one hop used, relay byte 0x99): we stand down.
         let copy = unicast_wire(2, 3, 0, 0x99, 0x503);
         let dupe = router
-            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &copy }, 100)
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy,
+                },
+                100,
+            )
             .unwrap();
         assert!(dupe.duplicate);
-        assert!(router.relay_tx_after(UNI_SOURCE, 0x503, 0).is_none(), "pending relay must be cancelled");
+        assert!(
+            router.relay_tx_after(UNI_SOURCE, 0x503, 0).is_none(),
+            "pending relay must be cancelled"
+        );
         assert!(router.poll_ready_relay(tx_after + 1).is_none());
         router.drain_sr_logs(&mut logs);
-        assert!(logs.iter().any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
     }
 
     #[test]
@@ -3685,22 +3828,40 @@ mod tests {
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
         // RELAYER (byte 0xBB) is a known SR-active direct neighbour and the designated next hop.
-        router.graph_mut().capability_mut().track_topology(UNI_RELAYER, true, 0);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_RELAYER, true, 0);
         let wire = unicast_wire(3, 3, 0xBB, 0xDD, 0x505);
         let result = router
-            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &wire }, 0)
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
             .unwrap();
         let _ = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
         let designated = logs.iter().find_map(|e| match e {
-            SrLogEvent::UnicastDesignated { sr_active, slot_delay_ms, .. } => Some((*sr_active, *slot_delay_ms)),
+            SrLogEvent::UnicastDesignated {
+                sr_active,
+                slot_delay_ms,
+                ..
+            } => Some((*sr_active, *slot_delay_ms)),
             _ => None,
         });
         let (sr_active, delay) = designated.expect("designated plan logged");
         assert!(sr_active);
         let stock_wait = coordinated_relay::tx_delay_ms_worst(coordinated_relay::DEFAULT_SLOT_MS);
-        assert!(delay < stock_wait, "SR peer slot-0 wait {delay} should be far below stock {stock_wait}");
+        assert!(
+            delay < stock_wait,
+            "SR peer slot-0 wait {delay} should be far below stock {stock_wait}"
+        );
     }
 
     #[test]
@@ -3721,10 +3882,15 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        router.graph_mut().observe_direct_neighbor(UNI_DEST, -75, 6, 0, 0);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_DEST, -75, 6, 0, 0);
         let wire = unicast_wire(1, 1, 0, 0xDD, 0x504);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
-        assert!(scheduled, "hop_limit 0 is fine when the next hop is the destination");
+        assert!(
+            scheduled,
+            "hop_limit 0 is fine when the next hop is the destination"
+        );
         assert_eq!(reason, None);
     }
 
@@ -3792,7 +3958,10 @@ mod tests {
                 .unwrap();
             limited |= result.rate_limited;
         }
-        assert!(limited, "rate limiter must still apply to traffic not addressed to us");
+        assert!(
+            limited,
+            "rate limiter must still apply to traffic not addressed to us"
+        );
     }
 
     #[test]
@@ -3821,12 +3990,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let plan = router.evaluate_tx_plan(
-            &result,
-            0.0,
-            coordinated_relay::DEFAULT_SLOT_MS,
-            0,
-        );
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         // `u32::MAX` looks "before" a small tx_after under wrapping subtract; poll at due time.
         let ready = plan.relay.is_some()
             || router
@@ -3862,12 +4026,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let plan = router.evaluate_tx_plan(
-            &result,
-            0.0,
-            coordinated_relay::DEFAULT_SLOT_MS,
-            0,
-        );
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         let ready = plan.relay.is_some()
             || router
                 .relay_tx_after(LAST_HOP_SOURCE, 44, 0)

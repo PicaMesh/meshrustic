@@ -124,8 +124,14 @@ impl EdgeStore {
             .map(move |i| &mut self.nodes[i])
     }
 
-    fn find_or_create_node(&mut self, node_id: u32, now_ms: u32, my_node: u32) -> Option<&mut NodeEdges> {
-        if let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == node_id) {
+    fn find_or_create_node(
+        &mut self,
+        node_id: u32,
+        now_ms: u32,
+        my_node: u32,
+    ) -> Option<&mut NodeEdges> {
+        if let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == node_id)
+        {
             return Some(&mut self.nodes[idx]);
         }
         if (self.node_count as usize) >= super::MAX_GRAPH_NODES {
@@ -210,7 +216,9 @@ impl EdgeStore {
         if !is_our_node && self.find_node(from).is_none() {
             if super::placeholder::is_placeholder_node(from) {
                 let _ = self.find_or_create_node(from, now_ms, my_node);
-            } else if !self.is_our_direct_neighbor(from, my_node) && !self.reachable_via_neighbor(from) {
+            } else if !self.is_our_direct_neighbor(from, my_node)
+                && !self.reachable_via_neighbor(from)
+            {
                 return EDGE_NO_CHANGE;
             }
         }
@@ -240,7 +248,11 @@ impl EdgeStore {
             }
             let old_etx = edge.etx();
             let abs_change = (etx - old_etx).abs();
-            let rel_change = if old_etx > 0.0 { abs_change / old_etx } else { 1.0 };
+            let rel_change = if old_etx > 0.0 {
+                abs_change / old_etx
+            } else {
+                1.0
+            };
             edge.set_etx(etx);
             if update_timestamp {
                 edge.last_update_ms = now_ms;
@@ -314,7 +326,9 @@ impl EdgeStore {
             }
             let listed_here = listed_ids.iter().any(|&id| id == node_id);
             for e in 0..self.nodes[i].edge_count as usize {
-                if self.nodes[i].edges[e].to == sender && self.nodes[i].edges[e].hears_us && !listed_here
+                if self.nodes[i].edges[e].to == sender
+                    && self.nodes[i].edges[e].hears_us
+                    && !listed_here
                 {
                     self.nodes[i].edges[e].hears_us = false;
                 }
@@ -433,7 +447,8 @@ impl EdgeStore {
             return false;
         }
         self.remove_node_edges_to(node_id);
-        let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == node_id) else {
+        let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == node_id)
+        else {
             return false;
         };
         if idx < self.node_count as usize - 1 {
@@ -485,26 +500,8 @@ mod tests {
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
         // Mirrored edges from an unknown `from` are rejected; establish BB first.
-        edges.update_edge(
-            0xAA,
-            0xAA,
-            0xBB,
-            2.0,
-            1_000,
-            EdgeSource::Reported,
-            true,
-            0,
-        );
-        edges.update_edge(
-            0xAA,
-            0xBB,
-            0xCC,
-            2.0,
-            1_000,
-            EdgeSource::Mirrored,
-            true,
-            0,
-        );
+        edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xBB, 0xCC, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
         assert!(edges.find_node(0xBB).is_some());
 
         let mut downstream = DownstreamTable::new();
@@ -533,7 +530,10 @@ mod tests {
         let _ = edges.update_node_activity(0xBB, 1_000, 0xAA);
         edges.update_edge(0xAA, 0xBB, 0xAA, 2.0, 1_000, EdgeSource::Reported, true, 0);
         assert_eq!(edges.count_direct_neighbors(0xAA), 1);
-        assert_eq!(edges.direct_neighbor_ids(0xAA, &mut [0; MAX_EDGES_PER_NODE]), 0);
+        assert_eq!(
+            edges.direct_neighbor_ids(0xAA, &mut [0; MAX_EDGES_PER_NODE]),
+            0
+        );
     }
 
     #[test]

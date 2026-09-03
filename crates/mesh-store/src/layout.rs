@@ -67,7 +67,9 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
 
     let key_len = config.channel_key.length.max(0) as u8;
     out[76] = key_len;
-    let copy_len = (key_len as usize).min(32).min(config.channel_key.bytes.len());
+    let copy_len = (key_len as usize)
+        .min(32)
+        .min(config.channel_key.bytes.len());
     out[77..77 + copy_len].copy_from_slice(&config.channel_key.bytes[..copy_len]);
 
     let lora = config.lora;
@@ -145,9 +147,9 @@ fn decode_v2_or_v3(buf: &[u8]) -> Result<NodeConfig, StoreError> {
     };
 
     let mut admin_public_keys = [[0u8; 32]; ADMIN_KEY_SLOTS];
-    for i in 0..ADMIN_KEY_SLOTS {
+    for (i, key) in admin_public_keys.iter_mut().enumerate() {
         let off = 124 + i * 32;
-        admin_public_keys[i].copy_from_slice(&buf[off..off + 32]);
+        key.copy_from_slice(&buf[off..off + 32]);
     }
 
     Ok(NodeConfig {
@@ -292,7 +294,10 @@ mod tests {
 
         let mut buf = [0u8; STORE_RECORD_LEN];
         encode(&config, &mut buf).unwrap();
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), STORE_VERSION);
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            STORE_VERSION
+        );
         assert!(buf[STORE_RESERVED_START..STORE_RESERVED_END]
             .iter()
             .all(|&b| b == 0));

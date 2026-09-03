@@ -1,11 +1,11 @@
 //! Duplicate RX handling — role cancel, upgrade, want_ack re-ACK.
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
-use mesh_protocol::{NODENUM_BROADCAST, PacketHeader, PACKET_HEADER_LEN};
-use mesh_radio::MODEM_SHORT_SLOW;
 use mesh_protocol::num::TEXT_MESSAGE_APP;
+use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
+use mesh_radio::MODEM_SHORT_SLOW;
 use mesh_routing::{
-    build_app_wire_frame, build_ack_nak_frame, coordinated_relay, DataEncodeOpts, InboundPacket,
+    build_ack_nak_frame, build_app_wire_frame, coordinated_relay, DataEncodeOpts, InboundPacket,
     Router, DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_ROUTER, ROUTING_ERROR_NONE,
 };
 
@@ -52,12 +52,7 @@ fn router_role_router_keeps_relay_commit_on_dupe() {
     };
 
     let result = router.process_inbound(&inbound, 0).expect("first rx");
-    let _plan = router.evaluate_tx_plan(
-        &result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        0,
-    );
+    let _plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
     assert!(
         router.relay_tx_after(0x1234_5678, 42, 0).is_some(),
         "relay should be committed"
@@ -104,12 +99,7 @@ fn client_cancels_relay_commit_on_dupe() {
     };
 
     let result = router.process_inbound(&inbound, 0).expect("first rx");
-    let _plan = router.evaluate_tx_plan(
-        &result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        0,
-    );
+    let _plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
     assert!(router.relay_tx_after(0x1234_5678, 43, 0).is_some());
 
     let _dupe = router.process_inbound(&inbound, 100).expect("dupe rx");
@@ -152,7 +142,9 @@ fn repeated_want_ack_to_us_schedules_ack_on_duplicate() {
 
     router.process_inbound(&inbound, 0).expect("first");
     router.poll_ack_tx(0);
-    router.process_inbound(&inbound, 50).expect("dupe repeated tx");
+    router
+        .process_inbound(&inbound, 50)
+        .expect("dupe repeated tx");
     assert!(
         router.poll_ack_tx(50).is_some(),
         "duplicate repeated want_ack should re-send ACK"
@@ -321,38 +313,26 @@ fn foreign_routing_ack_cancels_pending_relay() {
         bytes: &dm_frame[..usize::from(dm_len)],
     };
     let result = router.process_inbound(&dm, 1_000).expect("dm rx");
-    let plan = router.evaluate_tx_plan(
-        &result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        1_000,
-    );
+    let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 1_000);
     if plan.relay.is_some() {
         return;
     }
     let tx_after = router
         .relay_tx_after(ORIGIN, 77, 0)
         .expect("relay committed");
+    assert!(tx_after > 1_000, "need delayed pending relay for this test");
     assert!(
-        tx_after > 1_000,
-        "need delayed pending relay for this test"
-    );
-    assert!(
-        router.poll_ready_relay(tx_after.saturating_sub(1)).is_some()
-            || router.poll_ready_relay(tx_after.saturating_sub(1)).is_none()
+        router
+            .poll_ready_relay(tx_after.saturating_sub(1))
+            .is_some()
+            || router
+                .poll_ready_relay(tx_after.saturating_sub(1))
+                .is_none()
     );
 
-    let (ack_len, ack_wire) = build_ack_nak_frame(
-        ORIGIN,
-        DEST,
-        9001,
-        77,
-        0x77,
-        3,
-        ROUTING_ERROR_NONE,
-        &key,
-    )
-    .expect("ack frame");
+    let (ack_len, ack_wire) =
+        build_ack_nak_frame(ORIGIN, DEST, 9001, 77, 0x77, 3, ROUTING_ERROR_NONE, &key)
+            .expect("ack frame");
 
     let ack = InboundPacket {
         radio_id: 0,
@@ -397,12 +377,7 @@ fn upgraded_hop_limit_reprocesses_after_dropping_lower_pending() {
         bytes: &low_frame[..usize::from(low_len)],
     };
     let result = router.process_inbound(&low, 0).expect("low hop rx");
-    let plan = router.evaluate_tx_plan(
-        &result,
-        0.0,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        0,
-    );
+    let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
     if plan.relay.is_some() {
         return;
     }

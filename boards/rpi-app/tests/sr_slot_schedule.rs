@@ -1,8 +1,7 @@
 //! Broadcast relay slot scheduling (phased stock → SR → downstream → coverage).
 
 use mesh_routing::{
-    NeighborGraph, EdgeSource, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
-    POOR_LINK_ETX_THRESHOLD,
+    EdgeSource, NeighborGraph, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, POOR_LINK_ETX_THRESHOLD,
 };
 
 const ME: u32 = 0xCC00_00CC;
@@ -19,8 +18,12 @@ fn setup_stock_graph(graph: &mut NeighborGraph) {
     graph.confirm_direct_neighbor_hears_us(BB);
     graph.confirm_direct_neighbor_hears_us(DD);
     graph.track_node_role(DD, DEVICE_ROLE_REPEATER, 0);
-    graph.edges_mut().update_edge(ME, DD, BB, 2.0, 0, EdgeSource::Reported, true, 0);
-    graph.edges_mut().update_edge(ME, BB, DD, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, DD, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, BB, DD, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(DD, BB, true);
     graph.edges_mut().set_edge_hears_us(BB, DD, true);
 }
@@ -42,21 +45,35 @@ fn best_candidate_assigned_earlier_slot() {
     const FF: u32 = 0xAA00_00FF;
     const GG: u32 = 0xAA00_0011;
     graph.edges_mut().ensure_local_node(ME, 0);
-    graph.edges_mut().update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
-    graph.edges_mut().update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(ME, BB, true);
     graph.edges_mut().set_edge_hears_us(ME, EE, true);
     graph.capability_mut().track_topology(EE, true, 0);
     graph.capability_mut().track_topology(ME, true, 0);
-    graph.edges_mut().update_edge(ME, BB, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, BB, EE, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(BB, EE, true);
-    graph.edges_mut().update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
-    graph.edges_mut().update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
-    graph.edges_mut().update_edge(ME, EE, FF, 1.5, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, EE, FF, 1.5, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(EE, BB, true);
     graph.edges_mut().set_edge_hears_us(EE, ME, true);
     graph.edges_mut().set_edge_hears_us(EE, FF, true);
-    graph.edges_mut().update_edge(ME, ME, GG, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, ME, GG, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(ME, GG, true);
 
     let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
@@ -73,7 +90,9 @@ fn poor_etx_neighbor_not_precovered() {
     graph.observe_direct_neighbor(BB, -70, 8, 0, 0);
     graph.observe_direct_neighbor(DD, -72, 7, 0, 0);
     graph.track_node_role(DD, DEVICE_ROLE_REPEATER, 0);
-    graph.edges_mut().update_edge(ME, DD, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph
+        .edges_mut()
+        .update_edge(ME, DD, BB, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().update_edge(
         ME,
         BB,
@@ -92,9 +111,7 @@ fn poor_etx_neighbor_not_precovered() {
 fn we_relay_when_downstream_relay_for_source() {
     let mut graph = NeighborGraph::new();
     setup_stock_graph(&mut graph);
-    graph
-        .downstream_mut()
-        .update(ME, BB, ME, 1.0, 0, false, 0);
+    graph.downstream_mut().update(ME, BB, ME, 1.0, 0, false, 0);
     let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
     assert!(plan.should_relay);
 }

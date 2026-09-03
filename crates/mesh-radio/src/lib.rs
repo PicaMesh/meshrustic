@@ -9,26 +9,26 @@ mod config;
 mod frame;
 mod interface;
 mod packet_time;
-mod timing;
 mod queue;
 mod slot;
+mod timing;
 
 pub use airtime::{AirTime, AirtimeLog, CHANNEL_UTILIZATION_PERIODS, MINUTES_IN_HOUR, MS_IN_HOUR};
 pub use bus::SpiLoRaBus;
 pub use channel::primary_channel_hash;
 pub use config::{
-    modem_preset_channel_name, modem_preset_params, RadioConfig, RegionInfo, EU_868,
-    EU_868_DEFAULT_FREQ_MHZ, MODEM_DEFAULT_PRESET, MODEM_LONG_FAST, MODEM_LONG_MODERATE, MODEM_LONG_SLOW,
-    MODEM_LONG_TURBO, MODEM_MEDIUM_FAST, MODEM_MEDIUM_SLOW, MODEM_SHORT_FAST, MODEM_SHORT_SLOW,
-    MODEM_SHORT_TURBO, MODEM_VERY_LONG_SLOW, PACKET_HEADER_LEN, PREAMBLE_LENGTH, REGION_EU_868,
-    SYNC_WORD, SX126X_SYNC_CONTROL_BITS, sync_word_sx126x,
+    modem_preset_channel_name, modem_preset_params, sync_word_sx126x, RadioConfig, RegionInfo,
+    EU_868, EU_868_DEFAULT_FREQ_MHZ, MODEM_DEFAULT_PRESET, MODEM_LONG_FAST, MODEM_LONG_MODERATE,
+    MODEM_LONG_SLOW, MODEM_LONG_TURBO, MODEM_MEDIUM_FAST, MODEM_MEDIUM_SLOW, MODEM_SHORT_FAST,
+    MODEM_SHORT_SLOW, MODEM_SHORT_TURBO, MODEM_VERY_LONG_SLOW, PACKET_HEADER_LEN, PREAMBLE_LENGTH,
+    REGION_EU_868, SX126X_SYNC_CONTROL_BITS, SYNC_WORD,
 };
 pub use frame::{RadioId, RxFrame, TxFrame, MAX_BRIDGE_TARGETS, MAX_LORA_PAYLOAD, MAX_RADIOS};
 pub use interface::{RadioError, RadioInterface};
 pub use packet_time::packet_time_ms;
-pub use timing::{contention_window_ms, eu868_config_for_preset, slot_time_ms};
 pub use queue::{QueueError, RxQueue, TxQueue, DEFAULT_RX_QUEUE, DEFAULT_TX_QUEUE};
 pub use slot::{RadioSlot, ServiceReport};
+pub use timing::{contention_window_ms, eu868_config_for_preset, slot_time_ms};
 
 #[cfg(test)]
 mod tests {

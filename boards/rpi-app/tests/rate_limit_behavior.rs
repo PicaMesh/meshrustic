@@ -89,8 +89,9 @@ fn build_topology_wire(
     packed[10] = 8;
     packed[11] = 0x02; // hears_us
     let packed_len = PACKED_NEIGHBOR_HEADER_SIZE + 8;
-    let (len, frame) = build_topology_wire_frame(from, packet_id, channel, 3, key, &packed[..packed_len])
-        .expect("topology wire");
+    let (len, frame) =
+        build_topology_wire_frame(from, packet_id, channel, 3, key, &packed[..packed_len])
+            .expect("topology wire");
     let mut out = heapless::Vec::new();
     out.extend_from_slice(&frame[..len as usize]).unwrap();
     out
@@ -164,7 +165,8 @@ fn nodeinfo_request_to_us_is_answered_even_from_a_limited_node() {
     );
     let mut cipher = plaintext.clone();
     mesh_crypto::encrypt_packet(&key, requester, 0x99, &mut cipher);
-    let header = PacketHeader::from_fields(our_node, requester, 0x99, channel, 3, 3, false, false, 0, 0);
+    let header =
+        PacketHeader::from_fields(our_node, requester, 0x99, channel, 3, 3, false, false, 0, 0);
     let mut wire = heapless::Vec::<u8, 128>::new();
     let mut hdr = [0u8; PACKET_HEADER_LEN];
     header.encode_to(&mut hdr);
@@ -174,7 +176,10 @@ fn nodeinfo_request_to_us_is_answered_even_from_a_limited_node() {
     let result = router
         .process_inbound(&inbound(&wire), 2_000)
         .expect("nodeinfo request rx");
-    assert!(!result.rate_limited, "requests addressed to us are never rate limited");
+    assert!(
+        !result.rate_limited,
+        "requests addressed to us are never rate limited"
+    );
     let max_delay = mesh_routing::coordinated_relay::tx_delay_ms_contention_max(
         mesh_routing::coordinated_relay::slot_time_for_preset(MODEM_SHORT_SLOW),
     );

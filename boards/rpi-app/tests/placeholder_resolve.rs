@@ -1,7 +1,7 @@
 //! Placeholder → real node resolution and gateway transfer.
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
-use mesh_protocol::{NODENUM_BROADCAST, PacketHeader, PACKET_HEADER_LEN};
+use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
     get_placeholder_for_relay, is_placeholder_node, InboundPacket, NeighborGraph, Router,
     DEVICE_ROLE_ROUTER,
@@ -22,7 +22,12 @@ fn wire_bytes(header: PacketHeader, payload: &[u8]) -> heapless::Vec<u8, 280> {
     out
 }
 
-fn relayed_inbound(from: u32, id: u32, relay_byte: u8, wire: &mut heapless::Vec<u8, 280>) -> InboundPacket<'_> {
+fn relayed_inbound(
+    from: u32,
+    id: u32,
+    relay_byte: u8,
+    wire: &mut heapless::Vec<u8, 280>,
+) -> InboundPacket<'_> {
     let header = PacketHeader::from_fields(
         NODENUM_BROADCAST,
         from,
@@ -132,7 +137,18 @@ fn relayed_packet_uses_known_direct_neighbor_as_gateway() {
     graph.set_my_node(ME);
     graph.set_device_role(DEVICE_ROLE_ROUTER);
     graph.observe_direct_neighbor(REAL_RELAY, -70, 8, 0, 0);
-    graph.observe_packet(SOURCE, 3, 2, RELAY_BYTE, -70, 8, 200, 0, Some(REAL_RELAY), 0);
+    graph.observe_packet(
+        SOURCE,
+        3,
+        2,
+        RELAY_BYTE,
+        -70,
+        8,
+        200,
+        0,
+        Some(REAL_RELAY),
+        0,
+    );
 
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(!graph.has_graph_node(placeholder));

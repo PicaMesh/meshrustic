@@ -203,6 +203,9 @@ fn admin_get_lora_and_begin_commit() {
         router.take_pending_radio_reinit(),
         "commit LoRa preset must soft-reinit radio, not reboot"
     );
-    assert!(router.admin_config_dirty(), "commit must mark config dirty for flash save");
+    assert!(
+        router.admin_config_dirty(),
+        "commit must mark config dirty for flash save"
+    );
     assert!(router.take_pending_reboot_seconds().is_none());
 }

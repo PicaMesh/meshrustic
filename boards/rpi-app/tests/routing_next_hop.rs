@@ -2,9 +2,8 @@
 
 use mesh_protocol::PacketHeader;
 use mesh_routing::{
-    decode_packed_neighbors, relay_header_with_next_hop,
-    write_packed_header, DEVICE_ROLE_CLIENT_MUTE, NeighborGraph, PackedNeighbor,
-    TopologyMergeResult,
+    decode_packed_neighbors, relay_header_with_next_hop, write_packed_header, NeighborGraph,
+    PackedNeighbor, TopologyMergeResult, DEVICE_ROLE_CLIENT_MUTE,
 };
 
 fn merge_remote(graph: &mut NeighborGraph, reporter: u32, neighbor: u32, now_ms: u32) {
@@ -42,7 +41,8 @@ fn get_next_hop_two_hop_via_intermediate() {
 
 #[test]
 fn unicast_relay_sets_next_hop_byte() {
-    let header = PacketHeader::from_fields(0x1234_5678, 0xAABB_CCDD, 1, 0, 3, 3, false, false, 0, 0);
+    let header =
+        PacketHeader::from_fields(0x1234_5678, 0xAABB_CCDD, 1, 0, 3, 3, false, false, 0, 0);
     let parsed = header.parse();
     let relay = relay_header_with_next_hop(&parsed, 0xDEAD_BEEF, 0xBB).unwrap();
     assert_eq!(relay.next_hop, 0xBB);
@@ -123,7 +123,9 @@ fn next_hop_fallback_order() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(AA);
     graph.observe_direct_neighbor(RELAY, -70, 8, 0, 0);
-    graph.downstream_mut().update(AA, DEST, RELAY, 3.0, 100, false, 0);
+    graph
+        .downstream_mut()
+        .update(AA, DEST, RELAY, 3.0, 100, false, 0);
 
     assert_eq!(graph.get_next_hop(DEST, 0, 0, 200), RELAY);
 }

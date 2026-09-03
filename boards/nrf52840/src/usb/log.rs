@@ -783,7 +783,9 @@ pub mod battery {
 /// Signal-routing decision logs (`[SR]` prefix).
 pub mod sr {
     use super::{finish_line, line_prefix, push_hex_u32_8, push_hex_u8_2, push_i32, push_u32};
-    use mesh_routing::{Router, SrLogEvent, SrSkipReason, RelayRetxCancelReason, T1CancelReason, TopologyLogSink};
+    use mesh_routing::{
+        RelayRetxCancelReason, Router, SrLogEvent, SrSkipReason, T1CancelReason, TopologyLogSink,
+    };
 
     fn emit_topology_event(event: SrLogEvent) {
         match event {
@@ -1267,7 +1269,10 @@ pub mod sr {
                 }
                 finish_line(&mut line, pos);
             }
-            SrLogEvent::TopologyDownstreamSkippedAsymmetric { sender, destination } => {
+            SrLogEvent::TopologyDownstreamSkippedAsymmetric {
+                sender,
+                destination,
+            } => {
                 let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Skipping asymmetric downstream !";
@@ -1433,7 +1438,13 @@ pub mod sr {
                 pos += push_u32(&mut line[pos..], cost_x100 as u32);
                 finish_line(&mut line, pos);
             }
-            SrLogEvent::UnicastDesignated { next_hop, is_us, sr_active, slot, slot_delay_ms } => {
+            SrLogEvent::UnicastDesignated {
+                next_hop,
+                is_us,
+                sr_active,
+                slot,
+                slot_delay_ms,
+            } => {
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Unicast next hop 0x";

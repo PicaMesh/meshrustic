@@ -2,7 +2,9 @@
 
 use embassy_time::{Duration, Instant, Timer};
 use mesh_protocol::PacketHeader;
-use mesh_radio::{eu868_config_for_preset, packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868};
+use mesh_radio::{
+    eu868_config_for_preset, packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868,
+};
 use mesh_routing::{
     wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, InboundPacket, Router, RxDecodeInfo,
     SrLogEvent, MAX_SR_LOG,
@@ -10,8 +12,8 @@ use mesh_routing::{
 use mesh_store::{ConfigStore, EMPTY_ADMIN_KEY};
 use static_cell::StaticCell;
 
-use crate::store::NvmcConfigStore;
 use super::sx1262::Sx1262Driver;
+use crate::store::NvmcConfigStore;
 
 static AIR_TIME: StaticCell<AirTime> = StaticCell::new();
 
