@@ -386,7 +386,8 @@ pub mod radio {
             append_slice(line, pos, b" hopStart=");
             append_u32(line, pos, parsed.hop_start as u32);
         }
-        if parsed.next_hop != 0 {
+        // Unicasts always show the field: a cleared next hop is a decision, not an omission.
+        if parsed.next_hop != 0 || parsed.to != 0xFFFF_FFFF {
             append_slice(line, pos, b" nextHop=0x");
             *pos += push_hex_u8_2(&mut line[*pos..], parsed.next_hop);
         }
@@ -478,7 +479,7 @@ pub mod radio {
                 append_slice(&mut line, &mut pos, b" hopStart=");
                 append_u32(&mut line, &mut pos, parsed.hop_start as u32);
             }
-            if parsed.next_hop != 0 {
+            if parsed.next_hop != 0 || parsed.to != 0xFFFF_FFFF {
                 append_slice(&mut line, &mut pos, b" nextHop=0x");
                 pos += push_hex_u8_2(&mut line[pos..], parsed.next_hop);
             }
@@ -535,7 +536,7 @@ pub mod radio {
             append_slice(&mut line, &mut pos, b" hopStart=");
             append_u32(&mut line, &mut pos, parsed.hop_start as u32);
         }
-        if parsed.next_hop != 0 {
+        if parsed.next_hop != 0 || parsed.to != 0xFFFF_FFFF {
             append_slice(&mut line, &mut pos, b" nextHop=0x");
             pos += push_hex_u8_2(&mut line[pos..], parsed.next_hop);
         }
