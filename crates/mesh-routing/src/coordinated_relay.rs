@@ -73,6 +73,11 @@ pub fn tx_delay_ms_contention(
     jitter_slots(seed_a, seed_b, node_num, 1u32 << cw) * slot_ms
 }
 
+/// Upper bound of [`tx_delay_ms_contention`] at the given channel utilization.
+pub fn tx_delay_ms_contention_max_at(channel_util_pct: f32, slot_ms: u32) -> u32 {
+    (1u32 << crate::routing_ack::contention_window_size(channel_util_pct)) * slot_ms
+}
+
 /// Upper bound of [`tx_delay_ms_contention`] at any channel utilization.
 pub fn tx_delay_ms_contention_max(slot_ms: u32) -> u32 {
     (1u32 << crate::routing_ack::RETX_CW_MAX) * slot_ms

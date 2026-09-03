@@ -32,6 +32,10 @@ pub enum SrLogEvent {
         half_airtime_ms: u32,
         candidates: u8,
         slot_index: u8,
+        /// Slot holders in order (first `ranked_len` valid); empty for unicast slots.
+        ranked: [u32; crate::broadcast_relay::RANKED_LOG],
+        ranked_len: u8,
+        reason: crate::broadcast_relay::RelayReason,
     },
     RelayCommitted {
         id: u32,
@@ -220,6 +224,10 @@ pub enum SrSkipReason {
     NextHopIsRelayer,
     /// Unicast that would leave us with hop_limit 0 without a direct link to the target.
     DeadEndHop,
+    /// Unicast the transmitter, or an SR neighbour covering it, can already deliver.
+    UnicastCovered,
+    /// Unicast we have no direct, downstream or next-hop path for.
+    NoRelayPath,
 }
 
 /// Sink for periodic topology graph dumps (may emit many lines).

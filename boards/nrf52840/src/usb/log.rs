@@ -786,7 +786,8 @@ pub mod battery {
 pub mod sr {
     use super::{finish_line, line_prefix, push_hex_u32_8, push_hex_u8_2, push_i32, push_u32};
     use mesh_routing::{
-        RelayRetxCancelReason, Router, SrLogEvent, SrSkipReason, T1CancelReason, TopologyLogSink,
+        RelayReason, RelayRetxCancelReason, Router, SrLogEvent, SrSkipReason, T1CancelReason,
+        TopologyLogSink,
     };
 
     fn emit_topology_event(event: SrLogEvent) {
@@ -1058,8 +1059,11 @@ pub mod sr {
                 half_airtime_ms,
                 candidates,
                 slot_index,
+                ranked,
+                ranked_len,
+                reason,
             } => {
-                let mut line = [0u8; 144];
+                let mut line = [0u8; 224];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Slot scheduling for pkt 0x";
                 line[pos..pos + prefix.len()].copy_from_slice(prefix);
@@ -1077,6 +1081,30 @@ pub mod sr {
                 line[pos..pos + tail2.len()].copy_from_slice(tail2);
                 pos += tail2.len();
                 pos += push_u32(&mut line[pos..], slot_index as u32);
+                let via: &[u8] = match reason {
+                    RelayReason::None => b"",
+                    RelayReason::Ranked => b", via=rank",
+                    RelayReason::Downstream => b", via=downstream",
+                    RelayReason::StockCoverage => b", via=stock",
+                    RelayReason::Sparse => b", via=sparse",
+                    RelayReason::UnicastCost => b", via=cost",
+                };
+                line[pos..pos + via.len()].copy_from_slice(via);
+                pos += via.len();
+                if ranked_len > 0 {
+                    let order = b", order=";
+                    line[pos..pos + order.len()].copy_from_slice(order);
+                    pos += order.len();
+                    for (i, node) in ranked.iter().take(ranked_len as usize).enumerate() {
+                        if i > 0 {
+                            line[pos] = b'>';
+                            pos += 1;
+                        }
+                        line[pos] = b'!';
+                        pos += 1;
+                        pos += push_hex_u32_8(&mut line[pos..], *node);
+                    }
+                }
                 finish_line(&mut line, pos);
             }
             SrLogEvent::RelayCommitted {
@@ -1130,6 +1158,8 @@ pub mod sr {
                     SrSkipReason::BetterNeighbor => b"better neighbor",
                     SrSkipReason::NextHopIsRelayer => b"next hop is relayer",
                     SrSkipReason::DeadEndHop => b"dead end hop",
+                    SrSkipReason::UnicastCovered => b"unicast covered",
+                    SrSkipReason::NoRelayPath => b"no relay path",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

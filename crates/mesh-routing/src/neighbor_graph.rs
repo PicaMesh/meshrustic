@@ -622,6 +622,35 @@ impl NeighborGraph {
         )
     }
 
+    /// Cost-ranked slot for a unicast we overheard (see `unicast_relay`).
+    pub fn plan_unicast_relay(
+        &self,
+        packet_id: u32,
+        source: u32,
+        heard_from: u32,
+        destination: u32,
+        my_next_hop: u32,
+        now_ms: u32,
+    ) -> Result<crate::broadcast_relay::BroadcastRelayPlan, crate::sr_log::SrSkipReason> {
+        let ctx = crate::unicast_relay::UnicastRelayContext {
+            my_node: self.my_node,
+            edges: &self.edges,
+            capability: &self.capability,
+            downstream: &self.downstream,
+            downstream_ttl_ms: NEIGHBOR_TTL_MS,
+        };
+        crate::unicast_relay::plan_unicast_relay(
+            &ctx,
+            packet_id,
+            source,
+            heard_from,
+            destination,
+            my_next_hop,
+            now_ms,
+            |node| self.has_node_transmitted(node, packet_id, now_ms),
+        )
+    }
+
     fn fill_stock_relay_candidates(
         &self,
         packet_id: u32,

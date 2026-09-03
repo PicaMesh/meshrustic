@@ -29,6 +29,7 @@ pub mod sr_role;
 pub mod telemetry;
 pub mod topology;
 pub mod traceroute;
+pub mod unicast_relay;
 
 pub use admin::{
     encode_admin_response, encode_owner_response, handle_admin, AdminOutcome, AdminState,
@@ -48,7 +49,7 @@ pub use bridge::{
     evaluate_bridge_targets, should_bridge_to, BridgeDedupCache, BridgeEval, BridgeLeg,
 };
 pub use broadcast_relay::{
-    plan_broadcast_relay, BroadcastRelayContext, BroadcastRelayPlan, RelayCandidate,
+    plan_broadcast_relay, BroadcastRelayContext, BroadcastRelayPlan, RelayCandidate, RelayReason,
     POOR_LINK_ETX_THRESHOLD,
 };
 pub use capability::{
@@ -114,4 +115,8 @@ pub use topology::{
 pub use traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,
     RouteDiscovery, ROUTE_SIZE, TRACEROUTE_APP,
+};
+pub use unicast_relay::{
+    plan_unicast_relay, UnicastCandidate, UnicastRelayContext, BEST_EFFORT_SELF_COST,
+    DOWNSTREAM_TIER_COST, INDIRECT_TIER, MAX_UNICAST_CANDIDATES,
 };

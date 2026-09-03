@@ -1514,7 +1514,7 @@ impl Router {
             return plan;
         }
 
-        let next_hop = if parsed.to != NODENUM_BROADCAST {
+        let picked_hop = if parsed.to != NODENUM_BROADCAST {
             let hop = self
                 .graph
                 .get_next_hop(parsed.to, parsed.from, heard_from, now_ms);
@@ -1534,10 +1534,10 @@ impl Router {
         // must not go on the air as next_hop = our byte: receivers would treat us as the
         // designated forwarder and wait for a second copy that never comes. Leave it clear so
         // they coordinate by slot, and so we never arm retries waiting for ourselves.
-        let next_hop = if next_hop == self.node_num {
+        let next_hop = if picked_hop == self.node_num {
             0
         } else {
-            next_hop
+            picked_hop
         };
 
         // 1. The relayer we heard this from already holds the packet; handing it back only
@@ -1551,10 +1551,53 @@ impl Router {
             return plan;
         }
 
+        // Unicasts coordinate by cost to the destination: every SR node that overheard the
+        // packet ranks itself and its SR neighbours the same way, the best placed one keys up
+        // first and the rest cancel on its copy. Node id used to decide this order, which let
+        // the lowest id in the neighbourhood pre-empt the gateway on every unicast.
+        let unicast_ranking = if parsed.to != NODENUM_BROADCAST
+            && parsed.to != self.node_num
+            && self.graph.signal_routing_active()
+        {
+            Some(self.graph.plan_unicast_relay(
+                parsed.id,
+                parsed.from,
+                heard_from,
+                parsed.to,
+                picked_hop,
+                now_ms,
+            ))
+        } else {
+            None
+        };
+        let unicast_plan = match unicast_ranking {
+            Some(Err(reason)) if parsed.next_hop == 0 => {
+                self.pool.release(handle);
+                self.sr_log.push(SrLogEvent::RelaySkip {
+                    from: parsed.from,
+                    reason,
+                });
+                return plan;
+            }
+            Some(Ok(mut ranked)) if parsed.next_hop == 0 => {
+                // Slot 0 keys up at once. Later slots first wait for the leader's relay to
+                // clear the air (its contention delay plus one airtime, as for a designated SR
+                // hop), then space out by half an airtime.
+                ranked.slot_delay_ms = if ranked.slot_index == 0 {
+                    0
+                } else {
+                    self.sr_peer_relay_wait_ms(slot_ms)
+                        .saturating_add((ranked.slot_index as u32 - 1).saturating_mul(half_airtime))
+                };
+                Some(ranked)
+            }
+            _ => None,
+        };
+
         // A unicast that already names a next hop keeps SR coordination: the designated node
         // owns slot 0 and every other candidate shifts down one slot, cancelling on any heard copy.
         let designated_plan = if parsed.to != NODENUM_BROADCAST && parsed.next_hop != 0 {
-            Some(self.plan_designated_unicast(
+            match self.plan_designated_unicast(
                 &parsed,
                 heard_from,
                 result.rssi,
@@ -1562,10 +1605,22 @@ impl Router {
                 half_airtime,
                 slot_ms,
                 now_ms,
-            ))
+                unicast_ranking,
+            ) {
+                Ok(p) => Some(p),
+                Err(reason) => {
+                    self.pool.release(handle);
+                    self.sr_log.push(SrLogEvent::RelaySkip {
+                        from: parsed.from,
+                        reason,
+                    });
+                    return plan;
+                }
+            }
         } else {
             None
         };
+        let unicast_plan = unicast_plan.or(designated_plan);
 
         let direct_hop_limit = if parsed.to != NODENUM_BROADCAST {
             self.graph.unicast_hop_limit_for_direct_neighbor(parsed.to)
@@ -1713,14 +1768,26 @@ impl Router {
             half_airtime,
             cw_slot,
             self.node_num,
-            broadcast_plan.as_ref().or(designated_plan.as_ref()),
+            broadcast_plan.as_ref().or(unicast_plan.as_ref()),
         );
         let delay_ms = tx_after_ms.wrapping_sub(now_ms);
+        let (ranked, ranked_len, reason) =
+            broadcast_plan.as_ref().or(unicast_plan.as_ref()).map_or(
+                (
+                    [0u32; crate::broadcast_relay::RANKED_LOG],
+                    0,
+                    crate::broadcast_relay::RelayReason::None,
+                ),
+                |p| (p.ranked, p.ranked_len, p.reason),
+            );
         self.sr_log.push(SrLogEvent::SlotScheduling {
             id: parsed.id,
             half_airtime_ms: half_airtime,
             candidates,
             slot_index,
+            ranked,
+            ranked_len,
+            reason,
         });
         self.sr_log.push(SrLogEvent::RelayCommitted {
             id: parsed.id,
@@ -1908,7 +1975,8 @@ impl Router {
         half_airtime: u32,
         airtime_ms: u32,
         now_ms: u32,
-    ) -> crate::broadcast_relay::BroadcastRelayPlan {
+        ranking: Option<Result<crate::broadcast_relay::BroadcastRelayPlan, SrSkipReason>>,
+    ) -> Result<crate::broadcast_relay::BroadcastRelayPlan, SrSkipReason> {
         use crate::broadcast_relay::BroadcastRelayPlan;
         let our_byte = (self.node_num & 0xFF) as u8;
         if parsed.next_hop == our_byte {
@@ -1919,12 +1987,13 @@ impl Router {
                 slot: 0,
                 slot_delay_ms: 0,
             });
-            return BroadcastRelayPlan {
+            return Ok(BroadcastRelayPlan {
                 should_relay: true,
                 slot_delay_ms: 0,
                 slot_index: 0,
                 candidate_count: 1,
-            };
+                ..Default::default()
+            });
         }
         let designated = self
             .relay_identity
@@ -1945,12 +2014,35 @@ impl Router {
                 self.graph.capability_status(n) == crate::capability::CapabilityStatus::SrActive
             })
             .unwrap_or(false);
+        // An SR peer queues its relay behind its own contention delay (up to 2^CW slots at
+        // the current utilisation) and then needs one airtime to send it; a half-airtime
+        // reservation let us pre-empt a healthy designated node by 200 ms in the field.
         let slot0_wait = if sr_active {
-            half_airtime
+            self.sr_peer_relay_wait_ms(airtime_ms)
         } else {
             tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
         };
-        let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+        // Behind the designated node, the cost ranking orders the remaining candidates.
+        let (rank, count, ranked, ranked_len, reason) = match ranking {
+            Some(Ok(p)) => (
+                p.slot_index,
+                p.candidate_count,
+                p.ranked,
+                p.ranked_len,
+                p.reason,
+            ),
+            Some(Err(reason)) => return Err(reason),
+            None => {
+                let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+                (
+                    rank,
+                    count,
+                    [0u32; crate::broadcast_relay::RANKED_LOG],
+                    0,
+                    crate::broadcast_relay::RelayReason::None,
+                )
+            }
+        };
         let slot = rank.saturating_add(1);
         let slot_delay_ms = slot0_wait.saturating_add((rank as u32).saturating_mul(half_airtime));
         self.sr_log.push(SrLogEvent::UnicastDesignated {
@@ -1960,12 +2052,24 @@ impl Router {
             slot,
             slot_delay_ms,
         });
-        BroadcastRelayPlan {
+        Ok(BroadcastRelayPlan {
             should_relay: true,
             slot_delay_ms,
             slot_index: slot,
             candidate_count: count.saturating_add(1),
-        }
+            ranked,
+            ranked_len,
+            reason,
+        })
+    }
+
+    /// How long an SR peer that owns the slot ahead of us needs before its relay has left the
+    /// air: its contention delay at the current utilisation plus one airtime.
+    fn sr_peer_relay_wait_ms(&self, airtime_ms: u32) -> u32 {
+        airtime_ms.saturating_add(crate::coordinated_relay::tx_delay_ms_contention_max_at(
+            self.channel_util_pct,
+            self.cw_slot_ms(),
+        ))
     }
 
     fn try_resolve_placeholder(&mut self, parsed: &ParsedPacket, now_ms: u32) -> bool {
@@ -3834,6 +3938,66 @@ mod tests {
             .any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
     }
 
+    /// Field case of 2026-09-03: the relayer that actually reaches the destination must own
+    /// slot 0 even when our node id is lower; we follow only after its relay would have
+    /// cleared the air, and stand down when its copy arrives.
+    #[test]
+    fn undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire(3, 3, 0, 0xDD, 0x701);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        assert!(
+            plan.relay.is_none(),
+            "RELAYER holds slot 0, we must not key up first"
+        );
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x701, 0)
+            .expect("we hold a later slot");
+        let leader_wait = coordinated_relay::DEFAULT_SLOT_MS
+            + coordinated_relay::tx_delay_ms_contention_max_at(0.0, router.cw_slot_ms());
+        let half = half_airtime_ms(coordinated_relay::DEFAULT_SLOT_MS).max(50);
+        assert!(
+            tx_after + half / 2 >= leader_wait,
+            "tx_after {tx_after} fires before the leader's relay clears ({leader_wait})"
+        );
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::SlotScheduling { id: 0x701, slot_index: 1, ranked, ranked_len: 2, reason: crate::broadcast_relay::RelayReason::UnicastCost, .. }
+                if ranked[0] == UNI_RELAYER && ranked[1] == UNI_ME
+        )), "slot log: {logs:?}");
+
+        // RELAYER's copy (relay byte 0xBB, one hop used) cancels our pending relay.
+        let copy = unicast_wire(2, 3, 0, 0xBB, 0x701);
+        let dupe = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy,
+                },
+                100,
+            )
+            .unwrap();
+        assert!(dupe.duplicate);
+        assert!(router.relay_tx_after(UNI_SOURCE, 0x701, 0).is_none());
+    }
+
     #[test]
     fn unicast_designated_sr_peer_uses_half_airtime_slot() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -3873,6 +4037,16 @@ mod tests {
         assert!(
             delay < stock_wait,
             "SR peer slot-0 wait {delay} should be far below stock {stock_wait}"
+        );
+        // ...but not shorter than the peer's own queue delay plus one airtime.
+        let min_wait = coordinated_relay::DEFAULT_SLOT_MS
+            + coordinated_relay::tx_delay_ms_contention_max_at(
+                0.0,
+                coordinated_relay::DEFAULT_SLOT_MS,
+            );
+        assert!(
+            delay >= min_wait,
+            "SR peer slot-0 wait {delay} below {min_wait}"
         );
     }
 

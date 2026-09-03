@@ -1,7 +1,9 @@
 //! Phased broadcast relay slot scheduling (stock → SR ranked → downstream → stock coverage).
 
 use crate::capability::{CapabilityCache, CapabilityStatus};
-use crate::graph::{is_placeholder_node, DownstreamTable, EdgeStore, MAX_EDGES_PER_NODE};
+use crate::graph::{
+    is_placeholder_node, DownstreamTable, EdgeSource, EdgeStore, MAX_EDGES_PER_NODE,
+};
 use crate::sr_role::role_is_mute;
 
 /// ETX above this threshold is not treated as good pre-coverage from `heard_from`.
@@ -25,8 +27,41 @@ pub struct BroadcastRelayPlan {
     pub slot_delay_ms: u32,
     pub slot_index: u8,
     pub candidate_count: u8,
+    /// Slot holders in slot order (first `ranked_len` entries), for the log: lets two nodes'
+    /// views of the same packet be compared side by side.
+    pub ranked: [u32; RANKED_LOG],
+    pub ranked_len: u8,
+    pub reason: RelayReason,
 }
 
+/// How many slot holders the plan records for logging.
+pub const RANKED_LOG: usize = 4;
+
+/// Why the plan decided we relay (for the log; `None` when we defer).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RelayReason {
+    #[default]
+    None,
+    /// We won a slot in the coverage ranking.
+    Ranked,
+    /// We are the known downstream relay for the source or destination.
+    Downstream,
+    /// A stock (mute or legacy) neighbour of ours is not covered by anyone ranked ahead.
+    StockCoverage,
+    /// Sparse mesh: we were the only candidate.
+    Sparse,
+    /// Unicast: we hold a slot in the cost-to-destination ranking.
+    UnicastCost,
+}
+
+fn push_ranked(plan_ranked: &mut [u32; RANKED_LOG], len: &mut u8, node: u32) {
+    if (*len as usize) < RANKED_LOG {
+        plan_ranked[*len as usize] = node;
+        *len += 1;
+    }
+}
+
+#[derive(Clone, Copy)]
 struct NodeSet {
     ids: [u32; MAX_CANDIDATES],
     count: u8,
@@ -113,7 +148,7 @@ fn is_non_relaying_legacy(capability: &CapabilityCache, node_id: u32) -> bool {
 
 fn get_coverage_if_relays(
     edges: &EdgeStore,
-    _my_node: u32,
+    my_node: u32,
     relay: u32,
     out: &mut [u32; MAX_EDGES_PER_NODE],
 ) -> u8 {
@@ -125,6 +160,13 @@ fn get_coverage_if_relays(
         let edge = relay_edges.edges[i];
         let target = edge.to;
         if target == 0 || is_placeholder_node(target) {
+            continue;
+        }
+        // Rank ourselves from the edges peers can see, i.e. what our topology broadcast
+        // carries (Reported edges). Mirrored edges learned from relayed packets are real
+        // but invisible to peers; counting them made every node rate its own coverage
+        // above the others' and two nodes then both settled on the same slot.
+        if relay == my_node && edge.source != EdgeSource::Reported {
             continue;
         }
         // Count nodes that can hear this relay (not our own egress set — that
@@ -314,10 +356,20 @@ fn stock_can_hear_transmitter(edges: &EdgeStore, stock: u32, heard_from: u32) ->
         .is_some()
 }
 
+/// True when a stock neighbour of ours still needs this broadcast and we are the SR candidate
+/// that should provide it.
+///
+/// A stock node is covered if the source, the relayer we heard, or any candidate ranked ahead
+/// of us (`already_covered` holds their edges) reaches it. For the rest, exactly one SR
+/// candidate must relay: the one with the lowest node id among those that have an edge to it,
+/// a rule every peer can evaluate identically from the reported topology. Before this, every
+/// SR node next to a mute neighbour relayed every broadcast for it, in the same slot.
 fn should_relay_for_stock_neighbors(
     ctx: &BroadcastRelayContext<'_>,
     source: u32,
     heard_from: u32,
+    already_covered: &CoveredSet,
+    peers: &NodeSet,
 ) -> bool {
     let mut stock = [0u32; MAX_EDGES_PER_NODE];
     let mut stock_count = 0u8;
@@ -371,8 +423,11 @@ fn should_relay_for_stock_neighbors(
                 }
             }
         }
-        if heard_directly {
+        if heard_directly || already_covered.contains(stock_neighbor) {
             continue;
+        }
+        if stock_owner(ctx, peers, stock_neighbor) != ctx.my_node {
+            continue; // a lower-id SR peer that also reaches it takes this one
         }
         has_uncovered = true;
         if let Some(edge) = my_edges.find_edge(stock_neighbor) {
@@ -385,6 +440,25 @@ fn should_relay_for_stock_neighbors(
     }
 
     has_uncovered && best_neighbor != 0
+}
+
+/// Lowest node id among us and the SR candidates that have an edge to `stock_neighbor`.
+fn stock_owner(ctx: &BroadcastRelayContext<'_>, peers: &NodeSet, stock_neighbor: u32) -> u32 {
+    let mut owner = ctx.my_node;
+    for &peer in &peers.ids[..peers.count as usize] {
+        if peer == ctx.my_node || peer >= owner {
+            continue;
+        }
+        let reaches = ctx
+            .edges
+            .find_node(peer)
+            .map(|n| n.find_edge(stock_neighbor).is_some())
+            .unwrap_or(false);
+        if reaches {
+            owner = peer;
+        }
+    }
+    owner
 }
 
 pub fn plan_broadcast_relay<F>(
@@ -404,10 +478,14 @@ where
     let prefer_high = (packet_id & 1) != 0;
     let mut already_covered = build_already_covered(ctx.edges, source, heard_from);
     let mut candidates = build_candidates(ctx, source, heard_from);
+    let peers = candidates; // every SR candidate, kept for the stock-coverage tie-break
     let initial_candidates = candidates.count;
+    let mut reason = RelayReason::None;
     let mut slot_delay = 0u32;
     let mut should_relay = false;
     let mut my_delay = 0u32;
+    let mut ranked = [0u32; RANKED_LOG];
+    let mut ranked_len = 0u8;
 
     if let Some(my_edges) = ctx.edges.find_node(ctx.my_node) {
         for i in 0..my_edges.edge_count as usize {
@@ -426,6 +504,7 @@ where
             // Stock takes the early slot — count their coverage now so we only
             // trail if we still have unique nodes after they relay.
             absorb_relay_coverage(ctx.edges, &mut already_covered, neighbor);
+            push_ranked(&mut ranked, &mut ranked_len, neighbor);
             slot_delay = slot_delay.saturating_add(half);
         }
     }
@@ -449,8 +528,10 @@ where
             continue;
         }
 
+        push_ranked(&mut ranked, &mut ranked_len, best.node_id);
         if best.node_id == ctx.my_node {
             should_relay = true;
+            reason = RelayReason::Ranked;
             my_delay = slot_delay;
             break;
         }
@@ -468,18 +549,23 @@ where
             .get_relay(broadcast_dest, now_ms, DOWNSTREAM_TTL_MS);
         if relay_for_source == Some(ctx.my_node) || relay_for_dest == Some(ctx.my_node) {
             should_relay = true;
+            reason = RelayReason::Downstream;
             my_delay = slot_delay;
         }
     }
 
-    if !should_relay && should_relay_for_stock_neighbors(ctx, source, heard_from) {
+    if !should_relay
+        && should_relay_for_stock_neighbors(ctx, source, heard_from, &already_covered, &peers)
+    {
         should_relay = true;
+        reason = RelayReason::StockCoverage;
         my_delay = slot_delay;
     }
 
     // Sparse mesh: only we were a candidate and ranking found no unique coverage.
     if !should_relay && initial_candidates <= 1 {
         should_relay = true;
+        reason = RelayReason::Sparse;
         my_delay = slot_delay;
     }
 
@@ -492,6 +578,9 @@ where
         slot_delay_ms: my_delay,
         slot_index,
         candidate_count: initial_candidates.max(1),
+        ranked,
+        ranked_len,
+        reason,
     }
 }
 
@@ -692,6 +781,145 @@ mod tests {
             "must defer when an SR peer has unique coverage and we have none"
         );
         assert!(plan.candidate_count >= 2);
+    }
+
+    #[test]
+    fn self_coverage_counts_only_reported_edges_so_peers_agree_on_order() {
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        const FF: u32 = 0xAA00_00FF;
+        const GG: u32 = 0xAA00_0011;
+        const JJ: u32 = 0xAA00_0022;
+        const KK: u32 = 0xAA00_0033;
+        const HH1: u32 = 0xAA00_0044;
+        const HH2: u32 = 0xAA00_0055;
+        edges.ensure_local_node(ME, 0);
+        // Direct neighbours: BB is the transmitter, EE an SR peer that hears us.
+        edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(ME, EE, true);
+        // Our reported coverage beyond the transmitter: EE and KK.
+        edges.update_edge(ME, ME, KK, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, KK, true);
+        // Two mirrored edges learned from relayed packets: real, but never in our broadcast.
+        edges.update_edge(ME, ME, HH1, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, ME, HH2, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.set_edge_hears_us(ME, HH1, true);
+        edges.set_edge_hears_us(ME, HH2, true);
+        // EE hears the transmitter too, so both candidates sit in the same bidi tier and
+        // only coverage decides the order.
+        edges.update_edge(ME, EE, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(EE, BB, true);
+        // EE reports three neighbours that hear it.
+        for n in [FF, GG, JJ] {
+            edges.update_edge(ME, EE, n, 1.5, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(EE, n, true);
+        }
+        edges.update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(EE, ME, true);
+        capability.track_topology(EE, true, 0);
+        capability.track_topology(ME, true, 0);
+
+        // Even id: on a tie the lower id (ME) would win, so only the coverage counts decide.
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x98,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            never_transmitted,
+        );
+        // Counting the mirrored edges we would claim 4 unique nodes and take slot 0 while EE,
+        // seeing only our 2 reported ones, ranks itself first: both in slot 0. Reported-only
+        // gives us 2 against EE's 3, so EE leads and we trail in slot 1 with KK still unique.
+        assert!(plan.should_relay);
+        assert_eq!(plan.slot_index, 1);
+        assert_eq!(plan.ranked_len, 2);
+        assert_eq!(plan.ranked[0], EE);
+        assert_eq!(plan.ranked[1], ME);
+    }
+
+    /// ME and a peer both neighbour a mute stock node SS that nobody upstream reaches.
+    fn stock_fixture(peer: u32) -> (EdgeStore, CapabilityCache) {
+        const SS: u32 = 0xDD00_00DD;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, peer, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, SS, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(ME, peer, true);
+        // BB reaches the peer directly, so neither of us has unique hears_us coverage and the
+        // ranking assigns no slot: only the stock fallback can decide.
+        edges.update_edge(ME, BB, peer, 2.0, 0, EdgeSource::Reported, true, 0);
+        // The peer reports BB and SS as its neighbours too.
+        edges.update_edge(ME, peer, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, peer, SS, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(peer, BB, true);
+        capability.track_topology(peer, true, 0);
+        capability.track_topology(ME, true, 0);
+        capability.track_role(SS, DEVICE_ROLE_TRACKER, 0); // mute legacy
+        (edges, capability)
+    }
+
+    #[test]
+    fn stock_coverage_goes_to_the_lowest_id_candidate_only() {
+        let downstream = DownstreamTable::new();
+        // Peer id above ours: we own SS and relay.
+        let (edges, capability) = stock_fixture(0xEE00_00EE);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            never_transmitted,
+        );
+        assert!(plan.should_relay);
+        assert_eq!(plan.reason, RelayReason::StockCoverage);
+        // Peer id below ours: the peer owns SS and we stay silent.
+        let (edges, capability) = stock_fixture(0xAA00_00AA);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            never_transmitted,
+        );
+        assert!(
+            !plan.should_relay,
+            "lower-id peer that also reaches SS must take it"
+        );
+        assert_eq!(plan.reason, RelayReason::None);
+    }
+
+    #[test]
+    fn stock_neighbour_covered_by_transmitter_needs_no_relay() {
+        let downstream = DownstreamTable::new();
+        let (mut edges, capability) = stock_fixture(0xEE00_00EE);
+        // BB itself reaches SS.
+        edges.update_edge(ME, BB, 0xDD00_00DD, 2.0, 0, EdgeSource::Reported, true, 0);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            never_transmitted,
+        );
+        assert!(!plan.should_relay);
     }
 
     #[test]
