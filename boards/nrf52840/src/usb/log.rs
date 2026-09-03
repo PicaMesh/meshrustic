@@ -906,21 +906,27 @@ pub mod sr {
                 pos += push_u32(&mut line[pos..], count as u32);
                 finish_line(&mut line, pos);
             }
-            SrLogEvent::NetworkTopologyDownstreamRoute {
-                destination,
+            SrLogEvent::NetworkTopologyDownstreamGroup {
                 relay,
+                destinations,
+                len,
                 last: _,
             } => {
-                let mut line = [0u8; 128];
+                // ~33 bytes of prefix plus 10 per destination: 12 ids need ~153 bytes.
+                let mut line = [0u8; 256];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR]   !";
                 line[pos..pos + prefix.len()].copy_from_slice(prefix);
                 pos += prefix.len();
-                pos += push_hex_u32_8(&mut line[pos..], destination);
-                let mid = b" -> !";
-                line[pos..pos + mid.len()].copy_from_slice(mid);
-                pos += mid.len();
                 pos += push_hex_u32_8(&mut line[pos..], relay);
+                line[pos] = b':';
+                pos += 1;
+                for dest in destinations.iter().take(len as usize) {
+                    let sep = b" !";
+                    line[pos..pos + sep.len()].copy_from_slice(sep);
+                    pos += sep.len();
+                    pos += push_hex_u32_8(&mut line[pos..], *dest);
+                }
                 finish_line(&mut line, pos);
             }
             SrLogEvent::TopologyLoggingComplete => {
@@ -1361,7 +1367,7 @@ pub mod sr {
             | SrLogEvent::NetworkTopologyNeighbor { .. }
             | SrLogEvent::NetworkTopologyMirrored { .. }
             | SrLogEvent::NetworkTopologyDownstreamHeader { .. }
-            | SrLogEvent::NetworkTopologyDownstreamRoute { .. }
+            | SrLogEvent::NetworkTopologyDownstreamGroup { .. }
             | SrLogEvent::TopologyLoggingComplete) => emit_topology_event(event),
             SrLogEvent::GraphAged { before, after } => {
                 let mut line = [0u8; 96];

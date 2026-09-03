@@ -263,11 +263,12 @@ fn emit_topology_log_lists_mirrored_and_downstream_nodes() {
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        SrLogEvent::NetworkTopologyDownstreamRoute {
-            destination: 0xCC,
+        SrLogEvent::NetworkTopologyDownstreamGroup {
             relay: 0xBB,
+            destinations,
+            len,
             ..
-        }
+        } if destinations[..*len as usize].contains(&0xCC)
     )));
 }
 

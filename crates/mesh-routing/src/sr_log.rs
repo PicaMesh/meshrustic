@@ -1,6 +1,9 @@
 //! SR routing decision log events (`[SR]` USB prefix).
 
 pub const MAX_SR_LOG: usize = 64;
+/// Destinations per downstream log line. Twelve ids fit a 256-byte USB line with room to
+/// spare; the array also sets the size of every `SrLogEvent`, so it is not made larger.
+pub const DOWNSTREAM_LOG_GROUP: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SrLogEvent {
@@ -110,9 +113,12 @@ pub enum SrLogEvent {
     NetworkTopologyDownstreamHeader {
         count: u16,
     },
-    NetworkTopologyDownstreamRoute {
-        destination: u32,
+    /// One line of the downstream dump: `relay: dest dest ...`. A relay with more than
+    /// [`DOWNSTREAM_LOG_GROUP`] destinations continues on further events for the same relay.
+    NetworkTopologyDownstreamGroup {
         relay: u32,
+        destinations: [u32; DOWNSTREAM_LOG_GROUP],
+        len: u8,
         last: bool,
     },
     TopologyDownstreamSkippedAsymmetric {

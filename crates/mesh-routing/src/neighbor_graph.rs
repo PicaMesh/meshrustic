@@ -2144,15 +2144,54 @@ impl NeighborGraph {
             return;
         }
         sink.emit(SrLogEvent::NetworkTopologyDownstreamHeader { count });
+        // Grouped by relay: one line per relay (continued when a branch exceeds a line) instead
+        // of one line per destination. Relays are emitted in order of first appearance.
+        let mut done = heapless::Vec::<u32, 64>::new();
+        let mut emitted = 0u16;
         for i in 0..count {
-            let Some(entry) = self.downstream.entry(i) else {
+            let Some(head) = self.downstream.entry(i) else {
                 continue;
             };
-            sink.emit(SrLogEvent::NetworkTopologyDownstreamRoute {
-                destination: entry.destination,
-                relay: entry.relay,
-                last: i + 1 == count,
-            });
+            let relay = head.relay;
+            let seen = if done.is_full() {
+                (0..i).any(|j| self.downstream.entry(j).is_some_and(|e| e.relay == relay))
+            } else {
+                done.contains(&relay)
+            };
+            if seen {
+                continue;
+            }
+            let _ = done.push(relay);
+            let mut group = [0u32; crate::sr_log::DOWNSTREAM_LOG_GROUP];
+            let mut len = 0usize;
+            for j in i..count {
+                let Some(entry) = self.downstream.entry(j) else {
+                    continue;
+                };
+                if entry.relay != relay {
+                    continue;
+                }
+                group[len] = entry.destination;
+                len += 1;
+                emitted += 1;
+                if len == group.len() {
+                    sink.emit(SrLogEvent::NetworkTopologyDownstreamGroup {
+                        relay,
+                        destinations: group,
+                        len: len as u8,
+                        last: emitted == count,
+                    });
+                    len = 0;
+                }
+            }
+            if len > 0 {
+                sink.emit(SrLogEvent::NetworkTopologyDownstreamGroup {
+                    relay,
+                    destinations: group,
+                    len: len as u8,
+                    last: emitted == count,
+                });
+            }
         }
     }
 
