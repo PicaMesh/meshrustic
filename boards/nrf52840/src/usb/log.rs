@@ -412,6 +412,19 @@ pub mod radio {
         finish_line(&mut line, pos);
     }
 
+    pub fn tx_cancelled(id: u32) {
+        let mut line = [0u8; 96];
+        let mut pos = line_prefix(&mut line);
+        let prefix = b"[Radio0] TX cancelled id=0x";
+        line[pos..pos + prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += push_hex_u32_8(&mut line[pos..], id);
+        let tail = b" (copy heard before it left the queue)";
+        line[pos..pos + tail.len()].copy_from_slice(tail);
+        pos += tail.len();
+        finish_line(&mut line, pos);
+    }
+
     pub fn tx_done(tx_id: Option<u32>, tx_to: Option<u32>, len: u8) {
         let mut line = [0u8; 128];
         let mut pos = line_prefix(&mut line);

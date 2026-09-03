@@ -74,6 +74,11 @@ pub async fn radio_task(
     let mut reboot_deadline: Option<Instant> = None;
     // LoRa preset: persist + soft-reinit after completion reply TX (never sys_reset).
     let mut radio_reinit_pending = false;
+    // Nothing is handed to the radio before this instant. Set after every reception and every
+    // listen-before-talk deferral to a random contention delay, as stock Meshtastic does after
+    // busyRx: two nodes released by the end of the same frame must not key up together.
+    let mut tx_hold_until: Option<Instant> = None;
+    let mut tx_cancels: heapless::Vec<u32, 8> = heapless::Vec::new();
 
     const LOOP_ACTIVE_MS: u64 = 5;
     const LOOP_IDLE_MS: u64 = 100;
@@ -82,41 +87,49 @@ pub async fn radio_task(
         let now_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
         let slot_ms = packet_time_ms(slot.config(), 64, true).max(1);
 
-        if let Some(relay) = router.poll_ready_relay(now_ms) {
-            enqueue_tx(relay, slot, router, node_num, b"relay");
-        }
+        // Release frames to the radio only when the channel is quiet, nothing received is still
+        // waiting for the router, and no post-reception hold is running. Pending work keeps its
+        // due time inside the router and is picked up on the next pass.
+        let rx_busy = slot.rx_busy().unwrap_or(false);
+        let held = tx_hold_until.is_some_and(|until| Instant::now() < until);
+        let may_release = !rx_busy && !held && slot.rx_queue.is_empty();
+        if may_release {
+            if let Some(relay) = router.poll_ready_relay(now_ms) {
+                enqueue_tx(relay, slot, router, node_num, b"relay");
+            }
 
-        if let Some(topo) = router.poll_topology_tx(now_ms) {
-            enqueue_tx(topo, slot, router, node_num, b"topology");
-        }
+            if let Some(topo) = router.poll_topology_tx(now_ms) {
+                enqueue_tx(topo, slot, router, node_num, b"topology");
+            }
 
-        if let Some(nodeinfo) = router.poll_nodeinfo_tx(now_ms) {
-            enqueue_tx(nodeinfo, slot, router, node_num, b"nodeinfo");
-        }
+            if let Some(nodeinfo) = router.poll_nodeinfo_tx(now_ms) {
+                enqueue_tx(nodeinfo, slot, router, node_num, b"nodeinfo");
+            }
 
-        if let Some(telemetry) = router.poll_telemetry_tx(now_ms) {
-            enqueue_tx(telemetry, slot, router, node_num, b"telemetry");
-        }
+            if let Some(telemetry) = router.poll_telemetry_tx(now_ms) {
+                enqueue_tx(telemetry, slot, router, node_num, b"telemetry");
+            }
 
-        if let Some(tr) = router.poll_traceroute_tx(now_ms) {
-            enqueue_tx(tr, slot, router, node_num, b"traceroute");
-        }
+            if let Some(tr) = router.poll_traceroute_tx(now_ms) {
+                enqueue_tx(tr, slot, router, node_num, b"traceroute");
+            }
 
-        if let Some(t1) = router.poll_t1_retransmit(now_ms) {
-            enqueue_tx(t1, slot, router, node_num, b"t1");
-        }
+            if let Some(t1) = router.poll_t1_retransmit(now_ms) {
+                enqueue_tx(t1, slot, router, node_num, b"t1");
+            }
 
-        router.set_channel_utilization(air.channel_utilization_percent());
-        if let Some(retx) = router.poll_reliable_retransmit(now_ms) {
-            enqueue_tx(retx, slot, router, node_num, b"retx");
-        }
+            router.set_channel_utilization(air.channel_utilization_percent());
+            if let Some(retx) = router.poll_reliable_retransmit(now_ms) {
+                enqueue_tx(retx, slot, router, node_num, b"retx");
+            }
 
-        if let Some(ack) = router.poll_ack_tx(now_ms) {
-            enqueue_tx(ack, slot, router, node_num, b"ack");
-        }
+            if let Some(ack) = router.poll_ack_tx(now_ms) {
+                enqueue_tx(ack, slot, router, node_num, b"ack");
+            }
 
-        if let Some(admin) = router.poll_admin_tx(now_ms) {
-            enqueue_tx(admin, slot, router, node_num, b"admin");
+            if let Some(admin) = router.poll_admin_tx(now_ms) {
+                enqueue_tx(admin, slot, router, node_num, b"admin");
+            }
         }
 
         if router.take_pending_radio_reinit() {
@@ -146,9 +159,37 @@ pub async fn radio_task(
 
         match slot.service(air) {
             Ok(mut report) => {
+                let mut received = false;
+                let mut last_rx_id = 0u32;
                 while let Some(frame) = report.rx {
+                    received = true;
+                    if let Ok(h) = PacketHeader::decode(frame.payload()) {
+                        last_rx_id = h.parse().id;
+                    }
                     handle_rx_frame(frame, slot, router, node_num, air);
+                    // A copy of a packet we queued cancels the relay: pull the frame back before
+                    // the radio gets to it.
+                    router.take_tx_cancels(&mut tx_cancels);
+                    for id in tx_cancels.iter() {
+                        let removed = slot.remove_tx(*id);
+                        if removed > 0 {
+                            defmt::info!("[Radio0] TX cancelled id=0x{:08x} (copy heard)", *id);
+                            crate::usb_log::log::radio::tx_cancelled(*id);
+                        }
+                    }
                     report.rx = slot.rx_queue.pop().ok();
+                }
+                if received || report.tx_deferred_rx_busy || report.tx_deferred_rx_pending {
+                    let cw_slot = mesh_routing::slot_time_for_preset(router.modem_preset());
+                    let backoff = mesh_routing::coordinated_relay::tx_delay_ms_contention(
+                        air.channel_utilization_percent(),
+                        cw_slot,
+                        now_ms,
+                        last_rx_id,
+                        node_num,
+                    )
+                    .max(cw_slot);
+                    tx_hold_until = Some(Instant::now() + Duration::from_millis(backoff as u64));
                 }
                 if let Some(len) = report.tx_len {
                     defmt::info!(
@@ -158,6 +199,9 @@ pub async fn radio_task(
                         len
                     );
                     crate::usb_log::log::radio::tx_done(report.tx_id, report.tx_to, len);
+                    if let Some(id) = report.tx_id {
+                        router.note_tx_done(id);
+                    }
                 }
                 if report.tx_deferred_rx_busy {
                     defmt::trace!("[Radio0] TX deferred: reception in progress");

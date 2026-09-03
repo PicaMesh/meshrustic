@@ -1800,6 +1800,10 @@ impl NeighborGraph {
     }
 
     /// True when at least one direct neighbor is not covered by the union of `covered_by` edge sets.
+    /// Do we still reach a neighbour that none of `covered_by` (the transmitter and every relayer
+    /// heard so far) reaches? Ours are the `hears_us` neighbours plus the stock neighbours we own
+    /// under the stock-coverage rule; a coverer's edge counts only when its link is not poor,
+    /// the same threshold the slot ranking applies to pre-coverage.
     pub fn has_unique_coverage(&self, covered_by: &[u32]) -> bool {
         let Some(node) = self.edges.find_node(self.my_node) else {
             return false;
@@ -1807,32 +1811,79 @@ impl NeighborGraph {
         for i in 0..node.edge_count as usize {
             let edge = node.edges[i];
             let neighbor = edge.to;
-            if is_placeholder_node(neighbor) || !edge.hears_us {
+            if is_placeholder_node(neighbor) {
+                continue;
+            }
+            if !edge.hears_us && !self.is_owned_stock_neighbor(neighbor, edge.hears_us) {
                 continue;
             }
             if covered_by.contains(&neighbor) {
                 continue;
             }
-            let mut covered = false;
-            for &coverer in covered_by {
-                let Some(coverer_node) = self.edges.find_node(coverer) else {
-                    continue;
-                };
-                for j in 0..coverer_node.edge_count as usize {
-                    if coverer_node.edges[j].to == neighbor {
-                        covered = true;
-                        break;
-                    }
-                }
-                if covered {
-                    break;
-                }
-            }
+            let covered = covered_by.iter().any(|&coverer| {
+                self.edges
+                    .find_node(coverer)
+                    .and_then(|n| n.find_edge(neighbor))
+                    .is_some_and(|e| e.etx() < crate::broadcast_relay::POOR_LINK_ETX_THRESHOLD)
+            });
             if !covered {
                 return true;
             }
         }
         false
+    }
+
+    /// A legacy neighbour the stock-coverage rule makes our responsibility: mute (it never relays,
+    /// so it can never earn `hears_us`) or a legacy node that proved it hears us, and no SR peer
+    /// with a lower node id has an edge to it. Immediate routers take their own slot.
+    fn is_owned_stock_neighbor(&self, neighbor: u32, hears_us: bool) -> bool {
+        if self.capability.status(neighbor) != CapabilityStatus::Legacy
+            || self.capability.is_immediate_relay_router(neighbor)
+        {
+            return false;
+        }
+        let mute = self
+            .capability
+            .role(neighbor)
+            .map(crate::sr_role::role_is_mute)
+            .unwrap_or(false);
+        if !(mute || hears_us) {
+            return false;
+        }
+        let Some(me) = self.edges.find_node(self.my_node) else {
+            return false;
+        };
+        for i in 0..me.edge_count as usize {
+            let peer_edge = me.edges[i];
+            let peer = peer_edge.to;
+            if peer >= self.my_node
+                || !peer_edge.hears_us
+                || self.capability.status(peer) != CapabilityStatus::SrActive
+            {
+                continue;
+            }
+            let peer_reaches = self
+                .edges
+                .find_node(peer)
+                .and_then(|n| n.find_edge(neighbor))
+                .is_some();
+            if peer_reaches {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Drop every committed relay for `packet_id`: the frame is on the air (or was pulled back).
+    pub fn cancel_relay_for_id(&mut self, packet_id: u32) -> bool {
+        let mut any = false;
+        for slot in &mut self.relay_states {
+            if slot.active && slot.id == packet_id {
+                slot.active = false;
+                any = true;
+            }
+        }
+        any
     }
 
     fn find_relay_commit(&self, from: u32, id: u32) -> Option<usize> {
@@ -2694,6 +2745,79 @@ mod tests {
         let odd = graph.plan_broadcast_relay(0xcc21_2ebd, SRC, GW, 0xffff_ffff, 200, 91);
         assert!(odd.should_relay, "odd packet id: higher node id relays");
         assert_eq!(odd.slot_index, 0);
+    }
+
+    #[test]
+    fn poor_link_does_not_count_as_coverage() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const U: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        graph.observe_direct_neighbor(U, -70, 8, 100, 0);
+        graph.confirm_direct_neighbor_hears_us(PEER);
+        graph.confirm_direct_neighbor_hears_us(U);
+        // The peer reports U at ETX 40 (heard once, barely): that is not coverage.
+        graph
+            .edges_mut()
+            .update_edge(ME, PEER, U, 40.0, 100, EdgeSource::Mirrored, true, 0);
+        assert!(graph.has_unique_coverage(&[PEER]));
+        graph
+            .edges_mut()
+            .update_edge(ME, PEER, U, 1.5, 100, EdgeSource::Mirrored, true, 0);
+        assert!(!graph.has_unique_coverage(&[PEER]));
+    }
+
+    #[test]
+    fn owned_mute_neighbour_is_unique_coverage() {
+        const ME: u32 = 0xAA00_00AA;
+        const HIGH_PEER: u32 = 0xBB00_00BB;
+        const MUTE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        for n in [HIGH_PEER, MUTE] {
+            graph.observe_direct_neighbor(n, -70, 8, 100, 0);
+        }
+        graph.confirm_direct_neighbor_hears_us(HIGH_PEER);
+        graph.capability_mut().track_topology(HIGH_PEER, true, 100);
+        graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
+        // The mute node never earns hears_us, yet it is ours: the peer's copy does not reach it.
+        assert!(graph.has_unique_coverage(&[HIGH_PEER]));
+        // Once the transmitter reaches it, it is covered like any other neighbour.
+        graph
+            .edges_mut()
+            .update_edge(ME, HIGH_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
+        assert!(!graph.has_unique_coverage(&[HIGH_PEER]));
+    }
+
+    #[test]
+    fn mute_neighbour_owned_by_a_lower_id_peer_is_not_ours() {
+        const ME: u32 = 0xAA00_00AA;
+        const LOW_PEER: u32 = 0x1100_0011;
+        const OTHER: u32 = 0xBB00_00BB;
+        const MUTE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        for n in [LOW_PEER, OTHER, MUTE] {
+            graph.observe_direct_neighbor(n, -70, 8, 100, 0);
+        }
+        for n in [LOW_PEER, OTHER] {
+            graph.confirm_direct_neighbor_hears_us(n);
+            graph.capability_mut().track_topology(n, true, 100);
+        }
+        graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
+        // OTHER's copy reaches LOW_PEER but not the mute node: the mute node is ours so far.
+        graph
+            .edges_mut()
+            .update_edge(ME, OTHER, LOW_PEER, 1.5, 100, EdgeSource::Mirrored, true, 0);
+        assert!(graph.has_unique_coverage(&[OTHER]));
+        // A lower-id SR peer with an edge to the mute node owns it under the stock-coverage
+        // rule: it is no longer our unique coverage even though OTHER's copy never reaches it.
+        graph
+            .edges_mut()
+            .update_edge(ME, LOW_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
+        assert!(!graph.has_unique_coverage(&[OTHER]));
     }
 
     #[test]

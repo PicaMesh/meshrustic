@@ -213,6 +213,9 @@ pub struct Router {
     pending_ack: PendingAck,
     pending_admin: [PendingAdmin; MAX_PENDING_ADMIN],
     pending_admin_count: u8,
+    /// Packet ids whose relay we cancelled after it may already have been handed to the radio;
+    /// the board pulls matching frames back out of the radio's TX queue.
+    tx_cancels: heapless::Vec<u32, 8>,
     nodeinfo_identity: NodeInfoIdentity,
     nodeinfo_cache: NodeInfoCache,
     last_nodeinfo_ms: u32,
@@ -371,6 +374,7 @@ impl Router {
                 bytes: [0; MAX_WIRE_LEN],
             }; MAX_PENDING_ADMIN],
             pending_admin_count: 0,
+            tx_cancels: heapless::Vec::new(),
             nodeinfo_identity: NodeInfoIdentity::with_default_advert([0; 32]),
             nodeinfo_cache: NodeInfoCache::new(),
             last_nodeinfo_ms: 0,
@@ -1929,7 +1933,10 @@ impl Router {
         let idx = best_idx?;
         let pending = self.pending[idx];
         self.pending[idx].active = false;
-        self.graph.cancel_relay(pending.from, pending.id);
+        // The committed relay stays until the radio reports the frame on the air
+        // (`note_tx_done`): a copy heard while the frame waits in the radio queue still runs
+        // the coverage check and can pull the frame back. Release used to forget the relay here,
+        // which let the frame go out regardless of what arrived in the meantime.
         self.arm_relayed_unicast_retx(pending.len, pending.bytes, now_ms);
         Some(RelayPlan {
             len: pending.len,
@@ -2878,6 +2885,31 @@ impl Router {
         false
     }
 
+    /// Remember that `id` must not go on the air from us, wherever its frame currently sits.
+    fn note_tx_cancel(&mut self, id: u32) {
+        if !self.tx_cancels.contains(&id) {
+            let _ = self.tx_cancels.push(id);
+        }
+    }
+
+    /// Packet ids whose queued relay the board must remove from the radio TX queue. A copy heard
+    /// while our frame waits behind listen-before-talk is the usual case: the frame has left the
+    /// router but not the node, and only the radio queue can still stop it.
+    /// The radio finished sending `packet_id`: the committed relay is complete.
+    pub fn note_tx_done(&mut self, packet_id: u32) {
+        if packet_id != 0 {
+            self.graph.cancel_relay_for_id(packet_id);
+        }
+    }
+
+    pub fn take_tx_cancels(&mut self, out: &mut heapless::Vec<u32, 8>) {
+        out.clear();
+        for id in self.tx_cancels.iter() {
+            let _ = out.push(*id);
+        }
+        self.tx_cancels.clear();
+    }
+
     fn cancel_pending(&mut self, from: u32, id: u32) -> bool {
         let mut canceled = false;
         for pending in &mut self.pending {
@@ -2917,6 +2949,7 @@ impl Router {
         let dropped = self.cancel_pending_lower_hop(parsed.from, parsed.id, parsed.hop_limit);
         if dropped {
             self.graph.cancel_relay(parsed.from, parsed.id);
+            self.note_tx_cancel(parsed.id);
         }
         dropped
     }
@@ -3035,11 +3068,15 @@ impl Router {
 
         // A unicast copy heard from anyone means the packet is moving, whether the designated
         // next hop or an earlier slot carried it: our pending copy is redundant. Broadcast
-        // coverage reasoning below does not apply to unicasts.
-        if parsed.to != NODENUM_BROADCAST && (committed || has_pending) {
+        // coverage reasoning below does not apply to unicasts. `in_flight` covers the frame
+        // that already left the router for the radio queue (release forgets the relay here,
+        // but the board recorded our transmission when it queued the frame).
+        let in_flight = self.graph.has_our_transmission(parsed.id);
+        if parsed.to != NODENUM_BROADCAST && (committed || has_pending || in_flight) {
             if self.graph.role_allows_canceling_dupe() {
                 self.graph.cancel_relay(parsed.from, parsed.id);
                 let canceled_pending = self.cancel_pending(parsed.from, parsed.id);
+                self.note_tx_cancel(parsed.id);
                 if canceled_pending || has_pending {
                     self.sr_log.push(SrLogEvent::UnicastDupeCancel {
                         id: parsed.id,
@@ -3052,9 +3089,18 @@ impl Router {
 
         if committed {
             if !has_pending {
+                // Released to the radio (or already sent). Someone relayed, so T1 insurance is
+                // moot; the frame itself is pulled back only if the transmitters heard so far
+                // cover every neighbour we reach, the same rule as for a pending relay.
                 self.cancel_t1_retransmit(parsed.id, T1CancelReason::RelayHeard);
                 if self.graph.role_allows_canceling_dupe() {
+                    if let Some(heard_from) = heard_relayer {
+                        if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from) {
+                            return;
+                        }
+                    }
                     self.graph.cancel_relay(parsed.from, parsed.id);
+                    self.note_tx_cancel(parsed.id);
                     self.sr_log.push(SrLogEvent::BroadcastDupeCancel {
                         id: parsed.id,
                         from: parsed.from,
@@ -3089,6 +3135,7 @@ impl Router {
                 .is_some();
             let canceled_pending = self.cancel_pending(parsed.from, parsed.id);
             if had_relay || canceled_pending {
+                self.note_tx_cancel(parsed.id);
                 self.sr_log.push(SrLogEvent::BroadcastDupeCancel {
                     id: parsed.id,
                     from: parsed.from,
@@ -4032,6 +4079,195 @@ mod tests {
             e,
             SrLogEvent::RadioReconfigured { dropped } if *dropped >= 2
         )));
+    }
+
+    /// A copy heard after our relay left the router (it may sit in the radio queue behind
+    /// listen-before-talk) must be reported so the board can pull the frame back.
+    #[test]
+    fn dupe_cancel_reports_the_frame_for_radio_removal() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire(3, 3, 0, 0xDD, 0x901);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let _ = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x901, 0)
+            .expect("later slot");
+        // The slot fires: the frame leaves the router for the radio queue, and the board records
+        // the transmission as it queues the frame.
+        assert!(router.poll_ready_relay(tx_after).is_some());
+        router.record_tx_on_air(0x901, tx_after);
+        let mut cancels = heapless::Vec::new();
+        router.take_tx_cancels(&mut cancels);
+        assert!(cancels.is_empty());
+
+        // RELAYER's copy arrives while our frame is still queued in the radio.
+        let copy = unicast_wire(2, 3, 0, 0xBB, 0x901);
+        let dupe = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy,
+                },
+                tx_after + 20,
+            )
+            .unwrap();
+        assert!(dupe.duplicate);
+        router.take_tx_cancels(&mut cancels);
+        assert_eq!(cancels.as_slice(), &[0x901]);
+        router.take_tx_cancels(&mut cancels);
+        assert!(cancels.is_empty(), "reported once");
+    }
+
+    /// A broadcast copy heard after our relay left the router pulls the frame back only when the
+    /// transmitters heard so far cover every neighbour we reach; TX done ends the relay's life.
+    #[test]
+    fn released_broadcast_relay_is_pulled_back_only_when_covered() {
+        const ME: u32 = 0xCC00_00CC;
+        const SRC: u32 = 0xDD00_00DD;
+        const PEER: u32 = 0x1100_0011; // ranks ahead of us: covers three nodes
+        const UNIQ: u32 = 0xEE00_00EE; // hears only us
+        const OTHER: u32 = 0x9900_0099; // does not hear the source; its copy covers UNIQ
+        const X: u32 = 0x7700_0077;
+        const Y: u32 = 0x8800_0088;
+        const Z: u32 = 0x6600_0066;
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(ME));
+        {
+            let g = router.graph_mut();
+            for n in [SRC, PEER, UNIQ, OTHER] {
+                g.observe_direct_neighbor(n, -70, 8, 0, 0);
+            }
+            for n in [PEER, UNIQ] {
+                g.confirm_direct_neighbor_hears_us(n);
+            }
+            for n in [PEER, UNIQ, OTHER] {
+                g.capability_mut().track_topology(n, true, 0);
+            }
+            let mut packed = [0u8; 16];
+            write_packed_header(&mut packed, 1, true);
+            let (h, _) = decode_packed_neighbors(&packed, 8).unwrap();
+            let nb = |id: u32| PackedNeighbor {
+                node_id: id,
+                rssi: -70,
+                snr: 8,
+                signal_routing_active: true,
+                hears_us: true,
+                etx_variance: 0,
+            };
+            g.merge_topology(PEER, &h, &[nb(ME), nb(X), nb(Y), nb(Z)], true, 0, 0);
+            g.merge_topology(OTHER, &h, &[nb(ME), nb(UNIQ)], true, 0, 0);
+        }
+        let wire = encode_wire(
+            PacketHeader::from_fields(0xFFFF_FFFF, SRC, 0xB02, 0, 3, 3, false, false, 0, 0xDD),
+            &[1, 2, 3, 4],
+        );
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        // PEER covers four nodes to our three (OTHER's report lists us, so it counts for us).
+        assert!(plan.relay.is_none(), "PEER covers more and takes slot 0");
+        let tx_after = router
+            .relay_tx_after(SRC, 0xB02, 0)
+            .expect("our later slot");
+        assert!(router.poll_ready_relay(tx_after).is_some());
+        router.record_tx_on_air(0xB02, tx_after);
+        assert!(
+            router.graph_mut().is_committed_relay(SRC, 0xB02),
+            "relay outlives release"
+        );
+
+        // PEER's copy: it does not reach UNIQ, so our queued frame stays.
+        let mut cancels = heapless::Vec::new();
+        let copy = encode_wire(
+            PacketHeader::from_fields(0xFFFF_FFFF, SRC, 0xB02, 0, 2, 3, false, false, 0, 0x11),
+            &[1, 2, 3, 4],
+        );
+        let dupe = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy,
+                },
+                tx_after + 10,
+            )
+            .unwrap();
+        assert!(dupe.duplicate);
+        router.take_tx_cancels(&mut cancels);
+        assert!(cancels.is_empty(), "UNIQ is still uncovered");
+        assert!(router.graph_mut().is_committed_relay(SRC, 0xB02));
+
+        // OTHER's copy reaches UNIQ: now everyone is covered and the frame is pulled back.
+        let copy2 = encode_wire(
+            PacketHeader::from_fields(0xFFFF_FFFF, SRC, 0xB02, 0, 2, 3, false, false, 0, 0x99),
+            &[1, 2, 3, 4],
+        );
+        let _ = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy2,
+                },
+                tx_after + 20,
+            )
+            .unwrap();
+        router.take_tx_cancels(&mut cancels);
+        assert_eq!(cancels.as_slice(), &[0xB02]);
+        assert!(!router.graph_mut().is_committed_relay(SRC, 0xB02));
+    }
+
+    #[test]
+    fn tx_done_ends_the_committed_relay() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire(3, 3, 0, 0xDD, 0x902);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let _ = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x902, 0)
+            .expect("later slot");
+        assert!(router.poll_ready_relay(tx_after).is_some());
+        assert!(router.graph_mut().is_committed_relay(UNI_SOURCE, 0x902));
+        router.note_tx_done(0x902);
+        assert!(!router.graph_mut().is_committed_relay(UNI_SOURCE, 0x902));
+        assert!(!router.graph_mut().has_active_relay_commits());
     }
 
     /// Field case of 2026-09-03: the relayer that actually reaches the destination must own
