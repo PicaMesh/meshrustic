@@ -44,10 +44,15 @@ pub fn relay_header_with_next_hop_opts(
 
     let (hop_limit, hop_start) = relay_hop_fields(rx, direct_neighbor_hop_limit)?;
     let relay_node = (our_node & 0xFF) as u8;
+    // Every relay names its own next hop or none, as stock NextHopRouter does. Copying the
+    // incoming byte was wrong both ways: when it named us, the frame left still naming us, so
+    // legacy nodes (which relay a unicast only when next_hop is clear or their own byte) never
+    // touched it and SR peers waited for a second copy from us; when it named a node that stayed
+    // silent, keeping its byte kept legacy routers out of the recovery.
     let next_hop_byte = if next_hop != 0 {
         (next_hop & 0xFF) as u8
     } else {
-        rx.next_hop
+        0
     };
 
     Some(PacketHeader::from_fields(
@@ -152,6 +157,65 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn relay_without_own_route_clears_the_incoming_next_hop() {
+        // Named as next hop (0xCC) but with no onward route: the frame must not keep naming us.
+        let parsed = PacketHeader::from_fields(
+            0xDD00_00DD,
+            0xBB00_00BB,
+            1,
+            0,
+            5,
+            5,
+            false,
+            false,
+            0xCC,
+            0xBB,
+        )
+        .parse();
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, None).expect("relay");
+        assert_eq!(hdr.parse().next_hop, 0);
+        assert_eq!(hdr.parse().relay_node, 0xCC);
+
+        // Relaying behind a silent designated node (0x99): its byte is dropped too, so legacy
+        // routers can carry our copy at once instead of after the retry fallback.
+        let parsed = PacketHeader::from_fields(
+            0xDD00_00DD,
+            0xBB00_00BB,
+            2,
+            0,
+            5,
+            5,
+            false,
+            false,
+            0x99,
+            0xBB,
+        )
+        .parse();
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, None).expect("relay");
+        assert_eq!(hdr.parse().next_hop, 0);
+    }
+
+    #[test]
+    fn relay_with_own_route_names_that_next_hop() {
+        let parsed = PacketHeader::from_fields(
+            0xDD00_00DD,
+            0xBB00_00BB,
+            3,
+            0,
+            5,
+            5,
+            false,
+            false,
+            0xCC,
+            0xBB,
+        )
+        .parse();
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0xEE00_00EE, None)
+            .expect("relay");
+        assert_eq!(hdr.parse().next_hop, 0xEE);
     }
 
     #[test]
