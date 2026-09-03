@@ -244,8 +244,12 @@ where
             continue;
         }
 
+        // Bucketed to half an ETX: own links and peer-reported links price a few hundredths
+        // apart, and an exact comparison let colocated nodes rank each other in opposite orders.
         let avg_cost_fixed = if valid_costs > 0 {
-            (total_cost / valid_costs as f32 * 100.0) as u16
+            let fixed = (total_cost / valid_costs as f32 * 100.0) as u16;
+            fixed / crate::unicast_relay::COST_BUCKET_FIXED
+                * crate::unicast_relay::COST_BUCKET_FIXED
         } else {
             0
         };

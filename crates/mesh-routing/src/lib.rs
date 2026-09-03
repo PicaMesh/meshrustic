@@ -118,5 +118,5 @@ pub use traceroute::{
 };
 pub use unicast_relay::{
     plan_unicast_relay, UnicastCandidate, UnicastRelayContext, BEST_EFFORT_SELF_COST,
-    DOWNSTREAM_TIER_COST, INDIRECT_TIER, MAX_UNICAST_CANDIDATES,
+    COST_BUCKET_FIXED, DOWNSTREAM_TIER_COST, INDIRECT_TIER, MAX_UNICAST_CANDIDATES,
 };

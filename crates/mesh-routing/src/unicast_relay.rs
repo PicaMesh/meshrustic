@@ -12,9 +12,14 @@
 //!   branch before its topology report arrives);
 //! - edge to the shared next hop only: the edge's ETX with [`INDIRECT_TIER`] set.
 //!
-//! Ties are broken by node id, low first on even packet ids and high first on odd ones, as the
-//! fork does. Before ranking, the packet is suppressed outright when the transmitter or an
-//! SR neighbour that covers the transmitter can already deliver it.
+//! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Each node prices its own
+//! link from its own measurements and a peer's link from the peer's packed report, so two
+//! near-equal costs differ by a few hundredths on every node, in a direction that varies. Exact
+//! comparison then ranked the two colocated nicenanos in opposite orders (each behind the other),
+//! both took the same slot and keyed up together. Within a bucket, ties are broken by node id, low
+//! first on even packet ids and high first on odd ones, as the fork does. Before ranking, the
+//! packet is suppressed outright when the transmitter or an SR neighbour that covers the
+//! transmitter can already deliver it.
 
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
@@ -28,7 +33,13 @@ pub const DOWNSTREAM_TIER_COST: u16 = 0x7FFF;
 pub const INDIRECT_TIER: u16 = 0x8000;
 /// Cost we give ourselves when the route picker said "relay it yourself" and no edge backs it.
 pub const BEST_EFFORT_SELF_COST: u16 = 0xFFFE;
+/// ETX costs are compared in buckets this wide (fixed-point, ETX × 100): half an ETX.
+pub const COST_BUCKET_FIXED: u16 = 50;
 const NO_PATH: u16 = u16::MAX;
+
+fn bucket(etx_fixed: u16) -> u16 {
+    etx_fixed / COST_BUCKET_FIXED * COST_BUCKET_FIXED
+}
 
 pub struct UnicastRelayContext<'a> {
     pub my_node: u32,
@@ -71,7 +82,7 @@ impl UnicastRelayContext<'_> {
 
     fn candidate_cost(&self, node: u32, destination: u32, my_next_hop: u32, now_ms: u32) -> u16 {
         if let Some(cost) = self.edge_cost(node, destination) {
-            return cost.min(DOWNSTREAM_TIER_COST - 1);
+            return bucket(cost.min(DOWNSTREAM_TIER_COST - 1));
         }
         if self.downstream_relay(destination, now_ms) == Some(node) {
             return DOWNSTREAM_TIER_COST;
@@ -84,7 +95,7 @@ impl UnicastRelayContext<'_> {
             && my_next_hop != self.my_node
         {
             if let Some(cost) = self.edge_cost(node, my_next_hop) {
-                return cost.min(INDIRECT_TIER - 1) | INDIRECT_TIER;
+                return bucket(cost.min(INDIRECT_TIER - 1)) | INDIRECT_TIER;
             }
         }
         NO_PATH
@@ -345,6 +356,41 @@ mod tests {
         .expect("candidate");
         assert_eq!(&plan.ranked[..3], &[PEER, GW, ME]);
         assert_eq!(plan.slot_index, 2);
+    }
+
+    /// Field case of 2026-09-03 23:18 (cfd2d4da): A and B were both indirect-tier candidates whose
+    /// costs differed by a few hundredths in opposite directions on each node, so each ranked the
+    /// other first, both took slot 3 and collided. Half-ETX buckets make them tie, and the
+    /// packet-id parity picks the same node on both.
+    #[test]
+    fn near_equal_costs_fall_to_the_node_id_tie_break() {
+        let mut f = field_fixture();
+        // Our own link to the gateway prices at 1.31, the peer's reported one at 1.18.
+        f.edges
+            .update_edge(ME, ME, GW, 1.31, NOW, EdgeSource::Reported, true, 0);
+        f.edges
+            .update_edge(ME, PEER, GW, 1.18, NOW, EdgeSource::Reported, true, 0);
+        // Even id: lower node id first, although our own link is the dearer one.
+        let even = plan_unicast_relay(&f.ctx(), 0xcfd2_d4da, PHONE, PHONE, DEST, GW, NOW, |_| {
+            false
+        })
+        .unwrap();
+        assert_eq!(&even.ranked[..3], &[GW, ME, PEER]);
+        // Odd id: higher node id first.
+        let odd = plan_unicast_relay(&f.ctx(), 0xcfd2_d4db, PHONE, PHONE, DEST, GW, NOW, |_| {
+            false
+        })
+        .unwrap();
+        assert_eq!(&odd.ranked[..3], &[GW, PEER, ME]);
+        // A genuinely worse own link (a full bucket apart, ETX cannot go below 1.0) loses
+        // regardless of parity.
+        f.edges
+            .update_edge(ME, ME, GW, 1.6, NOW, EdgeSource::Reported, true, 0);
+        let better = plan_unicast_relay(&f.ctx(), 0xcfd2_d4da, PHONE, PHONE, DEST, GW, NOW, |_| {
+            false
+        })
+        .unwrap();
+        assert_eq!(&better.ranked[..3], &[GW, PEER, ME]);
     }
 
     #[test]
