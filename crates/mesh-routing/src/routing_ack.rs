@@ -26,7 +26,7 @@ pub const RETX_CW_MAX: u8 = 8;
 pub const RETX_PROCESSING_TIME_MS: u32 = 4_500;
 
 /// Contention-window size for a channel utilization, `map(util, 0, 100, CWmin, CWmax)`.
-fn contention_window_size(channel_util_pct: f32) -> u8 {
+pub(crate) fn contention_window_size(channel_util_pct: f32) -> u8 {
     let pct = if channel_util_pct.is_finite() { channel_util_pct.clamp(0.0, 100.0) } else { 0.0 };
     let span = (RETX_CW_MAX - RETX_CW_MIN) as f32;
     RETX_CW_MIN + ((pct * span) / 100.0) as u8

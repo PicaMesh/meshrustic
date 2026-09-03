@@ -55,6 +55,26 @@ pub fn tx_delay_ms_router(
     jitter_slots(from, id, node_num, span) * slot_ms
 }
 
+/// Meshtastic `getTxDelayMsec`: `random(0, 2^CWsize) * slotTime`, CWsize from channel
+/// utilization. Used for module replies (NodeInfo answers, dirty topology broadcasts) that
+/// several nodes may fire in response to the same packet. Deterministic per (seeds, node) so
+/// colocated nodes draw different slots without an RNG.
+pub fn tx_delay_ms_contention(
+    channel_util_pct: f32,
+    slot_ms: u32,
+    seed_a: u32,
+    seed_b: u32,
+    node_num: u32,
+) -> u32 {
+    let cw = crate::routing_ack::contention_window_size(channel_util_pct) as u32;
+    jitter_slots(seed_a, seed_b, node_num, 1u32 << cw) * slot_ms
+}
+
+/// Upper bound of [`tx_delay_ms_contention`] at any channel utilization.
+pub fn tx_delay_ms_contention_max(slot_ms: u32) -> u32 {
+    (1u32 << crate::routing_ack::RETX_CW_MAX) * slot_ms
+}
+
 /// Worst-case ROUTER_LATE relay window at strong SNR (T1 insurance timer base).
 pub fn tx_delay_ms_worst(cw_slot_ms: u32) -> u32 {
     let cw_max = CW_MAX as u32;

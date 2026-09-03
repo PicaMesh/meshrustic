@@ -10,7 +10,9 @@ use crate::admin::{
     ROUTING_ERROR_PKI_UNKNOWN_PUBKEY,
 };
 use crate::admin_codec::{AdminPayload, ADMIN_APP};
-use crate::coordinated_relay::{half_airtime_ms, slot_time_for_preset, tx_delay_ms_worst};
+use crate::coordinated_relay::{
+    half_airtime_ms, slot_time_for_preset, tx_delay_ms_contention, tx_delay_ms_worst,
+};
 use crate::neighbor_graph::{
     MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS,
     TOPOLOGY_BROADCAST_MS, TOPOLOGY_DIRTY_MIN_MS,
@@ -2489,6 +2491,19 @@ impl Router {
         self.last_nodeinfo_ms = now_ms;
     }
 
+    /// Contention-window delay for a reply several nodes may send to the same trigger
+    /// (Meshtastic `getTxDelayMsec`). Without it, colocated nodes answering one request
+    /// transmit inside each other's airtime.
+    fn reply_tx_delay_ms(&self, seed_a: u32, seed_b: u32) -> u32 {
+        tx_delay_ms_contention(
+            self.channel_util_pct,
+            self.cw_slot_ms(),
+            seed_a,
+            seed_b,
+            self.node_num,
+        )
+    }
+
     fn schedule_nodeinfo_unicast(&mut self, to: u32, reply_id: u32, now_ms: u32) {
         let packet_id = self.alloc_tx_id(now_ms);
         let Some((len, frame)) = build_nodeinfo_reply_frame(
@@ -2503,12 +2518,14 @@ impl Router {
         ) else {
             return;
         };
-        self.queue_nodeinfo_tx(now_ms, len, frame);
+        let delay_ms = self.reply_tx_delay_ms(to, reply_id);
+        self.sr_log.push(SrLogEvent::NodeInfoReplyDelayed { delay_ms });
+        self.queue_nodeinfo_tx(now_ms.wrapping_add(delay_ms), len, frame);
     }
 
-    fn queue_nodeinfo_tx(&mut self, now_ms: u32, len: u8, frame: [u8; MAX_WIRE_LEN]) {
+    fn queue_nodeinfo_tx(&mut self, tx_at_ms: u32, len: u8, frame: [u8; MAX_WIRE_LEN]) {
         self.pending_nodeinfo.active = true;
-        self.pending_nodeinfo.next_tx_ms = now_ms;
+        self.pending_nodeinfo.next_tx_ms = tx_at_ms;
         self.pending_nodeinfo.len = len;
         self.pending_nodeinfo.bytes = frame;
     }
@@ -2595,8 +2612,17 @@ impl Router {
         if !self.graph.can_send_topology() {
             return false;
         }
+        // A dirty broadcast reacts to something every neighbour heard too (a new node, a
+        // report), so it gets a contention-window delay; periodic ones run on our own timer.
+        let dirty_delay_ms = if dirty {
+            self.reply_tx_delay_ms(self.graph.topology_version() as u32, now_ms)
+        } else {
+            0
+        };
         if dirty {
-            self.sr_log.push(SrLogEvent::TopologyDirtySending);
+            self.sr_log.push(SrLogEvent::TopologyDirtySending {
+                delay_ms: dirty_delay_ms,
+            });
         }
         let topo_v = self.graph.topology_version();
         let packet_count = self.graph.topology_packet_count();
@@ -2631,7 +2657,7 @@ impl Router {
         self.pending_topology.active = true;
         self.pending_topology.count = built;
         self.pending_topology.next_idx = 0;
-        self.pending_topology.next_tx_ms = now_ms;
+        self.pending_topology.next_tx_ms = now_ms.wrapping_add(dirty_delay_ms);
         self.pending_topology.spacing_ms = slot_ms.saturating_mul(2);
         self.sr_log.push(SrLogEvent::TopologySending {
             node_id: self.node_num,
@@ -3086,7 +3112,9 @@ mod tests {
                 500,
             )
             .unwrap();
-        let _ = router.poll_topology_tx(500);
+        // The new-neighbour dirty broadcast is jittered; drain it before the empty-peer step.
+        let drain_at = 500 + coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
+        let _ = router.poll_topology_tx(drain_at);
 
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 1, true);
@@ -3102,6 +3130,42 @@ mod tests {
 
         router.run_maintenance(1_000, 20);
         assert!(router.poll_topology_tx(1_000).is_some());
+    }
+
+    #[test]
+    fn new_neighbour_dirty_topology_broadcast_is_jittered() {
+        use mesh_crypto::{CryptoKey, DEFAULT_PSK};
+        use mesh_radio::MODEM_SHORT_SLOW;
+        const ME: u32 = 0x677a_1caf;
+        const PEER: u32 = 0x63dc_8f8c;
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut router = Router::with_channel(ME, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+        router.ensure_boot_broadcasts(0, 20);
+        let _ = router.poll_topology_tx(0);
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+
+        let direct_wire = encode_wire(
+            PacketHeader::from_fields(NODENUM_BROADCAST, PEER, 7, 0x77, 3, 3, false, false, 0, (PEER & 0xFF) as u8),
+            &[0x01],
+        );
+        router
+            .process_inbound(&InboundPacket { radio_id: 0, rssi: -70, snr: 8, bytes: &direct_wire }, 500)
+            .unwrap();
+        router.drain_sr_logs(&mut logs);
+        let delay = logs
+            .iter()
+            .find_map(|e| match e {
+                SrLogEvent::TopologyDirtySending { delay_ms } => Some(*delay_ms),
+                _ => None,
+            })
+            .expect("dirty broadcast scheduled");
+        let max = coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
+        assert!(delay <= max, "delay {delay} exceeds contention bound {max}");
+        if delay > 0 {
+            assert!(router.poll_topology_tx(500 + delay - 1).is_none(), "must not fire early");
+        }
+        assert!(router.poll_topology_tx(500 + delay).is_some());
     }
 
     #[test]

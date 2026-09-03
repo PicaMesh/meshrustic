@@ -52,7 +52,13 @@ pub enum SrLogEvent {
         packets: u8,
         topo_v: u8,
     },
-    TopologyDirtySending,
+    TopologyDirtySending {
+        delay_ms: u32,
+    },
+    /// A NodeInfo reply was queued behind a contention-window delay.
+    NodeInfoReplyDelayed {
+        delay_ms: u32,
+    },
     EmptyBootBroadcast,
     TopologyProcessing {
         from: u32,

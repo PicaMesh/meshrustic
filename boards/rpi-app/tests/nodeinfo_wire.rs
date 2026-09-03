@@ -149,7 +149,24 @@ fn router_replies_to_nodeinfo_request() {
         bytes: &wire,
     };
     assert!(router.process_inbound(&inbound, 1_000).is_some());
-    let reply = router.poll_nodeinfo_tx(1_000).expect("nodeinfo reply queued");
+    // Replies are jittered by a contention window so colocated responders do not collide.
+    let mut logs = heapless::Vec::new();
+    router.drain_sr_logs(&mut logs);
+    let delay = logs
+        .iter()
+        .find_map(|e| match e {
+            mesh_routing::SrLogEvent::NodeInfoReplyDelayed { delay_ms } => Some(*delay_ms),
+            _ => None,
+        })
+        .expect("reply delay logged");
+    let max = mesh_routing::coordinated_relay::tx_delay_ms_contention_max(
+        mesh_routing::coordinated_relay::slot_time_for_preset(MODEM_SHORT_SLOW),
+    );
+    assert!(delay <= max, "delay {delay} exceeds contention bound {max}");
+    if delay > 0 {
+        assert!(router.poll_nodeinfo_tx(1_000 + delay - 1).is_none());
+    }
+    let reply = router.poll_nodeinfo_tx(1_000 + delay).expect("nodeinfo reply queued");
     let header = PacketHeader::decode(&reply.bytes[..reply.len as usize]).unwrap();
     assert_eq!(header.from, our_node);
     assert_eq!(header.to, requester);

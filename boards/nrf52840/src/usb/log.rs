@@ -1169,12 +1169,28 @@ pub mod sr {
                 pos += 1;
                 finish_line(&mut line, pos);
             }
-            SrLogEvent::TopologyDirtySending => {
+            SrLogEvent::TopologyDirtySending { delay_ms } => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);
-                let msg = b"[SR] Topology dirty - sending early broadcast";
+                let msg = b"[SR] Topology dirty - early broadcast in ";
                 line[pos..pos + msg.len()].copy_from_slice(msg);
                 pos += msg.len();
+                pos += push_u32(&mut line[pos..], delay_ms);
+                let tail = b"ms";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::NodeInfoReplyDelayed { delay_ms } => {
+                let mut line = [0u8; 96];
+                let mut pos = line_prefix(&mut line);
+                let msg = b"[SR] NodeInfo reply in ";
+                line[pos..pos + msg.len()].copy_from_slice(msg);
+                pos += msg.len();
+                pos += push_u32(&mut line[pos..], delay_ms);
+                let tail = b"ms";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
                 finish_line(&mut line, pos);
             }
             SrLogEvent::EmptyBootBroadcast => {

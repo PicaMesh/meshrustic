@@ -175,8 +175,11 @@ fn nodeinfo_request_to_us_is_answered_even_from_a_limited_node() {
         .process_inbound(&inbound(&wire), 2_000)
         .expect("nodeinfo request rx");
     assert!(!result.rate_limited, "requests addressed to us are never rate limited");
+    let max_delay = mesh_routing::coordinated_relay::tx_delay_ms_contention_max(
+        mesh_routing::coordinated_relay::slot_time_for_preset(MODEM_SHORT_SLOW),
+    );
     assert!(
-        router.poll_nodeinfo_tx(2_000).is_some(),
+        router.poll_nodeinfo_tx(2_000 + max_delay).is_some(),
         "a direct NodeInfo request must still be answered"
     );
 }
