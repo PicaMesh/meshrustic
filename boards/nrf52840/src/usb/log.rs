@@ -1383,6 +1383,14 @@ pub mod sr {
             | SrLogEvent::NetworkTopologyDownstreamHeader { .. }
             | SrLogEvent::NetworkTopologyDownstreamGroup { .. }
             | SrLogEvent::TopologyLoggingComplete) => emit_topology_event(event),
+            SrLogEvent::BootstrapReplyRateLimited => {
+                let mut line = [0u8; 96];
+                let mut pos = line_prefix(&mut line);
+                let msg = b"[SR] Bootstrap reply rate-limited (list sent within the last minute)";
+                line[pos..pos + msg.len()].copy_from_slice(msg);
+                pos += msg.len();
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::RadioReconfigured { dropped } => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);

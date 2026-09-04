@@ -126,6 +126,8 @@ pub enum SrLogEvent {
         destination: u32,
     },
     TopologyLoggingComplete,
+    /// An empty bootstrap broadcast arrived inside the bootstrap-reply cooldown; no list sent.
+    BootstrapReplyRateLimited,
     /// The radio was re-initialised for a new preset; queued transmissions timed for the old
     /// air parameters (and addressed to nodes still on them) were dropped.
     RadioReconfigured {

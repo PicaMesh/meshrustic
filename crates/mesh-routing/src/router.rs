@@ -191,6 +191,9 @@ struct PendingAdmin {
     bytes: [u8; MAX_WIRE_LEN],
 }
 
+/// Minimum spacing between topology lists sent in answer to empty bootstrap broadcasts.
+pub const BOOTSTRAP_REPLY_MIN_MS: u32 = 60_000;
+
 /// Shared static router state.
 pub struct Router {
     node_num: u32,
@@ -216,6 +219,10 @@ pub struct Router {
     /// Packet ids whose relay we cancelled after it may already have been handed to the radio;
     /// the board pulls matching frames back out of the radio's TX queue.
     tx_cancels: heapless::Vec<u32, 8>,
+    /// When we last answered an empty bootstrap broadcast with our topology (0 = never).
+    /// Bootstrap replies are rate-limited so a burst of empty broadcasts cannot make every node
+    /// flood the channel with its list.
+    last_bootstrap_reply_ms: u32,
     nodeinfo_identity: NodeInfoIdentity,
     nodeinfo_cache: NodeInfoCache,
     last_nodeinfo_ms: u32,
@@ -375,6 +382,7 @@ impl Router {
             }; MAX_PENDING_ADMIN],
             pending_admin_count: 0,
             tx_cancels: heapless::Vec::new(),
+            last_bootstrap_reply_ms: 0,
             nodeinfo_identity: NodeInfoIdentity::with_default_advert([0; 32]),
             nodeinfo_cache: NodeInfoCache::new(),
             last_nodeinfo_ms: 0,
@@ -799,16 +807,11 @@ impl Router {
                     node_id,
                     total: self.graph.neighbor_count(),
                 });
-                // Immediate dirty topology when a new direct neighbor appears.
-                if !self.pending_topology.active
-                    && self.schedule_topology_broadcast(
-                        now_ms,
-                        crate::coordinated_relay::DEFAULT_SLOT_MS,
-                        true,
-                    )
-                {
-                    self.graph.commit_topology_broadcast(now_ms, true);
-                }
+                // The graph marked the topology dirty; the list goes out on the dirty schedule
+                // (once TOPOLOGY_DIRTY_MIN_MS has passed since our last broadcast, jittered).
+                // Sending a list the instant each neighbour appeared made peers treat every
+                // partial boot-time list as authoritative and clear hears_us on their edge to
+                // us; the empty boot broadcast already asks them for theirs.
             }
         }
 
@@ -1435,8 +1438,18 @@ impl Router {
         if self.pending_topology.active || !self.graph.can_send_topology() {
             return;
         }
+        // At most one bootstrap-triggered list per BOOTSTRAP_REPLY_MIN_MS: a burst of empty
+        // broadcasts (many nodes rebooting, or a rogue) must not make every node answer each
+        // one. The requester is already in our graph and gets the next periodic list.
+        if self.last_bootstrap_reply_ms != 0
+            && now_ms.wrapping_sub(self.last_bootstrap_reply_ms) < BOOTSTRAP_REPLY_MIN_MS
+        {
+            self.sr_log.push(SrLogEvent::BootstrapReplyRateLimited);
+            return;
+        }
         if self.schedule_topology_broadcast(now_ms, slot_ms, false) {
             self.graph.commit_topology_broadcast(now_ms, false);
+            self.last_bootstrap_reply_ms = now_ms.max(1);
         }
     }
 
@@ -3361,16 +3374,19 @@ mod tests {
         assert!(router.poll_topology_tx(1_000).is_some());
     }
 
+    /// A new neighbour marks the topology dirty; the list follows on the dirty schedule with
+    /// jitter, not the instant the neighbour appears (partial boot-time lists made peers clear
+    /// hears_us on their edge to us).
     #[test]
-    fn new_neighbour_dirty_topology_broadcast_is_jittered() {
+    fn new_neighbour_dirty_topology_broadcast_waits_for_the_dirty_window() {
         use mesh_crypto::{CryptoKey, DEFAULT_PSK};
         use mesh_radio::MODEM_SHORT_SLOW;
         const ME: u32 = 0x677a_1caf;
         const PEER: u32 = 0x63dc_8f8c;
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let mut router = Router::with_channel(ME, key, 0x77, MODEM_SHORT_SLOW, true, 3);
-        router.ensure_boot_broadcasts(0, 20);
-        let _ = router.poll_topology_tx(0);
+        router.ensure_boot_broadcasts(1_000, 20);
+        assert!(router.poll_topology_tx(1_000).is_some(), "empty bootstrap");
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
 
@@ -3397,9 +3413,22 @@ mod tests {
                     snr: 8,
                     bytes: &direct_wire,
                 },
-                500,
+                1_500,
             )
             .unwrap();
+        assert!(
+            router.poll_topology_tx(1_600).is_none(),
+            "no list the moment a neighbour appears"
+        );
+        router.run_maintenance(2_000, 20);
+        assert!(
+            router.poll_topology_tx(2_500).is_none(),
+            "dirty window not yet elapsed"
+        );
+        router.drain_sr_logs(&mut logs);
+
+        let due = 1_000 + crate::neighbor_graph::TOPOLOGY_DIRTY_MIN_MS;
+        router.run_maintenance(due, 20);
         router.drain_sr_logs(&mut logs);
         let delay = logs
             .iter()
@@ -3407,16 +3436,69 @@ mod tests {
                 SrLogEvent::TopologyDirtySending { delay_ms } => Some(*delay_ms),
                 _ => None,
             })
-            .expect("dirty broadcast scheduled");
+            .expect("dirty broadcast scheduled once the window elapsed");
         let max = coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
         assert!(delay <= max, "delay {delay} exceeds contention bound {max}");
         if delay > 0 {
             assert!(
-                router.poll_topology_tx(500 + delay - 1).is_none(),
+                router.poll_topology_tx(due + delay - 1).is_none(),
                 "must not fire early"
             );
         }
-        assert!(router.poll_topology_tx(500 + delay).is_some());
+        assert!(router.poll_topology_tx(due + delay).is_some());
+    }
+
+    /// Empty bootstrap broadcasts are answered at most once per BOOTSTRAP_REPLY_MIN_MS.
+    #[test]
+    fn bootstrap_replies_are_rate_limited() {
+        use crate::topology::{build_topology_wire_frame, PACKED_NEIGHBOR_HEADER_SIZE};
+        use mesh_radio::MODEM_SHORT_SLOW;
+        const ME: u32 = 0x677a_1caf;
+        const P1: u32 = 0x63dc_8f8c;
+        const P2: u32 = 0x5879_fa8f;
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut router = Router::with_channel(ME, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+        router.ensure_boot_broadcasts(1_000, 20);
+        let _ = router.poll_topology_tx(1_000);
+        let mut logs = heapless::Vec::new();
+        let bootstrap = |from: u32, id: u32| {
+            let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
+            write_packed_header(&mut packed, 1, true);
+            build_topology_wire_frame(from, id, 0x77, 3, &key, &packed).unwrap()
+        };
+        let feed = |router: &mut Router, frame: &(u8, [u8; MAX_WIRE_LEN]), at: u32| {
+            router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -70,
+                        snr: 8,
+                        bytes: &frame.1[..frame.0 as usize],
+                    },
+                    at,
+                )
+                .unwrap();
+            router.run_maintenance(at, 20);
+        };
+        // First bootstrap: answered.
+        feed(&mut router, &bootstrap(P1, 0x91), 5_000);
+        let max = coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
+        assert!((5_000..=5_000 + max).any(|t| router.poll_topology_tx(t).is_some()));
+        // Second one shortly after, from another node: rate-limited.
+        feed(&mut router, &bootstrap(P2, 0x92), 20_000);
+        assert!((20_000..=20_000 + max).all(|t| router.poll_topology_tx(t).is_none()));
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::BootstrapReplyRateLimited)));
+        // After the cooldown a bootstrap is answered again.
+        feed(
+            &mut router,
+            &bootstrap(P1, 0x93),
+            5_000 + BOOTSTRAP_REPLY_MIN_MS + 1,
+        );
+        let t3 = 5_000 + BOOTSTRAP_REPLY_MIN_MS + 1;
+        assert!((t3..=t3 + max).any(|t| router.poll_topology_tx(t).is_some()));
     }
 
     #[test]
