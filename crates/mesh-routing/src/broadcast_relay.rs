@@ -32,6 +32,31 @@ pub struct BroadcastRelayPlan {
     pub ranked: [u32; RANKED_LOG],
     pub ranked_len: u8,
     pub reason: RelayReason,
+    /// Ranking inputs of the first candidates evaluated: (node, unique coverage, cost bucket).
+    /// Lets two nodes' views of the same packet be compared when their orders disagree.
+    pub evaluated: [(u32, u8, u16); RANKED_LOG],
+    pub evaluated_len: u8,
+}
+
+/// Ranking inputs collected during the first pick, for the log.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvaluatedList {
+    pub items: [(u32, u8, u16); RANKED_LOG],
+    pub len: u8,
+}
+
+/// Record one candidate's ranking inputs for the log (first RANKED_LOG only).
+pub fn push_evaluated(
+    out: &mut [(u32, u8, u16); RANKED_LOG],
+    len: &mut u8,
+    node: u32,
+    coverage: u8,
+    cost: u16,
+) {
+    if (*len as usize) < RANKED_LOG {
+        out[*len as usize] = (node, coverage, cost);
+        *len += 1;
+    }
 }
 
 /// How many slot holders the plan records for logging.
@@ -199,6 +224,7 @@ fn find_best_relay_candidate<F>(
     prefer_high_node_id: bool,
     source_node: u32,
     has_transmitted: F,
+    mut evaluated: Option<&mut EvaluatedList>,
 ) -> RelayCandidate
 where
     F: Fn(u32) -> bool,
@@ -221,6 +247,9 @@ where
                 unique[unique_count as usize] = node;
                 unique_count += 1;
             }
+        }
+        if let Some(ev) = evaluated.as_deref_mut() {
+            push_evaluated(&mut ev.items, &mut ev.len, candidate, unique_count, 0);
         }
         // Zero unique coverage never wins a slot (including self). Sparse sole-candidate
         // flood and stock-trailing slots are handled after the ranking loop.
@@ -253,6 +282,13 @@ where
         } else {
             0
         };
+        if let Some(ev) = evaluated.as_deref_mut() {
+            // Fill in the cost of the entry pushed above now that it is known.
+            let n = ev.len as usize;
+            if n > 0 && ev.items[n - 1].0 == candidate {
+                ev.items[n - 1].2 = avg_cost_fixed;
+            }
+        }
         let mut tier = 0u8;
         if source_node != 0 {
             if let Some(edge) = candidate_edges.find_edge(source_node) {
@@ -490,6 +526,8 @@ where
     let mut my_delay = 0u32;
     let mut ranked = [0u32; RANKED_LOG];
     let mut ranked_len = 0u8;
+    let mut evaluated = EvaluatedList::default();
+    let mut first_pick = true;
 
     if let Some(my_edges) = ctx.edges.find_node(ctx.my_node) {
         for i in 0..my_edges.edge_count as usize {
@@ -521,7 +559,13 @@ where
             prefer_high,
             source,
             &has_transmitted,
+            if first_pick {
+                Some(&mut evaluated)
+            } else {
+                None
+            },
         );
+        first_pick = false;
         if best.node_id == 0 {
             break;
         }
@@ -585,6 +629,8 @@ where
         ranked,
         ranked_len,
         reason,
+        evaluated: evaluated.items,
+        evaluated_len: evaluated.len,
     }
 }
 

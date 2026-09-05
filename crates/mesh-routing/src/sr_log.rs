@@ -30,6 +30,13 @@ pub enum SrLogEvent {
         hop_limit: u8,
         direct: bool,
     },
+    /// A peer's topology report was accepted outside the forward version window: `last` was
+    /// stored, `received` arrived after the peer's boot broadcast or two silent intervals.
+    TopologyVersionResync {
+        from: u32,
+        received: u8,
+        last: u8,
+    },
     SlotScheduling {
         id: u32,
         half_airtime_ms: u32,
@@ -39,6 +46,10 @@ pub enum SrLogEvent {
         ranked: [u32; crate::broadcast_relay::RANKED_LOG],
         ranked_len: u8,
         reason: crate::broadcast_relay::RelayReason,
+        /// Ranking inputs of the first candidates evaluated: (node, unique coverage, cost bucket).
+        /// Unicast plans carry the tiered cost with coverage 0.
+        evaluated: [(u32, u8, u16); crate::broadcast_relay::RANKED_LOG],
+        evaluated_len: u8,
     },
     RelayCommitted {
         id: u32,

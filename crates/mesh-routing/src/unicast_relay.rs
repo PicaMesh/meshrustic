@@ -214,6 +214,15 @@ pub fn plan_unicast_relay(
         reason: RelayReason::UnicastCost,
         ..Default::default()
     };
+    for candidate in &candidates[..count] {
+        crate::broadcast_relay::push_evaluated(
+            &mut plan.evaluated,
+            &mut plan.evaluated_len,
+            candidate.node_id,
+            0,
+            candidate.cost,
+        );
+    }
     let mut slot = 0u8;
     let mut my_slot = None;
     for candidate in &candidates[..count] {

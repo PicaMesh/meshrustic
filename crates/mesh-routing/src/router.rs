@@ -1423,6 +1423,13 @@ impl Router {
             }
             TopologyMergeResult::IgnoredFormat => {}
         }
+        if let Some((from, received, last)) = self.graph.take_topology_version_resync() {
+            self.sr_log.push(SrLogEvent::TopologyVersionResync {
+                from,
+                received,
+                last,
+            });
+        }
         if neighbor_list.is_empty() && is_direct && header.signal_routing_active {
             self.sr_log
                 .push(SrLogEvent::TopologyDirtyFromNeighbor { from: parsed.from });
@@ -1872,14 +1879,24 @@ impl Router {
             broadcast_plan.as_ref().or(unicast_plan.as_ref()),
         );
         let delay_ms = tx_after_ms.wrapping_sub(now_ms);
-        let (ranked, ranked_len, reason) =
+        let (ranked, ranked_len, reason, evaluated, evaluated_len) =
             broadcast_plan.as_ref().or(unicast_plan.as_ref()).map_or(
                 (
                     [0u32; crate::broadcast_relay::RANKED_LOG],
                     0,
                     crate::broadcast_relay::RelayReason::None,
+                    [(0u32, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                    0,
                 ),
-                |p| (p.ranked, p.ranked_len, p.reason),
+                |p| {
+                    (
+                        p.ranked,
+                        p.ranked_len,
+                        p.reason,
+                        p.evaluated,
+                        p.evaluated_len,
+                    )
+                },
             );
         self.sr_log.push(SrLogEvent::SlotScheduling {
             id: parsed.id,
@@ -1889,6 +1906,8 @@ impl Router {
             ranked,
             ranked_len,
             reason,
+            evaluated,
+            evaluated_len,
         });
         self.sr_log.push(SrLogEvent::RelayCommitted {
             id: parsed.id,
@@ -2127,13 +2146,15 @@ impl Router {
             tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
         };
         // Behind the designated node, the cost ranking orders the remaining candidates.
-        let (rank, count, ranked, ranked_len, reason) = match ranking {
+        let (rank, count, ranked, ranked_len, reason, evaluated, evaluated_len) = match ranking {
             Some(Ok(p)) => (
                 p.slot_index,
                 p.candidate_count,
                 p.ranked,
                 p.ranked_len,
                 p.reason,
+                p.evaluated,
+                p.evaluated_len,
             ),
             Some(Err(reason)) => return Err(reason),
             None => {
@@ -2144,6 +2165,8 @@ impl Router {
                     [0u32; crate::broadcast_relay::RANKED_LOG],
                     0,
                     crate::broadcast_relay::RelayReason::None,
+                    [(0u32, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                    0,
                 )
             }
         };
@@ -2164,6 +2187,8 @@ impl Router {
             ranked,
             ranked_len,
             reason,
+            evaluated,
+            evaluated_len,
         })
     }
 

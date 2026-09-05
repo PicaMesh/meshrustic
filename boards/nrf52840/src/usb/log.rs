@@ -1082,8 +1082,10 @@ pub mod sr {
                 ranked,
                 ranked_len,
                 reason,
+                evaluated,
+                evaluated_len,
             } => {
-                let mut line = [0u8; 224];
+                let mut line = [0u8; 320];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Slot scheduling for pkt 0x";
                 line[pos..pos + prefix.len()].copy_from_slice(prefix);
@@ -1123,6 +1125,31 @@ pub mod sr {
                         line[pos] = b'!';
                         pos += 1;
                         pos += push_hex_u32_8(&mut line[pos..], *node);
+                    }
+                }
+                if evaluated_len > 0 {
+                    // Ranking inputs: !node(unique coverage,cost bucket); unicast costs carry tier bits.
+                    let cand = b", cand=";
+                    line[pos..pos + cand.len()].copy_from_slice(cand);
+                    pos += cand.len();
+                    for (i, (node, cov, cost)) in
+                        evaluated.iter().take(evaluated_len as usize).enumerate()
+                    {
+                        if i > 0 {
+                            line[pos] = b',';
+                            pos += 1;
+                        }
+                        line[pos] = b'!';
+                        pos += 1;
+                        pos += push_hex_u32_8(&mut line[pos..], *node);
+                        line[pos] = b'(';
+                        pos += 1;
+                        pos += push_u32(&mut line[pos..], *cov as u32);
+                        line[pos] = b',';
+                        pos += 1;
+                        pos += push_u32(&mut line[pos..], *cost as u32);
+                        line[pos] = b')';
+                        pos += 1;
                     }
                 }
                 finish_line(&mut line, pos);
@@ -1384,6 +1411,30 @@ pub mod sr {
             | SrLogEvent::NetworkTopologyDownstreamHeader { .. }
             | SrLogEvent::NetworkTopologyDownstreamGroup { .. }
             | SrLogEvent::TopologyLoggingComplete) => emit_topology_event(event),
+            SrLogEvent::TopologyVersionResync {
+                from,
+                received,
+                last,
+            } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Topology version resync from !";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], from);
+                let mid = b": accepted version ";
+                line[pos..pos + mid.len()].copy_from_slice(mid);
+                pos += mid.len();
+                pos += push_u32(&mut line[pos..], received as u32);
+                let tail = b" after stored ";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                pos += push_u32(&mut line[pos..], last as u32);
+                let tail2 = b" (peer reboot or two silent intervals)";
+                line[pos..pos + tail2.len()].copy_from_slice(tail2);
+                pos += tail2.len();
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::UnicastDestHeardDirect { id, wait_ms } => {
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

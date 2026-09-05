@@ -25,6 +25,10 @@ pub const MAX_HEARD_TRANSMITTERS: usize = 6;
 pub const MAX_TOPOLOGY_VERSION_ENTRIES: usize = 24;
 pub const TOPOLOGY_BROADCAST_MS: u32 = 600_000;
 pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
+/// No accepted report from a peer for this long: accept whatever version it sends next. Covers a
+/// peer whose reboot broadcast we missed, a peer that came back with a moved-on counter, and a
+/// receiver that was itself away. Twice the periodic interval.
+pub const TOPOLOGY_RESYNC_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
 pub const NEIGHBOR_TTL_MS: u32 = 7_200_000;
 
@@ -66,6 +70,8 @@ struct RelayCommit {
 struct TopologyVersionEntry {
     node_id: u32,
     version: u8,
+    /// When we last accepted a report from this node (0 = never).
+    last_accept_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -102,6 +108,9 @@ pub struct NeighborGraph {
     downstream: DownstreamTable,
     relay_states: [RelayCommit; MAX_RELAY_STATES],
     topo_versions: [TopologyVersionEntry; MAX_TOPOLOGY_VERSION_ENTRIES],
+    /// Set when a report was accepted outside the forward version window (peer reboot or long
+    /// silence): (sender, received version, previously stored version). Taken by the router for the log.
+    last_version_resync: Option<(u32, u8, u8)>,
     topo_version_count: u8,
     topology_version: u8,
     topology_dirty: bool,
@@ -148,8 +157,10 @@ impl NeighborGraph {
             topo_versions: [TopologyVersionEntry {
                 node_id: 0,
                 version: 0,
+                last_accept_ms: 0,
             }; MAX_TOPOLOGY_VERSION_ENTRIES],
             topo_version_count: 0,
+            last_version_resync: None,
             topology_version: 0,
             topology_dirty: false,
             last_topology_ms: 0,
@@ -1004,11 +1015,30 @@ impl NeighborGraph {
         }
 
         let received = header.topology_version;
-        let last = self.get_topo_version(sender);
-        if !Self::topology_version_accept(received, last) {
+        let (last, last_accept_ms) = self.topo_version_entry(sender);
+        // Three ways in: the forward window (normal), the sender's empty boot broadcast (an
+        // explicit restart: its counter starts over, so ours for it does too), or nothing accepted
+        // from it for two periodic intervals (its boot broadcast was lost, it came back with a
+        // moved-on counter, or we were away). Czar rebooted once and its reports were rejected as
+        // stale for three hours, until its whole neighbourhood had aged out of the graph.
+        // A header-only broadcast carrying version 0 is a peer's boot announcement: its version
+        // counter restarted, so forget the one we tracked. Empty lists with other versions are
+        // ordinary reports from a node without neighbours.
+        let boot_reset = neighbors.is_empty()
+            && received == 0
+            && is_direct_from_sender
+            && header.signal_routing_active;
+        let silence = last_accept_ms != 0
+            && now_ms.wrapping_sub(last_accept_ms) >= TOPOLOGY_RESYNC_MS
+            && now_ms.wrapping_sub(last_accept_ms) < 0x8000_0000;
+        let in_window = Self::topology_version_accept(received, last);
+        if !in_window && !boot_reset && !silence {
             return TopologyMergeResult::Stale { received, last };
         }
-        self.set_topo_version(sender, received);
+        if !in_window || (boot_reset && last != 0) {
+            self.last_version_resync = Some((sender, received, last));
+        }
+        self.set_topo_version(sender, if boot_reset { 0 } else { received }, now_ms);
         self.capability
             .track_topology(sender, header.signal_routing_active, now_ms);
 
@@ -1117,27 +1147,41 @@ impl NeighborGraph {
         self.merge_asymmetric_skips[..count].iter().copied()
     }
 
-    fn get_topo_version(&self, node_id: u32) -> u8 {
+    fn topo_version_entry(&self, node_id: u32) -> (u8, u32) {
         for i in 0..self.topo_version_count as usize {
             if self.topo_versions[i].node_id == node_id {
-                return self.topo_versions[i].version;
+                return (
+                    self.topo_versions[i].version,
+                    self.topo_versions[i].last_accept_ms,
+                );
             }
         }
-        0
+        (0, 0)
     }
 
-    fn set_topo_version(&mut self, node_id: u32, version: u8) {
+    fn set_topo_version(&mut self, node_id: u32, version: u8, now_ms: u32) {
+        let now_ms = now_ms.max(1);
         for i in 0..self.topo_version_count as usize {
             if self.topo_versions[i].node_id == node_id {
                 self.topo_versions[i].version = version;
+                self.topo_versions[i].last_accept_ms = now_ms;
                 return;
             }
         }
         if (self.topo_version_count as usize) < MAX_TOPOLOGY_VERSION_ENTRIES {
             let idx = self.topo_version_count as usize;
-            self.topo_versions[idx] = TopologyVersionEntry { node_id, version };
+            self.topo_versions[idx] = TopologyVersionEntry {
+                node_id,
+                version,
+                last_accept_ms: now_ms,
+            };
             self.topo_version_count += 1;
         }
+    }
+
+    /// A report was accepted outside the forward version window (sender, received, stored).
+    pub fn take_topology_version_resync(&mut self) -> Option<(u32, u8, u8)> {
+        self.last_version_resync.take()
     }
 
     /// Record a direct RF neighbor. `heard_on` is the receiving radio (`RadioId(0)` on v1 hardware).
@@ -2818,6 +2862,123 @@ mod tests {
             .edges_mut()
             .update_edge(ME, LOW_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
         assert!(!graph.has_unique_coverage(&[OTHER]));
+    }
+
+    fn topo_header(version: u8) -> crate::topology::PackedHeader {
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, version, true);
+        decode_packed_neighbors(&packed, 8).unwrap().0
+    }
+
+    fn peer_report(
+        graph: &mut NeighborGraph,
+        peer: u32,
+        version: u8,
+        now_ms: u32,
+    ) -> TopologyMergeResult {
+        let listed = PackedNeighbor {
+            node_id: 0xCC00_00CC,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        graph.merge_topology(peer, &topo_header(version), &[listed], true, now_ms, 0)
+    }
+
+    /// A version far behind the stored one is stale on its own: the forward window still holds.
+    #[test]
+    fn topology_version_going_backwards_is_stale() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 98, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 1, 2_000),
+            TopologyMergeResult::Stale {
+                received: 1,
+                last: 98
+            }
+        ));
+        assert!(graph.take_topology_version_resync().is_none());
+    }
+
+    /// The peer's empty boot broadcast restarts its counter for us too.
+    #[test]
+    fn peer_boot_broadcast_resets_its_topology_version() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 98, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        // Boot broadcast: zero neighbours, version 0, direct, SR-active.
+        let boot = graph.merge_topology(PEER, &topo_header(0), &[], true, 2_000, 0);
+        assert!(matches!(
+            boot,
+            TopologyMergeResult::Applied { neighbors: 0, .. }
+        ));
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 0, 98)));
+        // Its first real list after the reboot is accepted.
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 1, 3_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 2, 4_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+    }
+
+    /// The boot broadcast was missed: after two quiet intervals any version is accepted.
+    #[test]
+    fn peer_topology_resyncs_after_two_silent_intervals() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 98, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 3, 1_000 + TOPOLOGY_RESYNC_MS - 1),
+            TopologyMergeResult::Stale { .. }
+        ));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 3, 1_000 + TOPOLOGY_RESYNC_MS),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 3, 98)));
+        // Back in the forward window from the new base.
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 4, 1_000 + TOPOLOGY_RESYNC_MS + 10),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(
+            matches!(
+                peer_report(&mut graph, PEER, 4, 1_000 + TOPOLOGY_RESYNC_MS + 20),
+                TopologyMergeResult::Applied { .. }
+            ),
+            "same version is accepted as a repeat"
+        );
+        assert!(
+            matches!(
+                peer_report(&mut graph, PEER, 3, 1_000 + TOPOLOGY_RESYNC_MS + 30),
+                TopologyMergeResult::Stale { .. }
+            ),
+            "going backwards inside the window is still stale"
+        );
     }
 
     #[test]
