@@ -2914,6 +2914,7 @@ impl Router {
         }
         let mut packed_buf = [0u8; 256];
         let mut built = 0u8;
+        let mut longest_frame = 0usize;
         for chunk in 0..packet_count {
             let Some(packed_len) = self
                 .graph
@@ -2934,6 +2935,7 @@ impl Router {
             };
             self.pending_topology.frames[built as usize] = frame;
             self.pending_topology.lens[built as usize] = len;
+            longest_frame = longest_frame.max(len as usize);
             built += 1;
         }
         if built == 0 {
@@ -2943,7 +2945,12 @@ impl Router {
         self.pending_topology.count = built;
         self.pending_topology.next_idx = 0;
         self.pending_topology.next_tx_ms = now_ms.wrapping_add(dirty_delay_ms);
-        self.pending_topology.spacing_ms = slot_ms.saturating_mul(2);
+        // Chunks of one list are spaced by twice the packet airtime (as the fork does): our peers
+        // relay chunk N in the slots right after it, and our chunk N+1 must not land on top of
+        // them. Two contention slots, the previous value, were far shorter than one airtime.
+        let cfg = eu868_config_for_preset(self.modem_preset);
+        let airtime_ms = packet_time_ms(&cfg, longest_frame, false).max(slot_ms);
+        self.pending_topology.spacing_ms = airtime_ms.saturating_mul(2);
         self.sr_log.push(SrLogEvent::TopologySending {
             node_id: self.node_num,
             neighbors,
@@ -3405,6 +3412,33 @@ mod tests {
         out.extend_from_slice(&hdr).unwrap();
         out.extend_from_slice(payload).unwrap();
         out
+    }
+
+    #[test]
+    fn topology_chunks_are_spaced_by_two_airtimes() {
+        let mut router = Router::new(0x1100_0011);
+        for i in 0..30u32 {
+            router
+                .graph_mut()
+                .observe_direct_neighbor(0x2000_0000 + i, -60, 8, 1_000, 0);
+        }
+        assert!(router.schedule_topology_broadcast(10_000, 16, false));
+        assert_eq!(router.pending_topology.count, 2);
+        let first = router
+            .poll_topology_tx(10_000)
+            .expect("first chunk at once");
+        let cfg = eu868_config_for_preset(router.modem_preset());
+        let airtime = packet_time_ms(&cfg, first.len as usize, false);
+        assert!(
+            airtime > 100,
+            "a 28-entry chunk is a long frame: {airtime} ms"
+        );
+        assert!(
+            router.poll_topology_tx(10_000 + airtime).is_none(),
+            "second chunk held while peers relay the first"
+        );
+        assert!(router.poll_topology_tx(10_000 + 2 * airtime).is_some());
+        assert!(router.poll_topology_tx(10_000 + 2 * airtime + 1).is_none());
     }
 
     #[test]

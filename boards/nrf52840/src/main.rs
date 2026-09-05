@@ -9,6 +9,8 @@ mod store;
 #[path = "usb/mod.rs"]
 mod usb_log;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use cortex_m_rt::{exception, ExceptionFrame};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
@@ -30,7 +32,19 @@ use store::{ConfigLoadSource, NvmcConfigStore};
 /// nothing; the boot log shows `reset reason` SREQ so a panic reboot stays visible.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    defmt::error!("panic: {}", defmt::Display2Format(info));
+    // defmt-rtt panics when acquired re-entrantly, so a panic raised while a log line was being
+    // written would recurse through here into a stack overflow. Log once, then reset regardless.
+    static PANICKING: AtomicBool = AtomicBool::new(false);
+    if !PANICKING.swap(true, Ordering::SeqCst) {
+        defmt::error!("panic: {}", defmt::Display2Format(info));
+    }
+    cortex_m::peripheral::SCB::sys_reset()
+}
+
+/// Faults (stack overflow, bus fault, unaligned access) do not reach the panic handler. The
+/// cortex-m-rt default HardFault handler spins forever, the same dead-node outcome, so reset.
+#[exception]
+unsafe fn HardFault(_frame: &ExceptionFrame) -> ! {
     cortex_m::peripheral::SCB::sys_reset()
 }
 
