@@ -9,6 +9,7 @@ mod store;
 #[path = "usb/mod.rs"]
 mod usb_log;
 
+use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
@@ -22,7 +23,16 @@ use mesh_store::EMPTY_ADMIN_KEY;
 use node::NodeIdentity;
 use static_cell::{ConstStaticCell, StaticCell};
 use store::{ConfigLoadSource, NvmcConfigStore};
-use {defmt_rtt as _, panic_probe as _};
+
+/// Reset instead of halting. `panic_probe` parks the core, which in the field is a dead node
+/// until someone power-cycles it: both nicenanos sat silent for two hours after a log line
+/// overran its buffer. Nobody reads the defmt message without a probe, so a restart loses
+/// nothing; the boot log shows `reset reason` SREQ so a panic reboot stays visible.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    defmt::error!("panic: {}", defmt::Display2Format(info));
+    cortex_m::peripheral::SCB::sys_reset()
+}
 
 bind_interrupts!(struct Irqs {
     SPIM3 => spim::InterruptHandler<embassy_nrf::peripherals::SPI3>;
@@ -46,8 +56,9 @@ async fn main(spawner: Spawner) {
     hw_config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     let p = embassy_nrf::init(hw_config);
     // Adafruit UF2 bootloader leaves RESETREAS set; clear so a later soft-reset
-    // is not mistaken for a pin double-reset into upload mode.
-    clear_resetreas();
+    // is not mistaken for a pin double-reset into upload mode. Keep the value for the boot log:
+    // bit 0 RESETPIN, bit 1 DOG, bit 2 SREQ (panic handler / soft reset), bit 3 LOCKUP.
+    let reset_reason = clear_resetreas();
 
     let hw = NodeIdentity::from_hardware();
     let defaults = hw.first_boot_config();
@@ -61,6 +72,7 @@ async fn main(spawner: Spawner) {
 
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
     usb_log::log::mesh::node_id(config.node_num);
+    usb_log::log::mesh::reset_reason(reset_reason);
     usb_log::log::mesh::config_boot(load_src == ConfigLoadSource::Flash, admin_keys);
     defmt::info!(
         "[store] boot preset={} from_flash={}",
@@ -110,11 +122,12 @@ async fn main(spawner: Spawner) {
     core::future::pending().await
 }
 
-fn clear_resetreas() {
-    // nRF52840 POWER.RESETREAS — write 1 to clear sticky bits.
+/// Clear nRF52840 POWER.RESETREAS (write 1 to clear sticky bits) and return what it held.
+fn clear_resetreas() -> u32 {
     const NRF_POWER_RESETREAS: *mut u32 = 0x4000_0400 as *mut u32;
     unsafe {
         let v = core::ptr::read_volatile(NRF_POWER_RESETREAS);
         core::ptr::write_volatile(NRF_POWER_RESETREAS, v);
+        v
     }
 }

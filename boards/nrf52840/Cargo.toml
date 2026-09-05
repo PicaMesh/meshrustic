@@ -27,7 +27,6 @@ defmt-rtt = "0.4"
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 critical-section = "1"
 cortex-m-rt = "0.7"
-panic-probe = { version = "0.3", features = ["print-defmt"] }
 
 [features]
 default = []

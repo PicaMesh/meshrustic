@@ -206,7 +206,7 @@ fn push_freq_mhz(out: &mut [u8], freq_mhz: f32) -> usize {
 
 /// Boot and identity lines for USB CDC.
 pub mod mesh {
-    use super::{finish_line, line_prefix, push_hex_u32_8, push_u32};
+    use super::{finish_line, line_prefix, push_hex_u16_4, push_hex_u32_8, push_u32, put};
 
     pub fn node_id(node_num: u32) {
         let mut line = [0u8; 64];
@@ -219,6 +219,38 @@ pub mod mesh {
     }
 
     /// Flash load result + configurable admin public-key count.
+    /// `[meshrustic] reset reason=0x0004 (SREQ)` — RESETREAS bits as read at boot; SREQ is what
+    /// the panic handler's `sys_reset` leaves behind, so a panic reboot is visible in the log.
+    pub fn reset_reason(resetreas: u32) {
+        let mut line = [0u8; 96];
+        let mut pos = line_prefix(&mut line);
+        put(&mut line, &mut pos, b"[meshrustic] reset reason=0x");
+        let mut hex = [0u8; 4];
+        push_hex_u16_4(&mut hex, (resetreas & 0xFFFF) as u16);
+        put(&mut line, &mut pos, &hex);
+        let named: &[(u32, &[u8])] = &[
+            (1 << 0, b" RESETPIN"),
+            (1 << 1, b" DOG"),
+            (1 << 2, b" SREQ"),
+            (1 << 3, b" LOCKUP"),
+            (1 << 16, b" OFF"),
+        ];
+        let mut any = false;
+        for (bit, name) in named {
+            if resetreas & bit != 0 {
+                put(&mut line, &mut pos, if any { b"," } else { b" (" });
+                put(&mut line, &mut pos, &name[1..]);
+                any = true;
+            }
+        }
+        if any {
+            put(&mut line, &mut pos, b")");
+        } else {
+            put(&mut line, &mut pos, b" (power-on)");
+        }
+        finish_line(&mut line, pos);
+    }
+
     pub fn config_boot(from_flash: bool, admin_keys: u32) {
         let mut line = [0u8; 96];
         let mut pos = line_prefix(&mut line);
