@@ -31,6 +31,17 @@ pub struct DeviceMetricsSnapshot {
     pub uptime_seconds: u32,
 }
 
+impl DeviceMetricsSnapshot {
+    /// No readings yet (const form of `Default`).
+    pub const EMPTY: Self = Self {
+        battery_level: None,
+        voltage_v: None,
+        channel_utilization: 0.0,
+        air_util_tx: 0.0,
+        uptime_seconds: 0,
+    };
+}
+
 /// Encode `Telemetry { device_metrics { ... } }` (time=0 when RTC unset).
 pub fn encode_device_telemetry(
     metrics: &DeviceMetricsSnapshot,

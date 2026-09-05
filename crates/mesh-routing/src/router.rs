@@ -301,7 +301,16 @@ impl Router {
         )
     }
 
-    pub fn with_channel(
+    /// Router with no node id or channel yet. Boards place this in a `ConstStaticCell` so the
+    /// ~70 KB router is laid out at link time instead of being built on the stack: the nRF52840
+    /// has ~100 KB of stack above its statics and `with_channel` needs a frame larger than the
+    /// router itself, which stopped the boards booting once the graph caps grew.
+    /// `load_node_config` must run before the router is used.
+    pub const fn unconfigured() -> Self {
+        Self::with_channel(0, CryptoKey::none(), 0, MODEM_DEFAULT_PRESET, true, 3)
+    }
+
+    pub const fn with_channel(
         node_num: u32,
         channel_key: CryptoKey,
         channel_hash: u8,
@@ -383,13 +392,13 @@ impl Router {
             pending_admin_count: 0,
             tx_cancels: heapless::Vec::new(),
             last_bootstrap_reply_ms: 0,
-            nodeinfo_identity: NodeInfoIdentity::with_default_advert([0; 32]),
+            nodeinfo_identity: NodeInfoIdentity::unconfigured(),
             nodeinfo_cache: NodeInfoCache::new(),
             last_nodeinfo_ms: 0,
             last_nodeinfo_reply_to: 0,
             last_nodeinfo_reply_ms: 0,
             last_telemetry_ms: 0,
-            device_metrics: DeviceMetricsSnapshot::default(),
+            device_metrics: DeviceMetricsSnapshot::EMPTY,
             channel_key,
             channel_hash,
             modem_preset,
@@ -398,7 +407,7 @@ impl Router {
             next_tx_id: 1,
             sr_log: SrLog::new(),
             bridge_dedup: crate::bridge::BridgeDedupCache::new(),
-            admin: AdminState::default(),
+            admin: AdminState::new(),
             admin_reply_remote_pk: None,
             admin_reply_use_pki: false,
             pending_pki_error: None,
@@ -423,6 +432,7 @@ impl Router {
     pub fn load_node_config(&mut self, cfg: &mesh_store::NodeConfig) {
         self.node_num = cfg.node_num;
         self.graph.set_my_node(cfg.node_num);
+        self.rate_limit.set_node_num(cfg.node_num);
         self.admin.apply_node_config(cfg);
         self.nodeinfo_identity = NodeInfoIdentity::for_node(cfg.node_num, cfg.public_key);
         self.set_modem_preset(

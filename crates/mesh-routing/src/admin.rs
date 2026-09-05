@@ -51,6 +51,13 @@ pub struct AdminState {
 
 impl Default for AdminState {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdminState {
+    /// Fresh admin state (const, so a `Router` can live in a const static).
+    pub const fn new() -> Self {
         Self {
             session_passkey: [0; SESSION_PASSKEY_LEN],
             session_valid_until_ms: 0,

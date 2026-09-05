@@ -14,15 +14,15 @@ use crate::graph::{
 use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE};
 use crate::sr_role::role_is_active_routing;
 use crate::topology::{
-    write_packed_header, PackedHeader, PackedNeighbor, MAX_NEIGHBORS_PER_PACKET,
-    PACKED_NEIGHBOR_ENTRY_SIZE, PACKED_NEIGHBOR_FLAG_HEARS_US, PACKED_NEIGHBOR_FLAG_SR_ACTIVE,
-    PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_VERSION,
+    write_packed_header, write_packed_header_chunk, PackedHeader, PackedNeighbor,
+    MAX_NEIGHBORS_PER_PACKET, PACKED_NEIGHBOR_ENTRY_SIZE, PACKED_NEIGHBOR_FLAG_HEARS_US,
+    PACKED_NEIGHBOR_FLAG_SR_ACTIVE, PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_VERSION,
 };
 
 pub const MAX_NEIGHBORS: usize = MAX_EDGES_PER_NODE;
 pub const MAX_RELAY_STATES: usize = 32;
 pub const MAX_HEARD_TRANSMITTERS: usize = 6;
-pub const MAX_TOPOLOGY_VERSION_ENTRIES: usize = 24;
+pub const MAX_TOPOLOGY_VERSION_ENTRIES: usize = MAX_NEIGHBORS;
 pub const TOPOLOGY_BROADCAST_MS: u32 = 600_000;
 pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
 /// No accepted report from a peer for this long: accept whatever version it sends next. Covers a
@@ -74,6 +74,28 @@ struct TopologyVersionEntry {
     last_accept_ms: u32,
 }
 
+/// Neighbour ids listed so far by a multi-chunk topology report. The "unlisted neighbour does not
+/// hear the sender" rule needs the whole list, so ids are gathered across chunks and the rule runs
+/// on the last one; a chunk whose first packet was missed leaves the flags untouched.
+#[derive(Clone, Copy, Debug)]
+struct PendingListed {
+    sender: u32,
+    version: u8,
+    count: u8,
+    valid: bool,
+    ids: [u32; MAX_NEIGHBORS],
+}
+
+impl PendingListed {
+    const EMPTY: PendingListed = PendingListed {
+        sender: 0,
+        version: 0,
+        count: 0,
+        valid: false,
+        ids: [0; MAX_NEIGHBORS],
+    };
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct NodeTxRecord {
     node_id: u32,
@@ -111,6 +133,8 @@ pub struct NeighborGraph {
     /// Set when a report was accepted outside the forward version window (peer reboot or long
     /// silence): (sender, received version, previously stored version). Taken by the router for the log.
     last_version_resync: Option<(u32, u8, u8)>,
+    /// Listed neighbour ids of a multi-chunk report still being received (see `merge_topology`).
+    pending_listed: PendingListed,
     topo_version_count: u8,
     topology_version: u8,
     topology_dirty: bool,
@@ -161,6 +185,7 @@ impl NeighborGraph {
             }; MAX_TOPOLOGY_VERSION_ENTRIES],
             topo_version_count: 0,
             last_version_resync: None,
+            pending_listed: PendingListed::EMPTY,
             topology_version: 0,
             topology_dirty: false,
             last_topology_ms: 0,
@@ -192,7 +217,7 @@ impl NeighborGraph {
         }
     }
 
-    pub fn set_my_node(&mut self, node_id: u32) {
+    pub const fn set_my_node(&mut self, node_id: u32) {
         self.my_node = node_id;
     }
 
@@ -300,7 +325,7 @@ impl NeighborGraph {
         self.device_role
     }
 
-    pub fn set_modem_preset(&mut self, modem_preset: u8) {
+    pub const fn set_modem_preset(&mut self, modem_preset: u8) {
         self.modem_preset = modem_preset;
     }
 
@@ -943,7 +968,13 @@ impl NeighborGraph {
         if out.len() < need {
             return None;
         }
-        write_packed_header(out, topology_version, self.signal_routing_active);
+        write_packed_header_chunk(
+            out,
+            topology_version,
+            self.signal_routing_active,
+            start + count < total as usize,
+            chunk_index != 0,
+        );
         for i in 0..count {
             let entry = sorted[start + i];
             let base = PACKED_NEIGHBOR_HEADER_SIZE + i * PACKED_NEIGHBOR_ENTRY_SIZE;
@@ -1023,11 +1054,9 @@ impl NeighborGraph {
         // stale for three hours, until its whole neighbourhood had aged out of the graph.
         // A header-only broadcast carrying version 0 is a peer's boot announcement: its version
         // counter restarted, so forget the one we tracked. Empty lists with other versions are
-        // ordinary reports from a node without neighbours.
-        let boot_reset = neighbors.is_empty()
-            && received == 0
-            && is_direct_from_sender
-            && header.signal_routing_active;
+        // ordinary reports from a node without neighbours. Passive peers boot too (inno's restart
+        // was rejected as stale for twenty minutes), so the SR-active flag plays no part here.
+        let boot_reset = neighbors.is_empty() && received == 0 && is_direct_from_sender;
         let silence = last_accept_ms != 0
             && now_ms.wrapping_sub(last_accept_ms) >= TOPOLOGY_RESYNC_MS
             && now_ms.wrapping_sub(last_accept_ms) < 0x8000_0000;
@@ -1118,13 +1147,41 @@ impl NeighborGraph {
             }
         }
 
-        let mut listed = [0u32; MAX_NEIGHBORS];
-        let listed_count = neighbors.len().min(MAX_NEIGHBORS);
-        for (i, neighbor) in neighbors.iter().take(listed_count).enumerate() {
-            listed[i] = neighbor.node_id;
+        // The sender is authoritative about who it hears: a neighbour it does not list has its
+        // hears_us towards the sender cleared. That needs the complete list, so chunks of a
+        // multi-packet report are gathered first and the rule runs on the last one.
+        if !header.continuation {
+            self.pending_listed = PendingListed {
+                sender,
+                version: received,
+                count: 0,
+                valid: true,
+                ids: [0; MAX_NEIGHBORS],
+            };
         }
-        self.edges
-            .clear_hears_us_to_unlisted(sender, &listed[..listed_count]);
+        let pending = &mut self.pending_listed;
+        if pending.valid && pending.sender == sender && pending.version == received {
+            for neighbor in neighbors {
+                if (pending.count as usize) < MAX_NEIGHBORS {
+                    pending.ids[pending.count as usize] = neighbor.node_id;
+                    pending.count += 1;
+                } else {
+                    pending.valid = false;
+                }
+            }
+            if !header.more_chunks {
+                if pending.valid {
+                    let count = pending.count as usize;
+                    let listed = pending.ids;
+                    self.edges
+                        .clear_hears_us_to_unlisted(sender, &listed[..count]);
+                }
+                self.pending_listed.valid = false;
+            }
+        } else if header.continuation {
+            // First chunk missed: this list is incomplete, leave hears_us as it was.
+            pending.valid = false;
+        }
 
         TopologyMergeResult::Applied {
             neighbors: neighbors.len() as u8,
@@ -2941,6 +2998,31 @@ mod tests {
 
     /// The boot broadcast was missed: after two quiet intervals any version is accepted.
     #[test]
+    fn passive_peer_boot_broadcast_resets_its_topology_version_too() {
+        const PEER: u32 = 0xB000_000B;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xA000_000A);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 30, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 0, false);
+        let passive_boot = decode_packed_neighbors(&packed, 8).unwrap().0;
+        assert!(matches!(
+            graph.merge_topology(PEER, &passive_boot, &[], true, 2_000, 0),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(
+            matches!(
+                peer_report(&mut graph, PEER, 1, 3_000),
+                TopologyMergeResult::Applied { .. }
+            ),
+            "first list after a passive peer's reboot must be accepted"
+        );
+    }
+
+    #[test]
     fn peer_topology_resyncs_after_two_silent_intervals() {
         const ME: u32 = 0xAA00_00AA;
         const PEER: u32 = 0xBB00_00BB;
@@ -2979,6 +3061,115 @@ mod tests {
             ),
             "going backwards inside the window is still stale"
         );
+    }
+
+    #[test]
+    fn chunked_topology_clears_unlisted_hears_us_only_after_last_chunk() {
+        const ME: u32 = 0x1100_0011;
+        const SENDER: u32 = 0xAA00_00AA;
+        const IN_CHUNK2: u32 = 0xBB00_00BB;
+        const UNLISTED: u32 = 0xDD00_00DD;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        for node in [IN_CHUNK2, UNLISTED] {
+            graph.edges.ensure_local_node(node, 1_000);
+            graph.edges.update_edge(
+                ME,
+                node,
+                SENDER,
+                2.0,
+                1_000,
+                crate::graph::EdgeSource::Reported,
+                true,
+                0,
+            );
+            graph.edges.set_edge_hears_us(node, SENDER, true);
+        }
+        let hears = |g: &NeighborGraph, from: u32| {
+            g.edges
+                .find_node(from)
+                .and_then(|n| n.find_edge(SENDER))
+                .map(|e| e.hears_us)
+                .unwrap_or(false)
+        };
+        let entry = |id: u32| PackedNeighbor {
+            node_id: id,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let header = |more: bool, cont: bool| {
+            let mut p = [0u8; 16];
+            write_packed_header_chunk(&mut p, 7, true, more, cont);
+            decode_packed_neighbors(&p, 8).unwrap().0
+        };
+
+        // A continuation whose first chunk was missed must not clear anything.
+        graph.merge_topology(
+            SENDER,
+            &header(false, true),
+            &[entry(0xCC00_00CC)],
+            true,
+            2_000,
+            0,
+        );
+        assert!(hears(&graph, IN_CHUNK2));
+        assert!(hears(&graph, UNLISTED));
+
+        // Chunk 0 lists a third node only; IN_CHUNK2 arrives in the second packet.
+        graph.merge_topology(
+            SENDER,
+            &header(true, false),
+            &[entry(0xCC00_00CC)],
+            true,
+            3_000,
+            0,
+        );
+        assert!(
+            hears(&graph, IN_CHUNK2),
+            "not cleared while chunks are pending"
+        );
+        assert!(
+            hears(&graph, UNLISTED),
+            "not cleared while chunks are pending"
+        );
+        graph.merge_topology(
+            SENDER,
+            &header(false, true),
+            &[entry(IN_CHUNK2)],
+            true,
+            3_500,
+            0,
+        );
+        assert!(hears(&graph, IN_CHUNK2), "listed in the second chunk");
+        assert!(!hears(&graph, UNLISTED), "absent from the whole list");
+    }
+
+    #[test]
+    fn large_neighbourhood_splits_into_flagged_chunks() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0x1100_0011);
+        for i in 0..30u32 {
+            graph.observe_direct_neighbor(0x2000_0000 + i, -60, 8, 1_000, 0);
+        }
+        assert_eq!(
+            graph.neighbor_count(),
+            30,
+            "cap must hold 30 direct neighbours"
+        );
+        assert_eq!(graph.topology_packet_count(), 2);
+        let mut buf = [0u8; 256];
+        let len0 = graph.build_topology_chunk(0, 3, &mut buf).unwrap();
+        let (h0, n0) = decode_packed_neighbors(&buf[..len0], 32).unwrap();
+        assert!(h0.more_chunks && !h0.continuation && !h0.is_complete_list());
+        assert_eq!(n0.len(), MAX_NEIGHBORS_PER_PACKET);
+        let len1 = graph.build_topology_chunk(1, 3, &mut buf).unwrap();
+        let (h1, n1) = decode_packed_neighbors(&buf[..len1], 32).unwrap();
+        assert!(!h1.more_chunks && h1.continuation);
+        assert_eq!(n1.len(), 2);
+        assert!(graph.build_topology_chunk(2, 3, &mut buf).is_none());
     }
 
     #[test]

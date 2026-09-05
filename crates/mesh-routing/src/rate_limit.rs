@@ -97,6 +97,11 @@ impl NodeRateLimiter {
         Self::with_node_num(0)
     }
 
+    /// Our own node id: packets from it are never limited.
+    pub fn set_node_num(&mut self, node_num: u32) {
+        self.node_num = node_num;
+    }
+
     pub const fn with_node_num(node_num: u32) -> Self {
         Self {
             node_num,

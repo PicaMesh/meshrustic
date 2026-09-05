@@ -57,6 +57,13 @@ pub struct NodeInfoAdvert {
 
 impl Default for NodeInfoAdvert {
     fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl NodeInfoAdvert {
+    /// Nameless advert with the board defaults (const, so a `Router` can live in a const static).
+    pub const fn empty() -> Self {
         Self {
             long_name: [0; NODEINFO_LONG_NAME_MAX],
             long_name_len: 0,
@@ -124,6 +131,14 @@ impl NodeInfoIdentity {
 
     pub fn with_default_advert(public_key: [u8; 32]) -> Self {
         Self::for_node(0, public_key)
+    }
+
+    /// Placeholder identity until `Router::load_node_config` / `set_node_identity` runs.
+    pub const fn unconfigured() -> Self {
+        Self {
+            advert: NodeInfoAdvert::empty(),
+            public_key: [0; 32],
+        }
     }
 }
 

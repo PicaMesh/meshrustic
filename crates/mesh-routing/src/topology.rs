@@ -12,6 +12,10 @@ pub const PACKED_NEIGHBOR_HEADER_SIZE: usize = 5;
 pub const PACKED_NEIGHBOR_FLAG_SR_ACTIVE: u8 = 0x01;
 pub const PACKED_NEIGHBOR_FLAG_HEARS_US: u8 = 0x02;
 pub const PACKED_HEADER_FLAG_SR_ACTIVE: u8 = 0x01;
+/// More chunks of this topology version follow this packet.
+pub const PACKED_HEADER_FLAG_MORE_CHUNKS: u8 = 0x02;
+/// This packet is not the first chunk of its topology version.
+pub const PACKED_HEADER_FLAG_CONTINUATION: u8 = 0x04;
 /// Max neighbors per topology protobuf chunk (11 on wire; 28 entries fit in the 229-byte limit).
 pub const MAX_NEIGHBORS_PER_PACKET: usize = 28;
 pub const SR_BROADCAST_MAX_HOPS: u8 = 5;
@@ -44,6 +48,18 @@ pub struct PackedHeader {
     pub routing_version: u8,
     pub topology_version: u8,
     pub signal_routing_active: bool,
+    /// Set on every chunk except the last of a multi-packet list.
+    pub more_chunks: bool,
+    /// Set on every chunk except the first of a multi-packet list.
+    pub continuation: bool,
+}
+
+impl PackedHeader {
+    /// True when this packet carries the sender's whole list (single packet, or a sender that
+    /// predates the chunk flags), so "not listed" means "not heard".
+    pub fn is_complete_list(&self) -> bool {
+        !self.more_chunks && !self.continuation
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,16 +79,36 @@ pub struct TopologyChunk {
         [u8; PACKED_NEIGHBOR_HEADER_SIZE + MAX_NEIGHBORS_PER_PACKET * PACKED_NEIGHBOR_ENTRY_SIZE],
 }
 
+/// Header of a single-packet list (or the only chunk).
 pub fn write_packed_header(out: &mut [u8], topology_version: u8, signal_routing_active: bool) {
+    write_packed_header_chunk(out, topology_version, signal_routing_active, false, false);
+}
+
+/// Header of one chunk of a possibly multi-packet list. Receivers only apply the "unlisted
+/// neighbour does not hear the sender" rule once they hold the whole list, so every chunk except
+/// the last carries `more_chunks` and every chunk except the first carries `continuation`.
+pub fn write_packed_header_chunk(
+    out: &mut [u8],
+    topology_version: u8,
+    signal_routing_active: bool,
+    more_chunks: bool,
+    continuation: bool,
+) {
     out[0] = PACKED_NEIGHBOR_FORMAT_VERSION;
     out[1] = PACKED_NEIGHBOR_ENTRY_SIZE as u8;
     out[2] = SIGNAL_ROUTING_VERSION;
     out[3] = topology_version;
-    out[4] = if signal_routing_active {
-        PACKED_HEADER_FLAG_SR_ACTIVE
-    } else {
-        0
-    };
+    let mut flags = 0u8;
+    if signal_routing_active {
+        flags |= PACKED_HEADER_FLAG_SR_ACTIVE;
+    }
+    if more_chunks {
+        flags |= PACKED_HEADER_FLAG_MORE_CHUNKS;
+    }
+    if continuation {
+        flags |= PACKED_HEADER_FLAG_CONTINUATION;
+    }
+    out[4] = flags;
 }
 
 pub fn decode_packed_header(data: &[u8]) -> Option<PackedHeader> {
@@ -85,6 +121,8 @@ pub fn decode_packed_header(data: &[u8]) -> Option<PackedHeader> {
         routing_version: data[2],
         topology_version: data[3],
         signal_routing_active: data[4] & PACKED_HEADER_FLAG_SR_ACTIVE != 0,
+        more_chunks: data[4] & PACKED_HEADER_FLAG_MORE_CHUNKS != 0,
+        continuation: data[4] & PACKED_HEADER_FLAG_CONTINUATION != 0,
     })
 }
 

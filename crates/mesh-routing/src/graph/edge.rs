@@ -4,7 +4,10 @@ use mesh_radio::RadioId;
 
 use super::etx::{calculate_etx, etx_to_fixed, fixed_to_etx, EtxFixed};
 
-pub const MAX_EDGES_PER_NODE: usize = 24;
+/// Direct-edge slots per node. A city hub hears well over 24 nodes; with 24 slots it kept evicting
+/// weaker but real neighbours (FCM6 dropped Czar), so the cap is 40. Lists above
+/// `MAX_NEIGHBORS_PER_PACKET` go out as several chunks.
+pub const MAX_EDGES_PER_NODE: usize = 40;
 
 pub const EDGE_NO_CHANGE: i8 = 0;
 pub const EDGE_NEW: i8 = 1;
@@ -50,12 +53,24 @@ impl Edge {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeEdges {
     pub node_id: u32,
     pub edge_count: u8,
     pub last_full_update_ms: u32,
     pub edges: [Edge; MAX_EDGES_PER_NODE],
+}
+
+// Arrays longer than 32 have no derived `Default`.
+impl Default for NodeEdges {
+    fn default() -> Self {
+        Self {
+            node_id: 0,
+            edge_count: 0,
+            last_full_update_ms: 0,
+            edges: [Edge::default(); MAX_EDGES_PER_NODE],
+        }
+    }
 }
 
 impl NodeEdges {

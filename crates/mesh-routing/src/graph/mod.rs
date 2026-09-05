@@ -20,4 +20,4 @@ pub use route::{
     RoutableFilter, Route, RouteCache, MAX_CACHED_ROUTES, ROUTE_CACHE_TIMEOUT_MS,
 };
 
-pub const MAX_GRAPH_NODES: usize = 24;
+pub const MAX_GRAPH_NODES: usize = 40;

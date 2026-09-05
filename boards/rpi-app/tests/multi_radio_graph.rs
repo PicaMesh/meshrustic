@@ -37,6 +37,8 @@ fn merge_topology_downstream_stores_via_radio() {
         routing_version: 3,
         topology_version: 1,
         signal_routing_active: true,
+        more_chunks: false,
+        continuation: false,
     };
     let neighbor = PackedNeighbor {
         node_id: 0xEE00_00EE,

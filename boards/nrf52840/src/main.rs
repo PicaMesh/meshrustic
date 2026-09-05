@@ -20,7 +20,7 @@ use mesh_radio::{eu868_config_for_preset, RadioSlot};
 use mesh_routing::Router;
 use mesh_store::EMPTY_ADMIN_KEY;
 use node::NodeIdentity;
-use static_cell::StaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 use store::{ConfigLoadSource, NvmcConfigStore};
 use {defmt_rtt as _, panic_probe as _};
 
@@ -32,7 +32,9 @@ bind_interrupts!(struct Irqs {
 });
 
 static RADIO_SLOT: StaticCell<RadioSlot<lora::Sx1262Driver>> = StaticCell::new();
-static ROUTER: StaticCell<Router> = StaticCell::new();
+// Const-initialised so the ~70 KB router is placed by the linker, never built on the stack
+// (see `Router::unconfigured`). `load_node_config` below gives it its node id and channel.
+static ROUTER: ConstStaticCell<Router> = ConstStaticCell::new(Router::unconfigured());
 static CONFIG_STORE: StaticCell<NvmcConfigStore> = StaticCell::new();
 
 #[embassy_executor::main]
@@ -80,7 +82,7 @@ async fn main(spawner: Spawner) {
     driver.set_radio_config(eu868_config_for_preset(config.lora.modem_preset));
     let slot = RADIO_SLOT.init(RadioSlot::new(0, driver));
 
-    let router = ROUTER.init(Router::new(config.node_num));
+    let router = ROUTER.take();
     router.load_node_config(&config);
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(
         config.node_num,

@@ -23,19 +23,24 @@ fn v3_topology_field3_is_length_delimited_bytes() {
 fn multi_packet_chunk_size_golden() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
-    for i in 0..24u32 {
+    for i in 0..MAX_NEIGHBORS as u32 {
         graph.observe_direct_neighbor(0x1000 + i, -70, 8, 0, 0);
     }
-    // Graph node cap (24 slots including self) limits direct neighbors to 23.
+    // Graph node cap (MAX_NEIGHBORS slots including self) limits direct neighbors to one less.
     // Topology pack includes only reported edges with a cached direct signal.
-    assert_eq!(graph.neighbor_count(), 23);
+    assert_eq!(graph.neighbor_count() as usize, MAX_NEIGHBORS - 1);
     let mut packed_neighbors = [NeighborEntry::default(); MAX_NEIGHBORS];
     let pack_count = graph.topology_neighbors_for_pack(&mut packed_neighbors);
-    assert_eq!(pack_count, 24, "one cached signal per observed direct edge");
-    assert_eq!(graph.topology_packet_count(), 1);
+    assert_eq!(
+        pack_count as usize, MAX_NEIGHBORS,
+        "one cached signal per observed direct edge"
+    );
 
+    // 40 direct neighbours no longer fit one 28-entry packet: the list goes out as two chunks.
     let per_packet = MAX_NEIGHBORS_PER_PACKET;
-    assert_eq!((usize::from(pack_count) + per_packet - 1) / per_packet, 1);
+    let expected_packets = MAX_NEIGHBORS.div_ceil(per_packet);
+    assert_eq!(expected_packets, 2);
+    assert_eq!(graph.topology_packet_count() as usize, expected_packets);
 }
 
 #[test]

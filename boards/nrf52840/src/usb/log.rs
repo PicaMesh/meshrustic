@@ -92,10 +92,33 @@ fn line_prefix(line: &mut [u8]) -> usize {
     pos + suffix.len()
 }
 
-fn finish_line(line: &mut [u8], mut pos: usize) {
+fn finish_line(line: &mut [u8], pos: usize) {
+    // Never index past the buffer: a truncated line beats a halted node.
+    let pos = pos.min(line.len() - 1);
     line[pos] = b'\n';
-    pos += 1;
-    push_bytes(&line[..pos]);
+    push_bytes(&line[..pos + 1]);
+}
+
+/// Bounded appends: text that would overflow the line buffer is truncated (keeping room for the
+/// newline) instead of panicking. The version-resync line once overran its 128-byte buffer by
+/// three bytes; with `panic_probe` that halted both nicenanos on the first resync.
+fn put(line: &mut [u8], pos: &mut usize, text: &[u8]) {
+    let room = line.len().saturating_sub(*pos + 1);
+    let n = text.len().min(room);
+    line[*pos..*pos + n].copy_from_slice(&text[..n]);
+    *pos += n;
+}
+
+fn put_u32(line: &mut [u8], pos: &mut usize, n: u32) {
+    let mut tmp = [0u8; 10];
+    let k = push_u32(&mut tmp, n);
+    put(line, pos, &tmp[..k]);
+}
+
+fn put_hex8(line: &mut [u8], pos: &mut usize, n: u32) {
+    let mut tmp = [0u8; 8];
+    push_hex_u32_8(&mut tmp, n);
+    put(line, pos, &tmp);
 }
 
 pub fn push_line(content: &str) {
@@ -227,7 +250,7 @@ pub mod mesh {
 pub mod radio {
     use super::{
         finish_line, line_prefix, push_freq_mhz, push_hex_u16_4, push_hex_u32_8, push_hex_u8_2,
-        push_i32, push_u32, MAX_LOG_LINE,
+        push_i32, push_u32, put, put_hex8, MAX_LOG_LINE,
     };
 
     pub fn init_ok(module: &str, node_num: u32, preset: &str, freq_mhz: f32) {
@@ -416,12 +439,10 @@ pub mod radio {
         let mut line = [0u8; 96];
         let mut pos = line_prefix(&mut line);
         let prefix = b"[Radio0] TX cancelled id=0x";
-        line[pos..pos + prefix.len()].copy_from_slice(prefix);
-        pos += prefix.len();
-        pos += push_hex_u32_8(&mut line[pos..], id);
+        put(&mut line, &mut pos, prefix);
+        put_hex8(&mut line, &mut pos, id);
         let tail = b" (copy heard before it left the queue)";
-        line[pos..pos + tail.len()].copy_from_slice(tail);
-        pos += tail.len();
+        put(&mut line, &mut pos, tail);
         finish_line(&mut line, pos);
     }
 
@@ -798,7 +819,10 @@ pub mod battery {
 
 /// Signal-routing decision logs (`[SR]` prefix).
 pub mod sr {
-    use super::{finish_line, line_prefix, push_hex_u32_8, push_hex_u8_2, push_i32, push_u32};
+    use super::{
+        finish_line, line_prefix, push_hex_u32_8, push_hex_u8_2, push_i32, push_u32, put, put_hex8,
+        put_u32,
+    };
     use mesh_routing::{
         RelayReason, RelayRetxCancelReason, Router, SrLogEvent, SrSkipReason, T1CancelReason,
         TopologyLogSink,
@@ -930,16 +954,13 @@ pub mod sr {
                 let mut line = [0u8; 256];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR]   !";
-                line[pos..pos + prefix.len()].copy_from_slice(prefix);
-                pos += prefix.len();
-                pos += push_hex_u32_8(&mut line[pos..], relay);
-                line[pos] = b':';
-                pos += 1;
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, relay);
+                put(&mut line, &mut pos, b":");
                 for dest in destinations.iter().take(len as usize) {
                     let sep = b" !";
-                    line[pos..pos + sep.len()].copy_from_slice(sep);
-                    pos += sep.len();
-                    pos += push_hex_u32_8(&mut line[pos..], *dest);
+                    put(&mut line, &mut pos, sep);
+                    put_hex8(&mut line, &mut pos, *dest);
                 }
                 finish_line(&mut line, pos);
             }
@@ -1088,21 +1109,17 @@ pub mod sr {
                 let mut line = [0u8; 320];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Slot scheduling for pkt 0x";
-                line[pos..pos + prefix.len()].copy_from_slice(prefix);
-                pos += prefix.len();
-                pos += push_hex_u32_8(&mut line[pos..], id);
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, id);
                 let mid = b": halfAirtime=";
-                line[pos..pos + mid.len()].copy_from_slice(mid);
-                pos += mid.len();
-                pos += push_u32(&mut line[pos..], half_airtime_ms);
+                put(&mut line, &mut pos, mid);
+                put_u32(&mut line, &mut pos, half_airtime_ms);
                 let tail = b"ms, candidates=";
-                line[pos..pos + tail.len()].copy_from_slice(tail);
-                pos += tail.len();
-                pos += push_u32(&mut line[pos..], candidates as u32);
+                put(&mut line, &mut pos, tail);
+                put_u32(&mut line, &mut pos, candidates as u32);
                 let tail2 = b", slot=";
-                line[pos..pos + tail2.len()].copy_from_slice(tail2);
-                pos += tail2.len();
-                pos += push_u32(&mut line[pos..], slot_index as u32);
+                put(&mut line, &mut pos, tail2);
+                put_u32(&mut line, &mut pos, slot_index as u32);
                 let via: &[u8] = match reason {
                     RelayReason::None => b"",
                     RelayReason::Ranked => b", via=rank",
@@ -1111,45 +1128,35 @@ pub mod sr {
                     RelayReason::Sparse => b", via=sparse",
                     RelayReason::UnicastCost => b", via=cost",
                 };
-                line[pos..pos + via.len()].copy_from_slice(via);
-                pos += via.len();
+                put(&mut line, &mut pos, via);
                 if ranked_len > 0 {
                     let order = b", order=";
-                    line[pos..pos + order.len()].copy_from_slice(order);
-                    pos += order.len();
+                    put(&mut line, &mut pos, order);
                     for (i, node) in ranked.iter().take(ranked_len as usize).enumerate() {
                         if i > 0 {
-                            line[pos] = b'>';
-                            pos += 1;
+                            put(&mut line, &mut pos, b">");
                         }
-                        line[pos] = b'!';
-                        pos += 1;
-                        pos += push_hex_u32_8(&mut line[pos..], *node);
+                        put(&mut line, &mut pos, b"!");
+                        put_hex8(&mut line, &mut pos, *node);
                     }
                 }
                 if evaluated_len > 0 {
                     // Ranking inputs: !node(unique coverage,cost bucket); unicast costs carry tier bits.
                     let cand = b", cand=";
-                    line[pos..pos + cand.len()].copy_from_slice(cand);
-                    pos += cand.len();
+                    put(&mut line, &mut pos, cand);
                     for (i, (node, cov, cost)) in
                         evaluated.iter().take(evaluated_len as usize).enumerate()
                     {
                         if i > 0 {
-                            line[pos] = b',';
-                            pos += 1;
+                            put(&mut line, &mut pos, b",");
                         }
-                        line[pos] = b'!';
-                        pos += 1;
-                        pos += push_hex_u32_8(&mut line[pos..], *node);
-                        line[pos] = b'(';
-                        pos += 1;
-                        pos += push_u32(&mut line[pos..], *cov as u32);
-                        line[pos] = b',';
-                        pos += 1;
-                        pos += push_u32(&mut line[pos..], *cost as u32);
-                        line[pos] = b')';
-                        pos += 1;
+                        put(&mut line, &mut pos, b"!");
+                        put_hex8(&mut line, &mut pos, *node);
+                        put(&mut line, &mut pos, b"(");
+                        put_u32(&mut line, &mut pos, *cov as u32);
+                        put(&mut line, &mut pos, b",");
+                        put_u32(&mut line, &mut pos, *cost as u32);
+                        put(&mut line, &mut pos, b")");
                     }
                 }
                 finish_line(&mut line, pos);
@@ -1416,71 +1423,59 @@ pub mod sr {
                 received,
                 last,
             } => {
-                let mut line = [0u8; 128];
+                let mut line = [0u8; 192];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Topology version resync from !";
-                line[pos..pos + prefix.len()].copy_from_slice(prefix);
-                pos += prefix.len();
-                pos += push_hex_u32_8(&mut line[pos..], from);
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, from);
                 let mid = b": accepted version ";
-                line[pos..pos + mid.len()].copy_from_slice(mid);
-                pos += mid.len();
-                pos += push_u32(&mut line[pos..], received as u32);
+                put(&mut line, &mut pos, mid);
+                put_u32(&mut line, &mut pos, received as u32);
                 let tail = b" after stored ";
-                line[pos..pos + tail.len()].copy_from_slice(tail);
-                pos += tail.len();
-                pos += push_u32(&mut line[pos..], last as u32);
+                put(&mut line, &mut pos, tail);
+                put_u32(&mut line, &mut pos, last as u32);
                 let tail2 = b" (peer reboot or two silent intervals)";
-                line[pos..pos + tail2.len()].copy_from_slice(tail2);
-                pos += tail2.len();
+                put(&mut line, &mut pos, tail2);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::UnicastDestHeardDirect { id, wait_ms } => {
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Unicast 0x";
-                line[pos..pos + prefix.len()].copy_from_slice(prefix);
-                pos += prefix.len();
-                pos += push_hex_u32_8(&mut line[pos..], id);
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, id);
                 let mid = b": destination hears the source, waiting ";
-                line[pos..pos + mid.len()].copy_from_slice(mid);
-                pos += mid.len();
-                pos += push_u32(&mut line[pos..], wait_ms);
+                put(&mut line, &mut pos, mid);
+                put_u32(&mut line, &mut pos, wait_ms);
                 let tail = b"ms for its ACK before relaying";
-                line[pos..pos + tail.len()].copy_from_slice(tail);
-                pos += tail.len();
+                put(&mut line, &mut pos, tail);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::UnicastReplyCancel { id } => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Unicast reply heard for 0x";
-                line[pos..pos + prefix.len()].copy_from_slice(prefix);
-                pos += prefix.len();
-                pos += push_hex_u32_8(&mut line[pos..], id);
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, id);
                 let tail = b" - canceling relay";
-                line[pos..pos + tail.len()].copy_from_slice(tail);
-                pos += tail.len();
+                put(&mut line, &mut pos, tail);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::BootstrapReplyRateLimited => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);
                 let msg = b"[SR] Bootstrap reply rate-limited (list sent within the last minute)";
-                line[pos..pos + msg.len()].copy_from_slice(msg);
-                pos += msg.len();
+                put(&mut line, &mut pos, msg);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::RadioReconfigured { dropped } => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);
                 let msg = b"[SR] Preset applied: dropped ";
-                line[pos..pos + msg.len()].copy_from_slice(msg);
-                pos += msg.len();
-                pos += push_u32(&mut line[pos..], dropped as u32);
+                put(&mut line, &mut pos, msg);
+                put_u32(&mut line, &mut pos, dropped as u32);
                 let tail = b" pending TX timed for the old preset";
-                line[pos..pos + tail.len()].copy_from_slice(tail);
-                pos += tail.len();
+                put(&mut line, &mut pos, tail);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::GraphAged { before, after } => {
@@ -1488,20 +1483,16 @@ pub mod sr {
                 let mut pos = line_prefix(&mut line);
                 if before != after {
                     let prefix = b"[SR] Graph aged: ";
-                    line[pos..pos + prefix.len()].copy_from_slice(prefix);
-                    pos += prefix.len();
-                    pos += push_u32(&mut line[pos..], before as u32);
+                    put(&mut line, &mut pos, prefix);
+                    put_u32(&mut line, &mut pos, before as u32);
                     let mid = b" -> ";
-                    line[pos..pos + mid.len()].copy_from_slice(mid);
-                    pos += mid.len();
-                    pos += push_u32(&mut line[pos..], after as u32);
+                    put(&mut line, &mut pos, mid);
+                    put_u32(&mut line, &mut pos, after as u32);
                     let tail = b" direct neighbors";
-                    line[pos..pos + tail.len()].copy_from_slice(tail);
-                    pos += tail.len();
+                    put(&mut line, &mut pos, tail);
                 } else {
                     let msg = b"[SR] Graph aged (no direct neighbor count change)";
-                    line[pos..pos + msg.len()].copy_from_slice(msg);
-                    pos += msg.len();
+                    put(&mut line, &mut pos, msg);
                 }
                 finish_line(&mut line, pos);
             }
