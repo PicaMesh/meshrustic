@@ -1684,7 +1684,44 @@ impl Router {
         } else {
             None
         };
-        let unicast_plan = unicast_plan.or(designated_plan);
+        let mut unicast_plan = unicast_plan.or(designated_plan);
+
+        // Heard straight from the source, and the source's own topology says the destination
+        // hears it: the destination most likely has the packet already. A routing ACK on that
+        // link is never relayed (a lost ACK is covered by the sender's retransmission). Anything
+        // else waits for the destination's ACK or reply, which cancels the queued relay; only
+        // silence lets the relay go. Colocated receivers lose about half the frames of a very
+        // strong neighbour here, so the relay must stay available, just not be first.
+        if parsed.to != NODENUM_BROADCAST && heard_from == parsed.from {
+            let src_edge = self
+                .graph
+                .edges()
+                .find_node(parsed.from)
+                .and_then(|n| n.find_edge(parsed.to))
+                .copied();
+            if let Some(edge) = src_edge {
+                let is_routing_reply = result.decoded_portnum == Some(ROUTING_APP)
+                    && result.decoded_data.is_some_and(|d| d.request_id != 0);
+                if is_routing_reply {
+                    self.pool.release(handle);
+                    self.sr_log.push(SrLogEvent::RelaySkip {
+                        from: parsed.from,
+                        reason: SrSkipReason::ReplyRetracesLink,
+                    });
+                    return plan;
+                }
+                if edge.hears_us {
+                    if let Some(p) = unicast_plan.as_mut() {
+                        let wait = self.dest_ack_wait_ms(slot_ms);
+                        p.slot_delay_ms = p.slot_delay_ms.saturating_add(wait);
+                        self.sr_log.push(SrLogEvent::UnicastDestHeardDirect {
+                            id: parsed.id,
+                            wait_ms: wait,
+                        });
+                    }
+                }
+            }
+        }
 
         let direct_hop_limit = if parsed.to != NODENUM_BROADCAST {
             self.graph.unicast_hop_limit_for_direct_neighbor(parsed.to)
@@ -2128,6 +2165,19 @@ impl Router {
             ranked_len,
             reason,
         })
+    }
+
+    /// How long to give a destination that heard the packet directly to answer it: its ACK
+    /// contention delay (the channel may look busier to it than to us, hence twice our
+    /// contention maximum) plus the ACK's airtime.
+    fn dest_ack_wait_ms(&self, airtime_ms: u32) -> u32 {
+        airtime_ms.saturating_add(
+            crate::coordinated_relay::tx_delay_ms_contention_max_at(
+                self.channel_util_pct,
+                self.cw_slot_ms(),
+            )
+            .saturating_mul(2),
+        )
     }
 
     /// How long an SR peer that owns the slot ahead of us needs before its relay has left the
@@ -2985,8 +3035,17 @@ impl Router {
         } else {
             return;
         };
-        let _ = self.cancel_pending(parsed.to, cancel_id);
-        // The destination answered the origin: our forwarded copy no longer needs retries.
+        // The destination answered the origin: our copy is redundant wherever it sits, still
+        // pending here, committed, or already handed to the radio queue (both nicenanos once
+        // transmitted 80 ms after logging "reply heard" because only the retries were stopped).
+        let had_pending = self.cancel_pending(parsed.to, cancel_id);
+        let committed = self.graph.is_committed_relay(parsed.to, cancel_id);
+        if had_pending || committed || self.graph.has_our_transmission(cancel_id) {
+            self.graph.cancel_relay(parsed.to, cancel_id);
+            self.note_tx_cancel(cancel_id);
+            self.sr_log
+                .push(SrLogEvent::UnicastReplyCancel { id: cancel_id });
+        }
         self.cancel_relayed_retx(parsed.to, cancel_id, RelayRetxCancelReason::ReplyHeard);
     }
 
@@ -4350,6 +4409,163 @@ mod tests {
         router.note_tx_done(0x902);
         assert!(!router.graph_mut().is_committed_relay(UNI_SOURCE, 0x902));
         assert!(!router.graph_mut().has_active_relay_commits());
+    }
+
+    /// The destination answered the source while our relay of the request sat in the radio
+    /// queue: the frame must be reported for removal, not just the retries stopped.
+    #[test]
+    fn reply_heard_pulls_the_queued_relay() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x605, true);
+        let (_, released_at) = forward_unicast(router, &wire, 0);
+        router.record_tx_on_air(0x605, released_at);
+        let mut cancels = heapless::Vec::new();
+        router.take_tx_cancels(&mut cancels);
+        assert!(cancels.is_empty());
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let (len, ack) = build_ack_nak_frame(
+            UNI_SOURCE,
+            UNI_DEST,
+            0x7005,
+            0x605,
+            router.channel_hash(),
+            3,
+            ROUTING_ERROR_NONE,
+            &key,
+        )
+        .unwrap();
+        let _ = router.process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -70,
+                snr: 8,
+                bytes: &ack[..len as usize],
+            },
+            released_at + 20,
+        );
+        router.take_tx_cancels(&mut cancels);
+        assert_eq!(cancels.as_slice(), &[0x605]);
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::UnicastReplyCancel { id: 0x605 })));
+    }
+
+    /// Graph where SRC and DST are both our direct neighbours and SRC's topology says DST hears
+    /// it. Unicasts SRC -> DST heard straight from SRC reach DST without us.
+    fn setup_source_reaches_destination(router: &mut Router) {
+        const SRC: u32 = 0xDD00_00DD;
+        const DST: u32 = 0xEE00_00EE;
+        let g = router.graph_mut();
+        for n in [SRC, DST] {
+            g.observe_direct_neighbor(n, -70, 8, 0, 0);
+            g.confirm_direct_neighbor_hears_us(n);
+            g.capability_mut().track_topology(n, true, 0);
+        }
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let nb = |id: u32| PackedNeighbor {
+            node_id: id,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        g.merge_topology(SRC, &header, &[nb(DST), nb(UNI_ME)], true, 0, 0);
+    }
+
+    #[test]
+    fn unicast_to_a_neighbour_the_source_reaches_waits_for_its_ack() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_source_reaches_destination(router);
+        // Heard straight from SRC (relay byte 0xDD), addressed to DST.
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x606, true);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        assert!(plan.relay.is_none(), "must not relay at once");
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x606, 0)
+            .expect("held relay");
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        let wait = logs
+            .iter()
+            .find_map(|e| match e {
+                SrLogEvent::UnicastDestHeardDirect { id: 0x606, wait_ms } => Some(*wait_ms),
+                _ => None,
+            })
+            .expect("ack wait logged");
+        assert!(wait >= coordinated_relay::DEFAULT_SLOT_MS);
+        // commit_relay adds a deterministic tie-break of up to half a slot either way.
+        let jitter = half_airtime_ms(coordinated_relay::DEFAULT_SLOT_MS).max(50) / 2;
+        assert!(
+            tx_after + jitter >= wait,
+            "tx_after {tx_after} < ack wait {wait}"
+        );
+
+        // DST acks SRC: the held relay is cancelled and nothing goes out.
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let (len, ack) = build_ack_nak_frame(
+            UNI_SOURCE,
+            UNI_DEST,
+            0x7006,
+            0x606,
+            router.channel_hash(),
+            3,
+            ROUTING_ERROR_NONE,
+            &key,
+        )
+        .unwrap();
+        let _ = router.process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -70,
+                snr: 8,
+                bytes: &ack[..len as usize],
+            },
+            100,
+        );
+        assert!(router.relay_tx_after(UNI_SOURCE, 0x606, 0).is_none());
+        assert!(router.poll_ready_relay(tx_after + 1).is_none());
+    }
+
+    #[test]
+    fn routing_ack_toward_a_node_the_sender_heard_is_not_relayed() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_source_reaches_destination(router);
+        // SRC acks DST for some earlier packet; SRC lists DST as a neighbour it hears.
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let (len, ack) = build_ack_nak_frame(
+            UNI_DEST,
+            UNI_SOURCE,
+            0x7007,
+            0x1234,
+            router.channel_hash(),
+            3,
+            ROUTING_ERROR_NONE,
+            &key,
+        )
+        .unwrap();
+        let (scheduled, reason) = unicast_skip_reason(router, &ack[..len as usize]);
+        assert!(!scheduled);
+        assert_eq!(reason, Some(SrSkipReason::ReplyRetracesLink));
     }
 
     /// Field case of 2026-09-03: the relayer that actually reaches the destination must own

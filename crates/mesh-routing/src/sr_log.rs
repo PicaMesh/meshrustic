@@ -128,6 +128,16 @@ pub enum SrLogEvent {
     TopologyLoggingComplete,
     /// An empty bootstrap broadcast arrived inside the bootstrap-reply cooldown; no list sent.
     BootstrapReplyRateLimited,
+    /// The destination of this unicast hears its source directly (per the source's topology):
+    /// our relay waits `wait_ms` for the destination's ACK or reply before it may go out.
+    UnicastDestHeardDirect {
+        id: u32,
+        wait_ms: u32,
+    },
+    /// The destination answered the source: our queued relay of the request was cancelled.
+    UnicastReplyCancel {
+        id: u32,
+    },
     /// The radio was re-initialised for a new preset; queued transmissions timed for the old
     /// air parameters (and addressed to nodes still on them) were dropped.
     RadioReconfigured {
@@ -241,6 +251,9 @@ pub enum SrSkipReason {
     UnicastCovered,
     /// Unicast we have no direct, downstream or next-hop path for.
     NoRelayPath,
+    /// Routing ACK toward a node its sender heard directly: it retraces the request's link and
+    /// a lost ACK is covered by the sender's own retransmission.
+    ReplyRetracesLink,
 }
 
 /// Sink for periodic topology graph dumps (may emit many lines).

@@ -1180,6 +1180,7 @@ pub mod sr {
                     SrSkipReason::DeadEndHop => b"dead end hop",
                     SrSkipReason::UnicastCovered => b"unicast covered",
                     SrSkipReason::NoRelayPath => b"no relay path",
+                    SrSkipReason::ReplyRetracesLink => b"reply retraces link",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);
@@ -1383,6 +1384,34 @@ pub mod sr {
             | SrLogEvent::NetworkTopologyDownstreamHeader { .. }
             | SrLogEvent::NetworkTopologyDownstreamGroup { .. }
             | SrLogEvent::TopologyLoggingComplete) => emit_topology_event(event),
+            SrLogEvent::UnicastDestHeardDirect { id, wait_ms } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Unicast 0x";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], id);
+                let mid = b": destination hears the source, waiting ";
+                line[pos..pos + mid.len()].copy_from_slice(mid);
+                pos += mid.len();
+                pos += push_u32(&mut line[pos..], wait_ms);
+                let tail = b"ms for its ACK before relaying";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::UnicastReplyCancel { id } => {
+                let mut line = [0u8; 96];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Unicast reply heard for 0x";
+                line[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                pos += push_hex_u32_8(&mut line[pos..], id);
+                let tail = b" - canceling relay";
+                line[pos..pos + tail.len()].copy_from_slice(tail);
+                pos += tail.len();
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::BootstrapReplyRateLimited => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);
