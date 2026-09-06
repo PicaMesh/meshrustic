@@ -1065,12 +1065,16 @@ impl NeighborGraph {
         // A header-only broadcast carrying version 0 is a peer's boot announcement: its version
         // counter restarted, so forget the one we tracked. Empty lists with other versions are
         // ordinary reports from a node without neighbours. Passive peers boot too (inno's restart
-        // was rejected as stale for twenty minutes), so the SR-active flag plays no part here.
+        // was rejected as stale for twenty minutes), so the SR-active flag plays no part here,
+        // and neither does the relay byte (see below).
         // A fourth way in: the boot broadcast was lost on the air, and the peer's restarted
         // counter now shows as rejected versions climbing one by one. Two in a row cannot be
         // late copies of old reports (those arrive within seconds, not a whole interval apart),
         // so the second one re-bases us instead of waiting out two silent intervals.
-        let boot_reset = neighbors.is_empty() && received == 0 && is_direct_from_sender;
+        // The boot broadcast is a statement about the sender's counter, not about the link, so a
+        // copy that reached us through a relay counts too: angl heard Czar's restart only through
+        // A and rejected Czar's reports as stale for twenty minutes.
+        let boot_reset = neighbors.is_empty() && received == 0;
         let silence = last_accept_ms != 0
             && now_ms.wrapping_sub(last_accept_ms) >= TOPOLOGY_RESYNC_MS
             && now_ms.wrapping_sub(last_accept_ms) < 0x8000_0000;
@@ -3115,6 +3119,28 @@ mod tests {
             graph.edge_hears_us_for_test(PEER),
             "a boot broadcast is a restart notice, not a neighbour list"
         );
+    }
+
+    /// 2026-09-06 20:49: angl heard Czar's boot broadcast only as A's relayed copy and called
+    /// Czar's reports stale for twenty minutes. The restart notice is valid however it arrived.
+    #[test]
+    fn relayed_boot_broadcast_resets_the_topology_version_too() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 117, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        let boot = graph.merge_topology(PEER, &topo_header(0), &[], false, 2_000, 0);
+        assert!(matches!(boot, TopologyMergeResult::Applied { .. }));
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 0, 117)));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 1, 3_000),
+            TopologyMergeResult::Applied { .. }
+        ));
     }
 
     /// The boot broadcast was missed: after two quiet intervals any version is accepted.

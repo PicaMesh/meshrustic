@@ -140,13 +140,14 @@ airtime. Every SignalRouting node uses the same figure.
   SR neighbours answer a boot broadcast once per `BOOTSTRAP_REPLY_MIN_MS`. Originated packets do
   not reset the timer.
 - **Version acceptance** (`NeighborGraph::merge_topology`): first contact accepts any version;
-  then a repeat or a forward move of 1 to 127; a header-only version-0 direct broadcast resets the
-  tracked version, active or passive sender; after `TOPOLOGY_RESYNC_MS` without an accepted
+  then a repeat or a forward move of 1 to 127; a header-only version-0 broadcast, direct or
+  relayed, resets the tracked version, active or passive sender; after `TOPOLOGY_RESYNC_MS` without an accepted
   report, any version is taken as the new base; and when the boot broadcast was lost, two
   consecutive rejected reports whose versions climb by one re-base us on the second (late copies
   of old reports never arrive an interval apart). Tests: `peer_boot_broadcast_resets_its_topology_version`,
   `passive_peer_boot_broadcast_resets_its_topology_version_too`,
   `peer_topology_resyncs_after_two_silent_intervals`,
+  `relayed_boot_broadcast_resets_the_topology_version_too`,
   `peer_restart_is_accepted_after_two_climbing_stale_reports`.
 - **An empty list clears nothing.** The "an unlisted neighbour does not hear the sender" rule
   runs only on a complete, non-empty list: a boot broadcast is a restart notice, and a node that
