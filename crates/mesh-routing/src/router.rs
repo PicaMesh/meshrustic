@@ -1668,6 +1668,7 @@ impl Router {
                     next_hop: hop,
                     cost_x100: route.cost_fixed,
                     hops: route.hops,
+                    verified: route.verified,
                 });
             }
             hop
@@ -1693,6 +1694,7 @@ impl Router {
                 next_hop: 0,
                 cost_x100: 0,
                 hops: 0,
+                verified: true,
             });
         }
 

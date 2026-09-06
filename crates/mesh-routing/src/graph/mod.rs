@@ -18,6 +18,7 @@ pub use placeholder::{
 pub use route::{
     calculate_route, find_better_positioned_neighbor, is_node_routable, verified_connectivity,
     RoutableFilter, Route, RouteCache, MAX_CACHED_ROUTES, ROUTE_CACHE_TIMEOUT_MS,
+    UNVERIFIED_HOP_COST_FACTOR,
 };
 
 pub const MAX_GRAPH_NODES: usize = 40;

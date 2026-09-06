@@ -65,6 +65,7 @@ pub use graph::{
     fixed_to_etx, get_placeholder_for_relay, is_node_routable, is_placeholder_node,
     placeholder_node_id, verified_connectivity, DownstreamTable, EdgeSource, RoutableFilter, Route,
     RouteCache, MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE, PLACEHOLDER_NODE_PREFIX,
+    UNVERIFIED_HOP_COST_FACTOR,
 };
 pub use neighbor_graph::{
     MaintenanceReport, NeighborEntry, NeighborGraph, TopologyMergeResult, LAST_HOP_BUDGET,

@@ -43,7 +43,16 @@ pub struct Route {
     /// Hops on the path, 1 for a direct neighbour; 0 when the route came from the downstream
     /// table (length unknown) or there is none.
     pub hops: u8,
+    /// Every hop is confirmed by its receiver. False for the inbound-gateway fallback (a hop
+    /// into a topology-publishing node that never confirmed the sender, taken at
+    /// `UNVERIFIED_HOP_COST_FACTOR` times its cost) and for downstream-table routes.
+    pub verified: bool,
 }
+
+/// Cost factor of an unconfirmed hop in the fallback search: the receiver never listed the
+/// sender, so the link is marginal or one-way; a confirmed path of up to this many times the
+/// raw cost is preferred.
+pub const UNVERIFIED_HOP_COST_FACTOR: u16 = 4;
 
 impl Route {
     pub fn cost(&self) -> f32 {
@@ -78,6 +87,7 @@ impl RouteCache {
                     cost_fixed: 0,
                     timestamp_ms: 0,
                     hops: 0,
+                    verified: true,
                 },
             }; MAX_CACHED_ROUTES],
             count: 0,
@@ -216,34 +226,17 @@ fn relax(
     }
 }
 
-/// Route from `my_node` to `destination`: a Dijkstra search run backwards from the
-/// destination over "who hears whom". A settled node N is reached by the nodes that can deliver
-/// to it: the nodes N lists (N hears them, priced at the cost N measured on their signal), the
-/// nodes whose edge to N carries `hears_us` (N confirmed it hears them), and, when N publishes
-/// no topology, anyone who hears N (assumed symmetric, since nothing better is known). An edge
-/// alone is therefore never used against its direction, and every hop is priced at its receiver.
-/// Intermediate hops must pass `is_node_routable`; the destination and we ourselves need not.
-pub fn calculate_route(
+/// One backward Dijkstra pass (see `calculate_route`). With `allow_unverified`, a hop into a
+/// topology-publishing node that never confirmed the sender is taken too, at
+/// `UNVERIFIED_HOP_COST_FACTOR` times its cost. Returns `(cost, next_hop, hops)`.
+fn backward_search(
     edges: &EdgeStore,
-    downstream: &DownstreamTable,
     my_node: u32,
     destination: u32,
-    now_ms: u32,
     routable: Option<&RoutableFilter<'_>>,
-) -> Route {
+    allow_unverified: bool,
+) -> Option<(u16, u32, u8)> {
     let capability = routable.map(|f| f.capability);
-    let mut result = Route {
-        destination,
-        next_hop: 0,
-        egress_radio: 0,
-        cost_fixed: ROUTE_COST_UNKNOWN,
-        timestamp_ms: now_ms,
-        hops: 0,
-    };
-    if my_node == 0 || destination == 0 || destination == my_node {
-        return result;
-    }
-
     // `cost` is the cost of the path from a node to the destination; `prev` is the node after it
     // on that path.
     let mut nodes = [DNode {
@@ -253,9 +246,7 @@ pub fn calculate_route(
         visited: false,
     }; MAX_GRAPH_NODES];
     let mut node_count = 0usize;
-    let Some(dst_idx) = find_or_add_node(destination, &mut nodes, &mut node_count) else {
-        return result;
-    };
+    let dst_idx = find_or_add_node(destination, &mut nodes, &mut node_count)?;
     nodes[dst_idx].cost = 0;
 
     loop {
@@ -303,6 +294,7 @@ pub fn calculate_route(
         }
         // Nodes N confirmed hearing (`hears_us` on their edge to N), and, for a node without
         // lists, anyone hearing N. Priced at the sender's measurement of N, the best available.
+        // In the fallback pass an unconfirmed hop into a publishing node counts too, penalised.
         let n_publishes = publishes_topology(capability, n);
         for i in 0..edges.node_count() {
             let Some(m) = edges.node_id_at(i) else {
@@ -320,22 +312,65 @@ pub fn calculate_route(
             };
             if edge.hears_us || !n_publishes {
                 relax(&mut nodes, &mut node_count, m, n, u_cost, edge.etx_fixed);
+            } else if allow_unverified {
+                let penalised = edge.etx_fixed.saturating_mul(UNVERIFIED_HOP_COST_FACTOR);
+                relax(&mut nodes, &mut node_count, m, n, u_cost, penalised);
             }
         }
     }
 
-    if let Some(me) = nodes[..node_count].iter().find(|x| x.id == my_node) {
-        if me.cost < ROUTE_COST_UNKNOWN && me.prev != 0 {
-            result.cost_fixed = me.cost;
-            result.next_hop = me.prev;
-            let mut cur = me.prev;
-            let mut hops = 1u8;
-            while cur != destination && cur != 0 && (hops as usize) < MAX_GRAPH_NODES {
-                cur = prev_of(&nodes, node_count, cur);
-                hops = hops.saturating_add(1);
-            }
-            result.hops = hops;
-        }
+    let me = nodes[..node_count].iter().find(|x| x.id == my_node)?;
+    if me.cost == ROUTE_COST_UNKNOWN || me.prev == 0 {
+        return None;
+    }
+    let mut cur = me.prev;
+    let mut hops = 1u8;
+    while cur != destination && cur != 0 && (hops as usize) < MAX_GRAPH_NODES {
+        cur = prev_of(&nodes, node_count, cur);
+        hops = hops.saturating_add(1);
+    }
+    Some((me.cost, me.prev, hops))
+}
+
+/// Route from `my_node` to `destination`: a Dijkstra search run backwards from the
+/// destination over "who hears whom". A settled node N is reached by the nodes that can deliver
+/// to it: the nodes N lists (N hears them, priced at the cost N measured on their signal), the
+/// nodes whose edge to N carries `hears_us` (N confirmed it hears them), and, when N publishes
+/// no topology, anyone who hears N (assumed symmetric, since nothing better is known). An edge
+/// alone is therefore never used against its direction, and every hop is priced at its receiver.
+/// Intermediate hops must pass `is_node_routable`; the destination and we ourselves need not.
+///
+/// When no confirmed path exists, the downstream table is tried, then the inbound-gateway
+/// fallback: the same search with unconfirmed hops allowed at a penalty, so the node that hears
+/// the far side still carries the frame out (a one-way edge is usually a marginal link or a
+/// truncated list, not silence). Such a route is marked unverified.
+pub fn calculate_route(
+    edges: &EdgeStore,
+    downstream: &DownstreamTable,
+    my_node: u32,
+    destination: u32,
+    now_ms: u32,
+    routable: Option<&RoutableFilter<'_>>,
+) -> Route {
+    let mut result = Route {
+        destination,
+        next_hop: 0,
+        egress_radio: 0,
+        cost_fixed: ROUTE_COST_UNKNOWN,
+        timestamp_ms: now_ms,
+        hops: 0,
+        verified: true,
+    };
+    if my_node == 0 || destination == 0 || destination == my_node {
+        return result;
+    }
+
+    if let Some((cost, next_hop, hops)) =
+        backward_search(edges, my_node, destination, routable, false)
+    {
+        result.cost_fixed = cost;
+        result.next_hop = next_hop;
+        result.hops = hops;
     }
 
     if result.next_hop != 0 {
@@ -376,6 +411,7 @@ pub fn calculate_route(
         if best_relay != 0 {
             result.next_hop = best_relay;
             result.cost_fixed = best_cost;
+            result.verified = false;
             result.egress_radio = my_edges
                 .and_then(|n| n.find_edge(best_relay))
                 .map(|e| e.heard_on)
@@ -390,6 +426,22 @@ pub fn calculate_route(
                     }
                 }
             }
+        }
+    }
+
+    if result.next_hop == 0 {
+        if let Some((cost, next_hop, hops)) =
+            backward_search(edges, my_node, destination, routable, true)
+        {
+            result.cost_fixed = cost;
+            result.next_hop = next_hop;
+            result.hops = hops;
+            result.verified = false;
+            result.egress_radio = edges
+                .find_node(my_node)
+                .and_then(|n| n.find_edge(next_hop))
+                .map(|e| e.heard_on)
+                .unwrap_or(0);
         }
     }
 
@@ -527,11 +579,13 @@ mod tests {
             my_node: ME,
             device_role: DEVICE_ROLE_CLIENT,
         };
-        assert_eq!(
-            calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
-            0,
-            "a topology-publishing destination that never confirmed the relay is unreachable"
+        let fallback = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter));
+        assert!(
+            !fallback.verified,
+            "a topology-publishing destination that never confirmed the relay has no verified route"
         );
+        assert_eq!(fallback.next_hop, RELAY, "the inbound gateway still tries");
+        assert_eq!(fallback.cost_fixed, 100 + 400 * UNVERIFIED_HOP_COST_FACTOR);
         // A destination that publishes no topology cannot be ruled out.
         let mut stock = CapabilityCache::new();
         stock.track_topology(RELAY, true, 0);
@@ -544,12 +598,10 @@ mod tests {
             calculate_route(&edges, &downstream, ME, DEST, 0, Some(&stock_filter)).next_hop,
             RELAY
         );
-        // The destination confirms it hears the relay: the route is back.
+        // The destination confirms it hears the relay: the route is verified again.
         edges.set_edge_hears_us(RELAY, DEST, true);
-        assert_eq!(
-            calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
-            RELAY
-        );
+        let verified = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter));
+        assert_eq!((verified.next_hop, verified.verified), (RELAY, true));
         // The same for our own direct link: a neighbour that does not hear us is no next hop.
         edges.update_edge(ME, ME, DEST, 1.0, 0, EdgeSource::Reported, true, 0);
         assert_eq!(
@@ -562,6 +614,60 @@ mod tests {
             calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
             DEST
         );
+    }
+
+    /// 2026-09-06: the branch's only contact with the hub was one node hearing it at -108 dBm,
+    /// unconfirmed. A confirmed path wins whenever one exists, however long; without one the
+    /// node that hears the far side carries the frame out, and passive nodes never do.
+    #[test]
+    fn inbound_gateway_is_the_fallback_only_without_a_confirmed_path() {
+        const ME: u32 = 0xAA;
+        const GATEWAY: u32 = 0xBB;
+        const PASSIVE: u32 = 0x0200_0002;
+        const HUB: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, GATEWAY, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, GATEWAY, true);
+        edges.update_edge(ME, ME, PASSIVE, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, PASSIVE, true);
+        // Both hear the hub; the hub confirms neither.
+        edges.update_edge(ME, GATEWAY, HUB, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, PASSIVE, HUB, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(GATEWAY, true, 0);
+        capability.track_topology(PASSIVE, false, 0);
+        capability.track_topology(HUB, true, 0);
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+        };
+        let downstream = DownstreamTable::new();
+        let route = calculate_route(&edges, &downstream, ME, HUB, 0, Some(&filter));
+        assert_eq!(
+            route.next_hop, GATEWAY,
+            "the passive node never relays, the gateway tries"
+        );
+        assert!(!route.verified);
+        assert_eq!(route.cost_fixed, 100 + 200 * UNVERIFIED_HOP_COST_FACTOR);
+        assert_eq!(route.hops, 2);
+
+        // A confirmed path three hops long beats the two-hop unconfirmed one.
+        const FAR: u32 = 0xDD;
+        edges.update_edge(ME, GATEWAY, FAR, 3.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.set_edge_hears_us(GATEWAY, FAR, true);
+        edges.update_edge(ME, HUB, FAR, 3.0, 0, EdgeSource::Mirrored, true, 0);
+        capability.track_topology(FAR, true, 0);
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+        };
+        let route = calculate_route(&edges, &downstream, ME, HUB, 0, Some(&filter));
+        assert!(route.verified);
+        assert_eq!((route.next_hop, route.hops), (GATEWAY, 3));
+        assert_eq!(route.cost_fixed, 100 + 300 + 300);
     }
 
     /// Costs are what the receiver of each hop measured: R hears us at ETX 3 and the destination

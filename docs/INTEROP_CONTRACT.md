@@ -106,6 +106,13 @@ airtime. Every SignalRouting node uses the same figure.
   as `Route to !X via !Y cost=C hops=H`. `find_better_positioned_neighbor` applies the same
   evidence rule through `route::can_deliver`. Tests: `one_way_edge_is_not_a_route`,
   `route_cost_is_measured_at_the_receiver`.
+- **Inbound-gateway fallback.** When no confirmed path exists (and the downstream table has
+  none either), the search runs again allowing hops into a topology-publishing node that never
+  confirmed the sender, at `UNVERIFIED_HOP_COST_FACTOR` times their cost, so the node that hears
+  the far side still carries the frame out; a one-way edge is usually a marginal link or a
+  truncated list. The route is marked unverified (`Route::verified`, logged as `unverified`),
+  a confirmed path of any length wins over it, and passive nodes are never chosen as the
+  gateway. Test: `inbound_gateway_is_the_fallback_only_without_a_confirmed_path`.
 - **A next hop equal to the destination's byte names no relayer.** Stock's `NextHopRouter`
   learns the destination itself as next hop from a direct reply. Such a unicast is planned as one
   with no next hop: the cost ranking decides, nobody owns slot 0 (`Router::evaluate_tx_plan`,
