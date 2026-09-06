@@ -142,9 +142,15 @@ airtime. Every SignalRouting node uses the same figure.
 - **Version acceptance** (`NeighborGraph::merge_topology`): first contact accepts any version;
   then a repeat or a forward move of 1 to 127; a header-only version-0 direct broadcast resets the
   tracked version, active or passive sender; after `TOPOLOGY_RESYNC_MS` without an accepted
-  report, any version is taken as the new base. Tests: `peer_boot_broadcast_resets_its_topology_version`,
+  report, any version is taken as the new base; and when the boot broadcast was lost, two
+  consecutive rejected reports whose versions climb by one re-base us on the second (late copies
+  of old reports never arrive an interval apart). Tests: `peer_boot_broadcast_resets_its_topology_version`,
   `passive_peer_boot_broadcast_resets_its_topology_version_too`,
-  `peer_topology_resyncs_after_two_silent_intervals`.
+  `peer_topology_resyncs_after_two_silent_intervals`,
+  `peer_restart_is_accepted_after_two_climbing_stale_reports`.
+- **An empty list clears nothing.** The "an unlisted neighbour does not hear the sender" rule
+  runs only on a complete, non-empty list: a boot broadcast is a restart notice, and a node that
+  hears nobody says nothing about who hears it. Test: `empty_list_does_not_clear_hears_us`.
 - **Multi-packet lists.** Lists longer than `MAX_NEIGHBORS_PER_PACKET` go out as chunks of one
   version, spaced twice the chunk airtime (`Router::poll_topology_tx`), flagged in the header
   (`PACKED_HEADER_FLAG_MORE_CHUNKS`, `PACKED_HEADER_FLAG_CONTINUATION`). The "an unlisted
@@ -165,6 +171,11 @@ airtime. Every SignalRouting node uses the same figure.
   us and ADMIN are exempt (`NodeRateLimiter`).
 
 ## 7. Robustness
+
+- Packet ids are a counter mixed with uptime, seeded at boot from the RNG peripheral
+  (`Router::seed_tx_ids`), so no two boots or two nodes replay the same id sequence; stock
+  draws random ids too. Our own-transmission record is keyed by id alone and topology receive
+  no longer consults it (the sender check already excludes our own echoes).
 
 - A panic or hard fault resets the chip (`main.rs` panic and HardFault handlers); flip-link
   places the stack below the statics so an overflow faults instead of corrupting them; a 30 s

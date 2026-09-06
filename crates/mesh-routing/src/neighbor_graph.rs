@@ -75,6 +75,10 @@ struct TopologyVersionEntry {
     version: u8,
     /// When we last accepted a report from this node (0 = never).
     last_accept_ms: u32,
+    /// Version of the last report we rejected as stale, if any: a rebooted peer whose boot
+    /// broadcast we missed shows as rejected versions climbing one by one.
+    stale_version: u8,
+    stale_valid: bool,
 }
 
 /// Neighbour ids listed so far by a multi-chunk topology report. The "unlisted neighbour does not
@@ -194,6 +198,8 @@ impl NeighborGraph {
                 node_id: 0,
                 version: 0,
                 last_accept_ms: 0,
+                stale_version: 0,
+                stale_valid: false,
             }; MAX_TOPOLOGY_VERSION_ENTRIES],
             topo_version_count: 0,
             last_version_resync: None,
@@ -1060,12 +1066,18 @@ impl NeighborGraph {
         // counter restarted, so forget the one we tracked. Empty lists with other versions are
         // ordinary reports from a node without neighbours. Passive peers boot too (inno's restart
         // was rejected as stale for twenty minutes), so the SR-active flag plays no part here.
+        // A fourth way in: the boot broadcast was lost on the air, and the peer's restarted
+        // counter now shows as rejected versions climbing one by one. Two in a row cannot be
+        // late copies of old reports (those arrive within seconds, not a whole interval apart),
+        // so the second one re-bases us instead of waiting out two silent intervals.
         let boot_reset = neighbors.is_empty() && received == 0 && is_direct_from_sender;
         let silence = last_accept_ms != 0
             && now_ms.wrapping_sub(last_accept_ms) >= TOPOLOGY_RESYNC_MS
             && now_ms.wrapping_sub(last_accept_ms) < 0x8000_0000;
         let in_window = Self::topology_version_accept(received, last);
-        if !in_window && !boot_reset && !silence {
+        let climb = !in_window && self.topo_version_climbs_after_stale(sender, received);
+        if !in_window && !boot_reset && !silence && !climb {
+            self.note_topo_version_stale(sender, received);
             return TopologyMergeResult::Stale { received, last };
         }
         if !in_window || (boot_reset && last != 0) {
@@ -1175,7 +1187,9 @@ impl NeighborGraph {
                 }
             }
             if !header.more_chunks {
-                if pending.valid {
+                // An empty list is no evidence: a node that has just booted has heard nobody yet,
+                // and a node hearing nobody has nothing to say about who hears it.
+                if pending.valid && pending.count > 0 {
                     let count = pending.count as usize;
                     let listed = pending.ids;
                     self.edges
@@ -1227,6 +1241,7 @@ impl NeighborGraph {
             if self.topo_versions[i].node_id == node_id {
                 self.topo_versions[i].version = version;
                 self.topo_versions[i].last_accept_ms = now_ms;
+                self.topo_versions[i].stale_valid = false;
                 return;
             }
         }
@@ -1236,8 +1251,29 @@ impl NeighborGraph {
                 node_id,
                 version,
                 last_accept_ms: now_ms,
+                stale_version: 0,
+                stale_valid: false,
             };
             self.topo_version_count += 1;
+        }
+    }
+
+    /// Is `received` one past the version we last rejected from `node_id`?
+    fn topo_version_climbs_after_stale(&self, node_id: u32, received: u8) -> bool {
+        self.topo_versions[..self.topo_version_count as usize]
+            .iter()
+            .any(|e| {
+                e.node_id == node_id && e.stale_valid && received == e.stale_version.wrapping_add(1)
+            })
+    }
+
+    fn note_topo_version_stale(&mut self, node_id: u32, received: u8) {
+        for e in self.topo_versions[..self.topo_version_count as usize].iter_mut() {
+            if e.node_id == node_id {
+                e.stale_version = received;
+                e.stale_valid = true;
+                return;
+            }
         }
     }
 
@@ -1875,6 +1911,11 @@ impl NeighborGraph {
             .find_node(self.my_node)
             .and_then(|n| n.find_edge(peer))
             .is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn edge_hears_us_for_test(&self, peer: u32) -> bool {
+        self.edge_hears_us(peer)
     }
 
     fn edge_hears_us(&self, next_hop: u32) -> bool {
@@ -3018,6 +3059,62 @@ mod tests {
             peer_report(&mut graph, PEER, 2, 4_000),
             TopologyMergeResult::Applied { .. }
         ));
+    }
+
+    /// 2026-09-06 19:14: A rebooted, B never processed its boot broadcast and rejected versions
+    /// 1, 2 and 3 as stale against 13. Two rejected versions climbing one by one are a restart.
+    #[test]
+    fn peer_restart_is_accepted_after_two_climbing_stale_reports() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 13, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 1, 2_000),
+            TopologyMergeResult::Stale { .. }
+        ));
+        // A repeat of the rejected version, or a jump, is not a climb.
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 1, 2_500),
+            TopologyMergeResult::Stale { .. }
+        ));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 5, 3_000),
+            TopologyMergeResult::Stale { .. }
+        ));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 6, 4_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 6, 13)));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 7, 5_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+    }
+
+    /// 2026-09-06 19:16: Dura's boot broadcast cleared B's `hears_us` for it. An empty list
+    /// says nothing about who hears the sender.
+    #[test]
+    fn empty_list_does_not_clear_hears_us() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        graph.confirm_direct_neighbor_hears_us(PEER);
+        assert!(graph.caps_last_hop(PEER) || graph.edge_hears_us_for_test(PEER));
+        let boot = graph.merge_topology(PEER, &topo_header(0), &[], true, 2_000, 0);
+        assert!(matches!(boot, TopologyMergeResult::Applied { .. }));
+        assert!(
+            graph.edge_hears_us_for_test(PEER),
+            "a boot broadcast is a restart notice, not a neighbour list"
+        );
     }
 
     /// The boot broadcast was missed: after two quiet intervals any version is accepted.

@@ -1442,9 +1442,6 @@ impl Router {
         if parsed.from == 0 || parsed.from == self.node_num {
             return;
         }
-        if self.graph.has_our_transmission(parsed.id) {
-            return;
-        }
         let Some((header, neighbor_list)) = extract_packed_neighbors(payload) else {
             return;
         };
@@ -3130,6 +3127,13 @@ impl Router {
             topo_v,
         });
         true
+    }
+
+    /// Seed the packet id sequence with hardware entropy. Without it every boot replays the
+    /// same ids (counter mixed with uptime), and two nodes booting a minute apart collide in the
+    /// low id range: B dropped A's boot broadcast because id 0x3a matched one of B's own frames.
+    pub fn seed_tx_ids(&mut self, seed: u32) {
+        self.next_tx_id = seed;
     }
 
     fn alloc_tx_id(&mut self, now_ms: u32) -> u32 {

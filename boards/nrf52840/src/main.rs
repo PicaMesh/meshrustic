@@ -16,6 +16,7 @@ use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::nvmc::Nvmc;
+use embassy_nrf::rng;
 use embassy_nrf::saadc;
 use embassy_nrf::spim;
 use embassy_nrf::wdt;
@@ -50,6 +51,7 @@ unsafe fn HardFault(_frame: &ExceptionFrame) -> ! {
 }
 
 bind_interrupts!(struct Irqs {
+    RNG => rng::InterruptHandler<embassy_nrf::peripherals::RNG>;
     SPIM3 => spim::InterruptHandler<embassy_nrf::peripherals::SPI3>;
     USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;
     CLOCK_POWER => embassy_nrf::usb::vbus_detect::InterruptHandler;
@@ -133,6 +135,10 @@ async fn main(spawner: Spawner) {
 
     let router = ROUTER.take();
     router.load_node_config(&config);
+    // Packet ids must differ between boots and between nodes: seed them from the RNG peripheral.
+    let mut seed = [0u8; 4];
+    rng::Rng::new(p.RNG, Irqs).blocking_fill_bytes(&mut seed);
+    router.seed_tx_ids(u32::from_le_bytes(seed));
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(
         config.node_num,
         config.public_key,
