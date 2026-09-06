@@ -5,6 +5,7 @@ use mesh_protocol::PacketHeader;
 use mesh_radio::{
     eu868_config_for_preset, packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868,
 };
+use mesh_routing::channel_access::ChannelAccess;
 use mesh_routing::{
     wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, InboundPacket, Router, RxDecodeInfo,
     SrLogEvent, MAX_SR_LOG,
@@ -44,6 +45,11 @@ pub async fn radio_task(
             RadioError::Hardware => "init FAILED: hardware/SPI error",
         };
         loop {
+            // Keep the watchdog fed: a parked node that keeps logging its reason is worth more
+            // than a 30 s reboot loop that shows three lines per cycle.
+            if let Some(wdt) = watchdog.as_mut() {
+                wdt.pet();
+            }
             defmt::error!("[Radio0] {}", reason);
             crate::usb_log::log::radio::warn(reason);
             Timer::after_secs(10).await;
@@ -75,23 +81,14 @@ pub async fn radio_task(
     let mut reboot_deadline: Option<Instant> = None;
     // LoRa preset: persist + soft-reinit after completion reply TX (never sys_reset).
     let mut radio_reinit_pending = false;
-    // Nothing is handed to the radio before this instant. Set after every reception and every
-    // listen-before-talk deferral to a random contention delay, as stock Meshtastic does after
-    // busyRx: two nodes released by the end of the same frame must not key up together.
-    let mut tx_hold_until: Option<Instant> = None;
+    // The only decision point for keying up: post-reception turnaround, post-TX gap and the
+    // contention backoff all live in `ChannelAccess` (mesh-routing::channel_access), and both
+    // the router's polls and the radio queue itself are gated by it below.
+    let mut access = ChannelAccess::new();
     let mut tx_cancels: heapless::Vec<u32, 8> = heapless::Vec::new();
 
     const LOOP_ACTIVE_MS: u64 = 5;
     const LOOP_IDLE_MS: u64 = 100;
-    // Never start another frame right after one of ours ends: receivers are still reading the
-    // first frame out of the radio and re-arming, and a preamble that starts in that window is
-    // lost. Dura missed every traceroute reply that followed an ACK by exactly one airtime.
-    const TX_INTERFRAME_GAP_MS: u64 = 100;
-    // Same on the receive side: after any frame we heard, every other receiver of that frame is
-    // still reading it out and re-arming. A reply that keys up within a few milliseconds of the
-    // request's end is lost on every fork node (their own replies come 330-690 ms later; the
-    // old MeshRustic build answered after ~210 ms and was heard). Floor the post-reception hold.
-    const RX_TURNAROUND_GAP_MS: u32 = 150;
 
     loop {
         // Every pass through this loop proves the executor and the router are still making
@@ -106,8 +103,7 @@ pub async fn radio_task(
         // waiting for the router, and no post-reception hold is running. Pending work keeps its
         // due time inside the router and is picked up on the next pass.
         let rx_busy = slot.rx_busy().unwrap_or(false);
-        let held = tx_hold_until.is_some_and(|until| Instant::now() < until);
-        let may_release = !rx_busy && !held && slot.rx_queue.is_empty();
+        let may_release = !rx_busy && access.may_transmit(now_ms) && slot.rx_queue.is_empty();
         if may_release {
             if let Some(relay) = router.poll_ready_relay(now_ms) {
                 enqueue_tx(relay, slot, router, node_num, b"relay");
@@ -172,7 +168,7 @@ pub async fn radio_task(
             crate::usb_log::log::sr::emit(*event);
         }
 
-        match slot.service(air) {
+        match slot.service(air, may_release) {
             Ok(mut report) => {
                 let mut received = false;
                 let mut last_rx_id = 0u32;
@@ -203,10 +199,8 @@ pub async fn radio_task(
                         last_rx_id,
                         node_num,
                     )
-                    .max(cw_slot)
-                    .max(RX_TURNAROUND_GAP_MS);
-                    let hold_until = Instant::now() + Duration::from_millis(backoff as u64);
-                    tx_hold_until = Some(tx_hold_until.map_or(hold_until, |h| h.max(hold_until)));
+                    .max(cw_slot);
+                    access.note_rx((Instant::now().as_millis() & 0xFFFF_FFFF) as u32, backoff);
                 }
                 if let Some(len) = report.tx_len {
                     defmt::info!(
@@ -219,8 +213,7 @@ pub async fn radio_task(
                     if let Some(id) = report.tx_id {
                         router.note_tx_done(id);
                     }
-                    let gap_until = Instant::now() + Duration::from_millis(TX_INTERFRAME_GAP_MS);
-                    tx_hold_until = Some(tx_hold_until.map_or(gap_until, |h| h.max(gap_until)));
+                    access.note_tx_done((Instant::now().as_millis() & 0xFFFF_FFFF) as u32);
                 }
                 if report.tx_deferred_rx_busy {
                     defmt::trace!("[Radio0] TX deferred: reception in progress");
@@ -393,20 +386,17 @@ fn handle_rx_frame(
             crate::usb_log::log::qos::drop_relay(result.parsed.from, chutil);
         }
 
+        // Nothing leaves for the radio from here. An immediate relay is parked as a pending
+        // relay due now, and ACKs/admin/traceroute replies already sit in their pending slots;
+        // the loop top releases them once the post-reception hold has passed. Enqueueing here
+        // bypassed that hold and put replies on the air ~0 ms after the request, while the
+        // peer nodes were still busy with the request for 70-170 ms and heard none of them.
         if let Some(relay) = plan.relay {
-            enqueue_tx(relay, slot, router, node_num, b"relay");
-        }
-
-        if let Some(ack) = router.poll_ack_tx(now_ms) {
-            enqueue_tx(ack, slot, router, node_num, b"ack");
-        }
-
-        if let Some(admin) = router.poll_admin_tx(now_ms) {
-            enqueue_tx(admin, slot, router, node_num, b"admin");
-        }
-
-        if let Some(tr) = router.poll_traceroute_tx(now_ms) {
-            enqueue_tx(tr, slot, router, node_num, b"traceroute");
+            if !router.defer_relay(relay, result.radio_id, now_ms) {
+                // Pending table full: the radio queue is gated by ChannelAccess as well, so the
+                // frame still waits out the turnaround; it just cannot be pulled back by a dupe.
+                enqueue_tx(relay, slot, router, node_num, b"relay");
+            }
         }
     } else if let Ok(header) = PacketHeader::decode(frame.payload()) {
         let parsed = header.parse();

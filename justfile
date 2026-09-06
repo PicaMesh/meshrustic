@@ -41,6 +41,10 @@ flash board:
 uf2 board:
     just _in_board "bash scripts/make-uf2.sh" {{board}}
 
+# RAM/flash sections, largest statics and largest stack frames of the release build.
+size board:
+    just _in_board "bash scripts/size.sh" {{board}}
+
 deploy-rpi host:
     bash -lc '\
         cd boards/rpi-app && \

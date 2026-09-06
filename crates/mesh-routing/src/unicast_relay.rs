@@ -1,15 +1,14 @@
 //! Cost-ranked relay coordination for unicasts.
 //!
-//! Mirrors the fork's `shouldRelayUnicastForCoordination`: every SR node that overhears a
+//! Every SR node that overhears a
 //! unicast computes the same candidate ordering from its graph, so the node best placed to
 //! deliver the packet keys up first and everybody else cancels on its copy. Candidates are
 //! ourselves plus our SR-active direct neighbours, ranked by cost to the destination:
 //!
 //! - direct edge to the destination: the edge's ETX (`0x0064..0x7FFE`);
 //! - known downstream relay of the destination: [`DOWNSTREAM_TIER_COST`], after any direct
-//!   edge but ahead of every indirect candidate (the fork has no downstream tier; MeshRustic
-//!   adds it because the downstream table is often the only knowledge we have of a gateway's
-//!   branch before its topology report arrives);
+//!   edge but ahead of every indirect candidate (the downstream table is often the only
+//!   knowledge we have of a gateway's branch before its topology report arrives);
 //! - edge to the shared next hop only: the edge's ETX with [`INDIRECT_TIER`] set.
 //!
 //! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Each node prices its own
@@ -17,7 +16,7 @@
 //! near-equal costs differ by a few hundredths on every node, in a direction that varies. Exact
 //! comparison then ranked the two colocated nicenanos in opposite orders (each behind the other),
 //! both took the same slot and keyed up together. Within a bucket, ties are broken by node id, low
-//! first on even packet ids and high first on odd ones, as the fork does. Before ranking, the
+//! first on even packet ids and high first on odd ones. Before ranking, the
 //! packet is suppressed outright when the transmitter or an SR neighbour that covers the
 //! transmitter can already deliver it.
 
@@ -191,7 +190,7 @@ pub fn plan_unicast_relay(
     }
 
     // Ascending cost; equal costs ordered by node id, direction chosen by packet-id parity so
-    // no node is favoured across packets (same rule as the fork).
+    // no node is favoured across packets.
     let prefer_high_id = packet_id & 1 != 0;
     let ahead = |a: &UnicastCandidate, b: &UnicastCandidate| {
         a.cost < b.cost

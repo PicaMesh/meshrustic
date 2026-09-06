@@ -1,4 +1,7 @@
 [target.thumbv7em-none-eabihf]
+# flip-link places the stack below .data/.bss so an overflow hits the bottom of RAM and faults
+# (reset by the HardFault handler) instead of silently corrupting statics.
+linker = "flip-link"
 runner = "probe-rs run --chip nRF52840_xxAA"
 
 [build]

@@ -250,7 +250,7 @@ pub fn build_app_wire_frame(
         want_ack,
         false,
         0,
-        0,
+        (from & 0xFF) as u8, // relay byte = sender, as stock stamps its own frames
     );
     let mut bytes = [0u8; MAX_WIRE_LEN];
     header.encode_to((&mut bytes[..PACKET_HEADER_LEN]).try_into().ok()?);
@@ -358,7 +358,7 @@ pub fn build_topology_wire_frame(
         false,
         false,
         0,
-        0,
+        (node_num & 0xFF) as u8,
     );
     let mut bytes = [0u8; MAX_WIRE_LEN];
     header.encode_to((&mut bytes[..PACKET_HEADER_LEN]).try_into().ok()?);

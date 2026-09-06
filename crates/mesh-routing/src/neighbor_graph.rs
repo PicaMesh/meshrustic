@@ -29,7 +29,7 @@ pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
 /// peer whose reboot broadcast we missed, a peer that came back with a moved-on counter, and a
 /// receiver that was itself away. Twice the periodic interval.
 pub const TOPOLOGY_RESYNC_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS;
-/// Nominal link assumed for edges inferred from relayed packets (same as the fork's default).
+/// Nominal link assumed for edges inferred from relayed packets.
 pub const INFERRED_LINK_RSSI: i32 = -70;
 pub const INFERRED_LINK_SNR: f32 = 5.0;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
@@ -89,6 +89,9 @@ struct PendingListed {
     ids: [u32; MAX_NEIGHBORS],
 }
 
+/// Multi-chunk reports gathered at once; hubs with more than 28 neighbours are few.
+const PENDING_LISTED_SLOTS: usize = 4;
+
 impl PendingListed {
     const EMPTY: PendingListed = PendingListed {
         sender: 0,
@@ -136,8 +139,9 @@ pub struct NeighborGraph {
     /// Set when a report was accepted outside the forward version window (peer reboot or long
     /// silence): (sender, received version, previously stored version). Taken by the router for the log.
     last_version_resync: Option<(u32, u8, u8)>,
-    /// Listed neighbour ids of a multi-chunk report still being received (see `merge_topology`).
-    pending_listed: PendingListed,
+    /// Listed neighbour ids of multi-chunk reports still being received, one slot per sender
+    /// (see `merge_topology`). A single slot let any other node's report invalidate a hub's list.
+    pending_listed: [PendingListed; PENDING_LISTED_SLOTS],
     topo_version_count: u8,
     topology_version: u8,
     topology_dirty: bool,
@@ -188,7 +192,7 @@ impl NeighborGraph {
             }; MAX_TOPOLOGY_VERSION_ENTRIES],
             topo_version_count: 0,
             last_version_resync: None,
-            pending_listed: PendingListed::EMPTY,
+            pending_listed: [PendingListed::EMPTY; PENDING_LISTED_SLOTS],
             topology_version: 0,
             topology_dirty: false,
             last_topology_ms: 0,
@@ -1153,8 +1157,9 @@ impl NeighborGraph {
         // The sender is authoritative about who it hears: a neighbour it does not list has its
         // hears_us towards the sender cleared. That needs the complete list, so chunks of a
         // multi-packet report are gathered first and the rule runs on the last one.
+        let slot = self.pending_listed_slot(sender);
         if !header.continuation {
-            self.pending_listed = PendingListed {
+            self.pending_listed[slot] = PendingListed {
                 sender,
                 version: received,
                 count: 0,
@@ -1162,7 +1167,7 @@ impl NeighborGraph {
                 ids: [0; MAX_NEIGHBORS],
             };
         }
-        let pending = &mut self.pending_listed;
+        let pending = &mut self.pending_listed[slot];
         if pending.valid && pending.sender == sender && pending.version == received {
             for neighbor in neighbors {
                 if (pending.count as usize) < MAX_NEIGHBORS {
@@ -1179,7 +1184,7 @@ impl NeighborGraph {
                     self.edges
                         .clear_hears_us_to_unlisted(sender, &listed[..count]);
                 }
-                self.pending_listed.valid = false;
+                self.pending_listed[slot].valid = false;
             }
         } else if header.continuation {
             // First chunk missed: this list is incomplete, leave hears_us as it was.
@@ -1242,6 +1247,16 @@ impl NeighborGraph {
     /// A report was accepted outside the forward version window (sender, received, stored).
     pub fn take_topology_version_resync(&mut self) -> Option<(u32, u8, u8)> {
         self.last_version_resync.take()
+    }
+
+    /// Slot gathering `sender`'s chunks: its open one if any, else a free one, else slot 0
+    /// (whose owner then loses its half-gathered list, the only casualty of the cap).
+    fn pending_listed_slot(&self, sender: u32) -> usize {
+        self.pending_listed
+            .iter()
+            .position(|p| p.valid && p.sender == sender)
+            .or_else(|| self.pending_listed.iter().position(|p| !p.valid))
+            .unwrap_or(0)
     }
 
     /// Record a direct RF neighbor. `heard_on` is the receiving radio (`RadioId(0)` on v1 hardware).
@@ -1414,9 +1429,9 @@ impl NeighborGraph {
         }
         self.edges.ensure_local_node(self.my_node, now_ms);
         // What we measured is the relay's link to us, not the relay's link to the source. An
-        // inferred edge/downstream gets a nominal cost per hop the packet has travelled, as the
-        // fork does; with the measured value a two-hop path through a node a metre away priced
-        // at 1.05 and both nicenanos routed FCM6 through each other.
+        // inferred edge/downstream gets a nominal cost per hop the packet has travelled; with the
+        // measured value a two-hop path through a node a metre away priced at 1.05 and two
+        // colocated nodes routed a far hub through each other.
         let hops_used = hop_start.saturating_sub(hop_limit).max(1);
         let etx = calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR) * hops_used as f32;
 
@@ -1498,7 +1513,11 @@ impl NeighborGraph {
             (plan.slot_index, plan.candidate_count, plan.slot_delay_ms)
         } else {
             let (idx, count) = self.relay_slot_index(id, heard_from, now_ms);
-            (idx, count, idx as u32 * half)
+            (
+                idx,
+                count,
+                crate::channel_access::slot_delay_ms(idx as u32, half),
+            )
         };
         // The slot already encodes the coordinated order. Only a small deterministic tie-break
         // is added; the router-style SNR contention delay (up to 2·CW slots, several times a
@@ -3142,6 +3161,17 @@ mod tests {
         assert!(
             hears(&graph, UNLISTED),
             "not cleared while chunks are pending"
+        );
+        // Another node's complete report lands between the two chunks: it must not disturb the
+        // gathering of SENDER's list (one slot per sender).
+        const OTHER: u32 = 0xEE00_00EE;
+        graph.merge_topology(
+            OTHER,
+            &header(false, false),
+            &[entry(0xCC00_00CC)],
+            true,
+            3_200,
+            0,
         );
         graph.merge_topology(
             SENDER,

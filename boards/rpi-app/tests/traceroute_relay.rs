@@ -144,6 +144,59 @@ fn router_appends_traceroute_reply_on_route_back() {
 }
 
 #[test]
+fn traceroute_reply_stops_our_reliable_retransmit() {
+    const ME: u32 = 0xCCCC_CCCC;
+    const PEER: u32 = 0x1111_1111;
+    const CHANNEL: u8 = 0x77;
+    let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+    let mut router = Router::with_channel(ME, key, CHANNEL, MODEM_SHORT_SLOW, true, 3);
+    let mut route_wire = heapless::Vec::<u8, 128>::new();
+    encode_route_discovery(&RouteDiscovery::default(), &mut route_wire);
+    let sent = router
+        .send_local(PEER, TRACEROUTE_APP, &route_wire, true, 3, 1_000, 100)
+        .expect("request queued");
+    let request_id = PacketHeader::decode(&sent.bytes[..PACKET_HEADER_LEN])
+        .unwrap()
+        .parse()
+        .id;
+    assert!(router.has_pending_reliable(request_id));
+    // The peer answers with a traceroute reply (request_id set) and no separate ACK, as stock
+    // Meshtastic does: that reply is the acknowledgement.
+    let (len, reply) = build_app_wire_frame(
+        ME,
+        PEER,
+        0x5151_5151,
+        CHANNEL,
+        0,
+        0,
+        true,
+        &key,
+        TRACEROUTE_APP,
+        &route_wire,
+        DataEncodeOpts {
+            request_id,
+            ..Default::default()
+        },
+    )
+    .expect("reply wire");
+    router
+        .process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -60,
+                snr: 10,
+                bytes: &reply[..usize::from(len)],
+            },
+            2_000,
+        )
+        .expect("accepted");
+    assert!(
+        !router.has_pending_reliable(request_id),
+        "a module reply with our request id ends the reliable retransmit"
+    );
+}
+
+#[test]
 fn traceroute_reply_replaces_the_separate_ack() {
     const REQUESTER: u32 = 0x1111_1111;
     const TARGET: u32 = 0xCCCC_CCCC;

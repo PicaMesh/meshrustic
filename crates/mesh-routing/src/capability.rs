@@ -241,8 +241,7 @@ pub fn capability_from_role(role: u32) -> CapabilityStatus {
 
 /// Roles that broadcast SR topology. Every role does except LOST_AND_FOUND (and unknown
 /// roles): CLIENT_MUTE, TRACKER, SENSOR, TAK, TAK_TRACKER and CLIENT_HIDDEN announce their
-/// direct neighbours as SR-passive even though they never relay (mirrors the fork's
-/// `canSendTopology`).
+/// direct neighbours as SR-passive even though they never relay.
 pub fn role_may_send_topology(role: u32) -> bool {
     matches!(
         role,

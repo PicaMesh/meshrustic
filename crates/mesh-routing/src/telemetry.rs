@@ -103,7 +103,7 @@ pub fn build_device_telemetry_wire_frame(
         false,
         false,
         0,
-        0,
+        (node_num & 0xFF) as u8,
     );
     let mut bytes = [0u8; MAX_WIRE_LEN];
     header.encode_to((&mut bytes[..PACKET_HEADER_LEN]).try_into().ok()?);

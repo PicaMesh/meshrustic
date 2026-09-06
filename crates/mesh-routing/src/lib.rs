@@ -10,6 +10,7 @@ pub mod admin_codec;
 pub mod bridge;
 pub mod broadcast_relay;
 pub mod capability;
+pub mod channel_access;
 pub mod coordinated_relay;
 pub mod graph;
 pub mod neighbor_graph;

@@ -1,5 +1,6 @@
 //! Broadcast relay slot scheduling (phased stock → SR → downstream → coverage).
 
+use mesh_routing::channel_access::SLOT_ORIGIN_MS;
 use mesh_routing::{
     EdgeSource, NeighborGraph, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, POOR_LINK_ETX_THRESHOLD,
 };
@@ -34,7 +35,7 @@ fn stock_router_gets_first_slot() {
     setup_stock_graph(&mut graph);
     let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
     assert!(!plan.should_relay);
-    assert_eq!(plan.slot_delay_ms, 0);
+    assert_eq!(plan.slot_delay_ms, 0, "no relay planned, no delay");
 }
 
 #[test]
@@ -78,7 +79,7 @@ fn best_candidate_assigned_earlier_slot() {
 
     let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
     assert!(plan.should_relay);
-    assert_eq!(plan.slot_delay_ms, HALF);
+    assert_eq!(plan.slot_delay_ms, SLOT_ORIGIN_MS + HALF);
     assert_eq!(plan.slot_index, 1);
 }
 

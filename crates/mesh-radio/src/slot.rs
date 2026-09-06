@@ -22,6 +22,8 @@ pub struct ServiceReport {
     /// TX queue had a frame but a received frame had not yet reached the router; the router
     /// gets to cancel the queued relay first (a copy of the same packet is the usual reason).
     pub tx_deferred_rx_pending: bool,
+    /// TX queue had a frame but the channel-access gate (post-RX turnaround, post-TX gap) held it.
+    pub tx_held: bool,
     /// Frames waiting in the TX queue after this poll.
     pub tx_queue_len: u8,
 }
@@ -63,8 +65,15 @@ where
         self.driver.init()
     }
 
-    /// Poll hardware, enqueue RX frames, drain TX queue when duty cycle allows.
-    pub fn service(&mut self, air_time: &mut AirTime) -> Result<ServiceReport, RadioError> {
+    /// Poll hardware, enqueue RX frames, and send one queued frame when `may_tx` (the board's
+    /// channel-access gate) allows it and the duty cycle permits. The gate lives outside this
+    /// type on purpose: the queue must never key up on its own initiative, which is how a relay
+    /// parked during an incoming frame used to go out a few milliseconds after that frame ended.
+    pub fn service(
+        &mut self,
+        air_time: &mut AirTime,
+        may_tx: bool,
+    ) -> Result<ServiceReport, RadioError> {
         let mut report = ServiceReport::default();
 
         while let Some(frame) = self.driver.poll_recv()? {
@@ -82,6 +91,8 @@ where
             // put our relay on the air a few ms before the dedupe that cancels it runs: two
             // colocated nodes did exactly that, one keying up the instant the other's copy ended.
             report.tx_deferred_rx_pending = true;
+        } else if !self.tx_queue.is_empty() && !may_tx {
+            report.tx_held = true;
         } else if air_time.is_tx_allowed_duty_cycle() {
             if let Ok(tx) = self.tx_queue.pop() {
                 let len = tx.len;
@@ -184,14 +195,14 @@ mod tests {
         slot.enqueue_tx(TxFrame::new(0, &[0u8; 20]).unwrap())
             .unwrap();
 
-        let report = slot.service(&mut air).unwrap();
+        let report = slot.service(&mut air, true).unwrap();
         assert!(report.tx_deferred_rx_busy);
         assert!(report.tx_len.is_none());
         assert_eq!(slot.tx_queue_len(), 1, "frame stays queued");
         assert_eq!(slot.driver.sent, 0);
 
         slot.driver.busy = false;
-        let report = slot.service(&mut air).unwrap();
+        let report = slot.service(&mut air, true).unwrap();
         assert!(!report.tx_deferred_rx_busy);
         assert_eq!(report.tx_len, Some(20));
         assert_eq!(slot.driver.sent, 1);
@@ -229,7 +240,7 @@ mod tests {
             .unwrap();
 
         // The reception just completed: it is returned, the TX waits.
-        let report = slot.service(&mut air).unwrap();
+        let report = slot.service(&mut air, true).unwrap();
         assert!(report.rx.is_some());
         assert!(report.tx_deferred_rx_pending);
         assert!(report.tx_len.is_none());
@@ -237,7 +248,7 @@ mod tests {
 
         // The router saw a copy of the same packet and cancels our relay.
         assert_eq!(slot.remove_tx(0x1234), 1);
-        let report = slot.service(&mut air).unwrap();
+        let report = slot.service(&mut air, true).unwrap();
         assert!(report.tx_len.is_none());
         assert_eq!(slot.driver.sent, 0);
         assert_eq!(slot.tx_queue_len(), 0);
@@ -264,9 +275,9 @@ mod tests {
         assert_eq!(slot.remove_tx(2), 0);
         assert_eq!(slot.tx_queue_len(), 2);
         let mut air = AirTime::new(EU_868);
-        let first = slot.service(&mut air).unwrap();
+        let first = slot.service(&mut air, true).unwrap();
         assert_eq!(first.tx_id, Some(1));
-        let second = slot.service(&mut air).unwrap();
+        let second = slot.service(&mut air, true).unwrap();
         assert_eq!(second.tx_id, Some(3));
     }
 }

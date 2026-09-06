@@ -305,7 +305,7 @@ impl EdgeStore {
             self.nodes[from_idx].edge_count += 1;
             EDGE_NEW
         } else {
-            // Edge list full: replace the worst edge if the new one is better, as the fork does
+            // Edge list full: replace the worst edge if the new one is better
             // (score = ETX + age/300 s, so stale links lose first). Dropping the new edge instead
             // meant a hub never learned neighbours that appeared after its 40 slots filled.
             let node = &mut self.nodes[from_idx];

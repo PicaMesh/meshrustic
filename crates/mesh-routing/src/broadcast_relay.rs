@@ -533,7 +533,8 @@ where
     let peers = candidates; // every SR candidate, kept for the stock-coverage tie-break
     let initial_candidates = candidates.count;
     let mut reason = RelayReason::None;
-    let mut slot_delay = 0u32;
+    // Slot k fires at SLOT_ORIGIN_MS + k * half: nobody keys up inside the peers' turnaround.
+    let mut slot_delay = crate::channel_access::SLOT_ORIGIN_MS;
     let mut should_relay = false;
     let mut my_delay = 0u32;
     let mut ranked = [0u32; RANKED_LOG];
@@ -630,6 +631,7 @@ where
     }
 
     let slot_index = my_delay
+        .saturating_sub(crate::channel_access::SLOT_ORIGIN_MS)
         .checked_div(half)
         .map_or(0, |slots| slots.min(u8::MAX as u32) as u8);
 
@@ -1023,7 +1025,10 @@ mod tests {
             never_transmitted,
         );
         assert!(plan.should_relay);
-        assert_eq!(plan.slot_delay_ms, 100);
+        assert_eq!(
+            plan.slot_delay_ms,
+            crate::channel_access::SLOT_ORIGIN_MS + 100
+        );
         assert_eq!(plan.slot_index, 1);
     }
 }

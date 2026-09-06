@@ -50,7 +50,7 @@ pub fn tx_delay_ms_router(snr: i8, slot_ms: u32, from: u32, id: u32, node_num: u
 }
 
 /// Tie-breaker added to an SR relay slot: deterministic per (packet, node), within
-/// ±¼ half-airtime (fork: `±halfAirtime/4`). Small enough that two candidates in adjacent slots
+/// ±¼ half-airtime. Small enough that two candidates in adjacent slots
 /// can never swap order, large enough that two nodes computing the same slot do not key up in
 /// the same instant. Returns the signed offset in ms.
 pub fn slot_tie_break_ms(half_airtime_ms: u32, id: u32, node_num: u32) -> i32 {
