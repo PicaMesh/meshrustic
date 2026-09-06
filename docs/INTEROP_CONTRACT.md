@@ -55,6 +55,13 @@ airtime. Every SignalRouting node uses the same figure.
 - **Next hop.** A relayed unicast carries the next hop from our own route or zero, never the
   byte inherited from the incoming frame (`relay_header_with_next_hop_opts`). Zero means "any
   relay may carry it", stock's `NO_NEXT_HOP_PREFERENCE`.
+- **Data bitfield.** Every Data payload we originate carries `Data.bitfield`
+  (`encode_data_payload_opts`), as stock does since 2.5: bit 1 mirrors `want_response`, bit 0
+  (MQTT uplink allowed) stays clear. Its presence is what tells a stock receiver that our
+  `hop_start` is populated; a zero-`hop_start` frame without it has travelled an unknown number
+  of hops (`hops_away`, stock's `getHopsAway`), and stock never acknowledges a response whose hop
+  count it does not know. Tests: `originated_data_carries_the_bitfield`,
+  `hop_zero_reply_is_readable_as_direct_by_a_stock_receiver`.
 
 ## 3. Acknowledgements and replies
 
@@ -67,6 +74,12 @@ airtime. Every SignalRouting node uses the same figure.
   stops on an ACK, a NAK or a module reply that carries the request id
   (`Router::process_reliable_rx`, stock's `ReliableRouter`). Test:
   `traceroute_reply_stops_our_reliable_retransmit`.
+- **Responses are acknowledged only when direct.** A response addressed to us (request or reply
+  id set) with WantAck gets a hop-0 ACK only if it travelled zero hops or named us as next hop
+  (`Router::process_reliable_rx`, stock's `ReliableRouter::sniffReceived`); a relayed response
+  was acknowledged implicitly by its relay. Response hop budgets follow stock's
+  `getHopLimitForResponse` (`hop_limit_for_response`): hops used plus margin, zero for a
+  zero-hop request, the configured limit when the hop count is unknown.
 - **Routing ACKs that retrace the link are not relayed** (`SrSkipReason::ReplyRetracesLink`).
 
 ## 4. Duplicates and hand-offs

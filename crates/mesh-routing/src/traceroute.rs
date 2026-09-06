@@ -2,6 +2,8 @@
 
 use mesh_protocol::{ParsedPacket, NODENUM_BROADCAST};
 
+use crate::routing_ack::hops_away;
+
 pub const TRACEROUTE_APP: u32 = 70;
 pub const ROUTE_SIZE: usize = 8;
 /// Unknown hop SNR marker on the wire (Meshtastic-compatible).
@@ -113,25 +115,24 @@ pub fn encode_route_discovery(rd: &RouteDiscovery, out: &mut heapless::Vec<u8, 1
 pub fn alter_on_relay(
     rd: &mut RouteDiscovery,
     parsed: &ParsedPacket,
+    hop_start_known: bool,
     node_num: u32,
     snr: i8,
     request_id: u32,
 ) {
     let towards_destination = request_id == 0;
-    insert_unknown_hops(rd, parsed, towards_destination);
+    insert_unknown_hops(rd, parsed, hop_start_known, towards_destination);
     let snr_only = parsed.to == node_num;
     append_id_and_snr(rd, node_num, snr, towards_destination, snr_only);
 }
 
-fn hops_away(parsed: &ParsedPacket) -> Option<u8> {
-    if parsed.hop_start == 0 {
-        return None;
-    }
-    Some(parsed.hop_start.saturating_sub(parsed.hop_limit))
-}
-
-fn insert_unknown_hops(rd: &mut RouteDiscovery, parsed: &ParsedPacket, towards_destination: bool) {
-    let Some(hops_taken) = hops_away(parsed) else {
+fn insert_unknown_hops(
+    rd: &mut RouteDiscovery,
+    parsed: &ParsedPacket,
+    hop_start_known: bool,
+    towards_destination: bool,
+) {
+    let Some(hops_taken) = hops_away(parsed.hop_start, parsed.hop_limit, hop_start_known) else {
         return;
     };
     let (route, snr_list) = if towards_destination {
@@ -206,7 +207,14 @@ pub fn rebuild_relay_ciphertext(
     }
     let mut rd = decode_route_discovery(&inner)?;
     let towards = decoded.request_id == 0;
-    alter_on_relay(&mut rd, parsed, node_num, snr, decoded.request_id);
+    alter_on_relay(
+        &mut rd,
+        parsed,
+        data.has_bitfield,
+        node_num,
+        snr,
+        decoded.request_id,
+    );
     let route_len = if towards {
         rd.route.len()
     } else {
@@ -364,7 +372,7 @@ mod tests {
         let mut rd = RouteDiscovery::default();
         let parsed =
             PacketHeader::from_fields(0xAA, 0xBB, 1, 0x77, 3, 3, false, false, 0, 0).parse();
-        alter_on_relay(&mut rd, &parsed, 0xCC, 10, 0);
+        alter_on_relay(&mut rd, &parsed, true, 0xCC, 10, 0);
         assert_eq!(rd.route.as_slice(), &[0xCC]);
         assert_eq!(rd.snr_towards.as_slice(), &[40]);
     }
@@ -375,7 +383,7 @@ mod tests {
         // Direct unicast to us: append SNR only (no route id).
         let parsed =
             PacketHeader::from_fields(0xCC, 0xAA, 1, 0x77, 3, 3, false, false, 0, 0).parse();
-        alter_on_relay(&mut rd, &parsed, 0xCC, 8, 0);
+        alter_on_relay(&mut rd, &parsed, true, 0xCC, 8, 0);
         assert!(rd.route.is_empty());
         assert_eq!(rd.snr_towards.as_slice(), &[32]);
     }
@@ -385,7 +393,7 @@ mod tests {
         let mut rd = RouteDiscovery::default();
         let parsed =
             PacketHeader::from_fields(0xBB, 0xAA, 1, 0x77, 3, 3, false, false, 0, 0).parse();
-        alter_on_relay(&mut rd, &parsed, 0xCC, 6, 0x1234);
+        alter_on_relay(&mut rd, &parsed, true, 0xCC, 6, 0x1234);
         assert_eq!(rd.route_back.as_slice(), &[0xCC]);
         assert_eq!(rd.snr_back.as_slice(), &[24]);
         assert!(rd.route.is_empty());

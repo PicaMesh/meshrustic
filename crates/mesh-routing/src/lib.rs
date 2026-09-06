@@ -89,9 +89,9 @@ pub use relay_identity::{RelayIdentityCache, MAX_RELAY_IDENTITY_ENTRIES, RELAY_I
 pub use reliable::{PendingReliable, MAX_PENDING_RELIABLE};
 pub use router::{InboundPacket, ProcessResult, RelayPlan, Router, TxPlan, MAX_WIRE_LEN};
 pub use routing_ack::{
-    build_ack_nak_frame, decode_routing_payload, hop_limit_for_response, retransmission_delay_ms,
-    RoutingDecode, NUM_RELIABLE_RETX, RETX_PROCESSING_TIME_MS, ROUTING_APP,
-    ROUTING_ERROR_MAX_RETRANSMIT, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
+    build_ack_nak_frame, decode_routing_payload, hop_limit_for_response, hops_away,
+    retransmission_delay_ms, RoutingDecode, NUM_RELIABLE_RETX, RETX_PROCESSING_TIME_MS,
+    ROUTING_APP, ROUTING_ERROR_MAX_RETRANSMIT, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
 };
 pub use rx_decode::{summarize_decrypted, RxDecodeInfo, RxPayloadSummary};
 pub use sr_log::{
@@ -110,8 +110,9 @@ pub use topology::{
     decode_packed_neighbors, encode_data_payload, encode_data_payload_opts,
     encode_packed_neighbor_entry, encode_signal_routing_info, extract_packed_neighbors,
     try_decrypt_data, try_decrypt_data_full, write_packed_header, write_packed_header_chunk,
-    DataEncodeOpts, DecodedData, PackedHeader, PackedNeighbor, MAX_NEIGHBORS_PER_PACKET,
-    MAX_TOPOLOGY_PACKETS, PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
+    DataEncodeOpts, DecodedData, PackedHeader, PackedNeighbor, DATA_BITFIELD_OK_TO_MQTT,
+    DATA_BITFIELD_WANT_RESPONSE, MAX_NEIGHBORS_PER_PACKET, MAX_TOPOLOGY_PACKETS,
+    PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
 };
 pub use traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,

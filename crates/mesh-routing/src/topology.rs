@@ -21,6 +21,14 @@ pub const MAX_NEIGHBORS_PER_PACKET: usize = 28;
 pub const SR_BROADCAST_MAX_HOPS: u8 = 5;
 pub const SIGNAL_ROUTING_APP: u32 = 88;
 
+/// `Data.bitfield` (field 9). Stock stamps it on every frame it originates, and a receiver
+/// takes its presence as proof that the header's `hop_start` is populated: a frame with
+/// `hop_start` zero and no bitfield has travelled an unknown number of hops, and stock never
+/// ACKs a response whose hop count it does not know.
+pub const DATA_BITFIELD_OK_TO_MQTT: u8 = 1 << 0;
+pub const DATA_BITFIELD_WANT_RESPONSE: u8 = 1 << 1;
+const DATA_BITFIELD_FIELD: u32 = 9;
+
 pub const MAX_TOPOLOGY_PACKETS: usize = 4;
 
 /// Parsed `Data` protobuf fields (portnum + routing metadata).
@@ -31,6 +39,9 @@ pub struct DecodedData {
     pub dest: u32,
     pub request_id: u32,
     pub reply_id: u32,
+    /// The origin stamped `Data.bitfield`, so its `hop_start` can be trusted.
+    pub has_bitfield: bool,
+    pub bitfield: u8,
 }
 
 /// Optional fields when encoding a `Data` protobuf payload.
@@ -213,6 +224,13 @@ pub fn encode_data_payload_opts(
     if opts.reply_id != 0 {
         push_fixed32_field(&mut out, 7, opts.reply_id);
     }
+    // Every originated frame carries the bitfield, as stock does. MQTT uplink of our frames is
+    // not offered (stock's default); the want_response bit mirrors field 3.
+    let mut bitfield = 0u32;
+    if opts.want_response {
+        bitfield |= DATA_BITFIELD_WANT_RESPONSE as u32;
+    }
+    push_varint_field(&mut out, DATA_BITFIELD_FIELD, bitfield);
     out
 }
 
@@ -309,6 +327,12 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
                     u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
             }
+            (9, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                decoded.has_bitfield = true;
+                decoded.bitfield = v as u8;
+                i = ni;
+            }
             _ => {
                 i = skip_field(data, i, wire)?;
             }
@@ -317,6 +341,10 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
     }
     if !have_portnum {
         return None;
+    }
+    // Stock mirrors the want_response bit of the bitfield into `want_response` on receive.
+    if decoded.has_bitfield && decoded.bitfield & DATA_BITFIELD_WANT_RESPONSE != 0 {
+        decoded.want_response = true;
     }
     Some((decoded, payload))
 }
@@ -484,6 +512,44 @@ fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn originated_data_carries_the_bitfield() {
+        let plain = encode_data_payload(70, &[0x10, 0x38]);
+        assert_eq!(
+            &plain[plain.len() - 2..],
+            &[0x48, 0x00],
+            "field 9, varint 0"
+        );
+        let (decoded, payload) = decode_data_payload_full(&plain).unwrap();
+        assert!(decoded.has_bitfield);
+        assert_eq!(decoded.bitfield, 0);
+        assert!(!decoded.want_response);
+        assert_eq!(payload.as_slice(), &[0x10, 0x38]);
+
+        let asking = encode_data_payload_opts(
+            70,
+            &[],
+            DataEncodeOpts {
+                want_response: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(&asking[asking.len() - 2..], &[0x48, 0x02]);
+        let (decoded, _) = decode_data_payload_full(&asking).unwrap();
+        assert_eq!(decoded.bitfield, DATA_BITFIELD_WANT_RESPONSE);
+    }
+
+    #[test]
+    fn bitfield_want_response_bit_is_mirrored_on_receive() {
+        // portnum 1, empty payload, bitfield with only the want_response bit: no field 3.
+        let (decoded, _) = decode_data_payload_full(&[0x08, 0x01, 0x12, 0x00, 0x48, 0x02]).unwrap();
+        assert!(decoded.want_response);
+        // A frame from an origin without the bitfield.
+        let (decoded, _) = decode_data_payload_full(&[0x08, 0x01, 0x12, 0x00]).unwrap();
+        assert!(!decoded.has_bitfield);
+        assert!(!decoded.want_response);
+    }
     use mesh_crypto::{CryptoKey, DEFAULT_PSK};
     use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
 

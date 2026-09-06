@@ -38,7 +38,7 @@ use crate::reliable::{
 };
 use crate::routing_ack::{
     build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
-    retransmission_delay_ms, ROUTING_APP, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
+    hops_away, retransmission_delay_ms, ROUTING_APP, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
 };
 use crate::rx_decode::{summarize_decrypted, RxDecodeInfo};
 use crate::sr_log::{
@@ -545,7 +545,7 @@ impl Router {
             next_hop: 0,
             relay_node: 0,
         };
-        self.process_admin_rx(&parsed, inner, now_ms);
+        self.process_admin_rx(&parsed, inner, true, now_ms);
     }
 
     /// Host/unit-test only: replace Appendix A builtin pubs with a known keypair set.
@@ -932,12 +932,12 @@ impl Router {
                 }
             } else if data.portnum == ADMIN_APP && parsed.to == self.node_num {
                 if let Some(ref inner) = inner {
-                    self.process_admin_rx(&parsed, inner, now_ms);
+                    self.process_admin_rx(&parsed, inner, data.has_bitfield, now_ms);
                 }
             }
         } else if parsed.to == self.node_num {
             if let Some(err) = self.pending_pki_error.take() {
-                self.schedule_admin_routing_error(&parsed, err, now_ms);
+                self.schedule_admin_routing_error(&parsed, false, err, now_ms);
             }
         }
         self.pending_pki_error = None;
@@ -1097,7 +1097,13 @@ impl Router {
         )
     }
 
-    fn process_admin_rx(&mut self, parsed: &ParsedPacket, payload: &[u8], now_ms: u32) {
+    fn process_admin_rx(
+        &mut self,
+        parsed: &ParsedPacket,
+        payload: &[u8],
+        hop_start_known: bool,
+        now_ms: u32,
+    ) {
         // v1: admin is authorized only from this packet's successful PKI remote pubkey.
         let Some(remote_pk) = self
             .admin_reply_remote_pk
@@ -1105,6 +1111,7 @@ impl Router {
         else {
             self.schedule_admin_routing_error(
                 parsed,
+                hop_start_known,
                 ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED,
                 now_ms,
             );
@@ -1132,22 +1139,28 @@ impl Router {
         }
 
         if let Some(err) = outcome.routing_error {
-            self.schedule_admin_routing_error(parsed, err, now_ms);
+            self.schedule_admin_routing_error(parsed, hop_start_known, err, now_ms);
             return;
         }
 
         if let Some(resp) = outcome.response {
-            self.schedule_admin_response(parsed, &resp, now_ms);
+            self.schedule_admin_response(parsed, hop_start_known, &resp, now_ms);
         } else if outcome.routing_ok {
             // Mutating admin ops complete with ROUTING_APP Error_NONE.
             // This reply also serves as the WantAck ACK (no second ROUTING NONE).
             // Always send — some clients omit Data.want_response on set.
-            self.schedule_admin_routing_error(parsed, ROUTING_ERROR_NONE, now_ms);
+            self.schedule_admin_routing_error(parsed, hop_start_known, ROUTING_ERROR_NONE, now_ms);
         }
     }
 
-    fn schedule_admin_routing_error(&mut self, parsed: &ParsedPacket, error: u32, now_ms: u32) {
-        let hop = self.response_hop_limit(parsed);
+    fn schedule_admin_routing_error(
+        &mut self,
+        parsed: &ParsedPacket,
+        hop_start_known: bool,
+        error: u32,
+        now_ms: u32,
+    ) {
+        let hop = self.response_hop_limit(parsed, hop_start_known);
         let id = self.alloc_tx_id(now_ms);
         let routing = encode_routing_error(error);
         // Mirror setReplyTo: Data.request_id only (not reply_id), and copy WantAck so the reply
@@ -1207,6 +1220,7 @@ impl Router {
     fn schedule_admin_response(
         &mut self,
         parsed: &ParsedPacket,
+        hop_start_known: bool,
         resp: &crate::admin_codec::AdminMessage,
         now_ms: u32,
     ) {
@@ -1218,7 +1232,7 @@ impl Router {
             ),
             _ => encode_admin_response(resp),
         };
-        let hop = hop_limit_for_response(parsed, self.hop_limit).max(1);
+        let hop = hop_limit_for_response(parsed, hop_start_known, self.hop_limit).max(1);
         let id = self.alloc_tx_id(now_ms);
         // Clients correlate admin replies via Data.request_id (setReplyTo on the wire).
         let opts = DataEncodeOpts {
@@ -2271,8 +2285,8 @@ impl Router {
     /// direct neighbour that hears us goes out with hop limit 0 (1 on a marginal link) when
     /// stock neighbours are around, so nobody relays a packet we deliver ourselves. A
     /// traceroute reply from A to Dura went out with hop 2 and was relayed three times.
-    fn response_hop_limit(&self, parsed: &ParsedPacket) -> u8 {
-        let base = hop_limit_for_response(parsed, self.hop_limit);
+    fn response_hop_limit(&self, parsed: &ParsedPacket, hop_start_known: bool) -> u8 {
+        let base = hop_limit_for_response(parsed, hop_start_known, self.hop_limit);
         // A request that reached us through a relay says the direct link is not carrying
         // frames right now; the reply then keeps its hop budget so a relay can return it.
         let arrived_direct = is_direct_packet(
@@ -2700,23 +2714,37 @@ impl Router {
             if parsed.from != self.node_num
                 && parsed.from != 0
                 && parsed.want_ack
-                && data.request_id == 0
-                && data.reply_id == 0
                 && !self.module_reply_suppresses_ack
             {
-                self.schedule_ack(parsed, parsed.channel, now_ms);
+                if data.request_id == 0 && data.reply_id == 0 {
+                    self.schedule_ack(parsed, data.has_bitfield, parsed.channel, now_ms);
+                } else if hops_away(parsed.hop_start, parsed.hop_limit, data.has_bitfield)
+                    == Some(0)
+                    || parsed.next_hop != 0
+                {
+                    // Stock: a response is acknowledged only when it reached us with zero hops
+                    // or through a designated next hop, and then with a hop-0 ACK; a relayed
+                    // response was already implicitly acknowledged by the relay.
+                    self.schedule_ack_with_hop(parsed, parsed.channel, 0, now_ms);
+                }
             }
         } else if parsed.from != self.node_num
             && parsed.from != 0
             && parsed.want_ack
             && !self.module_reply_suppresses_ack
         {
-            self.schedule_nak(parsed, ROUTING_ERROR_NO_CHANNEL, now_ms);
+            self.schedule_nak(parsed, false, ROUTING_ERROR_NO_CHANNEL, now_ms);
         }
     }
 
-    fn schedule_ack(&mut self, parsed: &ParsedPacket, channel_hash: u8, now_ms: u32) {
-        let hop = self.response_hop_limit(parsed);
+    fn schedule_ack(
+        &mut self,
+        parsed: &ParsedPacket,
+        hop_start_known: bool,
+        channel_hash: u8,
+        now_ms: u32,
+    ) {
+        let hop = self.response_hop_limit(parsed, hop_start_known);
         self.schedule_ack_with_hop(parsed, channel_hash, hop, now_ms);
     }
 
@@ -2750,11 +2778,17 @@ impl Router {
         };
     }
 
-    fn schedule_nak(&mut self, parsed: &ParsedPacket, error: u32, now_ms: u32) {
+    fn schedule_nak(
+        &mut self,
+        parsed: &ParsedPacket,
+        hop_start_known: bool,
+        error: u32,
+        now_ms: u32,
+    ) {
         if self.pending_ack.active {
             return;
         }
-        let hop = self.response_hop_limit(parsed);
+        let hop = self.response_hop_limit(parsed, hop_start_known);
         let packet_id = self.alloc_tx_id(now_ms);
         let Some((len, frame)) =
             self.build_ack_nak_reply(parsed, packet_id, hop, error, parsed.channel)
@@ -2935,12 +2969,19 @@ impl Router {
             Some(rd) => rd,
             None => return,
         };
-        alter_on_relay(&mut rd, parsed, self.node_num, snr, data.request_id);
+        alter_on_relay(
+            &mut rd,
+            parsed,
+            data.has_bitfield,
+            self.node_num,
+            snr,
+            data.request_id,
+        );
         let mut route_wire = heapless::Vec::<u8, 128>::new();
         if !encode_route_discovery(&rd, &mut route_wire) {
             return;
         }
-        let hop = self.response_hop_limit(parsed);
+        let hop = self.response_hop_limit(parsed, data.has_bitfield);
         let packet_id = self.alloc_tx_id(now_ms);
         let Some((len, frame)) = build_app_wire_frame(
             parsed.from,
@@ -3168,11 +3209,12 @@ impl Router {
         dropped
     }
 
-    /// hopsAway == 0 (hop_start == hop_limit): original transmitter, not a relayed copy.
+    /// Zero hops away: the original transmitter's own frame, not a relayed copy.
     /// Unicast WantAck retries use this to emit a hop_limit=0 re-ACK without re-running modules.
     /// To-us DMs are never SR-suppressed for this check (SR is not used for packets to us).
-    fn is_repeated_reliable_tx(parsed: &ParsedPacket) -> bool {
-        parsed.hop_start > 0 && parsed.hop_start == parsed.hop_limit
+    fn is_repeated_reliable_tx(parsed: &ParsedPacket, data: Option<&DecodedData>) -> bool {
+        let hop_start_known = data.is_some_and(|d| d.has_bitfield);
+        hops_away(parsed.hop_start, parsed.hop_limit, hop_start_known) == Some(0)
     }
 
     fn maybe_cancel_relay_for_foreign_ack(&mut self, parsed: &ParsedPacket, data: &DecodedData) {
@@ -3227,13 +3269,13 @@ impl Router {
 
         // Dupe path never re-enters rate_limit / admin / modules (history short-circuit).
         // Original-sender WantAck retry: re-send idempotent admin GET replies, else hop_limit=0 re-ACK.
-        if Self::is_repeated_reliable_tx(parsed) {
+        if Self::is_repeated_reliable_tx(parsed, decoded_data) {
             if parsed.to == self.node_num && parsed.want_ack {
                 if let (Some(data), Some(payload)) = (decoded_data, inner) {
                     if data.portnum == ADMIN_APP {
                         if let Some(msg) = crate::admin_codec::decode_admin_message(payload) {
                             if crate::admin::admin_request_is_idempotent_read(&msg.payload) {
-                                self.process_admin_rx(parsed, payload, now_ms);
+                                self.process_admin_rx(parsed, payload, data.has_bitfield, now_ms);
                                 return;
                             }
                         }
@@ -3543,7 +3585,7 @@ mod tests {
         router.graph_mut().confirm_direct_neighbor_hears_us(DEST);
         let request = PacketHeader::from_fields(ME, DEST, 7, 0, 7, 7, true, false, 0, 0).parse();
         assert_eq!(
-            router.response_hop_limit(&request),
+            router.response_hop_limit(&request, true),
             2,
             "no stock neighbour: nothing to protect, default margin applies"
         );
@@ -3551,7 +3593,7 @@ mod tests {
             .graph_mut()
             .observe_direct_neighbor(STOCK, -60, 10, 1_000, 0);
         assert_eq!(
-            router.response_hop_limit(&request),
+            router.response_hop_limit(&request, true),
             0,
             "good direct link: deliver ourselves"
         );
@@ -3559,10 +3601,10 @@ mod tests {
         // right now, so the reply keeps a budget a relay can use to bring it back.
         let relayed = PacketHeader::from_fields(ME, DEST, 8, 0, 6, 7, true, false, 0, 0x99).parse();
         assert_eq!(
-            router.response_hop_limit(&relayed),
-            hop_limit_for_response(&relayed, router.hop_limit)
+            router.response_hop_limit(&relayed, true),
+            hop_limit_for_response(&relayed, true, router.hop_limit)
         );
-        assert!(router.response_hop_limit(&relayed) >= 1);
+        assert!(router.response_hop_limit(&relayed, true) >= 1);
     }
 
     #[test]

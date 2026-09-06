@@ -72,12 +72,9 @@ fn fresh_slot(from: u32, now_ms: u32, hops: u8) -> Slot {
     }
 }
 
+/// Hops travelled for the per-node statistics; an unknown count is recorded as zero.
 fn hops_away(hop_start: u8, hop_limit: u8) -> u8 {
-    if hop_start == 0 || hop_limit >= hop_start {
-        0
-    } else {
-        hop_start - hop_limit
-    }
+    crate::routing_ack::hops_away(hop_start, hop_limit, true).unwrap_or(0)
 }
 
 /// Fixed-size per-node abuse filter on the RX path.

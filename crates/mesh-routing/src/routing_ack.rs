@@ -51,14 +51,35 @@ pub fn retransmission_delay_ms(packet_airtime_ms: u32, slot_ms: u32, channel_uti
         .saturating_add(RETX_PROCESSING_TIME_MS)
 }
 
-/// Hop limit for an ACK/NAK routed back toward the original sender.
-pub fn hop_limit_for_response(parsed: &ParsedPacket, configured_hop_limit: u8) -> u8 {
-    if parsed.hop_start == 0 {
-        return 0;
+/// Hops a frame has travelled, stock's `getHopsAway`. Unknown when `hop_start` is zero on a
+/// frame whose Data carries no bitfield (`hop_start_known` false: a pre-2.5 origin), or when
+/// the header is inconsistent.
+pub fn hops_away(hop_start: u8, hop_limit: u8, hop_start_known: bool) -> Option<u8> {
+    if hop_start == 0 && !hop_start_known {
+        return None;
     }
-    let hops_used = parsed.hop_start.saturating_sub(parsed.hop_limit);
+    if hop_start < hop_limit {
+        return None;
+    }
+    Some(hop_start - hop_limit)
+}
+
+/// Hop limit for a response routed back toward the original sender, stock's
+/// `getHopLimitForResponse`: the hops the request used plus a margin; zero when the request was
+/// sent with zero hops; the configured limit when the hop count is unknown.
+pub fn hop_limit_for_response(
+    parsed: &ParsedPacket,
+    hop_start_known: bool,
+    configured_hop_limit: u8,
+) -> u8 {
+    let Some(hops_used) = hops_away(parsed.hop_start, parsed.hop_limit, hop_start_known) else {
+        return configured_hop_limit;
+    };
     if hops_used > configured_hop_limit {
         return hops_used;
+    }
+    if parsed.hop_start == 0 {
+        return 0;
     }
     let with_margin = hops_used.saturating_add(2);
     if with_margin < configured_hop_limit {
@@ -221,9 +242,22 @@ mod tests {
     #[test]
     fn hop_limit_for_response_uses_margin() {
         let parsed = PacketHeader::from_fields(0xAA, 0xBB, 1, 0, 1, 3, false, false, 0, 0).parse();
-        assert_eq!(hop_limit_for_response(&parsed, 3), 3);
-        let direct = PacketHeader::from_fields(0xAA, 0xBB, 1, 0, 3, 0, false, false, 0, 0).parse();
-        assert_eq!(hop_limit_for_response(&direct, 3), 0);
+        assert_eq!(hop_limit_for_response(&parsed, true, 3), 3);
+        let direct = PacketHeader::from_fields(0xAA, 0xBB, 1, 0, 3, 3, false, false, 0, 0).parse();
+        assert_eq!(hop_limit_for_response(&direct, true, 3), 2);
+        // A request sent with zero hops is answered with zero hops.
+        let zero = PacketHeader::from_fields(0xAA, 0xBB, 1, 0, 0, 0, false, false, 0, 0).parse();
+        assert_eq!(hop_limit_for_response(&zero, true, 3), 0);
+        // The same header from an origin without the bitfield: hops unknown, default budget.
+        assert_eq!(hop_limit_for_response(&zero, false, 3), 3);
+    }
+
+    #[test]
+    fn hops_away_follows_stock() {
+        assert_eq!(hops_away(0, 0, false), None);
+        assert_eq!(hops_away(0, 0, true), Some(0));
+        assert_eq!(hops_away(3, 1, false), Some(2));
+        assert_eq!(hops_away(1, 3, true), None);
     }
 
     #[test]

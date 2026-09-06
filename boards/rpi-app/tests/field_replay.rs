@@ -12,6 +12,7 @@ use mesh_routing::{
     DataEncodeOpts, InboundPacket, RouteDiscovery, Router, SrLogEvent, MAX_SR_LOG,
     PACKED_NEIGHBOR_HEADER_SIZE, TRACEROUTE_APP,
 };
+use mesh_routing::{hops_away, try_decrypt_data_full};
 
 const CHANNEL: u8 = 0x77;
 
@@ -166,4 +167,78 @@ fn reply_to_a_direct_request_is_held_for_the_peer_turnaround() {
     assert!(!bench.access.may_transmit(t0 + 1));
     assert!(!bench.access.may_transmit(t0 + PEER_TURNAROUND_MS - 1));
     assert!(bench.access.may_transmit(t0 + PEER_TURNAROUND_MS));
+}
+
+/// 2026-09-06 15:18: A's hop-0 reply to Dura reached every peer on the desk, yet Dura never
+/// acknowledged it while it acknowledged the peers' own hop-0 replies. Stock acknowledges a
+/// response only when it knows the response travelled zero hops, and it knows the hop count of
+/// a zero-`hop_start` frame only when the Data carries the bitfield. Our reply must therefore
+/// carry it, and a stock receiver must then read the reply as direct.
+#[test]
+fn hop_zero_reply_is_readable_as_direct_by_a_stock_receiver() {
+    const ME: u32 = 0xBDAC_CE55;
+    const DURA: u32 = 0x979E_D146;
+    let mut bench = Bench::new(ME);
+    bench
+        .router
+        .graph_mut()
+        .observe_direct_neighbor(DURA, -44, 14, 1_000, 0);
+    bench
+        .router
+        .graph_mut()
+        .confirm_direct_neighbor_hears_us(DURA);
+    // A stock neighbour, so the last-hop cap applies and the reply goes out with zero hops.
+    bench
+        .router
+        .graph_mut()
+        .observe_direct_neighbor(0xEE59_4922, -60, 11, 1_000, 0);
+    let mut route = heapless::Vec::<u8, 128>::new();
+    encode_route_discovery(&RouteDiscovery::default(), &mut route);
+    let (len, request) = build_app_wire_frame(
+        ME,
+        DURA,
+        0x9822_AA1C,
+        CHANNEL,
+        7,
+        7,
+        true,
+        &bench.key,
+        TRACEROUTE_APP,
+        &route,
+        DataEncodeOpts {
+            want_response: true,
+            ..Default::default()
+        },
+    )
+    .expect("request");
+    bench.hear(&request[..len as usize], 10_000);
+    let reply = bench.router.poll_traceroute_tx(10_000).expect("reply");
+    let hdr = PacketHeader::decode(&reply.bytes[..16]).unwrap().parse();
+    assert_eq!(
+        (hdr.hop_start, hdr.hop_limit),
+        (0, 0),
+        "capped last-hop reply"
+    );
+    let mut cipher = [0u8; 240];
+    let n = reply.len as usize - 16;
+    cipher[..n].copy_from_slice(&reply.bytes[16..reply.len as usize]);
+    let (data, _) = try_decrypt_data_full(
+        &bench.key,
+        hdr.from,
+        hdr.id,
+        CHANNEL,
+        hdr.channel,
+        &mut cipher[..n],
+    )
+    .expect("decodable Data");
+    assert_eq!(data.request_id, 0x9822_AA1C);
+    assert!(
+        data.has_bitfield,
+        "stock reads hop_start only when the bitfield is present"
+    );
+    assert_eq!(
+        hops_away(hdr.hop_start, hdr.hop_limit, data.has_bitfield),
+        Some(0),
+        "a stock receiver must see zero hops and acknowledge"
+    );
 }
