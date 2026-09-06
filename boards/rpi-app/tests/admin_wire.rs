@@ -169,6 +169,7 @@ fn admin_get_lora_and_begin_commit() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = passkey;

@@ -67,8 +67,9 @@ fn flood_routing_bucket(router: &mut Router, from: u32, channel: u8, key: &Crypt
     let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
     write_packed_header(&mut packed, 1, true);
     for i in 0..10u32 {
-        let (len, frame) = build_topology_wire_frame(from, 0x6000 + i, channel, 3, key, &packed)
-            .expect("routing flood wire");
+        let (len, frame) =
+            build_topology_wire_frame(from, 0x6000 + i, channel, 3, key, &packed, false)
+                .expect("routing flood wire");
         router
             .process_inbound(&inbound(&frame[..len as usize]), t)
             .expect("flood rx");
@@ -89,9 +90,16 @@ fn build_topology_wire(
     packed[10] = 8;
     packed[11] = 0x02; // hears_us
     let packed_len = PACKED_NEIGHBOR_HEADER_SIZE + 8;
-    let (len, frame) =
-        build_topology_wire_frame(from, packet_id, channel, 3, key, &packed[..packed_len])
-            .expect("topology wire");
+    let (len, frame) = build_topology_wire_frame(
+        from,
+        packet_id,
+        channel,
+        3,
+        key,
+        &packed[..packed_len],
+        false,
+    )
+    .expect("topology wire");
     let mut out = heapless::Vec::new();
     out.extend_from_slice(&frame[..len as usize]).unwrap();
     out
@@ -161,6 +169,7 @@ fn nodeinfo_request_to_us_is_answered_even_from_a_limited_node() {
             want_response: true,
             reply_id: 0,
             request_id: 0,
+            ..Default::default()
         },
     );
     let mut cipher = plaintext.clone();

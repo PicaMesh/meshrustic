@@ -36,7 +36,8 @@ fn nodeinfo_wire_decrypt_and_summary() {
     let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
     let identity = NodeInfoIdentity::for_node(0x677a_1caf, TEST_PUBKEY);
     let (len, frame) =
-        build_nodeinfo_wire_frame(0x677a_1caf, 99, channel_hash, 3, &key, &identity).unwrap();
+        build_nodeinfo_wire_frame(0x677a_1caf, 99, channel_hash, 3, &key, &identity, false)
+            .unwrap();
     let mut cipher = frame[PACKET_HEADER_LEN..len as usize].to_vec();
     let (portnum, payload) = mesh_routing::try_decrypt_data(
         &key,
@@ -77,6 +78,7 @@ fn nodeinfo_reply_frame_links_request_id() {
         3,
         &key,
         &identity,
+        false,
     )
     .unwrap();
     let header = PacketHeader::decode(&frame[..PACKET_HEADER_LEN]).unwrap();
@@ -108,6 +110,7 @@ fn build_nodeinfo_request_wire(
             want_response: true,
             reply_id: 0,
             request_id: 0,
+            ..Default::default()
         },
     );
     let mut cipher = plaintext.clone();
@@ -184,7 +187,7 @@ fn router_caches_received_nodeinfo() {
     let channel_hash = router.channel_hash();
     let identity = NodeInfoIdentity::for_node(peer, TEST_PUBKEY);
     let (len, frame) =
-        build_nodeinfo_wire_frame(peer, 55, channel_hash, 3, &key, &identity).unwrap();
+        build_nodeinfo_wire_frame(peer, 55, channel_hash, 3, &key, &identity, false).unwrap();
 
     let inbound = mesh_routing::InboundPacket {
         radio_id: 0,

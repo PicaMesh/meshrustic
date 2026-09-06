@@ -127,6 +127,7 @@ fn set_lora_persists_and_reloads_channel_hash() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = passkey;
@@ -233,6 +234,7 @@ fn set_long_fast_persists_to_store() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = passkey;
@@ -304,6 +306,7 @@ fn get_lora_reports_current_preset_after_set() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = passkey;

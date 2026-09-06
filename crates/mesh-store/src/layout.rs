@@ -5,7 +5,7 @@
 //! | Offset | Len | Status | Content |
 //! |--------|-----|--------|---------|
 //! | 0 | 4 | frozen | Magic `MRST` (`0x4D525354`) |
-//! | 4 | 4 | frozen | `STORE_VERSION` (current = 3) |
+//! | 4 | 4 | frozen | `STORE_VERSION` (current = 4) |
 //! | 8 | 4 | frozen | `node_num` |
 //! | 12 | 32 | frozen | `private_key` |
 //! | 44 | 32 | frozen | `public_key` |
@@ -20,7 +20,8 @@
 //! | 118 | 1 | frozen | hop_limit |
 //! | 119 | 1 | frozen | tx_power_dbm |
 //! | 120 | 1 | frozen | use_preset (0/1) |
-//! | 121 | 3 | reserved | must encode as 0; ignore on decode (future flags) |
+//! | 121 | 1 | frozen (v4) | ok_to_mqtt (0/1); records before v4 decode as 1 |
+//! | 122 | 2 | reserved | must encode as 0; ignore on decode (future flags) |
 //! | 124 | 96 | frozen | `admin_public_keys[3][32]` |
 //! | 220 | 32 | reserved | forward-compatible padding — encode 0; do not reinterpret |
 //! | 252 | 4 | frozen | CRC32 over bytes `[0..252)` |
@@ -34,9 +35,10 @@ use mesh_radio::EU_868;
 
 pub const STORE_MAGIC: u32 = 0x4D52_5354; // "MRST"
 /// Current on-disk version (v3 = v2 field map + documented reserved region / migration).
-pub const STORE_VERSION: u32 = 3;
+pub const STORE_VERSION: u32 = 4;
 pub const STORE_VERSION_V1: u32 = 1;
 pub const STORE_VERSION_V2: u32 = 2;
+pub const STORE_VERSION_V3: u32 = 3;
 pub const STORE_RECORD_LEN: usize = 256;
 pub const STORE_RECORD_LEN_V1: usize = 128;
 /// Start of forward-compatible reserved tail (before CRC).
@@ -82,7 +84,8 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
     out[118] = lora.hop_limit;
     out[119] = lora.tx_power_dbm;
     out[120] = if lora.use_preset { 1 } else { 0 };
-    // 121..124 reserved (zeros)
+    out[121] = if lora.ok_to_mqtt { 1 } else { 0 };
+    // 122..124 reserved (zeros)
 
     for i in 0..ADMIN_KEY_SLOTS {
         let off = 124 + i * 32;
@@ -108,12 +111,12 @@ pub fn decode(buf: &[u8]) -> Result<NodeConfig, StoreError> {
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     match version {
         STORE_VERSION_V1 => decode_v1(buf),
-        STORE_VERSION_V2 | STORE_VERSION => decode_v2_or_v3(buf),
+        STORE_VERSION_V2 | STORE_VERSION_V3 | STORE_VERSION => decode_v2_to_v4(buf, version),
         _ => Err(StoreError::BadVersion),
     }
 }
 
-fn decode_v2_or_v3(buf: &[u8]) -> Result<NodeConfig, StoreError> {
+fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
     if buf.len() < STORE_RECORD_LEN {
         return Err(StoreError::TooShort);
     }
@@ -144,6 +147,12 @@ fn decode_v2_or_v3(buf: &[u8]) -> Result<NodeConfig, StoreError> {
         hop_limit: buf[118],
         tx_power_dbm: buf[119],
         use_preset: buf[120] != 0,
+        // Byte 121 was reserved (zero) before v4; those records get the default.
+        ok_to_mqtt: if version >= STORE_VERSION {
+            buf[121] != 0
+        } else {
+            true
+        },
     };
 
     let mut admin_public_keys = [[0u8; 32]; ADMIN_KEY_SLOTS];
@@ -194,6 +203,7 @@ fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
         hop_limit: buf[105],
         tx_power_dbm: buf[106],
         use_preset: true,
+        ok_to_mqtt: true,
     };
 
     Ok(NodeConfig {
@@ -282,6 +292,41 @@ mod tests {
     use crate::keygen::generate_keypair;
     use mesh_crypto::CryptoKey;
     use mesh_radio::MODEM_SHORT_FAST;
+
+    #[test]
+    fn ok_to_mqtt_off_survives_round_trip() {
+        let (priv_key, pub_key) = generate_keypair(Some(&[0x5Au8; 16]), 7);
+        let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
+        assert!(config.lora.ok_to_mqtt, "on by default");
+        config.lora.ok_to_mqtt = false;
+        let mut buf = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut buf).unwrap();
+        assert_eq!(buf[121], 0);
+        assert!(!decode(&buf).unwrap().lora.ok_to_mqtt);
+    }
+
+    #[test]
+    fn v3_record_migrates_with_ok_to_mqtt_on() {
+        let (priv_key, pub_key) = generate_keypair(Some(&[0x5Bu8; 16]), 8);
+        let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
+        config.lora.ok_to_mqtt = false;
+        let mut buf = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut buf).unwrap();
+        // A v3 record: same layout, byte 121 reserved as zero.
+        buf[4..8].copy_from_slice(&STORE_VERSION_V3.to_le_bytes());
+        buf[121] = 0;
+        let crc = crc32(&buf[..STORE_CRC_OFFSET]);
+        buf[STORE_CRC_OFFSET..STORE_RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
+        let decoded = decode(&buf).unwrap();
+        assert!(decoded.lora.ok_to_mqtt, "pre-v4 records take the default");
+        let mut again = [0u8; STORE_RECORD_LEN];
+        encode(&decoded, &mut again).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(again[4..8].try_into().unwrap()),
+            STORE_VERSION
+        );
+        assert_eq!(again[121], 1);
+    }
 
     #[test]
     fn flash_round_trip_v3() {

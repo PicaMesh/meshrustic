@@ -5,7 +5,9 @@ use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
-use crate::topology::{encode_data_payload_opts, DataEncodeOpts, SR_BROADCAST_MAX_HOPS};
+use crate::topology::{
+    encode_data_payload_opts, DataBitfield, DataEncodeOpts, SR_BROADCAST_MAX_HOPS,
+};
 
 pub const TELEMETRY_APP: u32 = 67;
 /// Periodic device telemetry broadcast interval (20 min; config later).
@@ -74,12 +76,20 @@ pub fn build_device_telemetry_wire_frame(
     hop_limit: u8,
     key: &CryptoKey,
     metrics: &DeviceMetricsSnapshot,
+    ok_to_mqtt: bool,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     let mut telemetry = heapless::Vec::<u8, 128>::new();
     if !encode_device_telemetry(metrics, &mut telemetry) {
         return None;
     }
-    let plaintext = encode_data_payload_opts(TELEMETRY_APP, &telemetry, DataEncodeOpts::default());
+    let plaintext = encode_data_payload_opts(
+        TELEMETRY_APP,
+        &telemetry,
+        DataEncodeOpts {
+            bitfield: DataBitfield::Ours { ok_to_mqtt },
+            ..Default::default()
+        },
+    );
     if plaintext.len() > MAX_PACKET_PAYLOAD {
         return None;
     }
@@ -359,9 +369,16 @@ mod tests {
             air_util_tx: 1.5,
             uptime_seconds: 42,
         };
-        let (len, mut frame) =
-            build_device_telemetry_wire_frame(0x677a_1caf, 88, channel_hash, 3, &key, &metrics)
-                .unwrap();
+        let (len, mut frame) = build_device_telemetry_wire_frame(
+            0x677a_1caf,
+            88,
+            channel_hash,
+            3,
+            &key,
+            &metrics,
+            false,
+        )
+        .unwrap();
         let mut cipher = frame[mesh_protocol::PACKET_HEADER_LEN..len as usize].to_vec();
         let (portnum, payload) = crate::topology::try_decrypt_data(
             &key,

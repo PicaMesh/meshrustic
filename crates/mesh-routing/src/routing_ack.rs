@@ -4,7 +4,7 @@ use mesh_crypto::CryptoKey;
 use mesh_protocol::ParsedPacket;
 
 use crate::router::MAX_WIRE_LEN;
-use crate::topology::{build_app_wire_frame, DataEncodeOpts};
+use crate::topology::{build_app_wire_frame, DataBitfield, DataEncodeOpts};
 
 pub const ROUTING_APP: u32 = 5;
 
@@ -124,6 +124,7 @@ pub fn build_ack_nak_frame(
     hop_limit: u8,
     error_reason: u32,
     key: &CryptoKey,
+    ok_to_mqtt: bool,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     let routing = encode_routing_error(error_reason);
     build_app_wire_frame(
@@ -139,6 +140,7 @@ pub fn build_ack_nak_frame(
         &routing,
         DataEncodeOpts {
             request_id: acking_id,
+            bitfield: DataBitfield::Ours { ok_to_mqtt },
             ..Default::default()
         },
     )
@@ -272,6 +274,7 @@ mod tests {
             2,
             ROUTING_ERROR_NONE,
             &key,
+            false,
         )
         .unwrap();
         let header = PacketHeader::decode(&frame[..PACKET_HEADER_LEN]).unwrap();

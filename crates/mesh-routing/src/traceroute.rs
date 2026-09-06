@@ -229,6 +229,9 @@ pub fn rebuild_relay_ciphertext(
             want_response: decoded.want_response,
             request_id: decoded.request_id,
             reply_id: decoded.reply_id,
+            bitfield: crate::topology::DataBitfield::Origin(
+                data.has_bitfield.then_some(data.bitfield),
+            ),
         },
     );
     if plaintext.len() > cipher.len() {

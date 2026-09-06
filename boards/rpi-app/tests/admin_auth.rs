@@ -164,6 +164,7 @@ fn unauthorized_cannot_change_config() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = [1; 8];
@@ -213,6 +214,7 @@ fn builtin1_and_builtin2_can_set_lora() {
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: true,
         }));
         set.has_session_passkey = true;
         set.session_passkey = passkey;
@@ -252,6 +254,7 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = passkey;
@@ -332,6 +335,7 @@ fn stale_pki_then_channel_admin_cannot_mutate() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = passkey;
@@ -416,6 +420,7 @@ fn bad_session_key_rejects_set() {
         region: REGION_EU_868,
         hop_limit: 3,
         tx_power: 27,
+        config_ok_to_mqtt: true,
     }));
     set.has_session_passkey = true;
     set.session_passkey = [0xFF; 8];

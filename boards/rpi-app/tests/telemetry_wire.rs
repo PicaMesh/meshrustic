@@ -22,7 +22,7 @@ fn telemetry_wire_decrypt_and_summary() {
         uptime_seconds: 120,
     };
     let (len, frame) =
-        build_device_telemetry_wire_frame(0x677a_1caf, 42, channel_hash, 3, &key, &metrics)
+        build_device_telemetry_wire_frame(0x677a_1caf, 42, channel_hash, 3, &key, &metrics, false)
             .unwrap();
     let mut cipher = frame[mesh_protocol::PACKET_HEADER_LEN..len as usize].to_vec();
     let (portnum, payload) = try_decrypt_data(

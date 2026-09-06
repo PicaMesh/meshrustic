@@ -42,6 +42,7 @@ pub struct AdminState {
     pub use_preset: bool,
     pub hop_limit: u8,
     pub tx_power_dbm: u8,
+    pub ok_to_mqtt: bool,
     pub pending_reboot_seconds: Option<i32>,
     pub config_dirty: bool,
     /// Host/test only: replace Appendix A builtins for real PKI keypairs.
@@ -73,6 +74,7 @@ impl AdminState {
             use_preset: true,
             hop_limit: 3,
             tx_power_dbm: 27,
+            ok_to_mqtt: true,
             pending_reboot_seconds: None,
             config_dirty: false,
             #[cfg(any(test, feature = "std"))]
@@ -97,6 +99,7 @@ impl AdminState {
         self.use_preset = cfg.lora.use_preset;
         self.hop_limit = cfg.lora.hop_limit;
         self.tx_power_dbm = cfg.lora.tx_power_dbm;
+        self.ok_to_mqtt = cfg.lora.ok_to_mqtt;
     }
 
     /// Deprecated name kept as alias for call sites.
@@ -111,6 +114,7 @@ impl AdminState {
         cfg.lora.use_preset = self.use_preset;
         cfg.lora.hop_limit = self.hop_limit;
         cfg.lora.tx_power_dbm = self.tx_power_dbm;
+        cfg.lora.ok_to_mqtt = self.ok_to_mqtt;
         cfg.private_key = self.private_key;
         cfg.public_key = self.public_key;
     }
@@ -294,6 +298,7 @@ pub fn handle_admin(
                     region: REGION_EU_868,
                     hop_limit: state.hop_limit as u32,
                     tx_power: state.tx_power_dbm as i32,
+                    config_ok_to_mqtt: state.ok_to_mqtt,
                 }),
                 CONFIG_TYPE_SECURITY => ConfigPayload::Security(security_get(state)),
                 CONFIG_TYPE_SESSIONKEY => ConfigPayload::Sessionkey,
@@ -506,6 +511,7 @@ fn apply_lora_to_state(state: &mut AdminState, lora: &WireLoRaConfig) -> Result<
     let preset = lora.modem_preset as u8;
     state.modem_preset = preset;
     state.use_preset = true;
+    state.ok_to_mqtt = lora.config_ok_to_mqtt;
     Ok(preset)
 }
 
@@ -570,6 +576,7 @@ mod tests {
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: true,
         };
         let mut msg = AdminMessage::default();
         msg.payload = AdminPayload::SetConfig(ConfigPayload::Lora(lora));
@@ -624,6 +631,7 @@ mod tests {
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: true,
         }));
         set.has_session_passkey = true;
         set.session_passkey = resp.session_passkey;
@@ -684,6 +692,7 @@ mod tests {
             region: 1, // US — not EU_868
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: true,
         }));
         set.has_session_passkey = true;
         set.session_passkey = passkey;
@@ -755,6 +764,7 @@ mod tests {
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: true,
         }));
         set.has_session_passkey = true;
         set.session_passkey = passkey;

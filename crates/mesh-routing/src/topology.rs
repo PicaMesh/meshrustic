@@ -50,6 +50,22 @@ pub struct DataEncodeOpts {
     pub want_response: bool,
     pub reply_id: u32,
     pub request_id: u32,
+    pub bitfield: DataBitfield,
+}
+
+/// How `Data.bitfield` is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataBitfield {
+    /// A frame we originate: stock's bits, with the MQTT bit from our LoRa setting.
+    Ours { ok_to_mqtt: bool },
+    /// A frame we re-encode for relay: the origin's bitfield verbatim, none if it had none.
+    Origin(Option<u8>),
+}
+
+impl Default for DataBitfield {
+    fn default() -> Self {
+        Self::Ours { ok_to_mqtt: false }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -224,13 +240,25 @@ pub fn encode_data_payload_opts(
     if opts.reply_id != 0 {
         push_fixed32_field(&mut out, 7, opts.reply_id);
     }
-    // Every originated frame carries the bitfield, as stock does. MQTT uplink of our frames is
-    // not offered (stock's default); the want_response bit mirrors field 3.
-    let mut bitfield = 0u32;
-    if opts.want_response {
-        bitfield |= DATA_BITFIELD_WANT_RESPONSE as u32;
+    match opts.bitfield {
+        // Every originated frame carries the bitfield, as stock does since 2.5.
+        DataBitfield::Ours { ok_to_mqtt } => {
+            let mut bitfield = 0u32;
+            if ok_to_mqtt {
+                bitfield |= DATA_BITFIELD_OK_TO_MQTT as u32;
+            }
+            if opts.want_response {
+                bitfield |= DATA_BITFIELD_WANT_RESPONSE as u32;
+            }
+            push_varint_field(&mut out, DATA_BITFIELD_FIELD, bitfield);
+        }
+        // A relayed frame keeps the origin's word: gateways read the MQTT bit from the copy
+        // they hear, and a receiver reads "hop_start populated" from the bitfield's presence.
+        DataBitfield::Origin(Some(bitfield)) => {
+            push_varint_field(&mut out, DATA_BITFIELD_FIELD, bitfield as u32);
+        }
+        DataBitfield::Origin(None) => {}
     }
-    push_varint_field(&mut out, DATA_BITFIELD_FIELD, bitfield);
     out
 }
 
@@ -356,6 +384,7 @@ pub fn build_topology_wire_frame(
     hop_limit: u8,
     key: &CryptoKey,
     packed: &[u8],
+    ok_to_mqtt: bool,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     if packed.len()
         > PACKED_NEIGHBOR_HEADER_SIZE + MAX_NEIGHBORS_PER_PACKET * PACKED_NEIGHBOR_ENTRY_SIZE
@@ -363,7 +392,14 @@ pub fn build_topology_wire_frame(
         return None;
     }
     let sr_info = encode_signal_routing_info(packed);
-    let plaintext = encode_data_payload(SIGNAL_ROUTING_APP, &sr_info);
+    let plaintext = encode_data_payload_opts(
+        SIGNAL_ROUTING_APP,
+        &sr_info,
+        DataEncodeOpts {
+            bitfield: DataBitfield::Ours { ok_to_mqtt },
+            ..Default::default()
+        },
+    );
     if plaintext.len() > MAX_PACKET_PAYLOAD {
         return None;
     }
@@ -532,12 +568,42 @@ mod tests {
             &[],
             DataEncodeOpts {
                 want_response: true,
+                bitfield: DataBitfield::Ours { ok_to_mqtt: true },
                 ..Default::default()
             },
         );
-        assert_eq!(&asking[asking.len() - 2..], &[0x48, 0x02]);
+        assert_eq!(&asking[asking.len() - 2..], &[0x48, 0x03]);
         let (decoded, _) = decode_data_payload_full(&asking).unwrap();
-        assert_eq!(decoded.bitfield, DATA_BITFIELD_WANT_RESPONSE);
+        assert_eq!(
+            decoded.bitfield,
+            DATA_BITFIELD_WANT_RESPONSE | DATA_BITFIELD_OK_TO_MQTT
+        );
+    }
+
+    #[test]
+    fn relayed_data_keeps_the_origin_bitfield() {
+        let kept = encode_data_payload_opts(
+            70,
+            &[],
+            DataEncodeOpts {
+                bitfield: DataBitfield::Origin(Some(0x01)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(&kept[kept.len() - 2..], &[0x48, 0x01]);
+        let none = encode_data_payload_opts(
+            70,
+            &[],
+            DataEncodeOpts {
+                bitfield: DataBitfield::Origin(None),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            none.as_slice(),
+            &[0x08, 0x46, 0x12, 0x00],
+            "no bitfield added"
+        );
     }
 
     #[test]
@@ -560,8 +626,7 @@ mod tests {
             &[],
             DataEncodeOpts {
                 want_response: true,
-                reply_id: 0,
-                request_id: 0,
+                ..Default::default()
             },
         );
         let (decoded, payload) = decode_data_payload_full(&data).unwrap();
@@ -627,7 +692,8 @@ mod tests {
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 3, true);
         let (len, frame) =
-            build_topology_wire_frame(0x1234_5678, 99, channel_hash, 3, &key, &packed).unwrap();
+            build_topology_wire_frame(0x1234_5678, 99, channel_hash, 3, &key, &packed, false)
+                .unwrap();
         let mut cipher = frame[PACKET_HEADER_LEN..len as usize].to_vec();
         let (portnum, payload) = try_decrypt_data(
             &key,

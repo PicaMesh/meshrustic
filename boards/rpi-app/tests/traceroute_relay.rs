@@ -107,6 +107,7 @@ fn router_appends_traceroute_reply_on_route_back() {
             want_response: false,
             request_id: REQUEST_ID,
             reply_id: 0,
+            ..Default::default()
         },
     )
     .expect("wire frame");

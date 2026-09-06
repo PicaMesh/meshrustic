@@ -56,11 +56,16 @@ airtime. Every SignalRouting node uses the same figure.
   byte inherited from the incoming frame (`relay_header_with_next_hop_opts`). Zero means "any
   relay may carry it", stock's `NO_NEXT_HOP_PREFERENCE`.
 - **Data bitfield.** Every Data payload we originate carries `Data.bitfield`
-  (`encode_data_payload_opts`), as stock does since 2.5: bit 1 mirrors `want_response`, bit 0
-  (MQTT uplink allowed) stays clear. Its presence is what tells a stock receiver that our
-  `hop_start` is populated; a zero-`hop_start` frame without it has travelled an unknown number
-  of hops (`hops_away`, stock's `getHopsAway`), and stock never acknowledges a response whose hop
-  count it does not know. Tests: `originated_data_carries_the_bitfield`,
+  (`encode_data_payload_opts`, `DataBitfield::Ours`), as stock does since 2.5: bit 1 mirrors
+  `want_response`, bit 0 is our LoRa "OK to MQTT" setting (stock's `config_ok_to_mqtt`, admin
+  field 105, persisted in the flash record, on by default). Its presence is what tells a stock
+  receiver that our `hop_start` is populated; a zero-`hop_start` frame without it has travelled
+  an unknown number of hops (`hops_away`, stock's `getHopsAway`), and stock never acknowledges a
+  response whose hop count it does not know. The Meshtastic Android app goes further and shows a
+  zero-`hop_start` traceroute reply only when the bitfield word is nonzero, which is why the
+  MQTT bit defaults on. A frame we re-encode for relay keeps the origin's word verbatim
+  (`DataBitfield::Origin`), so gateways and receivers read what the origin wrote. Tests:
+  `originated_data_carries_the_bitfield`, `relayed_data_keeps_the_origin_bitfield`,
   `hop_zero_reply_is_readable_as_direct_by_a_stock_receiver`.
 
 ## 3. Acknowledgements and replies
@@ -81,6 +86,19 @@ airtime. Every SignalRouting node uses the same figure.
   `getHopLimitForResponse` (`hop_limit_for_response`): hops used plus margin, zero for a
   zero-hop request, the configured limit when the hop count is unknown.
 - **Routing ACKs that retrace the link are not relayed** (`SrSkipReason::ReplyRetracesLink`).
+
+## 3a. Unicast routes
+
+- **An edge is one-directional evidence.** A node listing a neighbour says it hears that
+  neighbour. A route hop from A to B needs B to hear A: A's edge to B carries `hears_us`, or B
+  lists A. A node that publishes topology and confirms neither does not hear A and is never
+  routed through that hop; a node that publishes none (stock, unclassified) cannot be ruled out
+  (`route::can_deliver`, applied in `calculate_route` and `find_better_positioned_neighbor`).
+  Test: `one_way_edge_is_not_a_route`.
+- **A next hop equal to the destination's byte names no relayer.** Stock's `NextHopRouter`
+  learns the destination itself as next hop from a direct reply. Such a unicast is planned as one
+  with no next hop: the cost ranking decides, nobody owns slot 0 (`Router::evaluate_tx_plan`,
+  `relayer_named`). Test: `next_hop_equal_to_the_destination_names_no_relayer`.
 
 ## 4. Duplicates and hand-offs
 

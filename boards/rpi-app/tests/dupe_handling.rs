@@ -330,9 +330,18 @@ fn foreign_routing_ack_cancels_pending_relay() {
                 .is_none()
     );
 
-    let (ack_len, ack_wire) =
-        build_ack_nak_frame(ORIGIN, DEST, 9001, 77, 0x77, 3, ROUTING_ERROR_NONE, &key)
-            .expect("ack frame");
+    let (ack_len, ack_wire) = build_ack_nak_frame(
+        ORIGIN,
+        DEST,
+        9001,
+        77,
+        0x77,
+        3,
+        ROUTING_ERROR_NONE,
+        &key,
+        false,
+    )
+    .expect("ack frame");
 
     let ack = InboundPacket {
         radio_id: 0,

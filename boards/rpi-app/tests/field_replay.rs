@@ -74,7 +74,8 @@ fn packed_list(version: u8, neighbours: &[u32]) -> heapless::Vec<u8, 240> {
 }
 
 fn topology_frame(bench: &Bench, from: u32, id: u32, packed: &[u8]) -> (u8, [u8; 256]) {
-    build_topology_wire_frame(from, id, CHANNEL, 5, &bench.key, packed).expect("topology frame")
+    build_topology_wire_frame(from, id, CHANNEL, 5, &bench.key, packed, false)
+        .expect("topology frame")
 }
 
 /// 2026-09-06 02:29: Czar was rebooted by admin; its version counter restarted at 0 after 108.
@@ -240,5 +241,13 @@ fn hop_zero_reply_is_readable_as_direct_by_a_stock_receiver() {
         hops_away(hdr.hop_start, hdr.hop_limit, data.has_bitfield),
         Some(0),
         "a stock receiver must see zero hops and acknowledge"
+    );
+    // 2026-09-06 17:29: Dura acknowledged B's reply but the Meshtastic Android app showed no
+    // route: it takes a zero bitfield on a zero-hop_start frame for a legacy frame and drops
+    // the traceroute. The default LoRa setting keeps the MQTT bit on, so the word is nonzero.
+    assert!(bench.router.ok_to_mqtt(), "OK-to-MQTT is on by default");
+    assert_ne!(
+        data.bitfield, 0,
+        "a zero bitfield hides a hop-0 reply in the app"
     );
 }

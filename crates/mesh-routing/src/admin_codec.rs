@@ -35,6 +35,8 @@ pub struct WireLoRaConfig {
     pub region: u32,
     pub hop_limit: u32,
     pub tx_power: i32,
+    /// Field 105, stock's `config_ok_to_mqtt`.
+    pub config_ok_to_mqtt: bool,
 }
 
 impl Default for WireLoRaConfig {
@@ -45,6 +47,7 @@ impl Default for WireLoRaConfig {
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: true,
         }
     }
 }
@@ -243,6 +246,9 @@ pub fn encode_lora_config(lora: &WireLoRaConfig) -> heapless::Vec<u8, 64> {
     if lora.tx_power != 0 {
         push_svarint_field(&mut out, 11, lora.tx_power);
     }
+    if lora.config_ok_to_mqtt {
+        push_varint_field(&mut out, 105, 1);
+    }
     out
 }
 
@@ -384,6 +390,7 @@ pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
         region: 0,
         hop_limit: 0,
         tx_power: 0,
+        config_ok_to_mqtt: false,
     };
     let mut idx = 0usize;
     while idx < payload.len() {
@@ -414,6 +421,11 @@ pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
             (11, 0) => {
                 let (v, ni) = read_svarint(payload, i)?;
                 lora.tx_power = v;
+                i = ni;
+            }
+            (105, 0) => {
+                let (v, ni) = read_varint(payload, i)?;
+                lora.config_ok_to_mqtt = v != 0;
                 i = ni;
             }
             _ => {
@@ -931,6 +943,7 @@ mod tests {
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: false,
         };
         let mut set = AdminMessage::default();
         set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(lora));
@@ -1036,6 +1049,7 @@ mod tests {
             region: 3,
             hop_limit: 0,
             tx_power: 0,
+            config_ok_to_mqtt: false,
         };
         let bytes = encode_lora_config(&lora);
         // use_preset=true → field 1 varint 1: 08 01
@@ -1054,6 +1068,7 @@ mod tests {
             region: REGION_EU_868,
             hop_limit: 3,
             tx_power: 27,
+            config_ok_to_mqtt: false,
         };
         let bytes = encode_lora_config(&lora);
         assert_eq!(

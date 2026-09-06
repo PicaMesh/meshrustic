@@ -110,9 +110,9 @@ pub use topology::{
     decode_packed_neighbors, encode_data_payload, encode_data_payload_opts,
     encode_packed_neighbor_entry, encode_signal_routing_info, extract_packed_neighbors,
     try_decrypt_data, try_decrypt_data_full, write_packed_header, write_packed_header_chunk,
-    DataEncodeOpts, DecodedData, PackedHeader, PackedNeighbor, DATA_BITFIELD_OK_TO_MQTT,
-    DATA_BITFIELD_WANT_RESPONSE, MAX_NEIGHBORS_PER_PACKET, MAX_TOPOLOGY_PACKETS,
-    PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
+    DataBitfield, DataEncodeOpts, DecodedData, PackedHeader, PackedNeighbor,
+    DATA_BITFIELD_OK_TO_MQTT, DATA_BITFIELD_WANT_RESPONSE, MAX_NEIGHBORS_PER_PACKET,
+    MAX_TOPOLOGY_PACKETS, PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
 };
 pub use traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,

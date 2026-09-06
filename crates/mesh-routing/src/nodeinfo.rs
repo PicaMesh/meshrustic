@@ -5,7 +5,9 @@ use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
-use crate::topology::{encode_data_payload_opts, DataEncodeOpts, SR_BROADCAST_MAX_HOPS};
+use crate::topology::{
+    encode_data_payload_opts, DataBitfield, DataEncodeOpts, SR_BROADCAST_MAX_HOPS,
+};
 
 pub const NODEINFO_APP: u32 = 4;
 /// `Config.DeviceConfig.Role.CLIENT` on the wire.
@@ -389,6 +391,7 @@ pub fn build_nodeinfo_wire_frame(
     hop_limit: u8,
     key: &CryptoKey,
     identity: &NodeInfoIdentity,
+    ok_to_mqtt: bool,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     build_nodeinfo_frame(
         NODENUM_BROADCAST,
@@ -398,7 +401,10 @@ pub fn build_nodeinfo_wire_frame(
         hop_limit,
         key,
         identity,
-        DataEncodeOpts::default(),
+        DataEncodeOpts {
+            bitfield: DataBitfield::Ours { ok_to_mqtt },
+            ..Default::default()
+        },
     )
 }
 
@@ -412,6 +418,7 @@ pub fn build_nodeinfo_reply_frame(
     hop_limit: u8,
     key: &CryptoKey,
     identity: &NodeInfoIdentity,
+    ok_to_mqtt: bool,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     build_nodeinfo_frame(
         to,
@@ -425,6 +432,7 @@ pub fn build_nodeinfo_reply_frame(
             want_response: false,
             reply_id,
             request_id: 0,
+            bitfield: DataBitfield::Ours { ok_to_mqtt },
         },
     )
 }
@@ -566,7 +574,8 @@ mod tests {
         let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
         let identity = NodeInfoIdentity::for_node(0x677a_1caf, TEST_PUBKEY);
         let (len, frame) =
-            build_nodeinfo_wire_frame(0x677a_1caf, 42, channel_hash, 3, &key, &identity).unwrap();
+            build_nodeinfo_wire_frame(0x677a_1caf, 42, channel_hash, 3, &key, &identity, false)
+                .unwrap();
         let mut cipher = frame[PACKET_HEADER_LEN..len as usize].to_vec();
         let (decoded, payload) = try_decrypt_data_full(
             &key,
@@ -628,6 +637,7 @@ mod tests {
             3,
             &key,
             &identity,
+            false,
         )
         .unwrap();
         let header = PacketHeader::decode(&frame[..PACKET_HEADER_LEN]).unwrap();

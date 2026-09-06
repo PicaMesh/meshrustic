@@ -25,6 +25,10 @@ pub struct LoRaConfig {
     pub hop_limit: u8,
     pub tx_power_dbm: u8,
     pub use_preset: bool,
+    /// Stock's `config_ok_to_mqtt`: gateways may uplink our frames, and every Data we originate
+    /// carries the bit. On by default: without it a hop-0 reply shows no route in the
+    /// Meshtastic Android app, which takes a zero bitfield for a legacy frame.
+    pub ok_to_mqtt: bool,
 }
 
 impl LoRaConfig {
@@ -41,6 +45,7 @@ impl LoRaConfig {
             hop_limit: 3,
             tx_power_dbm: 27,
             use_preset: true,
+            ok_to_mqtt: true,
         };
         cfg.apply_modem_preset(MODEM_DEFAULT_PRESET);
         cfg
@@ -58,6 +63,7 @@ impl LoRaConfig {
             hop_limit: 3,
             tx_power_dbm: 27,
             use_preset: true,
+            ok_to_mqtt: true,
         }
     }
 

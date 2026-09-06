@@ -153,6 +153,37 @@ fn prev_of(nodes: &[DNode; MAX_GRAPH_NODES], node_count: usize, id: u32) -> u32 
         .map_or(0, |n| n.prev)
 }
 
+/// Can a frame transmitted by `from` be received by `to`? An edge records hearing: `from`
+/// listing `to` says `from` hears `to`. The reverse is known only when that edge carries
+/// `hears_us` (`to` confirmed it hears `from`) or `to` itself lists `from`. A node that
+/// publishes topology and confirms neither does not hear `from`; a node that publishes none
+/// (stock, or not yet classified) cannot be ruled out.
+pub fn can_deliver(
+    edges: &EdgeStore,
+    capability: Option<&CapabilityCache>,
+    from: u32,
+    to: u32,
+) -> bool {
+    if edges
+        .find_node(from)
+        .and_then(|n| n.find_edge(to))
+        .is_some_and(|e| e.hears_us)
+    {
+        return true;
+    }
+    if edges
+        .find_node(to)
+        .and_then(|n| n.find_edge(from))
+        .is_some()
+    {
+        return true;
+    }
+    !matches!(
+        capability.map(|c| c.status(to)),
+        Some(CapabilityStatus::SrActive) | Some(CapabilityStatus::Passive)
+    )
+}
+
 pub fn calculate_route(
     edges: &EdgeStore,
     downstream: &DownstreamTable,
@@ -161,6 +192,7 @@ pub fn calculate_route(
     now_ms: u32,
     routable: Option<&RoutableFilter<'_>>,
 ) -> Route {
+    let capability = routable.map(|f| f.capability);
     let mut result = Route {
         destination,
         next_hop: 0,
@@ -175,6 +207,7 @@ pub fn calculate_route(
     if let Some(edge) = edges
         .find_node(my_node)
         .and_then(|n| n.find_edge(destination))
+        .filter(|_| can_deliver(edges, capability, my_node, destination))
     {
         result.next_hop = destination;
         result.cost_fixed = edge.etx_fixed;
@@ -240,7 +273,7 @@ pub fn calculate_route(
             let Some(v_idx) = find_or_add_node(v, &mut nodes, &mut node_count) else {
                 continue;
             };
-            if nodes[v_idx].visited {
+            if nodes[v_idx].visited || !can_deliver(edges, capability, u, v) {
                 continue;
             }
             let new_cost = u_cost.saturating_add(edge.etx_fixed).min(0xFFFE);
@@ -396,7 +429,9 @@ pub fn find_better_positioned_neighbor(
             continue;
         };
         for j in 0..neighbor_edges.edge_count as usize {
-            if neighbor_edges.edges[j].to != destination {
+            if neighbor_edges.edges[j].to != destination
+                || !can_deliver(edges, Some(capability), neighbor, destination)
+            {
                 continue;
             }
             let direct_etx = neighbor_edges.edges[j].etx();
@@ -426,6 +461,66 @@ mod tests {
         let route = calculate_route(&edges, &downstream, 0xAA, 0xBB, 0, None);
         assert_eq!(route.next_hop, 0xBB);
         assert_eq!(route.egress_radio, 1);
+    }
+
+    /// 2026-09-06 17:31: MR22 hears FCM6 at -108 dBm and lists it without hearsUs; FCM6's own
+    /// list has no MR22. Both nicenanos still routed "to FCM6 via MR22". An edge says who hears
+    /// whom in one direction only; forwarding needs the other one.
+    #[test]
+    fn one_way_edge_is_not_a_route() {
+        const ME: u32 = 0xAA;
+        const RELAY: u32 = 0xBB;
+        const DEST: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, RELAY, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, RELAY, true);
+        // The relay hears the destination; nothing says the destination hears the relay.
+        edges.update_edge(ME, RELAY, DEST, 4.0, 0, EdgeSource::Mirrored, true, 0);
+        let downstream = DownstreamTable::new();
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(RELAY, true, 0);
+        capability.track_topology(DEST, true, 0);
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+        };
+        assert_eq!(
+            calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
+            0,
+            "a topology-publishing destination that never confirmed the relay is unreachable"
+        );
+        // A destination that publishes no topology cannot be ruled out.
+        let mut stock = CapabilityCache::new();
+        stock.track_topology(RELAY, true, 0);
+        let stock_filter = RoutableFilter {
+            capability: &stock,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+        };
+        assert_eq!(
+            calculate_route(&edges, &downstream, ME, DEST, 0, Some(&stock_filter)).next_hop,
+            RELAY
+        );
+        // The destination confirms it hears the relay: the route is back.
+        edges.set_edge_hears_us(RELAY, DEST, true);
+        assert_eq!(
+            calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
+            RELAY
+        );
+        // The same for our own direct link: a neighbour that does not hear us is no next hop.
+        edges.update_edge(ME, ME, DEST, 1.0, 0, EdgeSource::Reported, true, 0);
+        assert_eq!(
+            calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
+            RELAY,
+            "heard but not hearing us: go through the relay it confirmed"
+        );
+        edges.set_edge_hears_us(ME, DEST, true);
+        assert_eq!(
+            calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
+            DEST
+        );
     }
 
     #[test]
@@ -496,6 +591,7 @@ mod tests {
         edges.update_edge(0xAA, 0xBB, 0xCC, 3.0, 0, EdgeSource::Mirrored, true, 0);
         let mut capability = CapabilityCache::new();
         capability.track_topology(P, false, 0); // passive: sends topology, never relays
+        edges.set_edge_hears_us(0xAA, P, true); // its list names us: it hears us
         let filter = RoutableFilter {
             capability: &capability,
             my_node: 0xAA,

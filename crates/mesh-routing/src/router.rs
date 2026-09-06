@@ -49,8 +49,8 @@ use crate::telemetry::{
 };
 use crate::topology::{
     build_app_wire_frame, build_topology_wire_frame, extract_packed_neighbors,
-    try_decrypt_data_full, DataEncodeOpts, DecodedData, MAX_TOPOLOGY_PACKETS, SIGNAL_ROUTING_APP,
-    SIGNAL_ROUTING_VERSION, SR_BROADCAST_MAX_HOPS,
+    try_decrypt_data_full, DataBitfield, DataEncodeOpts, DecodedData, MAX_TOPOLOGY_PACKETS,
+    SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION, SR_BROADCAST_MAX_HOPS,
 };
 use crate::traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,
@@ -611,6 +611,17 @@ impl Router {
         self.graph.edge_heard_on(peer)
     }
 
+    /// Our LoRa "OK to MQTT" setting: the MQTT bit of every Data bitfield we originate.
+    pub fn ok_to_mqtt(&self) -> bool {
+        self.admin.ok_to_mqtt
+    }
+
+    fn ours(&self) -> DataBitfield {
+        DataBitfield::Ours {
+            ok_to_mqtt: self.admin.ok_to_mqtt,
+        }
+    }
+
     pub fn modem_preset(&self) -> u8 {
         self.modem_preset
     }
@@ -1168,6 +1179,7 @@ impl Router {
         let opts = DataEncodeOpts {
             request_id: parsed.id,
             want_response: false,
+            bitfield: self.ours(),
             ..Default::default()
         };
         let frame = if let Some(remote_pk) = self.remote_pk_for_error_reply(parsed) {
@@ -1238,6 +1250,7 @@ impl Router {
         let opts = DataEncodeOpts {
             want_response: false,
             request_id: parsed.id,
+            bitfield: self.ours(),
             ..Default::default()
         };
         let frame = if self.admin_reply_use_pki {
@@ -1704,8 +1717,12 @@ impl Router {
         } else {
             None
         };
+        // A next hop equal to the destination's own byte names no relayer: the source expects
+        // direct delivery (stock learns the destination as its own next hop from a direct
+        // reply). Nobody owns slot 0 then; the cost ranking decides as for an unnamed hop.
+        let relayer_named = parsed.next_hop != 0 && parsed.next_hop != (parsed.to & 0xFF) as u8;
         let unicast_plan = match unicast_ranking {
-            Some(Err(reason)) if parsed.next_hop == 0 => {
+            Some(Err(reason)) if !relayer_named => {
                 self.pool.release(handle);
                 self.sr_log.push(SrLogEvent::RelaySkip {
                     from: parsed.from,
@@ -1713,7 +1730,7 @@ impl Router {
                 });
                 return plan;
             }
-            Some(Ok(mut ranked)) if parsed.next_hop == 0 => {
+            Some(Ok(mut ranked)) if !relayer_named => {
                 // Slot 0 keys up at once. Later slots first wait for the leader's relay to
                 // clear the air (its contention delay plus one airtime, as for a designated SR
                 // hop), then space out by half an airtime.
@@ -1730,7 +1747,7 @@ impl Router {
 
         // A unicast that already names a next hop keeps SR coordination: the designated node
         // owns slot 0 and every other candidate shifts down one slot, cancelling on any heard copy.
-        let designated_plan = if parsed.to != NODENUM_BROADCAST && parsed.next_hop != 0 {
+        let designated_plan = if parsed.to != NODENUM_BROADCAST && relayer_named {
             match self.plan_designated_unicast(
                 &parsed,
                 heard_from,
@@ -2817,6 +2834,7 @@ impl Router {
         let routing = encode_routing_error(error_reason);
         let opts = DataEncodeOpts {
             request_id: parsed.id,
+            bitfield: self.ours(),
             ..Default::default()
         };
         if self.admin_reply_use_pki {
@@ -2843,6 +2861,7 @@ impl Router {
             hop,
             error_reason,
             &self.channel_key,
+            self.ok_to_mqtt(),
         )
     }
 
@@ -2881,6 +2900,7 @@ impl Router {
             self.hop_limit,
             &self.channel_key,
             &self.nodeinfo_identity,
+            self.ok_to_mqtt(),
         ) else {
             return;
         };
@@ -2912,6 +2932,7 @@ impl Router {
             self.hop_limit,
             &self.channel_key,
             &self.nodeinfo_identity,
+            self.ok_to_mqtt(),
         ) else {
             return;
         };
@@ -2937,6 +2958,7 @@ impl Router {
             self.hop_limit,
             &self.channel_key,
             &self.device_metrics,
+            self.ok_to_mqtt(),
         ) else {
             return;
         };
@@ -2997,6 +3019,7 @@ impl Router {
             DataEncodeOpts {
                 want_response: false,
                 request_id: parsed.id,
+                bitfield: self.ours(),
                 ..Default::default()
             },
         ) else {
@@ -3057,6 +3080,7 @@ impl Router {
                 self.hop_limit,
                 &self.channel_key,
                 &packed_buf[..packed_len],
+                self.ok_to_mqtt(),
             ) else {
                 continue;
             };
@@ -3691,7 +3715,8 @@ mod tests {
 
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 1, true);
-        let (len, frame) = build_topology_wire_frame(PEER, 99, 0x77, 3, &key, &packed).unwrap();
+        let (len, frame) =
+            build_topology_wire_frame(PEER, 99, 0x77, 3, &key, &packed, false).unwrap();
         let inbound = InboundPacket {
             radio_id: 0,
             rssi: -70,
@@ -3795,7 +3820,7 @@ mod tests {
         let bootstrap = |from: u32, id: u32| {
             let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
             write_packed_header(&mut packed, 1, true);
-            build_topology_wire_frame(from, id, 0x77, 3, &key, &packed).unwrap()
+            build_topology_wire_frame(from, id, 0x77, 3, &key, &packed, false).unwrap()
         };
         let feed = |router: &mut Router, frame: &(u8, [u8; MAX_WIRE_LEN]), at: u32| {
             router
@@ -4347,6 +4372,7 @@ mod tests {
             3,
             ROUTING_ERROR_NONE,
             &key,
+            false,
         )
         .unwrap();
         let _ = router.process_inbound(
@@ -4451,6 +4477,47 @@ mod tests {
         assert!(
             router.poll_ready_relay(50 + origin + 10_000).is_none(),
             "the first copy's later-slot frame was replaced, not queued behind the hand-off"
+        );
+    }
+
+    /// 2026-09-06 17:31: Dura's request to FCM6 carried FCM6's own byte as next hop. Both
+    /// nicenanos waited the worst-case stock delay for a relayer that cannot exist.
+    #[test]
+    fn next_hop_equal_to_the_destination_names_no_relayer() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire(3, 3, (UNI_DEST & 0xFF) as u8, 0xDD, 0x504);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        let slot0_wait = coordinated_relay::tx_delay_ms_worst(coordinated_relay::DEFAULT_SLOT_MS)
+            + coordinated_relay::DEFAULT_SLOT_MS;
+        let tx_after = plan
+            .relay
+            .map(|r| r.delay_ms)
+            .or_else(|| router.relay_tx_after(UNI_SOURCE, 0x504, 0))
+            .expect("relay planned by the cost ranking");
+        assert!(
+            tx_after < slot0_wait,
+            "no slot-0 reservation for the destination itself: {tx_after} >= {slot0_wait}"
+        );
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(
+            !logs
+                .iter()
+                .any(|e| matches!(e, SrLogEvent::UnicastDesignated { .. })),
+            "the destination byte is not a designated relayer"
         );
     }
 
@@ -4777,6 +4844,7 @@ mod tests {
             3,
             ROUTING_ERROR_NONE,
             &key,
+            false,
         )
         .unwrap();
         let _ = router.process_inbound(
@@ -4873,6 +4941,7 @@ mod tests {
             3,
             ROUTING_ERROR_NONE,
             &key,
+            false,
         )
         .unwrap();
         let _ = router.process_inbound(
@@ -4904,6 +4973,7 @@ mod tests {
             3,
             ROUTING_ERROR_NONE,
             &key,
+            false,
         )
         .unwrap();
         let (scheduled, reason) = unicast_skip_reason(router, &ack[..len as usize]);
