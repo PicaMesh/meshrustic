@@ -128,6 +128,11 @@ pub enum TopologyMergeResult {
 const MAX_OUR_TX_RECORDS: usize = 16;
 const MAX_NODE_TX_RECORDS: usize = 32;
 
+/// Hop budget of a last-hop unicast (see `NeighborGraph::caps_last_hop`): one hop, so the
+/// destination reads it as direct (`hop_start == hop_limit`, or one hop used on a relay) and
+/// every receiver sees a populated `hop_start`; the named next hop keeps stock relays out.
+pub const LAST_HOP_BUDGET: u8 = 1;
+
 pub struct NeighborGraph {
     my_node: u32,
     device_role: u32,
@@ -245,24 +250,25 @@ impl NeighborGraph {
         self.edges.is_our_direct_neighbor(node_id, self.my_node)
     }
 
-    /// Limit remaining hops for unicast to a direct `hears_us` neighbor when stock peers exist.
-    ///
-    /// Good link (ETX < 3.0) ⇒ 0 hops (direct delivery only); marginal ⇒ 1 hop.
-    pub fn unicast_hop_limit_for_direct_neighbor(&self, destination: u32) -> Option<u8> {
+    /// Is a unicast to `destination` a last hop: the destination is a direct neighbour that
+    /// hears us and stock neighbours are listening? Such a frame goes out with
+    /// [`LAST_HOP_BUDGET`] and the destination named as next hop, so stock neighbours (which
+    /// relay a unicast only when the next hop is unset or their own byte) leave it alone while
+    /// the destination still reads it as a direct, ACK-worthy frame. Among SR peers only, the
+    /// slot coordination suppresses relays by itself and the budget stays untouched.
+    pub fn caps_last_hop(&self, destination: u32) -> bool {
         if destination == 0 || destination == NODENUM_BROADCAST {
-            return None;
+            return false;
         }
-        let my_edges = self.edges.find_node(self.my_node)?;
-
-        let mut dest_etx = None;
-        for i in 0..my_edges.edge_count as usize {
-            let edge = my_edges.edges[i];
-            if edge.to == destination && edge.hears_us {
-                dest_etx = Some(edge.etx());
-                break;
-            }
+        let Some(my_edges) = self.edges.find_node(self.my_node) else {
+            return false;
+        };
+        let dest_hears_us = (0..my_edges.edge_count as usize)
+            .map(|i| my_edges.edges[i])
+            .any(|edge| edge.to == destination && edge.hears_us);
+        if !dest_hears_us {
+            return false;
         }
-        let dest_etx = dest_etx?;
 
         let mut has_stock_neighbor = false;
         for i in 0..my_edges.edge_count as usize {
@@ -275,16 +281,7 @@ impl NeighborGraph {
                 break;
             }
         }
-        if !has_stock_neighbor {
-            return None;
-        }
-
-        const RELIABLE_ETX_CEILING: f32 = 3.0;
-        if dest_etx < RELIABLE_ETX_CEILING {
-            Some(0)
-        } else {
-            Some(1)
-        }
+        has_stock_neighbor
     }
 
     #[doc(hidden)]
@@ -3501,25 +3498,13 @@ mod tests {
     }
 
     #[test]
-    fn unicast_hop_limit_good_link_returns_zero() {
+    fn last_hop_cap_applies_regardless_of_link_quality() {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xCC00_00CC);
         graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
         graph.confirm_direct_neighbor_hears_us(0xDD00_00DD);
         graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
-        assert_eq!(
-            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn unicast_hop_limit_marginal_link_returns_one() {
-        let mut graph = NeighborGraph::new();
-        graph.set_my_node(0xCC00_00CC);
-        graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
-        graph.confirm_direct_neighbor_hears_us(0xDD00_00DD);
-        graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
+        assert!(graph.caps_last_hop(0xDD00_00DD));
         graph.edges_mut().update_edge(
             0xCC00_00CC,
             0xCC00_00CC,
@@ -3530,9 +3515,9 @@ mod tests {
             true,
             0,
         );
-        assert_eq!(
-            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
-            Some(1)
+        assert!(
+            graph.caps_last_hop(0xDD00_00DD),
+            "a marginal link is still a last hop"
         );
     }
 
@@ -3544,10 +3529,7 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(0xDD00_00DD);
         graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
         graph.capability_mut().track_topology(0xEE00_00EE, true, 0);
-        assert_eq!(
-            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
-            None
-        );
+        assert!(!graph.caps_last_hop(0xDD00_00DD));
     }
 
     #[test]
@@ -3556,10 +3538,7 @@ mod tests {
         graph.set_my_node(0xCC00_00CC);
         graph.observe_direct_neighbor(0xDD00_00DD, -70, 8, 0, 0);
         graph.observe_direct_neighbor(0xEE00_00EE, -72, 7, 0, 0);
-        assert_eq!(
-            graph.unicast_hop_limit_for_direct_neighbor(0xDD00_00DD),
-            None
-        );
+        assert!(!graph.caps_last_hop(0xDD00_00DD));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use mesh_routing::{
     DataEncodeOpts, InboundPacket, RouteDiscovery, Router, SrLogEvent, MAX_SR_LOG,
     PACKED_NEIGHBOR_HEADER_SIZE, TRACEROUTE_APP,
 };
-use mesh_routing::{hops_away, try_decrypt_data_full};
+use mesh_routing::{hops_away, try_decrypt_data_full, LAST_HOP_BUDGET};
 
 const CHANNEL: u8 = 0x77;
 
@@ -144,6 +144,7 @@ fn reply_to_a_direct_request_is_held_for_the_peer_turnaround() {
             want_response: true,
             ..Default::default()
         },
+        0,
     )
     .expect("request");
     let t0 = 10_000;
@@ -171,12 +172,13 @@ fn reply_to_a_direct_request_is_held_for_the_peer_turnaround() {
 }
 
 /// 2026-09-06 15:18: A's hop-0 reply to Dura reached every peer on the desk, yet Dura never
-/// acknowledged it while it acknowledged the peers' own hop-0 replies. Stock acknowledges a
-/// response only when it knows the response travelled zero hops, and it knows the hop count of
-/// a zero-`hop_start` frame only when the Data carries the bitfield. Our reply must therefore
-/// carry it, and a stock receiver must then read the reply as direct.
+/// acknowledged it while it acknowledged the peers' own replies: stock acknowledges a response
+/// only when it knows it travelled zero hops, and at 17:29 the Android app dropped an
+/// acknowledged hop-0 reply because a zero `hop_start` with a zero bitfield reads as legacy.
+/// A last-hop reply therefore carries one hop with the requester named as next hop: stock
+/// neighbours leave it alone, the requester reads zero hops used, and the app shows it.
 #[test]
-fn hop_zero_reply_is_readable_as_direct_by_a_stock_receiver() {
+fn last_hop_reply_is_direct_for_stock_and_left_alone_by_stock_relays() {
     const ME: u32 = 0xBDAC_CE55;
     const DURA: u32 = 0x979E_D146;
     let mut bench = Bench::new(ME);
@@ -210,6 +212,7 @@ fn hop_zero_reply_is_readable_as_direct_by_a_stock_receiver() {
             want_response: true,
             ..Default::default()
         },
+        0,
     )
     .expect("request");
     bench.hear(&request[..len as usize], 10_000);
@@ -217,8 +220,13 @@ fn hop_zero_reply_is_readable_as_direct_by_a_stock_receiver() {
     let hdr = PacketHeader::decode(&reply.bytes[..16]).unwrap().parse();
     assert_eq!(
         (hdr.hop_start, hdr.hop_limit),
-        (0, 0),
-        "capped last-hop reply"
+        (LAST_HOP_BUDGET, LAST_HOP_BUDGET),
+        "one hop, and hop_start populated"
+    );
+    assert_eq!(
+        hdr.next_hop,
+        (DURA & 0xFF) as u8,
+        "the requester is the next hop: stock relays leave the frame alone"
     );
     let mut cipher = [0u8; 240];
     let n = reply.len as usize - 16;
@@ -241,13 +249,5 @@ fn hop_zero_reply_is_readable_as_direct_by_a_stock_receiver() {
         hops_away(hdr.hop_start, hdr.hop_limit, data.has_bitfield),
         Some(0),
         "a stock receiver must see zero hops and acknowledge"
-    );
-    // 2026-09-06 17:29: Dura acknowledged B's reply but the Meshtastic Android app showed no
-    // route: it takes a zero bitfield on a zero-hop_start frame for a legacy frame and drops
-    // the traceroute. The default LoRa setting keeps the MQTT bit on, so the word is nonzero.
-    assert!(bench.router.ok_to_mqtt(), "OK-to-MQTT is on by default");
-    assert_ne!(
-        data.bitfield, 0,
-        "a zero bitfield hides a hop-0 reply in the app"
     );
 }

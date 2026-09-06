@@ -35,6 +35,7 @@ fn flood_other_bucket(router: &mut Router, from: u32, channel: u8, key: &CryptoK
             TELEMETRY_APP,
             &[],
             DataEncodeOpts::default(),
+            0,
         )
         .expect("telemetry wire");
         router
@@ -56,6 +57,7 @@ fn establish_direct_peer(router: &mut Router, from: u32, channel: u8, key: &Cryp
         TELEMETRY_APP,
         &[],
         DataEncodeOpts::default(),
+        0,
     )
     .expect("direct peer wire");
     router
@@ -227,6 +229,7 @@ fn dedup_still_runs_when_rate_limited() {
         num::TEXT_MESSAGE_APP,
         b"hi",
         DataEncodeOpts::default(),
+        0,
     )
     .expect("text wire");
     let bytes = &frame[..len as usize];

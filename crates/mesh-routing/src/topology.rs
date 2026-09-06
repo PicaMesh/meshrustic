@@ -275,6 +275,7 @@ pub fn build_app_wire_frame(
     portnum: u32,
     inner: &[u8],
     opts: DataEncodeOpts,
+    next_hop: u8,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     let plaintext = encode_data_payload_opts(portnum, inner, opts);
     if plaintext.len() > MAX_PACKET_PAYLOAD {
@@ -295,7 +296,7 @@ pub fn build_app_wire_frame(
         start,
         want_ack,
         false,
-        0,
+        next_hop,
         (from & 0xFF) as u8, // relay byte = sender, as stock stamps its own frames
     );
     let mut bytes = [0u8; MAX_WIRE_LEN];

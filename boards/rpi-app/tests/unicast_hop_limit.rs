@@ -1,9 +1,10 @@
-//! Unicast hop-limit tightening for direct hears-us neighbors when stock peers exist.
+//! Last-hop unicasts: to a direct hears-us neighbour while stock peers listen, the frame carries
+//! one hop and names the destination as next hop, whatever the link quality.
 
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_routing::{
     coordinated_relay, relay_header_with_next_hop_opts, EdgeSource, InboundPacket, ProcessResult,
-    RelayPlan, Router, DEVICE_ROLE_ROUTER,
+    RelayPlan, Router, DEVICE_ROLE_ROUTER, LAST_HOP_BUDGET,
 };
 use static_cell::StaticCell;
 
@@ -32,11 +33,8 @@ fn relay_header_for(dest_etx: f32, hop_limit: u8, hop_start: u8) -> PacketHeader
     .parse();
     let mut router = Router::new(ME);
     setup_router(&mut router, dest_etx);
-    let limited = router
-        .graph_mut()
-        .unicast_hop_limit_for_direct_neighbor(DEST)
-        .expect("hop limit applies");
-    relay_header_with_next_hop_opts(&parsed, ME, 0, Some(limited)).expect("relay header")
+    assert!(router.graph_mut().caps_last_hop(DEST), "last hop applies");
+    relay_header_with_next_hop_opts(&parsed, ME, 0, true).expect("relay header")
 }
 
 fn ready_relay(router: &mut Router, result: &ProcessResult, now_ms: u32) -> RelayPlan {
@@ -51,17 +49,13 @@ fn ready_relay(router: &mut Router, result: &ProcessResult, now_ms: u32) -> Rela
 }
 
 #[test]
-fn good_link_limits_to_zero_hops() {
-    let hdr = relay_header_for(2.0, 5, 3);
-    assert_eq!(hdr.hop_limit(), 0);
-    assert_eq!(hdr.hop_start(), 3);
-}
-
-#[test]
-fn marginal_link_allows_one_hop() {
-    let hdr = relay_header_for(4.0, 5, 3);
-    assert_eq!(hdr.hop_limit(), 1);
-    assert_eq!(hdr.hop_start(), 4);
+fn last_hop_has_one_hop_and_names_the_destination_on_any_link() {
+    for etx in [2.0, 4.0] {
+        let hdr = relay_header_for(etx, 5, 3);
+        assert_eq!(hdr.hop_limit(), LAST_HOP_BUDGET);
+        assert_eq!(hdr.hop_start(), 4);
+        assert_eq!(hdr.parse().next_hop, (DEST & 0xFF) as u8);
+    }
 }
 
 #[test]
@@ -81,12 +75,7 @@ fn all_sr_neighbors_skips_limit() {
         .graph_mut()
         .capability_mut()
         .track_topology(STOCK, true, 0);
-    assert_eq!(
-        router
-            .graph_mut()
-            .unicast_hop_limit_for_direct_neighbor(DEST),
-        None
-    );
+    assert!(!router.graph_mut().caps_last_hop(DEST));
 }
 
 #[test]
@@ -112,6 +101,7 @@ fn router_relay_applies_limit_on_unicast() {
         .expect("inbound");
     let relay = ready_relay(router, &result, 0);
     let tx_hdr = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN]).expect("header");
-    assert_eq!(tx_hdr.hop_limit(), 0);
-    assert_eq!(tx_hdr.hop_start(), 3);
+    assert_eq!(tx_hdr.hop_limit(), LAST_HOP_BUDGET);
+    assert_eq!(tx_hdr.hop_start(), 4);
+    assert_eq!(tx_hdr.parse().next_hop, (DEST & 0xFF) as u8);
 }

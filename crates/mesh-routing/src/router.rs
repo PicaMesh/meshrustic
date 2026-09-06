@@ -17,6 +17,7 @@ use crate::admin_codec::{AdminPayload, ADMIN_APP};
 use crate::coordinated_relay::{
     half_airtime_ms, slot_time_for_preset, tx_delay_ms_contention, tx_delay_ms_worst,
 };
+use crate::neighbor_graph::LAST_HOP_BUDGET;
 use crate::neighbor_graph::{
     MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS, TOPOLOGY_BROADCAST_MS,
     TOPOLOGY_DIRTY_MIN_MS,
@@ -1171,7 +1172,7 @@ impl Router {
         error: u32,
         now_ms: u32,
     ) {
-        let hop = self.response_hop_limit(parsed, hop_start_known);
+        let (hop, next_hop) = self.response_header(parsed, hop_start_known);
         let id = self.alloc_tx_id(now_ms);
         let routing = encode_routing_error(error);
         // Mirror setReplyTo: Data.request_id only (not reply_id), and copy WantAck so the reply
@@ -1192,6 +1193,7 @@ impl Router {
                 opts,
                 &remote_pk,
                 parsed.want_ack,
+                next_hop,
             )
         } else {
             build_app_wire_frame(
@@ -1206,6 +1208,7 @@ impl Router {
                 ROUTING_APP,
                 &routing,
                 opts,
+                next_hop,
             )
         };
         let Some((len, bytes)) = frame else {
@@ -1245,6 +1248,7 @@ impl Router {
             _ => encode_admin_response(resp),
         };
         let hop = hop_limit_for_response(parsed, hop_start_known, self.hop_limit).max(1);
+        let next_hop = 0u8;
         let id = self.alloc_tx_id(now_ms);
         // Clients correlate admin replies via Data.request_id (setReplyTo on the wire).
         let opts = DataEncodeOpts {
@@ -1264,6 +1268,7 @@ impl Router {
                     opts,
                     &remote_pk,
                     parsed.want_ack,
+                    next_hop,
                 ),
                 None => None,
             }
@@ -1280,6 +1285,7 @@ impl Router {
                 ADMIN_APP,
                 &inner,
                 opts,
+                next_hop,
             )
         };
         let Some((len, bytes)) = frame else {
@@ -1351,6 +1357,7 @@ impl Router {
         opts: DataEncodeOpts,
         remote_pk: &[u8; 32],
         want_ack: bool,
+        next_hop: u8,
     ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
         #[cfg(feature = "pki")]
         {
@@ -1385,7 +1392,7 @@ impl Router {
                 hop_limit.min(SR_BROADCAST_MAX_HOPS),
                 want_ack,
                 false,
-                0,
+                next_hop,
                 (self.node_num & 0xFF) as u8,
             );
             let mut bytes = [0u8; MAX_WIRE_LEN];
@@ -1397,7 +1404,7 @@ impl Router {
         #[cfg(not(feature = "pki"))]
         {
             let _ = (
-                to, packet_id, hop_limit, portnum, inner, opts, remote_pk, want_ack,
+                to, packet_id, hop_limit, portnum, inner, opts, remote_pk, want_ack, next_hop,
             );
             None
         }
@@ -1810,27 +1817,19 @@ impl Router {
             }
         }
 
-        let direct_hop_limit = if parsed.to != NODENUM_BROADCAST {
-            self.graph.unicast_hop_limit_for_direct_neighbor(parsed.to)
-        } else {
-            None
-        };
-        let relay_hdr = match relay_header_with_next_hop_opts(
-            &parsed,
-            self.node_num,
-            next_hop,
-            direct_hop_limit,
-        ) {
-            Some(h) => h,
-            None => {
-                self.pool.release(handle);
-                self.sr_log.push(SrLogEvent::RelaySkip {
-                    from: parsed.from,
-                    reason: SrSkipReason::WireGate,
-                });
-                return plan;
-            }
-        };
+        let last_hop = parsed.to != NODENUM_BROADCAST && self.graph.caps_last_hop(parsed.to);
+        let relay_hdr =
+            match relay_header_with_next_hop_opts(&parsed, self.node_num, next_hop, last_hop) {
+                Some(h) => h,
+                None => {
+                    self.pool.release(handle);
+                    self.sr_log.push(SrLogEvent::RelaySkip {
+                        from: parsed.from,
+                        reason: SrSkipReason::WireGate,
+                    });
+                    return plan;
+                }
+            };
 
         // 2. A unicast leaving us with hop_limit 0 can only still be delivered by a node that
         // is the destination itself; without a direct link to the target it is dead airtime.
@@ -2302,7 +2301,11 @@ impl Router {
     /// direct neighbour that hears us goes out with hop limit 0 (1 on a marginal link) when
     /// stock neighbours are around, so nobody relays a packet we deliver ourselves. A
     /// traceroute reply from A to Dura went out with hop 2 and was relayed three times.
-    fn response_hop_limit(&self, parsed: &ParsedPacket, hop_start_known: bool) -> u8 {
+    /// Header fields of a response to `parsed`: hop budget and next hop. A last-hop reply (the
+    /// requester hears us directly, stock nodes listen, and the request came direct) gets
+    /// `LAST_HOP_BUDGET` and names the requester as next hop; anything else keeps stock's budget
+    /// and no next hop.
+    fn response_header(&self, parsed: &ParsedPacket, hop_start_known: bool) -> (u8, u8) {
         let base = hop_limit_for_response(parsed, hop_start_known, self.hop_limit);
         // A request that reached us through a relay says the direct link is not carrying
         // frames right now; the reply then keeps its hop budget so a relay can return it.
@@ -2312,15 +2315,10 @@ impl Router {
             parsed.hop_limit,
             parsed.relay_node,
         );
-        if !arrived_direct {
-            return base;
-        }
-        match self
-            .graph
-            .unicast_hop_limit_for_direct_neighbor(parsed.from)
-        {
-            Some(limited) => limited.min(base),
-            None => base,
+        if arrived_direct && self.graph.caps_last_hop(parsed.from) {
+            (LAST_HOP_BUDGET.min(base), (parsed.from & 0xFF) as u8)
+        } else {
+            (base, 0)
         }
     }
 
@@ -2419,7 +2417,12 @@ impl Router {
         airtime_ms: u32,
     ) -> Option<RelayPlan> {
         let packet_id = self.alloc_tx_id(now_ms);
-        let hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
+        let mut hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
+        let mut next_hop = 0u8;
+        if to != NODENUM_BROADCAST && self.graph.caps_last_hop(to) {
+            hop = hop.min(LAST_HOP_BUDGET);
+            next_hop = (to & 0xFF) as u8;
+        }
         let (len, frame) = build_app_wire_frame(
             to,
             self.node_num,
@@ -2431,7 +2434,11 @@ impl Router {
             &self.channel_key,
             portnum,
             payload,
-            DataEncodeOpts::default(),
+            DataEncodeOpts {
+                bitfield: self.ours(),
+                ..Default::default()
+            },
+            next_hop,
         )?;
         if want_ack {
             let delay = self.reliable_retx_delay_ms(len, self.node_num, packet_id);
@@ -2742,7 +2749,7 @@ impl Router {
                     // Stock: a response is acknowledged only when it reached us with zero hops
                     // or through a designated next hop, and then with a hop-0 ACK; a relayed
                     // response was already implicitly acknowledged by the relay.
-                    self.schedule_ack_with_hop(parsed, parsed.channel, 0, now_ms);
+                    self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
                 }
             }
         } else if parsed.from != self.node_num
@@ -2761,14 +2768,14 @@ impl Router {
         channel_hash: u8,
         now_ms: u32,
     ) {
-        let hop = self.response_hop_limit(parsed, hop_start_known);
-        self.schedule_ack_with_hop(parsed, channel_hash, hop, now_ms);
+        let (hop, next_hop) = self.response_header(parsed, hop_start_known);
+        self.schedule_ack_with_hop(parsed, channel_hash, hop, next_hop, now_ms);
     }
 
     /// Original-sender WantAck retry (dupe, hopsAway==0): cheap hop_limit=0 re-ACK only.
     /// Must not re-run admin/modules — those already ran on first delivery.
     fn schedule_dupe_want_ack(&mut self, parsed: &ParsedPacket, channel_hash: u8, now_ms: u32) {
-        self.schedule_ack_with_hop(parsed, channel_hash, 0, now_ms);
+        self.schedule_ack_with_hop(parsed, channel_hash, 0, 0, now_ms);
     }
 
     fn schedule_ack_with_hop(
@@ -2776,15 +2783,21 @@ impl Router {
         parsed: &ParsedPacket,
         channel_hash: u8,
         hop: u8,
+        next_hop: u8,
         now_ms: u32,
     ) {
         if self.pending_ack.active {
             return;
         }
         let packet_id = self.alloc_tx_id(now_ms);
-        let Some((len, frame)) =
-            self.build_ack_nak_reply(parsed, packet_id, hop, ROUTING_ERROR_NONE, channel_hash)
-        else {
+        let Some((len, frame)) = self.build_ack_nak_reply(
+            parsed,
+            packet_id,
+            hop,
+            next_hop,
+            ROUTING_ERROR_NONE,
+            channel_hash,
+        ) else {
             return;
         };
         self.pending_ack = PendingAck {
@@ -2805,10 +2818,10 @@ impl Router {
         if self.pending_ack.active {
             return;
         }
-        let hop = self.response_hop_limit(parsed, hop_start_known);
+        let (hop, next_hop) = self.response_header(parsed, hop_start_known);
         let packet_id = self.alloc_tx_id(now_ms);
         let Some((len, frame)) =
-            self.build_ack_nak_reply(parsed, packet_id, hop, error, parsed.channel)
+            self.build_ack_nak_reply(parsed, packet_id, hop, next_hop, error, parsed.channel)
         else {
             return;
         };
@@ -2828,6 +2841,7 @@ impl Router {
         parsed: &ParsedPacket,
         packet_id: u32,
         hop: u8,
+        next_hop: u8,
         error_reason: u32,
         channel_hash: u8,
     ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
@@ -2849,6 +2863,7 @@ impl Router {
                     opts,
                     &remote_pk,
                     false,
+                    next_hop,
                 );
             }
         }
@@ -2862,6 +2877,7 @@ impl Router {
             error_reason,
             &self.channel_key,
             self.ok_to_mqtt(),
+            next_hop,
         )
     }
 
@@ -3003,7 +3019,7 @@ impl Router {
         if !encode_route_discovery(&rd, &mut route_wire) {
             return;
         }
-        let hop = self.response_hop_limit(parsed, data.has_bitfield);
+        let (hop, next_hop) = self.response_header(parsed, data.has_bitfield);
         let packet_id = self.alloc_tx_id(now_ms);
         let Some((len, frame)) = build_app_wire_frame(
             parsed.from,
@@ -3022,6 +3038,7 @@ impl Router {
                 bitfield: self.ours(),
                 ..Default::default()
             },
+            next_hop,
         ) else {
             return;
         };
@@ -3609,26 +3626,26 @@ mod tests {
         router.graph_mut().confirm_direct_neighbor_hears_us(DEST);
         let request = PacketHeader::from_fields(ME, DEST, 7, 0, 7, 7, true, false, 0, 0).parse();
         assert_eq!(
-            router.response_hop_limit(&request, true),
-            2,
+            router.response_header(&request, true),
+            (2, 0),
             "no stock neighbour: nothing to protect, default margin applies"
         );
         router
             .graph_mut()
             .observe_direct_neighbor(STOCK, -60, 10, 1_000, 0);
         assert_eq!(
-            router.response_hop_limit(&request, true),
-            0,
-            "good direct link: deliver ourselves"
+            router.response_header(&request, true),
+            (LAST_HOP_BUDGET, (DEST & 0xFF) as u8),
+            "last hop: one hop, the requester named as next hop"
         );
         // The same request arriving through a relay: the direct link is not carrying frames
         // right now, so the reply keeps a budget a relay can use to bring it back.
         let relayed = PacketHeader::from_fields(ME, DEST, 8, 0, 6, 7, true, false, 0, 0x99).parse();
         assert_eq!(
-            router.response_hop_limit(&relayed, true),
-            hop_limit_for_response(&relayed, true, router.hop_limit)
+            router.response_header(&relayed, true),
+            (hop_limit_for_response(&relayed, true, router.hop_limit), 0)
         );
-        assert!(router.response_hop_limit(&relayed, true) >= 1);
+        assert!(router.response_header(&relayed, true).0 >= 1);
     }
 
     #[test]
@@ -4373,6 +4390,7 @@ mod tests {
             ROUTING_ERROR_NONE,
             &key,
             false,
+            0,
         )
         .unwrap();
         let _ = router.process_inbound(
@@ -4845,6 +4863,7 @@ mod tests {
             ROUTING_ERROR_NONE,
             &key,
             false,
+            0,
         )
         .unwrap();
         let _ = router.process_inbound(
@@ -4942,6 +4961,7 @@ mod tests {
             ROUTING_ERROR_NONE,
             &key,
             false,
+            0,
         )
         .unwrap();
         let _ = router.process_inbound(
@@ -4974,6 +4994,7 @@ mod tests {
             ROUTING_ERROR_NONE,
             &key,
             false,
+            0,
         )
         .unwrap();
         let (scheduled, reason) = unicast_skip_reason(router, &ack[..len as usize]);

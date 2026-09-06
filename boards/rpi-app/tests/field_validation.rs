@@ -64,6 +64,7 @@ fn field_traceroute_three_node_chain() {
         TRACEROUTE_APP,
         &route_wire,
         DataEncodeOpts::default(),
+        0,
     )
     .expect("wire frame");
 

@@ -45,6 +45,7 @@ fn router_appends_traceroute_hop_on_rebroadcast() {
         TRACEROUTE_APP,
         &route_wire,
         DataEncodeOpts::default(),
+        0,
     )
     .expect("wire frame");
 
@@ -109,6 +110,7 @@ fn router_appends_traceroute_reply_on_route_back() {
             reply_id: 0,
             ..Default::default()
         },
+        0,
     )
     .expect("wire frame");
 
@@ -178,6 +180,7 @@ fn traceroute_reply_stops_our_reliable_retransmit() {
             request_id,
             ..Default::default()
         },
+        0,
     )
     .expect("reply wire");
     router
@@ -220,6 +223,7 @@ fn traceroute_reply_replaces_the_separate_ack() {
             want_response: true,
             ..Default::default()
         },
+        0,
     )
     .expect("request wire");
     let mut router = Router::with_channel(TARGET, key, CHANNEL, MODEM_SHORT_SLOW, true, 3);
@@ -265,6 +269,7 @@ fn traceroute_to_us_sends_response_with_request_id() {
             want_response: true,
             ..Default::default()
         },
+        0,
     )
     .expect("request wire");
 

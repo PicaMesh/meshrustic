@@ -130,6 +130,7 @@ fn repeated_want_ack_to_us_schedules_ack_on_duplicate() {
         TEXT_MESSAGE_APP,
         payload,
         DataEncodeOpts::default(),
+        0,
     )
     .expect("wire");
 
@@ -173,6 +174,7 @@ fn router_role_repeated_want_ack_still_re_acks() {
         TEXT_MESSAGE_APP,
         payload,
         DataEncodeOpts::default(),
+        0,
     )
     .expect("wire");
 
@@ -229,6 +231,7 @@ fn want_ack_to_us_is_never_rate_limited_even_from_a_limited_node() {
             TEXT_MESSAGE_APP,
             b"x",
             DataEncodeOpts::default(),
+            0,
         )
         .expect("wire");
         let inbound = InboundPacket {
@@ -261,6 +264,7 @@ fn want_ack_to_us_is_never_rate_limited_even_from_a_limited_node() {
         TEXT_MESSAGE_APP,
         b"hi",
         DataEncodeOpts::default(),
+        0,
     )
     .expect("wire");
     let inbound = InboundPacket {
@@ -303,6 +307,7 @@ fn foreign_routing_ack_cancels_pending_relay() {
         TEXT_MESSAGE_APP,
         b"payload",
         DataEncodeOpts::default(),
+        0,
     )
     .expect("dm wire");
 
@@ -340,6 +345,7 @@ fn foreign_routing_ack_cancels_pending_relay() {
         ROUTING_ERROR_NONE,
         &key,
         false,
+        0,
     )
     .expect("ack frame");
 
@@ -376,6 +382,7 @@ fn upgraded_hop_limit_reprocesses_after_dropping_lower_pending() {
         TEXT_MESSAGE_APP,
         payload,
         DataEncodeOpts::default(),
+        0,
     )
     .expect("low hop wire");
 
@@ -407,6 +414,7 @@ fn upgraded_hop_limit_reprocesses_after_dropping_lower_pending() {
         TEXT_MESSAGE_APP,
         payload,
         DataEncodeOpts::default(),
+        0,
     )
     .expect("high hop wire");
 

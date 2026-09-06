@@ -6,6 +6,8 @@
 
 use mesh_protocol::{PacketHeader, ParsedPacket};
 
+use crate::neighbor_graph::LAST_HOP_BUDGET;
+
 /// Whether this frame is eligible for relay consideration at the wire layer.
 ///
 /// Does not inspect payload or portnum. Further gates (dedup, rate limit, QoS, SR slot,
@@ -28,7 +30,7 @@ pub fn relay_header_with_next_hop(
     our_node: u32,
     next_hop: u32,
 ) -> Option<PacketHeader> {
-    relay_header_with_next_hop_opts(rx, our_node, next_hop, None)
+    relay_header_with_next_hop_opts(rx, our_node, next_hop, false)
 }
 
 /// Build a relay header, optionally applying a direct-neighbor hop budget instead of decrementing.
@@ -36,20 +38,23 @@ pub fn relay_header_with_next_hop_opts(
     rx: &ParsedPacket,
     our_node: u32,
     next_hop: u32,
-    direct_neighbor_hop_limit: Option<u8>,
+    last_hop: bool,
 ) -> Option<PacketHeader> {
     if rx.hop_limit == 0 {
         return None;
     }
 
-    let (hop_limit, hop_start) = relay_hop_fields(rx, direct_neighbor_hop_limit)?;
+    let (hop_limit, hop_start) = relay_hop_fields(rx, last_hop)?;
     let relay_node = (our_node & 0xFF) as u8;
     // Every relay names its own next hop or none, as stock NextHopRouter does. Copying the
     // incoming byte was wrong both ways: when it named us, the frame left still naming us, so
     // legacy nodes (which relay a unicast only when next_hop is clear or their own byte) never
     // touched it and SR peers waited for a second copy from us; when it named a node that stayed
     // silent, keeping its byte kept legacy routers out of the recovery.
-    let next_hop_byte = if next_hop != 0 {
+    // A last hop names the destination itself, so stock neighbours leave the frame alone.
+    let next_hop_byte = if last_hop {
+        (rx.to & 0xFF) as u8
+    } else if next_hop != 0 {
         (next_hop & 0xFF) as u8
     } else {
         0
@@ -69,22 +74,19 @@ pub fn relay_header_with_next_hop_opts(
     ))
 }
 
-/// Outgoing hop fields for a relay: normal decrement, or a direct-neighbor hop budget.
-pub fn relay_hop_fields(
-    rx: &ParsedPacket,
-    direct_neighbor_hop_limit: Option<u8>,
-) -> Option<(u8, u8)> {
+/// Outgoing hop fields for a relay: normal decrement, or the last-hop budget with `hop_start`
+/// rewritten so receivers still count the hops used.
+pub fn relay_hop_fields(rx: &ParsedPacket, last_hop: bool) -> Option<(u8, u8)> {
     if rx.hop_limit == 0 {
         return None;
     }
-    match direct_neighbor_hop_limit {
-        Some(limited) => {
-            let hops_away_rx = rx.hop_limit.saturating_sub(rx.hop_start);
-            let hops_away_tx = hops_away_rx.saturating_add(1);
-            let hop_start = hops_away_tx.saturating_add(limited);
-            Some((limited, hop_start))
-        }
-        None => Some((rx.hop_limit - 1, rx.hop_start)),
+    if last_hop {
+        let hops_away_rx = rx.hop_limit.saturating_sub(rx.hop_start);
+        let hops_away_tx = hops_away_rx.saturating_add(1);
+        let hop_start = hops_away_tx.saturating_add(LAST_HOP_BUDGET);
+        Some((LAST_HOP_BUDGET, hop_start))
+    } else {
+        Some((rx.hop_limit - 1, rx.hop_start))
     }
 }
 
@@ -175,7 +177,7 @@ mod tests {
             0xBB,
         )
         .parse();
-        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, None).expect("relay");
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, false).expect("relay");
         assert_eq!(hdr.parse().next_hop, 0);
         assert_eq!(hdr.parse().relay_node, 0xCC);
 
@@ -194,7 +196,7 @@ mod tests {
             0xBB,
         )
         .parse();
-        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, None).expect("relay");
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, false).expect("relay");
         assert_eq!(hdr.parse().next_hop, 0);
     }
 
@@ -213,30 +215,29 @@ mod tests {
             0xBB,
         )
         .parse();
-        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0xEE00_00EE, None)
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0xEE00_00EE, false)
             .expect("relay");
         assert_eq!(hdr.parse().next_hop, 0xEE);
     }
 
     #[test]
-    fn direct_neighbor_hop_limit_adjusts_hop_start() {
+    fn last_hop_relay_has_one_hop_and_names_the_destination() {
         let parsed =
             PacketHeader::from_fields(0xDD00_00DD, 0xBB00_00BB, 1, 0, 5, 3, false, false, 0, 0)
                 .parse();
-        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(0)).expect("relay");
-        assert_eq!(hdr.hop_limit(), 0);
-        assert_eq!(hdr.hop_start(), 3);
-        assert_eq!(hdr.hop_start().saturating_sub(hdr.hop_limit()), 3);
-    }
-
-    #[test]
-    fn direct_neighbor_hop_limit_marginal_allows_one_hop() {
-        let parsed =
-            PacketHeader::from_fields(0xDD00_00DD, 0xBB00_00BB, 1, 0, 5, 3, false, false, 0, 0)
-                .parse();
-        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0, Some(1)).expect("relay");
-        assert_eq!(hdr.hop_limit(), 1);
+        let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0xEE00_00EE, true)
+            .expect("relay");
+        assert_eq!(hdr.hop_limit(), LAST_HOP_BUDGET);
         assert_eq!(hdr.hop_start(), 4);
-        assert_eq!(hdr.hop_start().saturating_sub(hdr.hop_limit()), 3);
+        assert_eq!(
+            hdr.hop_start().saturating_sub(hdr.hop_limit()),
+            3,
+            "hops used kept"
+        );
+        assert_eq!(
+            hdr.parse().next_hop,
+            0xDD,
+            "the destination, not our route's next hop"
+        );
     }
 }

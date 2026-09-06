@@ -67,8 +67,8 @@ pub use graph::{
     RouteCache, MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE, PLACEHOLDER_NODE_PREFIX,
 };
 pub use neighbor_graph::{
-    MaintenanceReport, NeighborEntry, NeighborGraph, TopologyMergeResult, MAX_HEARD_TRANSMITTERS,
-    MAX_NEIGHBORS, MAX_RELAY_STATES, NEIGHBOR_TTL_MS,
+    MaintenanceReport, NeighborEntry, NeighborGraph, TopologyMergeResult, LAST_HOP_BUDGET,
+    MAX_HEARD_TRANSMITTERS, MAX_NEIGHBORS, MAX_RELAY_STATES, NEIGHBOR_TTL_MS,
 };
 pub use nodeinfo::{
     build_nodeinfo_reply_frame, build_nodeinfo_wire_frame, decode_user, encode_user,

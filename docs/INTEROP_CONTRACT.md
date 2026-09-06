@@ -43,11 +43,19 @@ airtime. Every SignalRouting node uses the same figure.
 ## 2. Header fields on frames we originate
 
 - **Hop fields.** Originated frames carry `hop_start` equal to `hop_limit`, as stock does.
-  Replies (`Router::response_hop_limit`) use stock's hops-used-plus-margin rule from
-  `hop_limit_for_response`, capped to 0 (1 on a marginal link) when the requester is a direct
-  neighbour that hears us, stock neighbours are present, and the request itself arrived direct;
-  a request that reached us through a relay keeps its reply's hop budget. Tests:
-  `reply_to_direct_hearing_neighbour_is_hop_limited_when_stock_nodes_are_around`.
+  Replies (`Router::response_header`) use stock's hops-used-plus-margin rule from
+  `hop_limit_for_response`. A request that reached us through a relay keeps its reply's hop
+  budget. Tests: `reply_to_direct_hearing_neighbour_is_hop_limited_when_stock_nodes_are_around`.
+- **Last hop.** A unicast to a direct neighbour that hears us, while stock neighbours listen
+  (`NeighborGraph::caps_last_hop`), goes out with `LAST_HOP_BUDGET` (one hop) and the
+  destination's byte as next hop, whether we originate it (`Router::send_local`, replies, ACKs)
+  or relay it (`relay_header_with_next_hop_opts`, which rewrites `hop_start` so hops used stay
+  countable). Stock relays a unicast only when the next hop is unset or its own byte, so the
+  frame is left alone; the destination reads zero hops used and acknowledges; and `hop_start` is
+  populated, which the Meshtastic Android app requires before it shows a traceroute reply. Among
+  SR peers only, slot coordination suppresses relays and the budget stays untouched. Tests:
+  `last_hop_relay_has_one_hop_and_names_the_destination`, `unicast_hop_limit`,
+  `last_hop_reply_is_direct_for_stock_and_left_alone_by_stock_relays`.
 - **Relay byte.** Every frame we originate carries our own low node byte in `relay_node`, as
   stock does since 2.5 (`build_app_wire_frame`, the topology, nodeinfo and telemetry frame
   builders, the PKI frame builder). Receivers treat a relay byte equal to the sender's byte, or
@@ -61,9 +69,8 @@ airtime. Every SignalRouting node uses the same figure.
   field 105, persisted in the flash record, on by default). Its presence is what tells a stock
   receiver that our `hop_start` is populated; a zero-`hop_start` frame without it has travelled
   an unknown number of hops (`hops_away`, stock's `getHopsAway`), and stock never acknowledges a
-  response whose hop count it does not know. The Meshtastic Android app goes further and shows a
-  zero-`hop_start` traceroute reply only when the bitfield word is nonzero, which is why the
-  MQTT bit defaults on. A frame we re-encode for relay keeps the origin's word verbatim
+  response whose hop count it does not know. A frame we re-encode for relay keeps the origin's
+  word verbatim
   (`DataBitfield::Origin`), so gateways and receivers read what the origin wrote. Tests:
   `originated_data_carries_the_bitfield`, `relayed_data_keeps_the_origin_bitfield`,
   `hop_zero_reply_is_readable_as_direct_by_a_stock_receiver`.

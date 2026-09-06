@@ -38,6 +38,7 @@ fn channel_admin_frame(to: u32, from: u32, id: u32, inner: &[u8]) -> Vec<u8> {
         ADMIN_APP,
         inner,
         DataEncodeOpts::default(),
+        0,
     )
     .unwrap();
     frame[..len as usize].to_vec()

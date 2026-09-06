@@ -176,6 +176,7 @@ fn routing_ack_stops_pending_retransmit() {
         ROUTING_ERROR_NONE,
         &CryptoKey::from_bytes(&DEFAULT_PSK),
         false,
+        0,
     ) else {
         panic!("build ack");
     };

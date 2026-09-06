@@ -125,6 +125,7 @@ pub fn build_ack_nak_frame(
     error_reason: u32,
     key: &CryptoKey,
     ok_to_mqtt: bool,
+    next_hop: u8,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     let routing = encode_routing_error(error_reason);
     build_app_wire_frame(
@@ -143,6 +144,7 @@ pub fn build_ack_nak_frame(
             bitfield: DataBitfield::Ours { ok_to_mqtt },
             ..Default::default()
         },
+        next_hop,
     )
 }
 
@@ -275,6 +277,7 @@ mod tests {
             ROUTING_ERROR_NONE,
             &key,
             false,
+            0,
         )
         .unwrap();
         let header = PacketHeader::decode(&frame[..PACKET_HEADER_LEN]).unwrap();
