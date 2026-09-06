@@ -40,6 +40,9 @@ pub struct Route {
     pub egress_radio: RadioId,
     pub cost_fixed: u16,
     pub timestamp_ms: u32,
+    /// Hops on the path, 1 for a direct neighbour; 0 when the route came from the downstream
+    /// table (length unknown) or there is none.
+    pub hops: u8,
 }
 
 impl Route {
@@ -74,6 +77,7 @@ impl RouteCache {
                     egress_radio: 0,
                     cost_fixed: 0,
                     timestamp_ms: 0,
+                    hops: 0,
                 },
             }; MAX_CACHED_ROUTES],
             count: 0,
@@ -178,12 +182,47 @@ pub fn can_deliver(
     {
         return true;
     }
-    !matches!(
-        capability.map(|c| c.status(to)),
+    !publishes_topology(capability, to)
+}
+
+/// Does `node` broadcast neighbour lists (SR active or passive)? Then its list is the
+/// authoritative set of nodes that can deliver to it, and a missing entry means "does not hear".
+pub fn publishes_topology(capability: Option<&CapabilityCache>, node: u32) -> bool {
+    matches!(
+        capability.map(|c| c.status(node)),
         Some(CapabilityStatus::SrActive) | Some(CapabilityStatus::Passive)
     )
 }
 
+/// Lower `cost[m]` to `cost + edge_cost` with `via` as the next hop toward the destination.
+fn relax(
+    nodes: &mut [DNode; MAX_GRAPH_NODES],
+    node_count: &mut usize,
+    m: u32,
+    via: u32,
+    cost: u16,
+    edge_cost: u16,
+) {
+    let Some(m_idx) = find_or_add_node(m, nodes, node_count) else {
+        return;
+    };
+    if nodes[m_idx].visited {
+        return;
+    }
+    let new_cost = cost.saturating_add(edge_cost).min(0xFFFE);
+    if new_cost < nodes[m_idx].cost {
+        nodes[m_idx].cost = new_cost;
+        nodes[m_idx].prev = via;
+    }
+}
+
+/// Route from `my_node` to `destination`: a Dijkstra search run backwards from the
+/// destination over "who hears whom". A settled node N is reached by the nodes that can deliver
+/// to it: the nodes N lists (N hears them, priced at the cost N measured on their signal), the
+/// nodes whose edge to N carries `hears_us` (N confirmed it hears them), and, when N publishes
+/// no topology, anyone who hears N (assumed symmetric, since nothing better is known). An edge
+/// alone is therefore never used against its direction, and every hop is priced at its receiver.
+/// Intermediate hops must pass `is_node_routable`; the destination and we ourselves need not.
 pub fn calculate_route(
     edges: &EdgeStore,
     downstream: &DownstreamTable,
@@ -199,22 +238,14 @@ pub fn calculate_route(
         egress_radio: 0,
         cost_fixed: ROUTE_COST_UNKNOWN,
         timestamp_ms: now_ms,
+        hops: 0,
     };
     if my_node == 0 || destination == 0 || destination == my_node {
         return result;
     }
 
-    if let Some(edge) = edges
-        .find_node(my_node)
-        .and_then(|n| n.find_edge(destination))
-        .filter(|_| can_deliver(edges, capability, my_node, destination))
-    {
-        result.next_hop = destination;
-        result.cost_fixed = edge.etx_fixed;
-        result.egress_radio = edge.heard_on;
-        return result;
-    }
-
+    // `cost` is the cost of the path from a node to the destination; `prev` is the node after it
+    // on that path.
     let mut nodes = [DNode {
         id: 0,
         cost: ROUTE_COST_UNKNOWN,
@@ -222,17 +253,10 @@ pub fn calculate_route(
         visited: false,
     }; MAX_GRAPH_NODES];
     let mut node_count = 0usize;
-
-    let Some(src_idx) = find_or_add_node(my_node, &mut nodes, &mut node_count) else {
+    let Some(dst_idx) = find_or_add_node(destination, &mut nodes, &mut node_count) else {
         return result;
     };
-    nodes[src_idx].cost = 0;
-    let _ = find_or_add_node(destination, &mut nodes, &mut node_count);
-    for i in 0..edges.node_count() {
-        if let Some(id) = edges.node_id_at(i) {
-            let _ = find_or_add_node(id, &mut nodes, &mut node_count);
-        }
-    }
+    nodes[dst_idx].cost = 0;
 
     loop {
         let mut u_idx = None;
@@ -249,52 +273,68 @@ pub fn calculate_route(
         if u_cost == ROUTE_COST_UNKNOWN {
             break;
         }
-
-        let u = nodes[u_idx].id;
+        let n = nodes[u_idx].id;
         nodes[u_idx].visited = true;
-        if u == destination {
+        if n == my_node {
             break;
         }
-
-        if u != my_node {
+        // Every settled node other than the destination would relay on this path.
+        if n != destination {
             if let Some(filter) = routable {
-                if !is_node_routable(filter, u) {
+                if !is_node_routable(filter, n) {
                     continue;
                 }
             }
         }
 
-        let Some(u_edges) = edges.find_node(u) else {
-            continue;
-        };
-        for e in 0..u_edges.edge_count as usize {
-            let edge = u_edges.edges[e];
-            let v = edge.to;
-            let Some(v_idx) = find_or_add_node(v, &mut nodes, &mut node_count) else {
+        // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
+        if let Some(n_edges) = edges.find_node(n) {
+            for e in 0..n_edges.edge_count as usize {
+                let edge = n_edges.edges[e];
+                relax(
+                    &mut nodes,
+                    &mut node_count,
+                    edge.to,
+                    n,
+                    u_cost,
+                    edge.etx_fixed,
+                );
+            }
+        }
+        // Nodes N confirmed hearing (`hears_us` on their edge to N), and, for a node without
+        // lists, anyone hearing N. Priced at the sender's measurement of N, the best available.
+        let n_publishes = publishes_topology(capability, n);
+        for i in 0..edges.node_count() {
+            let Some(m) = edges.node_id_at(i) else {
                 continue;
             };
-            if nodes[v_idx].visited || !can_deliver(edges, capability, u, v) {
+            if m == n {
                 continue;
             }
-            let new_cost = u_cost.saturating_add(edge.etx_fixed).min(0xFFFE);
-            if new_cost < nodes[v_idx].cost {
-                nodes[v_idx].cost = new_cost;
-                nodes[v_idx].prev = u;
+            let listed_by_n = edges.find_node(n).and_then(|ne| ne.find_edge(m)).is_some();
+            if listed_by_n {
+                continue;
+            }
+            let Some(edge) = edges.find_node(m).and_then(|me| me.find_edge(n)) else {
+                continue;
+            };
+            if edge.hears_us || !n_publishes {
+                relax(&mut nodes, &mut node_count, m, n, u_cost, edge.etx_fixed);
             }
         }
     }
 
-    for i in 0..node_count {
-        if nodes[i].id == destination && nodes[i].cost < ROUTE_COST_UNKNOWN {
-            result.cost_fixed = nodes[i].cost;
-            let mut cur = destination;
-            let mut prev = nodes[i].prev;
-            while prev != my_node && prev != 0 {
-                cur = prev;
-                prev = prev_of(&nodes, node_count, cur);
+    if let Some(me) = nodes[..node_count].iter().find(|x| x.id == my_node) {
+        if me.cost < ROUTE_COST_UNKNOWN && me.prev != 0 {
+            result.cost_fixed = me.cost;
+            result.next_hop = me.prev;
+            let mut cur = me.prev;
+            let mut hops = 1u8;
+            while cur != destination && cur != 0 && (hops as usize) < MAX_GRAPH_NODES {
+                cur = prev_of(&nodes, node_count, cur);
+                hops = hops.saturating_add(1);
             }
-            result.next_hop = cur;
-            break;
+            result.hops = hops;
         }
     }
 
@@ -461,6 +501,7 @@ mod tests {
         let route = calculate_route(&edges, &downstream, 0xAA, 0xBB, 0, None);
         assert_eq!(route.next_hop, 0xBB);
         assert_eq!(route.egress_radio, 1);
+        assert_eq!(route.hops, 1);
     }
 
     /// 2026-09-06 17:31: MR22 hears FCM6 at -108 dBm and lists it without hearsUs; FCM6's own
@@ -521,6 +562,36 @@ mod tests {
             calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
             DEST
         );
+    }
+
+    /// Costs are what the receiver of each hop measured: R hears us at ETX 3 and the destination
+    /// hears R at ETX 2, however good R's signal looks to us.
+    #[test]
+    fn route_cost_is_measured_at_the_receiver() {
+        const ME: u32 = 0xAA;
+        const RELAY: u32 = 0xBB;
+        const DEST: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, RELAY, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, RELAY, ME, 3.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, RELAY, DEST, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, DEST, RELAY, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(RELAY, true, 0);
+        capability.track_topology(DEST, true, 0);
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+        };
+        let route = calculate_route(&edges, &DownstreamTable::new(), ME, DEST, 0, Some(&filter));
+        assert_eq!(route.next_hop, RELAY);
+        assert_eq!(
+            route.cost_fixed, 500,
+            "3.0 into the relay plus 2.0 into the destination"
+        );
+        assert_eq!(route.hops, 2);
     }
 
     #[test]

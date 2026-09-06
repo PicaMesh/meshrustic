@@ -96,12 +96,16 @@ airtime. Every SignalRouting node uses the same figure.
 
 ## 3a. Unicast routes
 
-- **An edge is one-directional evidence.** A node listing a neighbour says it hears that
-  neighbour. A route hop from A to B needs B to hear A: A's edge to B carries `hears_us`, or B
-  lists A. A node that publishes topology and confirms neither does not hear A and is never
-  routed through that hop; a node that publishes none (stock, unclassified) cannot be ruled out
-  (`route::can_deliver`, applied in `calculate_route` and `find_better_positioned_neighbor`).
-  Test: `one_way_edge_is_not_a_route`.
+- **An edge is one-directional evidence, priced at the receiver.** A node listing a neighbour
+  says it hears that neighbour, at the RSSI and SNR it measured on that neighbour's signal.
+  `calculate_route` therefore runs Dijkstra backwards from the destination: a settled node is
+  reached by the nodes it lists (at the cost it measured), by the nodes whose edge to it carries
+  `hears_us`, and, if it publishes no topology (`route::publishes_topology`), by anyone who hears
+  it. An edge is never used against its direction and every hop costs what its receiver measured.
+  Intermediate hops must be routable; the destination need not. The route carries `hops`, logged
+  as `Route to !X via !Y cost=C hops=H`. `find_better_positioned_neighbor` applies the same
+  evidence rule through `route::can_deliver`. Tests: `one_way_edge_is_not_a_route`,
+  `route_cost_is_measured_at_the_receiver`.
 - **A next hop equal to the destination's byte names no relayer.** Stock's `NextHopRouter`
   learns the destination itself as next hop from a direct reply. Such a unicast is planned as one
   with no next hop: the cost ranking decides, nobody owns slot 0 (`Router::evaluate_tx_plan`,

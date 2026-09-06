@@ -1500,6 +1500,7 @@ pub mod sr {
                 destination,
                 next_hop,
                 cost_x100,
+                hops,
             } => {
                 let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
@@ -1512,6 +1513,8 @@ pub mod sr {
                 let tail = b" cost=";
                 put(&mut line, &mut pos, tail);
                 put_u32(&mut line, &mut pos, cost_x100 as u32);
+                put(&mut line, &mut pos, b" hops=");
+                put_u32(&mut line, &mut pos, hops as u32);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::UnicastDesignated {

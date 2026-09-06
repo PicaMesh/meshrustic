@@ -179,6 +179,7 @@ pub enum SrLogEvent {
         destination: u32,
         next_hop: u32,
         cost_x100: u16,
+        hops: u8,
     },
     T1Scheduled {
         id: u32,
