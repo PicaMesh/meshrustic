@@ -87,6 +87,11 @@ pub async fn radio_task(
     // first frame out of the radio and re-arming, and a preamble that starts in that window is
     // lost. Dura missed every traceroute reply that followed an ACK by exactly one airtime.
     const TX_INTERFRAME_GAP_MS: u64 = 100;
+    // Same on the receive side: after any frame we heard, every other receiver of that frame is
+    // still reading it out and re-arming. A reply that keys up within a few milliseconds of the
+    // request's end is lost on every fork node (their own replies come 330-690 ms later; the
+    // old MeshRustic build answered after ~210 ms and was heard). Floor the post-reception hold.
+    const RX_TURNAROUND_GAP_MS: u32 = 150;
 
     loop {
         // Every pass through this loop proves the executor and the router are still making
@@ -198,8 +203,10 @@ pub async fn radio_task(
                         last_rx_id,
                         node_num,
                     )
-                    .max(cw_slot);
-                    tx_hold_until = Some(Instant::now() + Duration::from_millis(backoff as u64));
+                    .max(cw_slot)
+                    .max(RX_TURNAROUND_GAP_MS);
+                    let hold_until = Instant::now() + Duration::from_millis(backoff as u64);
+                    tx_hold_until = Some(tx_hold_until.map_or(hold_until, |h| h.max(hold_until)));
                 }
                 if let Some(len) = report.tx_len {
                     defmt::info!(
