@@ -220,6 +220,7 @@ pub fn plan_unicast_relay(
             &mut plan.evaluated_len,
             candidate.node_id,
             0,
+            0,
             candidate.cost,
         );
     }

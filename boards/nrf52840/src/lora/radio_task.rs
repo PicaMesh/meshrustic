@@ -27,6 +27,7 @@ pub async fn radio_task(
     router: &'static mut Router,
     store: &'static mut NvmcConfigStore,
     node_num: u32,
+    mut watchdog: Option<embassy_nrf::wdt::WatchdogHandle>,
 ) {
     let air = air_time();
     let profile = slot.driver.profile();
@@ -84,6 +85,11 @@ pub async fn radio_task(
     const LOOP_IDLE_MS: u64 = 100;
 
     loop {
+        // Every pass through this loop proves the executor and the router are still making
+        // progress; a hang anywhere in the firmware stops the petting and the WDT resets the chip.
+        if let Some(wdt) = watchdog.as_mut() {
+            wdt.pet();
+        }
         let now_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
         let slot_ms = packet_time_ms(slot.config(), 64, true).max(1);
 

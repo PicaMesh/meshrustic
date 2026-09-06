@@ -18,6 +18,7 @@ use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::saadc;
 use embassy_nrf::spim;
+use embassy_nrf::wdt;
 use lora::{create_radio, radio_task, LoRaPins, Sx1262ModuleProfile};
 use mesh_radio::{eu868_config_for_preset, RadioSlot};
 use mesh_routing::Router;
@@ -55,6 +56,8 @@ bind_interrupts!(struct Irqs {
     SAADC => saadc::InterruptHandler;
 });
 
+const WATCHDOG_TIMEOUT_SECS: u32 = 30;
+
 static RADIO_SLOT: StaticCell<RadioSlot<lora::Sx1262Driver>> = StaticCell::new();
 // Const-initialised so the ~70 KB router is placed by the linker, never built on the stack
 // (see `Router::unconfigured`). `load_node_config` below gives it its node id and channel.
@@ -69,6 +72,21 @@ async fn main(spawner: Spawner) {
     // RC some units enumerate and others never show up on the host.
     hw_config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     let p = embassy_nrf::init(hw_config);
+    // Hardware watchdog: the panic and HardFault handlers cover crashes, this covers hangs (a task
+    // that never yields stalls the whole cooperative executor). The radio task pets it on every
+    // pass of its loop, which sleeps at most 100 ms; 30 s leaves room for a full-length TX and
+    // an NVMC page erase. It keeps counting in sleep and pauses under a debugger. A WDT reset
+    // shows up as `reset reason ... DOG` in the boot log.
+    let mut wdt_config = wdt::Config::default();
+    wdt_config.timeout_ticks = 32768 * WATCHDOG_TIMEOUT_SECS;
+    wdt_config.action_during_sleep = wdt::SleepConfig::RUN;
+    wdt_config.action_during_debug_halt = wdt::HaltConfig::PAUSE;
+    let radio_wdt = match wdt::Watchdog::try_new::<1>(p.WDT, wdt_config) {
+        Ok((_wdt, [handle])) => Some(handle),
+        // Already running with a different setup (nothing we ship does this): we cannot pet an
+        // unknown configuration, so run without and say so.
+        Err(_) => None,
+    };
     // Adafruit UF2 bootloader leaves RESETREAS set; clear so a later soft-reset
     // is not mistaken for a pin double-reset into upload mode. Keep the value for the boot log:
     // bit 0 RESETPIN, bit 1 DOG, bit 2 SREQ (panic handler / soft reset), bit 3 LOCKUP.
@@ -87,6 +105,11 @@ async fn main(spawner: Spawner) {
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
     usb_log::log::mesh::node_id(config.node_num);
     usb_log::log::mesh::reset_reason(reset_reason);
+    usb_log::log::push_line(if radio_wdt.is_some() {
+        "[meshrustic] watchdog armed: 30 s, pet by the radio task"
+    } else {
+        "[meshrustic] watchdog NOT armed: WDT already running with another configuration"
+    });
     usb_log::log::mesh::config_boot(load_src == ConfigLoadSource::Flash, admin_keys);
     defmt::info!(
         "[store] boot preset={} from_flash={}",
@@ -130,7 +153,13 @@ async fn main(spawner: Spawner) {
     let saadc = saadc::Saadc::new(p.SAADC, Irqs, saadc_config, [saadc_channel]);
     spawner.spawn(battery::battery_task(saadc)).unwrap();
     spawner
-        .spawn(radio_task::radio_task(slot, router, store, config.node_num))
+        .spawn(radio_task::radio_task(
+            slot,
+            router,
+            store,
+            config.node_num,
+            radio_wdt,
+        ))
         .unwrap();
 
     core::future::pending().await

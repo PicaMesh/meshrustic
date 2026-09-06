@@ -193,6 +193,11 @@ struct PendingAdmin {
 
 /// Minimum spacing between topology lists sent in answer to empty bootstrap broadcasts.
 pub const BOOTSTRAP_REPLY_MIN_MS: u32 = 60_000;
+/// Extra time a destination needs to turn a received packet into an ACK on the air, on top of
+/// its contention delay and the ACK airtime. Measured: a phone-connected fork node ACKed a
+/// direct traceroute reply 440 ms after it ended while the formula without this gave 246 ms,
+/// and a neighbour relayed the reply needlessly.
+pub const DEST_ACK_PROCESSING_MS: u32 = 250;
 
 /// Shared static router state.
 pub struct Router {
@@ -1119,7 +1124,7 @@ impl Router {
     }
 
     fn schedule_admin_routing_error(&mut self, parsed: &ParsedPacket, error: u32, now_ms: u32) {
-        let hop = hop_limit_for_response(parsed, self.hop_limit);
+        let hop = self.response_hop_limit(parsed);
         let id = self.alloc_tx_id(now_ms);
         let routing = encode_routing_error(error);
         // Mirror setReplyTo: Data.request_id only (not reply_id), and copy WantAck so the reply
@@ -1889,13 +1894,14 @@ impl Router {
             broadcast_plan.as_ref().or(unicast_plan.as_ref()),
         );
         let delay_ms = tx_after_ms.wrapping_sub(now_ms);
-        let (ranked, ranked_len, reason, evaluated, evaluated_len) =
+        let (ranked, ranked_len, reason, evaluated, evaluated_len, pre_covered) =
             broadcast_plan.as_ref().or(unicast_plan.as_ref()).map_or(
                 (
                     [0u32; crate::broadcast_relay::RANKED_LOG],
                     0,
                     crate::broadcast_relay::RelayReason::None,
-                    [(0u32, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                    [(0u32, 0u8, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                    0,
                     0,
                 ),
                 |p| {
@@ -1905,6 +1911,7 @@ impl Router {
                         p.reason,
                         p.evaluated,
                         p.evaluated_len,
+                        p.pre_covered,
                     )
                 },
             );
@@ -1918,6 +1925,7 @@ impl Router {
             reason,
             evaluated,
             evaluated_len,
+            pre_covered,
         });
         self.sr_log.push(SrLogEvent::RelayCommitted {
             id: parsed.id,
@@ -2156,30 +2164,33 @@ impl Router {
             tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
         };
         // Behind the designated node, the cost ranking orders the remaining candidates.
-        let (rank, count, ranked, ranked_len, reason, evaluated, evaluated_len) = match ranking {
-            Some(Ok(p)) => (
-                p.slot_index,
-                p.candidate_count,
-                p.ranked,
-                p.ranked_len,
-                p.reason,
-                p.evaluated,
-                p.evaluated_len,
-            ),
-            Some(Err(reason)) => return Err(reason),
-            None => {
-                let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
-                (
-                    rank,
-                    count,
-                    [0u32; crate::broadcast_relay::RANKED_LOG],
-                    0,
-                    crate::broadcast_relay::RelayReason::None,
-                    [(0u32, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
-                    0,
-                )
-            }
-        };
+        let (rank, count, ranked, ranked_len, reason, evaluated, evaluated_len, pre_covered) =
+            match ranking {
+                Some(Ok(p)) => (
+                    p.slot_index,
+                    p.candidate_count,
+                    p.ranked,
+                    p.ranked_len,
+                    p.reason,
+                    p.evaluated,
+                    p.evaluated_len,
+                    p.pre_covered,
+                ),
+                Some(Err(reason)) => return Err(reason),
+                None => {
+                    let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+                    (
+                        rank,
+                        count,
+                        [0u32; crate::broadcast_relay::RANKED_LOG],
+                        0,
+                        crate::broadcast_relay::RelayReason::None,
+                        [(0u32, 0u8, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                        0,
+                        0,
+                    )
+                }
+            };
         let slot = rank.saturating_add(1);
         let slot_delay_ms = slot0_wait.saturating_add((rank as u32).saturating_mul(half_airtime));
         self.sr_log.push(SrLogEvent::UnicastDesignated {
@@ -2199,6 +2210,7 @@ impl Router {
             reason,
             evaluated,
             evaluated_len,
+            pre_covered,
         })
     }
 
@@ -2206,13 +2218,30 @@ impl Router {
     /// contention delay (the channel may look busier to it than to us, hence twice our
     /// contention maximum) plus the ACK's airtime.
     fn dest_ack_wait_ms(&self, airtime_ms: u32) -> u32 {
-        airtime_ms.saturating_add(
-            crate::coordinated_relay::tx_delay_ms_contention_max_at(
-                self.channel_util_pct,
-                self.cw_slot_ms(),
+        airtime_ms
+            .saturating_add(
+                crate::coordinated_relay::tx_delay_ms_contention_max_at(
+                    self.channel_util_pct,
+                    self.cw_slot_ms(),
+                )
+                .saturating_mul(2),
             )
-            .saturating_mul(2),
-        )
+            .saturating_add(DEST_ACK_PROCESSING_MS)
+    }
+
+    /// Hop budget for a reply we originate. Like the fork's `Router::send`, a reply to a
+    /// direct neighbour that hears us goes out with hop limit 0 (1 on a marginal link) when
+    /// stock neighbours are around, so nobody relays a packet we deliver ourselves. A
+    /// traceroute reply from A to Dura went out with hop 2 and was relayed three times.
+    fn response_hop_limit(&self, parsed: &ParsedPacket) -> u8 {
+        let base = hop_limit_for_response(parsed, self.hop_limit);
+        match self
+            .graph
+            .unicast_hop_limit_for_direct_neighbor(parsed.from)
+        {
+            Some(limited) => limited.min(base),
+            None => base,
+        }
     }
 
     /// How long an SR peer that owns the slot ahead of us needs before its relay has left the
@@ -2634,7 +2663,7 @@ impl Router {
     }
 
     fn schedule_ack(&mut self, parsed: &ParsedPacket, channel_hash: u8, now_ms: u32) {
-        let hop = hop_limit_for_response(parsed, self.hop_limit);
+        let hop = self.response_hop_limit(parsed);
         self.schedule_ack_with_hop(parsed, channel_hash, hop, now_ms);
     }
 
@@ -2672,7 +2701,7 @@ impl Router {
         if self.pending_ack.active {
             return;
         }
-        let hop = hop_limit_for_response(parsed, self.hop_limit);
+        let hop = self.response_hop_limit(parsed);
         let packet_id = self.alloc_tx_id(now_ms);
         let Some((len, frame)) =
             self.build_ack_nak_reply(parsed, packet_id, hop, error, parsed.channel)
@@ -2858,7 +2887,7 @@ impl Router {
         if !encode_route_discovery(&rd, &mut route_wire) {
             return;
         }
-        let hop = hop_limit_for_response(parsed, self.hop_limit);
+        let hop = self.response_hop_limit(parsed);
         let packet_id = self.alloc_tx_id(now_ms);
         let Some((len, frame)) = build_app_wire_frame(
             parsed.from,
@@ -3412,6 +3441,39 @@ mod tests {
         out.extend_from_slice(&hdr).unwrap();
         out.extend_from_slice(payload).unwrap();
         out
+    }
+
+    #[test]
+    fn reply_to_direct_hearing_neighbour_is_hop_limited_when_stock_nodes_are_around() {
+        const ME: u32 = 0x1100_0011;
+        const DEST: u32 = 0xD000_000D;
+        const STOCK: u32 = 0x5000_0005;
+        let mut router = Router::new(ME);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(DEST, -40, 12, 1_000, 0);
+        router.graph_mut().confirm_direct_neighbor_hears_us(DEST);
+        let request = PacketHeader::from_fields(ME, DEST, 7, 0, 7, 7, true, false, 0, 0).parse();
+        assert_eq!(
+            router.response_hop_limit(&request),
+            2,
+            "no stock neighbour: nothing to protect, default margin applies"
+        );
+        router
+            .graph_mut()
+            .observe_direct_neighbor(STOCK, -60, 10, 1_000, 0);
+        assert_eq!(
+            router.response_hop_limit(&request),
+            0,
+            "good direct link: deliver ourselves"
+        );
+    }
+
+    #[test]
+    fn dest_ack_wait_includes_processing_allowance() {
+        let router = Router::new(0x1100_0011);
+        let wait = router.dest_ack_wait_ms(100);
+        assert!(wait >= 100 + DEST_ACK_PROCESSING_MS, "got {wait}");
     }
 
     #[test]

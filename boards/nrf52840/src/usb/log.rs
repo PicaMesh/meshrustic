@@ -1137,6 +1137,7 @@ pub mod sr {
                 reason,
                 evaluated,
                 evaluated_len,
+                pre_covered,
             } => {
                 let mut line = [0u8; 320];
                 let mut pos = line_prefix(&mut line);
@@ -1149,6 +1150,8 @@ pub mod sr {
                 let tail = b"ms, candidates=";
                 put(&mut line, &mut pos, tail);
                 put_u32(&mut line, &mut pos, candidates as u32);
+                put(&mut line, &mut pos, b", pre=");
+                put_u32(&mut line, &mut pos, pre_covered as u32);
                 let tail2 = b", slot=";
                 put(&mut line, &mut pos, tail2);
                 put_u32(&mut line, &mut pos, slot_index as u32);
@@ -1173,10 +1176,11 @@ pub mod sr {
                     }
                 }
                 if evaluated_len > 0 {
-                    // Ranking inputs: !node(unique coverage,cost bucket); unicast costs carry tier bits.
+                    // Ranking inputs: !node(unique/total coverage,cost bucket); unicast costs carry
+                    // tier bits and no coverage.
                     let cand = b", cand=";
                     put(&mut line, &mut pos, cand);
-                    for (i, (node, cov, cost)) in
+                    for (i, (node, cov, total, cost)) in
                         evaluated.iter().take(evaluated_len as usize).enumerate()
                     {
                         if i > 0 {
@@ -1186,6 +1190,8 @@ pub mod sr {
                         put_hex8(&mut line, &mut pos, *node);
                         put(&mut line, &mut pos, b"(");
                         put_u32(&mut line, &mut pos, *cov as u32);
+                        put(&mut line, &mut pos, b"/");
+                        put_u32(&mut line, &mut pos, *total as u32);
                         put(&mut line, &mut pos, b",");
                         put_u32(&mut line, &mut pos, *cost as u32);
                         put(&mut line, &mut pos, b")");

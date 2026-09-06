@@ -32,29 +32,33 @@ pub struct BroadcastRelayPlan {
     pub ranked: [u32; RANKED_LOG],
     pub ranked_len: u8,
     pub reason: RelayReason,
-    /// Ranking inputs of the first candidates evaluated: (node, unique coverage, cost bucket).
-    /// Lets two nodes' views of the same packet be compared when their orders disagree.
-    pub evaluated: [(u32, u8, u16); RANKED_LOG],
+    /// Ranking inputs of the first candidates evaluated: (node, unique coverage, total coverage,
+    /// cost bucket). Lets two nodes' views of the same packet be compared when their orders
+    /// disagree: unique < total shows how much pre-coverage took away.
+    pub evaluated: [(u32, u8, u8, u16); RANKED_LOG],
     pub evaluated_len: u8,
+    /// Nodes counted as already covered before ranking (source, heard-from and its good links).
+    pub pre_covered: u8,
 }
 
 /// Ranking inputs collected during the first pick, for the log.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EvaluatedList {
-    pub items: [(u32, u8, u16); RANKED_LOG],
+    pub items: [(u32, u8, u8, u16); RANKED_LOG],
     pub len: u8,
 }
 
 /// Record one candidate's ranking inputs for the log (first RANKED_LOG only).
 pub fn push_evaluated(
-    out: &mut [(u32, u8, u16); RANKED_LOG],
+    out: &mut [(u32, u8, u8, u16); RANKED_LOG],
     len: &mut u8,
     node: u32,
     coverage: u8,
+    total: u8,
     cost: u16,
 ) {
     if (*len as usize) < RANKED_LOG {
-        out[*len as usize] = (node, coverage, cost);
+        out[*len as usize] = (node, coverage, total, cost);
         *len += 1;
     }
 }
@@ -249,7 +253,14 @@ where
             }
         }
         if let Some(ev) = evaluated.as_deref_mut() {
-            push_evaluated(&mut ev.items, &mut ev.len, candidate, unique_count, 0);
+            push_evaluated(
+                &mut ev.items,
+                &mut ev.len,
+                candidate,
+                unique_count,
+                coverage_n,
+                0,
+            );
         }
         // Zero unique coverage never wins a slot (including self). Sparse sole-candidate
         // flood and stock-trailing slots are handled after the ranking loop.
@@ -286,7 +297,7 @@ where
             // Fill in the cost of the entry pushed above now that it is known.
             let n = ev.len as usize;
             if n > 0 && ev.items[n - 1].0 == candidate {
-                ev.items[n - 1].2 = avg_cost_fixed;
+                ev.items[n - 1].3 = avg_cost_fixed;
             }
         }
         let mut tier = 0u8;
@@ -517,6 +528,7 @@ where
     let half = half_airtime_ms.max(50);
     let prefer_high = (packet_id & 1) != 0;
     let mut already_covered = build_already_covered(ctx.edges, source, heard_from);
+    let pre_covered_count = already_covered.count;
     let mut candidates = build_candidates(ctx, source, heard_from);
     let peers = candidates; // every SR candidate, kept for the stock-coverage tie-break
     let initial_candidates = candidates.count;
@@ -631,6 +643,7 @@ where
         reason,
         evaluated: evaluated.items,
         evaluated_len: evaluated.len,
+        pre_covered: pre_covered_count,
     }
 }
 

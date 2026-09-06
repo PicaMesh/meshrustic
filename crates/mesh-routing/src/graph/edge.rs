@@ -305,7 +305,33 @@ impl EdgeStore {
             self.nodes[from_idx].edge_count += 1;
             EDGE_NEW
         } else {
-            EDGE_NO_CHANGE
+            // Edge list full: replace the worst edge if the new one is better, as the fork does
+            // (score = ETX + age/300 s, so stale links lose first). Dropping the new edge instead
+            // meant a hub never learned neighbours that appeared after its 40 slots filled.
+            let node = &mut self.nodes[from_idx];
+            let mut worst_idx = 0usize;
+            let mut worst_score = f32::MIN;
+            for (i, edge) in node.edges.iter().enumerate().take(node.edge_count as usize) {
+                let age_s = now_ms.wrapping_sub(edge.last_update_ms) as f32 / 1000.0;
+                let score = edge.etx() + age_s / 300.0;
+                if score > worst_score {
+                    worst_score = score;
+                    worst_idx = i;
+                }
+            }
+            if etx >= worst_score {
+                return EDGE_NO_CHANGE;
+            }
+            node.edges[worst_idx] = Edge {
+                to,
+                etx_fixed: etx_to_fixed(etx),
+                last_update_ms: now_ms,
+                etx_variance: 0,
+                source,
+                hears_us: false, // must be re-proven for the new neighbour
+                heard_on,
+            };
+            EDGE_NEW
         }
     }
 
@@ -502,6 +528,49 @@ impl EdgeStore {
 mod tests {
     use super::*;
     use crate::graph::DownstreamTable;
+
+    #[test]
+    fn full_edge_list_replaces_worst_edge_when_new_one_is_better() {
+        const ME: u32 = 0xAA;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        for i in 0..MAX_EDGES_PER_NODE as u32 {
+            assert_eq!(
+                edges.update_edge(ME, ME, 0x1000 + i, 4.0, 0, EdgeSource::Reported, true, 0),
+                EDGE_NEW
+            );
+        }
+        // Refresh every edge but the first at t=600 s: the first is now the stale one
+        // (score 4 + 600/300 = 6, the others 4).
+        for i in 1..MAX_EDGES_PER_NODE as u32 {
+            edges.update_edge(
+                ME,
+                ME,
+                0x1000 + i,
+                4.0,
+                600_000,
+                EdgeSource::Reported,
+                true,
+                0,
+            );
+        }
+        // Worse than every slot: dropped, list unchanged.
+        assert_eq!(
+            edges.update_edge(ME, ME, 0x2000, 9.0, 600_000, EdgeSource::Reported, true, 0),
+            EDGE_NO_CHANGE
+        );
+        assert!(edges.find_node(ME).unwrap().find_edge(0x1000).is_some());
+        // Better than the stale slot: takes it, with hears_us cleared for the newcomer.
+        assert_eq!(
+            edges.update_edge(ME, ME, 0x2001, 5.0, 600_000, EdgeSource::Reported, true, 0),
+            EDGE_NEW
+        );
+        let node = edges.find_node(ME).unwrap();
+        assert!(node.find_edge(0x1000).is_none(), "stale edge evicted");
+        let newcomer = node.find_edge(0x2001).expect("newcomer stored");
+        assert!(!newcomer.hears_us);
+        assert_eq!(node.edge_count as usize, MAX_EDGES_PER_NODE);
+    }
 
     #[test]
     fn age_removes_nodes_with_no_outgoing_edges() {

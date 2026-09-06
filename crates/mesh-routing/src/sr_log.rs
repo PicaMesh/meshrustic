@@ -46,10 +46,12 @@ pub enum SrLogEvent {
         ranked: [u32; crate::broadcast_relay::RANKED_LOG],
         ranked_len: u8,
         reason: crate::broadcast_relay::RelayReason,
-        /// Ranking inputs of the first candidates evaluated: (node, unique coverage, cost bucket).
-        /// Unicast plans carry the tiered cost with coverage 0.
-        evaluated: [(u32, u8, u16); crate::broadcast_relay::RANKED_LOG],
+        /// Ranking inputs of the first candidates evaluated: (node, unique coverage, total
+        /// coverage, cost bucket). Unicast plans carry the tiered cost with coverage 0.
+        evaluated: [(u32, u8, u8, u16); crate::broadcast_relay::RANKED_LOG],
         evaluated_len: u8,
+        /// Nodes counted as already covered before ranking.
+        pre_covered: u8,
     },
     RelayCommitted {
         id: u32,
