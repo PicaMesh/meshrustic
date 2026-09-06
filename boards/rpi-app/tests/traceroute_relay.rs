@@ -144,6 +144,49 @@ fn router_appends_traceroute_reply_on_route_back() {
 }
 
 #[test]
+fn traceroute_reply_replaces_the_separate_ack() {
+    const REQUESTER: u32 = 0x1111_1111;
+    const TARGET: u32 = 0xCCCC_CCCC;
+    const CHANNEL: u8 = 0x77;
+    let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+    let mut route_wire = heapless::Vec::<u8, 128>::new();
+    encode_route_discovery(&RouteDiscovery::default(), &mut route_wire);
+    let (req_len, req_wire) = build_app_wire_frame(
+        TARGET,
+        REQUESTER,
+        0xABCD_5678,
+        CHANNEL,
+        3,
+        3,
+        true,
+        &key,
+        TRACEROUTE_APP,
+        &route_wire,
+        DataEncodeOpts {
+            want_response: true,
+            ..Default::default()
+        },
+    )
+    .expect("request wire");
+    let mut router = Router::with_channel(TARGET, key, CHANNEL, MODEM_SHORT_SLOW, true, 3);
+    router
+        .process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -68,
+                snr: 9,
+                bytes: &req_wire[..usize::from(req_len)],
+            },
+            100,
+        )
+        .expect("accepted");
+    // The reply carries request_id and is the ACK; a separate ACK frame right before it was
+    // what receivers lost.
+    assert!(router.poll_ack_tx(100).is_none(), "no separate ACK");
+    assert!(router.poll_traceroute_tx(100).is_some(), "reply queued");
+}
+
+#[test]
 fn traceroute_to_us_sends_response_with_request_id() {
     const REQUESTER: u32 = 0x1111_1111;
     const TARGET: u32 = 0xCCCC_CCCC;

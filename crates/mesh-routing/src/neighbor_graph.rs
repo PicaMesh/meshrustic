@@ -29,6 +29,9 @@ pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
 /// peer whose reboot broadcast we missed, a peer that came back with a moved-on counter, and a
 /// receiver that was itself away. Twice the periodic interval.
 pub const TOPOLOGY_RESYNC_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS;
+/// Nominal link assumed for edges inferred from relayed packets (same as the fork's default).
+pub const INFERRED_LINK_RSSI: i32 = -70;
+pub const INFERRED_LINK_SNR: f32 = 5.0;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
 pub const NEIGHBOR_TTL_MS: u32 = 7_200_000;
 
@@ -1410,23 +1413,28 @@ impl NeighborGraph {
             return None;
         }
         self.edges.ensure_local_node(self.my_node, now_ms);
-        let etx = calculate_etx(rssi as i32, snr as f32);
+        // What we measured is the relay's link to us, not the relay's link to the source. An
+        // inferred edge/downstream gets a nominal cost per hop the packet has travelled, as the
+        // fork does; with the measured value a two-hop path through a node a metre away priced
+        // at 1.05 and both nicenanos routed FCM6 through each other.
+        let hops_used = hop_start.saturating_sub(hop_limit).max(1);
+        let etx = calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR) * hops_used as f32;
 
         let is_new_gateway =
             self.observe_relay_gateway_signal(gateway, rssi, snr, now_ms, heard_on);
 
-        let single_hop = hop_start.saturating_sub(hop_limit) == 1;
+        let single_hop = hops_used == 1;
         let source_sr_active = matches!(self.capability.status(from), CapabilityStatus::SrActive);
 
         if !source_sr_active || single_hop {
-            let result_relay_to_dest = self.edges.update_edge_from_observation(
+            let result_relay_to_dest = self.edges.update_edge(
                 self.my_node,
                 gateway,
                 from,
-                rssi,
-                snr,
+                etx,
                 now_ms,
                 EdgeSource::Mirrored,
+                true,
                 heard_on,
             );
             if result_relay_to_dest == EDGE_NEW || result_relay_to_dest == EDGE_SIGNIFICANT_CHANGE {
@@ -3170,6 +3178,28 @@ mod tests {
         assert!(!h1.more_chunks && h1.continuation);
         assert_eq!(n1.len(), 2);
         assert!(graph.build_topology_chunk(2, 3, &mut buf).is_none());
+    }
+
+    #[test]
+    fn relayed_packet_inference_prices_the_path_per_hop_not_by_the_relay_signal() {
+        const ME: u32 = 0x1100_0011;
+        const RELAYER: u32 = 0xBB00_00BB;
+        const FAR: u32 = 0xFA00_00FA;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(RELAYER, -16, 14, 1_000, 0);
+        // FAR's packet arrives via RELAYER after two hops, at bench strength (-16 dBm).
+        graph.observe_packet(FAR, 7, 5, 0xBB, -16, 14, 2_000, 0, Some(RELAYER), 0x77);
+        let route = graph.get_route(FAR, 2_000);
+        assert_eq!(route.next_hop, RELAYER);
+        let nominal =
+            crate::graph::etx_to_fixed(calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR));
+        assert!(
+            route.cost_fixed as u32 >= 2 * nominal as u32,
+            "two inferred hops must cost at least twice the nominal link: {} < {}",
+            route.cost_fixed,
+            2 * nominal as u32
+        );
     }
 
     #[test]

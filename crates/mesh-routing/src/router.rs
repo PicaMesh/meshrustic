@@ -198,6 +198,10 @@ pub const BOOTSTRAP_REPLY_MIN_MS: u32 = 60_000;
 /// direct traceroute reply 440 ms after it ended while the formula without this gave 246 ms,
 /// and a neighbour relayed the reply needlessly.
 pub const DEST_ACK_PROCESSING_MS: u32 = 250;
+/// Extra time a designated SR next hop needs before its relay is on the air, on top of one
+/// airtime and its contention maximum. Measured: Czar relayed 511 ms after the frame it was
+/// named in while the formula without this gave 158 ms, so B pre-empted it and both relayed.
+pub const PEER_RELAY_PROCESSING_MS: u32 = 250;
 
 /// Shared static router state.
 pub struct Router {
@@ -255,6 +259,8 @@ pub struct Router {
     admin_reply_suppresses_ack: bool,
     /// LoRa preset changed; board must soft-reinit the radio (no sys_reset).
     pending_radio_reinit: bool,
+    /// Packet id of a duplicate that named us as next hop and is being forwarded as a hand-off.
+    designated_repeat_id: Option<u32>,
 }
 
 impl Router {
@@ -418,6 +424,7 @@ impl Router {
             pending_pki_error: None,
             admin_reply_suppresses_ack: false,
             pending_radio_reinit: false,
+            designated_repeat_id: None,
         }
     }
 
@@ -708,7 +715,7 @@ impl Router {
         packet: &InboundPacket<'_>,
         now_ms: u32,
     ) -> Option<ProcessResult> {
-        // Per-RX: admin replies for this packet suppress a separate WantAck ACK.
+        // Per-RX: module replies (admin, traceroute) for this packet suppress a separate WantAck ACK.
         self.admin_reply_suppresses_ack = false;
         let header = PacketHeader::decode(packet.bytes).ok()?;
         let parsed = header.parse();
@@ -746,25 +753,41 @@ impl Router {
                 }
             }
             ObserveResult::Duplicate => {
-                self.handle_duplicate_rx(
-                    &parsed,
-                    decoded_data.as_ref(),
-                    inner.as_deref(),
-                    packet,
-                    now_ms,
-                );
-                return Some(ProcessResult {
-                    parsed,
-                    duplicate: true,
-                    rate_limited: false,
-                    handle: None,
-                    radio_id: packet.radio_id,
-                    rssi: packet.rssi,
-                    snr: packet.snr,
-                    decoded_portnum: decode.portnum,
-                    decode,
-                    decoded_data,
-                });
+                // A copy that names our byte as next hop is the previous relay handing the
+                // packet to us (stock: `weWereNextHop`): forward it like a fresh reception
+                // instead of cancelling. B relayed a traceroute to A, A dropped it as a dupe
+                // and B retried three times into silence.
+                let our_byte = (self.node_num & 0xFF) as u8;
+                let designated_repeat = parsed.to != NODENUM_BROADCAST
+                    && parsed.to != self.node_num
+                    && parsed.from != self.node_num
+                    && parsed.next_hop == our_byte
+                    && parsed.hop_limit > 0
+                    && self.graph.is_active_routing_role()
+                    && !self.graph.has_our_transmission(parsed.id);
+                if designated_repeat {
+                    self.designated_repeat_id = Some(parsed.id);
+                } else {
+                    self.handle_duplicate_rx(
+                        &parsed,
+                        decoded_data.as_ref(),
+                        inner.as_deref(),
+                        packet,
+                        now_ms,
+                    );
+                    return Some(ProcessResult {
+                        parsed,
+                        duplicate: true,
+                        rate_limited: false,
+                        handle: None,
+                        radio_id: packet.radio_id,
+                        rssi: packet.rssi,
+                        snr: packet.snr,
+                        decoded_portnum: decode.portnum,
+                        decode,
+                        decoded_data,
+                    });
+                }
             }
             ObserveResult::New => {}
         }
@@ -1620,11 +1643,22 @@ impl Router {
         // must not go on the air as next_hop = our byte: receivers would treat us as the
         // designated forwarder and wait for a second copy that never comes. Leave it clear so
         // they coordinate by slot, and so we never arm retries waiting for ourselves.
-        let next_hop = if picked_hop == self.node_num {
+        let mut next_hop = if picked_hop == self.node_num {
             0
         } else {
             picked_hop
         };
+        // Hand-off: the previous relay named us and our only route points back at it. Stock
+        // floods here (next_hop cleared) rather than dropping the packet, and so do we.
+        let designated_repeat = self.designated_repeat_id.take() == Some(parsed.id);
+        if designated_repeat && parsed.to != NODENUM_BROADCAST && next_hop == heard_from {
+            next_hop = 0;
+            self.sr_log.push(SrLogEvent::RouteNextHop {
+                destination: parsed.to,
+                next_hop: 0,
+                cost_x100: 0,
+            });
+        }
 
         // 1. The relayer we heard this from already holds the packet; handing it back only
         // produces a duplicate there.
@@ -2247,10 +2281,12 @@ impl Router {
     /// How long an SR peer that owns the slot ahead of us needs before its relay has left the
     /// air: its contention delay at the current utilisation plus one airtime.
     fn sr_peer_relay_wait_ms(&self, airtime_ms: u32) -> u32 {
-        airtime_ms.saturating_add(crate::coordinated_relay::tx_delay_ms_contention_max_at(
-            self.channel_util_pct,
-            self.cw_slot_ms(),
-        ))
+        airtime_ms
+            .saturating_add(crate::coordinated_relay::tx_delay_ms_contention_max_at(
+                self.channel_util_pct,
+                self.cw_slot_ms(),
+            ))
+            .saturating_add(PEER_RELAY_PROCESSING_MS)
     }
 
     fn try_resolve_placeholder(&mut self, parsed: &ParsedPacket, now_ms: u32) -> bool {
@@ -2912,6 +2948,10 @@ impl Router {
         self.pending_traceroute.next_tx_ms = now_ms;
         self.pending_traceroute.len = len;
         self.pending_traceroute.bytes = frame;
+        // The reply carries request_id and is the ACK (stock: a module reply replaces the
+        // separate ACK). Sending both put two frames on the air back to back and Dura missed
+        // the second one every time.
+        self.admin_reply_suppresses_ack = true;
         self.sr_log.push(SrLogEvent::TracerouteAppended {
             towards: data.request_id == 0,
             route_len: rd.route.len().min(u8::MAX as usize) as u8,
@@ -3441,6 +3481,12 @@ mod tests {
         out.extend_from_slice(&hdr).unwrap();
         out.extend_from_slice(payload).unwrap();
         out
+    }
+
+    #[test]
+    fn peer_relay_wait_includes_processing_allowance() {
+        let router = Router::new(0x1100_0011);
+        assert!(router.sr_peer_relay_wait_ms(100) >= 100 + PEER_RELAY_PROCESSING_MS);
     }
 
     #[test]
@@ -4240,6 +4286,67 @@ mod tests {
         assert!(scheduled);
         assert_eq!(reason, None);
         assert!(router.relay_tx_after(UNI_SOURCE, 0x502, 0).is_some());
+    }
+
+    #[test]
+    fn duplicate_naming_us_as_next_hop_is_forwarded_with_next_hop_cleared() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // First copy names RELAYER (0xBB) as next hop: we take a later slot.
+        let wire = unicast_wire(3, 3, 0xBB, 0xDD, 0x611);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        assert!(plan.relay.is_none());
+        // RELAYER forwards it naming us. Our own route to DEST goes through RELAYER, so the
+        // hand-off is honoured by flooding with next_hop cleared instead of being dropped.
+        let copy = unicast_wire(2, 3, 0xCC, 0xBB, 0x611);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy,
+                },
+                50,
+            )
+            .unwrap();
+        assert!(!result.duplicate, "a hand-off is not a dupe");
+        let _ = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 50);
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(
+            logs.iter().any(|e| matches!(
+                e,
+                SrLogEvent::UnicastDesignated {
+                    is_us: true,
+                    slot: 0,
+                    ..
+                }
+            )),
+            "hand-off takes slot 0; log: {logs:?}"
+        );
+        // Slot 0 still sits behind the short post-reception hold, so it is pending, not inline.
+        let relay = router
+            .poll_ready_relay(50 + coordinated_relay::DEFAULT_SLOT_MS)
+            .expect("hand-off relay ready within one slot");
+        let hdr = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert_eq!(hdr.next_hop, 0, "route pointed back at the relayer: flood");
+        assert_eq!(hdr.relay_node, 0xCC);
+        assert_eq!(hdr.hop_limit, 1);
     }
 
     #[test]

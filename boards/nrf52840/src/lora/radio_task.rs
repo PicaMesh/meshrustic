@@ -83,6 +83,10 @@ pub async fn radio_task(
 
     const LOOP_ACTIVE_MS: u64 = 5;
     const LOOP_IDLE_MS: u64 = 100;
+    // Never start another frame right after one of ours ends: receivers are still reading the
+    // first frame out of the radio and re-arming, and a preamble that starts in that window is
+    // lost. Dura missed every traceroute reply that followed an ACK by exactly one airtime.
+    const TX_INTERFRAME_GAP_MS: u64 = 100;
 
     loop {
         // Every pass through this loop proves the executor and the router are still making
@@ -208,6 +212,8 @@ pub async fn radio_task(
                     if let Some(id) = report.tx_id {
                         router.note_tx_done(id);
                     }
+                    let gap_until = Instant::now() + Duration::from_millis(TX_INTERFRAME_GAP_MS);
+                    tx_hold_until = Some(tx_hold_until.map_or(gap_until, |h| h.max(gap_until)));
                 }
                 if report.tx_deferred_rx_busy {
                     defmt::trace!("[Radio0] TX deferred: reception in progress");
