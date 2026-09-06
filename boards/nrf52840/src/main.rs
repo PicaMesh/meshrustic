@@ -134,11 +134,12 @@ async fn main(spawner: Spawner) {
     let slot = RADIO_SLOT.init(RadioSlot::new(0, driver));
 
     let router = ROUTER.take();
-    router.load_node_config(&config);
-    // Packet ids must differ between boots and between nodes: seed them from the RNG peripheral.
+    // Packet ids must differ between boots and between nodes: seed them from the RNG peripheral
+    // before the config load queues the first frames (the boot broadcast and nodeinfo).
     let mut seed = [0u8; 4];
     rng::Rng::new(p.RNG, Irqs).blocking_fill_bytes(&mut seed);
     router.seed_tx_ids(u32::from_le_bytes(seed));
+    router.load_node_config(&config);
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(
         config.node_num,
         config.public_key,
