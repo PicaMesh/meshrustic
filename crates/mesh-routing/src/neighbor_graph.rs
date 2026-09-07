@@ -3604,7 +3604,7 @@ mod tests {
             rssi: -72,
             snr: 8,
             signal_routing_active: true,
-            hears_us: false,
+            hears_us: true,
             etx_variance: 0,
         };
         let mut packed = [0u8; 16];

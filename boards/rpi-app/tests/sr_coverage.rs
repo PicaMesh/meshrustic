@@ -27,7 +27,7 @@ fn merge_remote_neighbor(graph: &mut NeighborGraph, reporter: u32, neighbor: u32
         rssi: -72,
         snr: 8,
         signal_routing_active: true,
-        hears_us: false,
+        hears_us: true,
         etx_variance: 0,
     };
     let mut packed = [0u8; 16];
