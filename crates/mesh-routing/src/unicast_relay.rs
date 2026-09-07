@@ -10,8 +10,8 @@
 //! - deliverable hop to the shared next hop only: receiver-priced ETX with [`INDIRECT_TIER`].
 //!
 //! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Within a bucket, ties
-//! break by node id (packet-id parity). Before ranking, the packet is suppressed when the
-//! transmitter or an SR neighbour that already covers it can deliver to the destination.
+//! break by node id (packet-id parity). Before ranking, suppress only when a coverer is known to
+//! hold this copy (heard from them, or they already transmitted this id).
 
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
@@ -85,8 +85,14 @@ impl UnicastRelayContext<'_> {
         NO_PATH
     }
 
-    /// SR neighbour that already holds the frame (hears `heard_from`) and can finish delivery.
-    fn better_positioned_neighbor(&self, heard_from: u32, destination: u32, now_ms: u32) -> bool {
+    /// Neighbour that already transmitted this id, heard `heard_from`, and can finish delivery.
+    fn better_positioned_neighbor(
+        &self,
+        heard_from: u32,
+        destination: u32,
+        now_ms: u32,
+        has_transmitted: &impl Fn(u32) -> bool,
+    ) -> bool {
         let Some(mine) = self.edges.find_node(self.my_node) else {
             return false;
         };
@@ -96,6 +102,7 @@ impl UnicastRelayContext<'_> {
                 && n != self.my_node
                 && !is_placeholder_node(n)
                 && self.capability.status(n) == CapabilityStatus::SrActive
+                && has_transmitted(n)
                 && can_deliver(self.edges, Some(self.capability), heard_from, n)
                 && self.reaches(n, destination, now_ms)
         })
@@ -118,21 +125,21 @@ pub fn plan_unicast_relay(
 ) -> Result<BroadcastRelayPlan, SrSkipReason> {
     let me = ctx.my_node;
 
-    // Source and destination hang off the same relay: that relay delivers on its own.
     let source_relay = ctx.downstream_relay(source, now_ms);
-    if source_relay.is_some()
-        && source_relay == ctx.downstream_relay(destination, now_ms)
-        && source_relay != Some(me)
-    {
-        return Err(SrSkipReason::UnicastCovered);
+    if let Some(relay) = source_relay {
+        if source_relay == ctx.downstream_relay(destination, now_ms) && relay != me {
+            // Only if that gateway already holds this copy — otherwise we may be the sole hearer.
+            if relay == heard_from || has_transmitted(relay) {
+                return Err(SrSkipReason::UnicastCovered);
+            }
+        }
     }
 
     if heard_from != 0 && heard_from != me && heard_from != source {
-        // The relayer we heard already reaches the destination; handing it back is a dupe.
         if ctx.reaches(heard_from, destination, now_ms) {
             return Err(SrSkipReason::UnicastCovered);
         }
-        if ctx.better_positioned_neighbor(heard_from, destination, now_ms) {
+        if ctx.better_positioned_neighbor(heard_from, destination, now_ms, &has_transmitted) {
             return Err(SrSkipReason::UnicastCovered);
         }
     }
@@ -419,23 +426,36 @@ mod tests {
     }
 
     #[test]
-    fn sr_neighbour_covering_the_relayer_suppresses_us() {
+    fn sr_neighbour_must_have_transmitted_to_suppress_us() {
         let mut f = field_fixture();
-        // Heard from the peer; the gateway hears the peer and reaches the destination.
+        // DEST publishes: PEER does not reach it without confirmation. GW hears PEER and holds
+        // DEST downstream — but must have transmitted this id before we stand down.
+        f.capability.track_topology(DEST, true, NOW);
         f.edges
             .update_edge(ME, GW, PEER, 1.3, NOW, EdgeSource::Reported, true, 0);
-        let err =
-            plan_unicast_relay(&f.ctx(), 0x21, PHONE, PEER, DEST, GW, NOW, |_| false).unwrap_err();
+        assert!(
+            plan_unicast_relay(&f.ctx(), 0x21, PHONE, PEER, DEST, GW, NOW, |_| false).is_ok(),
+            "possible coverer without a heard copy must not suppress"
+        );
+        let err = plan_unicast_relay(&f.ctx(), 0x21, PHONE, PEER, DEST, GW, NOW, |n| n == GW)
+            .unwrap_err();
         assert_eq!(err, SrSkipReason::UnicastCovered);
     }
 
     #[test]
-    fn shared_downstream_relay_suppresses_us() {
+    fn shared_downstream_suppresses_only_when_gateway_holds_copy() {
         let mut f = field_fixture();
         f.downstream.update(ME, PHONE, GW, 2.0, NOW, false, 0);
-        let err =
-            plan_unicast_relay(&f.ctx(), 0x22, PHONE, PHONE, DEST, GW, NOW, |_| false).unwrap_err();
-        assert_eq!(err, SrSkipReason::UnicastCovered);
+        assert!(
+            plan_unicast_relay(&f.ctx(), 0x22, PHONE, PHONE, DEST, GW, NOW, |_| false).is_ok(),
+            "shared GW not known to hold this copy must not suppress"
+        );
+        let from_gw =
+            plan_unicast_relay(&f.ctx(), 0x22, PHONE, GW, DEST, GW, NOW, |_| false).unwrap_err();
+        assert_eq!(from_gw, SrSkipReason::UnicastCovered);
+        let tx_gw = plan_unicast_relay(&f.ctx(), 0x22, PHONE, PHONE, DEST, GW, NOW, |n| n == GW)
+            .unwrap_err();
+        assert_eq!(tx_gw, SrSkipReason::UnicastCovered);
     }
 
     #[test]

@@ -1704,15 +1704,24 @@ impl Router {
             });
         }
 
-        // 1. The relayer we heard this from already holds the packet; handing it back only
-        // produces a duplicate there.
+        // Relayer already holds the packet and can finish: handing it back is a dupe.
+        // If they cannot finish, clear next_hop and stay in the ranking as backup.
         if parsed.to != NODENUM_BROADCAST && next_hop != 0 && next_hop == heard_from {
-            self.pool.release(handle);
-            self.sr_log.push(SrLogEvent::RelaySkip {
-                from: parsed.from,
-                reason: SrSkipReason::NextHopIsRelayer,
-            });
-            return plan;
+            let finishes = crate::graph::can_deliver(
+                self.graph.edges(),
+                Some(self.graph.capability()),
+                heard_from,
+                parsed.to,
+            ) || self.graph.get_downstream_relay(parsed.to, now_ms) == Some(heard_from);
+            if finishes {
+                self.pool.release(handle);
+                self.sr_log.push(SrLogEvent::RelaySkip {
+                    from: parsed.from,
+                    reason: SrSkipReason::NextHopIsRelayer,
+                });
+                return plan;
+            }
+            next_hop = 0;
         }
 
         // Unicasts coordinate by cost to the destination: every SR node that overheard the
@@ -1765,7 +1774,7 @@ impl Router {
         // A unicast that already names a next hop keeps SR coordination: the designated node
         // owns slot 0 and every other candidate shifts down one slot, cancelling on any heard copy.
         let designated_plan = if parsed.to != NODENUM_BROADCAST && relayer_named {
-            match self.plan_designated_unicast(
+            Some(self.plan_designated_unicast(
                 &parsed,
                 heard_from,
                 result.rssi,
@@ -1774,17 +1783,7 @@ impl Router {
                 slot_ms,
                 now_ms,
                 unicast_ranking,
-            ) {
-                Ok(p) => Some(p),
-                Err(reason) => {
-                    self.pool.release(handle);
-                    self.sr_log.push(SrLogEvent::RelaySkip {
-                        from: parsed.from,
-                        reason,
-                    });
-                    return plan;
-                }
-            }
+            ))
         } else {
             None
         };
@@ -2187,7 +2186,7 @@ impl Router {
         airtime_ms: u32,
         now_ms: u32,
         ranking: Option<Result<crate::broadcast_relay::BroadcastRelayPlan, SrSkipReason>>,
-    ) -> Result<crate::broadcast_relay::BroadcastRelayPlan, SrSkipReason> {
+    ) -> crate::broadcast_relay::BroadcastRelayPlan {
         use crate::broadcast_relay::BroadcastRelayPlan;
         let our_byte = (self.node_num & 0xFF) as u8;
         if parsed.next_hop == our_byte {
@@ -2198,13 +2197,13 @@ impl Router {
                 slot: 0,
                 slot_delay_ms: 0,
             });
-            return Ok(BroadcastRelayPlan {
+            return BroadcastRelayPlan {
                 should_relay: true,
                 slot_delay_ms: crate::channel_access::SLOT_ORIGIN_MS,
                 slot_index: 0,
                 candidate_count: 1,
                 ..Default::default()
-            });
+            };
         }
         let designated = self
             .relay_identity
@@ -2233,7 +2232,7 @@ impl Router {
         } else {
             tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
         };
-        // Behind the designated node, the cost ranking orders the remaining candidates.
+        // Ranking Err → unranked backup behind the designated wait (silent designated hop).
         let (rank, count, ranked, ranked_len, reason, evaluated, evaluated_len, pre_covered) =
             match ranking {
                 Some(Ok(p)) => (
@@ -2246,7 +2245,16 @@ impl Router {
                     p.evaluated_len,
                     p.pre_covered,
                 ),
-                Some(Err(reason)) => return Err(reason),
+                Some(Err(_)) => (
+                    0,
+                    1,
+                    [0u32; crate::broadcast_relay::RANKED_LOG],
+                    0,
+                    crate::broadcast_relay::RelayReason::UnicastCost,
+                    [(0u32, 0u8, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                    0,
+                    0,
+                ),
                 None => {
                     let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
                     (
@@ -2270,7 +2278,7 @@ impl Router {
             slot,
             slot_delay_ms,
         });
-        Ok(BroadcastRelayPlan {
+        BroadcastRelayPlan {
             should_relay: true,
             slot_delay_ms,
             slot_index: slot,
@@ -2281,7 +2289,7 @@ impl Router {
             evaluated,
             evaluated_len,
             pre_covered,
-        })
+        }
     }
 
     /// How long to give a destination that heard the packet directly to answer it: its ACK
@@ -4668,6 +4676,144 @@ mod tests {
         assert!(logs
             .iter()
             .any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
+    }
+
+    #[test]
+    fn designated_hop_backup_survives_ranking_skip() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        const PEER: u32 = 0xAA00_00AA;
+        router
+            .graph_mut()
+            .observe_direct_neighbor(PEER, -70, 8, 0, 0);
+        router.graph_mut().confirm_direct_neighbor_hears_us(PEER);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(PEER, true, 0);
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let dest = PackedNeighbor {
+            node_id: UNI_DEST,
+            rssi: -75,
+            snr: 8,
+            signal_routing_active: false,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let us = PackedNeighbor {
+            node_id: UNI_ME,
+            ..dest
+        };
+        router
+            .graph_mut()
+            .merge_topology(PEER, &header, &[dest, us], true, 0, 0);
+
+        // Named hop owns slot 0; ranking UnicastCover because PEER already reaches DEST —
+        // previously that Err aborted the whole plan. Relay byte is PEER (not our path hop).
+        let wire = unicast_wire(3, 3, 0x99, 0xAA, 0x505);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        assert!(plan.relay.is_none(), "backup waits behind designated");
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x505, 0)
+            .expect("designated backup must still schedule");
+        let slot0_wait = coordinated_relay::tx_delay_ms_worst(coordinated_relay::DEFAULT_SLOT_MS)
+            + coordinated_relay::DEFAULT_SLOT_MS;
+        assert!(
+            tx_after >= slot0_wait,
+            "tx_after {tx_after} < slot-0 wait {slot0_wait}"
+        );
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(
+            !logs
+                .iter()
+                .any(|e| matches!(e, SrLogEvent::RelaySkip { .. })),
+            "ranking skip must not abort designated backup; log: {logs:?}"
+        );
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::UnicastDesignated {
+                next_hop: 0x99,
+                is_us: false,
+                slot,
+                ..
+            } if *slot >= 1
+        )));
+        let relay = router
+            .poll_ready_relay(tx_after + coordinated_relay::DEFAULT_SLOT_MS)
+            .expect("backup TX after designated wait");
+        let hdr = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert_eq!(hdr.next_hop, 0xBB, "path next hop, not flood");
+        assert_eq!(hdr.relay_node, 0xCC);
+    }
+
+    #[test]
+    fn next_hop_is_relayer_clears_when_they_cannot_finish() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_RELAYER);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_RELAYER, true, 0);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_DEST, true, 0);
+        // Unverified RELAYER→DEST listing (no hears_us): route may still pick RELAYER, but
+        // can_deliver is false and there is no downstream entry, so handing back is not a dupe.
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let dest = PackedNeighbor {
+            node_id: UNI_DEST,
+            rssi: -75,
+            snr: 8,
+            signal_routing_active: false,
+            hears_us: false,
+            etx_variance: 0,
+        };
+        let us = PackedNeighbor {
+            node_id: UNI_ME,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        router
+            .graph_mut()
+            .merge_topology(UNI_RELAYER, &header, &[dest, us], true, 0, 0);
+
+        let wire = unicast_wire(2, 3, 0, 0xBB, 0x506);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(
+            scheduled,
+            "cannot finish at RELAYER: stay in ranking, not NextHopIsRelayer"
+        );
+        assert_ne!(reason, Some(SrSkipReason::NextHopIsRelayer));
     }
 
     /// After a preset switch the requester stays on its preset: retries, T1 insurance, ACKs
