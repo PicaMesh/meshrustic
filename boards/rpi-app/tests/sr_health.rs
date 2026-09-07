@@ -76,6 +76,14 @@ fn healthy_topology_defers_when_stock_router_covers() {
         router.relay_tx_after(NEIGHBOR, 99, 0).is_none(),
         "BetterNeighbor skip must not commit a redundant relay"
     );
+    assert!(
+        router.has_pending_work(),
+        "deferred broadcast must arm T1 insurance"
+    );
+    let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_DEFAULT_PRESET);
+    let fire_ms =
+        coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(coordinated_relay::DEFAULT_SLOT_MS);
+    assert!(router.poll_t1_retransmit(fire_ms).is_some());
 }
 
 #[test]

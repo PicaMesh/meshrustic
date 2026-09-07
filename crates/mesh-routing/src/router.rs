@@ -1630,9 +1630,18 @@ impl Router {
                 self.graph
                     .record_node_transmission(self.node_num, parsed.id, now_ms);
             } else if relay_plan.candidate_count <= 1 {
-                // No SR peer to defer to — use coordinated relay timing below.
+                // No SR peer to defer to — take the coordinated relay path below.
             } else {
-                self.pool.release(handle);
+                // No unique coverage: leave the ranked slots to others; T1 is late insurance
+                // if nobody retransmits for the source to hear.
+                self.arm_t1_for_deferred_broadcast(
+                    &parsed,
+                    handle,
+                    heard_from,
+                    result.decoded_portnum,
+                    slot_ms,
+                    now_ms,
+                );
                 self.sr_log.push(SrLogEvent::RelaySkip {
                     from: parsed.from,
                     reason: SrSkipReason::BetterNeighbor,
@@ -1997,16 +2006,6 @@ impl Router {
             heard_from,
             delay_ms,
         });
-
-        self.maybe_schedule_t1_retransmit(
-            &parsed,
-            len,
-            bytes,
-            result.decoded_portnum,
-            slot_ms,
-            now_ms,
-            true,
-        );
 
         if delay_ms == 0 {
             self.arm_relayed_unicast_retx(len, bytes, now_ms);
@@ -3403,9 +3402,7 @@ impl Router {
 
         if committed {
             if !has_pending {
-                // Released to the radio (or already sent). Someone relayed, so T1 insurance is
-                // moot; the frame itself is pulled back only if the transmitters heard so far
-                // cover every neighbour we reach, the same rule as for a pending relay.
+                // Released to the radio (or already sent). Someone relayed, so T1 is moot.
                 self.cancel_t1_retransmit(parsed.id, T1CancelReason::RelayHeard);
                 if self.graph.role_allows_canceling_dupe() {
                     if let Some(heard_from) = heard_relayer {
@@ -3475,20 +3472,16 @@ impl Router {
             if now_ms < slot.fire_after_ms {
                 continue;
             }
-            // After we actually TX'd this packet, cancel T1 unless a hears_us neighbor
-            // remains uncovered by heard_from ∪ us (do not require neighbors to retransmit).
+            // Our own TX already gave the source a retransmission to hear.
             if self.graph.has_our_transmission(slot.packet_id) {
-                let coverers = [slot.heard_from, self.node_num];
-                if !self.graph.has_unique_coverage(&coverers) {
-                    let id = slot.packet_id;
-                    slot.active = false;
-                    slot.canceled = true;
-                    self.sr_log.push(SrLogEvent::T1Canceled {
-                        id,
-                        reason: T1CancelReason::AllHearsUsHeard,
-                    });
-                    continue;
-                }
+                let id = slot.packet_id;
+                slot.active = false;
+                slot.canceled = true;
+                self.sr_log.push(SrLogEvent::T1Canceled {
+                    id,
+                    reason: T1CancelReason::AllHearsUsHeard,
+                });
+                continue;
             }
             if self.graph.all_hears_us_neighbors_heard_packet(
                 slot.packet_id,
@@ -3517,29 +3510,43 @@ impl Router {
         None
     }
 
-    fn maybe_schedule_t1_retransmit(
+    /// Build a relay frame and arm T1 after we deferred (no ranked slot).
+    fn arm_t1_for_deferred_broadcast(
         &mut self,
         parsed: &ParsedPacket,
-        len: u8,
-        bytes: [u8; MAX_WIRE_LEN],
+        handle: PacketHandle,
+        heard_from: u32,
         decoded_portnum: Option<u32>,
         airtime_ms: u32,
         now_ms: u32,
-        require_relay_commit: bool,
     ) {
-        if parsed.to != NODENUM_BROADCAST {
+        if decoded_portnum == Some(SIGNAL_ROUTING_APP)
+            || !self.graph.has_any_hears_us_neighbor()
+        {
+            self.pool.release(handle);
             return;
         }
-        if decoded_portnum == Some(SIGNAL_ROUTING_APP) {
+        let Some(relay_hdr) =
+            relay_header_with_next_hop_opts(parsed, self.node_num, 0, false)
+        else {
+            self.pool.release(handle);
             return;
-        }
-        if !self.graph.has_any_hears_us_neighbor() {
-            return;
-        }
-        if require_relay_commit && !self.graph.is_committed_relay(parsed.from, parsed.id) {
-            return;
-        }
-        self.schedule_t1_broadcast(parsed.id, parsed.from, len, bytes, airtime_ms, now_ms);
+        };
+        let mut bytes = [0u8; MAX_WIRE_LEN];
+        relay_hdr.encode_to(
+            (&mut bytes[..PACKET_HEADER_LEN])
+                .try_into()
+                .expect("header slice"),
+        );
+        let plen = {
+            let rx = self.pool.get(handle).unwrap();
+            let n = rx.payload_len as usize;
+            bytes[PACKET_HEADER_LEN..PACKET_HEADER_LEN + n].copy_from_slice(&rx.payload[..n]);
+            n
+        };
+        self.pool.release(handle);
+        let len = (PACKET_HEADER_LEN + plen) as u8;
+        self.schedule_t1_broadcast(parsed.id, heard_from, len, bytes, airtime_ms, now_ms);
     }
 
     fn schedule_t1_broadcast(
@@ -3598,6 +3605,7 @@ impl Router {
 mod tests {
     use super::*;
     use crate::coordinated_relay;
+    use crate::graph::EdgeSource;
     use crate::routing_ack::{build_ack_nak_frame, ROUTING_ERROR_NONE};
     use crate::sr_log::RelayRetxCancelReason;
     use crate::topology::{decode_packed_neighbors, write_packed_header, PackedNeighbor};
@@ -3966,10 +3974,63 @@ mod tests {
     }
 
     #[test]
-    fn t1_retransmit_fires_after_window() {
+    fn t1_retransmit_fires_after_defer_window() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(0xCC00_00CC));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        let graph = router.graph_mut();
+        const NEIGHBOR: u32 = 0xBB00_00BB;
+        const STOCK: u32 = 0xDD00_00DD;
+        graph.observe_direct_neighbor(NEIGHBOR, -70, 8, 0, 0);
+        graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
+        graph.confirm_direct_neighbor_hears_us(NEIGHBOR);
+        graph.confirm_direct_neighbor_hears_us(STOCK);
+        graph.track_node_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
+        graph.capability_mut().track_topology(NEIGHBOR, true, 0);
+        graph
+            .edges_mut()
+            .update_edge(0xCC00_00CC, STOCK, NEIGHBOR, 2.0, 0, EdgeSource::Reported, true, 0);
+        graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
+
+        let header = PacketHeader::from_fields(
+            NODENUM_BROADCAST,
+            NEIGHBOR,
+            99,
+            0,
+            3,
+            3,
+            false,
+            false,
+            0,
+            0,
+        );
+        let wire = encode_wire(header, &[0x01, 0x02]);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 10,
+                    bytes: &wire,
+                },
+                1_000,
+            )
+            .unwrap();
+        let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
+        let plan = router.evaluate_tx_plan(&result, 0.0, airtime, 1_000);
+        assert!(plan.relay.is_none());
+        assert!(router.relay_tx_after(NEIGHBOR, 99, 0).is_none());
+
+        let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
+        let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
+        assert!(router.poll_t1_retransmit(1_000 + fire_ms - 1).is_none());
+        assert!(router.poll_t1_retransmit(1_000 + fire_ms).is_some());
+    }
+
+    #[test]
+    fn ranked_broadcast_slot_does_not_arm_t1() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(0x677a_1caf));
-
         let neighbor_wire = encode_wire(
             PacketHeader::from_fields(0xFFFF_FFFF, 0x1111_1111, 1, 0, 3, 3, false, false, 0, 0),
             &[0x01],
@@ -4013,12 +4074,12 @@ mod tests {
             .unwrap();
         let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
         let _plan = router.evaluate_tx_plan(&result, 0.0, airtime, 1_000);
-
-        // T1 uses preset slot time (`cw_slot_ms`), not DEFAULT_SLOT_MS.
         let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
         let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
-        assert!(router.poll_t1_retransmit(1_000 + fire_ms - 1).is_none());
-        assert!(router.poll_t1_retransmit(1_000 + fire_ms).is_some());
+        assert!(
+            router.poll_t1_retransmit(1_000 + fire_ms).is_none(),
+            "a node that took a relay slot must not also arm T1"
+        );
     }
 
     #[test]
