@@ -81,9 +81,16 @@ fn healthy_topology_defers_when_stock_router_covers() {
         "deferred broadcast must arm T1 insurance"
     );
     let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_DEFAULT_PRESET);
-    let fire_ms =
-        coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(coordinated_relay::DEFAULT_SLOT_MS);
-    assert!(router.poll_t1_retransmit(fire_ms).is_some());
+    let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms)
+        .saturating_add(coordinated_relay::DEFAULT_SLOT_MS);
+    assert!(
+        router.poll_t1_retransmit(fire_ms - 1).is_none(),
+        "T1 must not fire inside the defer window"
+    );
+    // Insurers take rungs one half-airtime apart; ours is somewhere in that ladder.
+    let ladder = coordinated_relay::half_airtime_ms(coordinated_relay::DEFAULT_SLOT_MS)
+        * mesh_routing::MAX_EDGES_PER_NODE as u32;
+    assert!(router.poll_t1_retransmit(fire_ms + ladder).is_some());
 }
 
 #[test]

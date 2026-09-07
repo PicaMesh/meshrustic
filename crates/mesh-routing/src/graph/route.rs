@@ -211,10 +211,20 @@ pub fn publishes_topology(capability: Option<&CapabilityCache>, node: u32) -> bo
     )
 }
 
-/// Hop cost for a deliverable `from → to`, priced at the receiver when that measurement exists.
-///
-/// Falls back to the sender's edge when only `hears_us` (or a non-publishing receiver) backs
-/// delivery. `None` if not deliverable, or deliverable only by stock assumption with no edge cost.
+/// Cost of the hop `from → to`, priced at the receiver when it published a measurement of the
+/// sender, else at the sender's own measurement. `None` when neither has an edge.
+pub fn hop_cost_fixed(edges: &EdgeStore, from: u32, to: u32) -> Option<u16> {
+    if let Some(edge) = edges.find_node(to).and_then(|n| n.find_edge(from)) {
+        return Some(edge.etx_fixed);
+    }
+    edges
+        .find_node(from)
+        .and_then(|n| n.find_edge(to))
+        .map(|e| e.etx_fixed)
+}
+
+/// Hop cost for a deliverable `from → to` (see [`hop_cost_fixed`]). `None` if not deliverable, or
+/// deliverable only by stock assumption with no edge cost either way.
 pub fn delivery_hop_cost_fixed(
     edges: &EdgeStore,
     capability: Option<&CapabilityCache>,
@@ -224,13 +234,20 @@ pub fn delivery_hop_cost_fixed(
     if !can_deliver(edges, capability, from, to) {
         return None;
     }
-    if let Some(edge) = edges.find_node(to).and_then(|n| n.find_edge(from)) {
-        return Some(edge.etx_fixed);
-    }
-    edges
-        .find_node(from)
-        .and_then(|n| n.find_edge(to))
-        .map(|e| e.etx_fixed)
+    hop_cost_fixed(edges, from, to)
+}
+
+/// Delivery cost above which a confirmed hop still does not count as coverage. `hears_us` is
+/// sticky: a peer that heard the sender once keeps the flag while its link decays, and a rooftop
+/// node kept it with its antenna 20 dB down. Coverage decides whether we may stay silent, so it
+/// has to mean "that frame very likely arrived", not "it arrived once". ETX 7 in fixed point.
+pub const COVERAGE_ETX_CEILING_FIXED: u16 = 700;
+
+/// Does a transmission by `from` reach `to` well enough to relieve us of relaying? The receiver
+/// must be known to hear the sender and the delivery-direction link must not be hopeless.
+pub fn covers(edges: &EdgeStore, from: u32, to: u32) -> bool {
+    known_to_hear(edges, from, to)
+        && hop_cost_fixed(edges, from, to).is_some_and(|c| c <= COVERAGE_ETX_CEILING_FIXED)
 }
 
 /// Lower `cost[m]` to `cost + edge_cost` with `via` as the next hop toward the destination.
@@ -877,10 +894,26 @@ mod tests {
         edges.ensure_local_node(TX, 0);
         edges.update_edge(TX, TX, STOCK, 2.5, 0, EdgeSource::Reported, true, 0);
         assert!(can_deliver(&edges, None, TX, STOCK));
-        assert_eq!(
-            delivery_hop_cost_fixed(&edges, None, TX, STOCK),
-            Some(250)
+        assert_eq!(delivery_hop_cost_fixed(&edges, None, TX, STOCK), Some(250));
+    }
+
+    /// A hop confirmed once but priced hopeless is not coverage: the peer keeps `hears_us` while
+    /// its link decays, and staying silent on that evidence drops the frame.
+    #[test]
+    fn covers_requires_a_link_that_is_not_hopeless() {
+        const TX: u32 = 0xAA;
+        const RX: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(TX, 0);
+        edges.update_edge(TX, TX, RX, 40.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(TX, RX, true);
+        assert!(known_to_hear(&edges, TX, RX));
+        assert!(
+            !covers(&edges, TX, RX),
+            "confirmed but hopeless is not coverage"
         );
+        edges.update_edge(TX, TX, RX, 1.5, 0, EdgeSource::Reported, true, 0);
+        assert!(covers(&edges, TX, RX));
     }
 
     #[test]

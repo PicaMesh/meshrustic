@@ -1640,6 +1640,7 @@ impl Router {
                     heard_from,
                     result.decoded_portnum,
                     slot_ms,
+                    half_airtime,
                     now_ms,
                 );
                 self.sr_log.push(SrLogEvent::RelaySkip {
@@ -1712,7 +1713,8 @@ impl Router {
                 Some(self.graph.capability()),
                 heard_from,
                 parsed.to,
-            ) || self.graph.get_downstream_relay(parsed.to, now_ms) == Some(heard_from);
+            ) || self.graph.get_downstream_relay(parsed.to, now_ms)
+                == Some(heard_from);
             if finishes {
                 self.pool.release(handle);
                 self.sr_log.push(SrLogEvent::RelaySkip {
@@ -2244,16 +2246,23 @@ impl Router {
                     p.evaluated_len,
                     p.pre_covered,
                 ),
-                Some(Err(_)) => (
-                    0,
-                    1,
-                    [0u32; crate::broadcast_relay::RANKED_LOG],
-                    0,
-                    crate::broadcast_relay::RelayReason::UnicastCost,
-                    [(0u32, 0u8, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
-                    0,
-                    0,
-                ),
+                Some(Err(_)) => {
+                    // Coverage skipped us for the ranking, but a named next hop still needs a
+                    // backup. Take the unranked slot order rather than all backups sharing
+                    // slot 1: a silent designated hop would otherwise be answered by every
+                    // candidate at once.
+                    let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+                    (
+                        rank,
+                        count,
+                        [0u32; crate::broadcast_relay::RANKED_LOG],
+                        0,
+                        crate::broadcast_relay::RelayReason::UnicastCost,
+                        [(0u32, 0u8, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                        0,
+                        0,
+                    )
+                }
                 None => {
                     let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
                     (
@@ -2462,7 +2471,7 @@ impl Router {
             );
         }
         if to == NODENUM_BROADCAST && portnum != SIGNAL_ROUTING_APP {
-            self.schedule_t1_broadcast(packet_id, 0, len, frame, airtime_ms, now_ms);
+            self.schedule_t1_broadcast(packet_id, 0, len, frame, airtime_ms, 0, now_ms);
         }
         Some(RelayPlan {
             len,
@@ -3525,16 +3534,14 @@ impl Router {
         heard_from: u32,
         decoded_portnum: Option<u32>,
         airtime_ms: u32,
+        half_airtime_ms: u32,
         now_ms: u32,
     ) {
-        if decoded_portnum == Some(SIGNAL_ROUTING_APP)
-            || !self.graph.has_any_hears_us_neighbor()
-        {
+        if decoded_portnum == Some(SIGNAL_ROUTING_APP) || !self.graph.has_any_hears_us_neighbor() {
             self.pool.release(handle);
             return;
         }
-        let Some(relay_hdr) =
-            relay_header_with_next_hop_opts(parsed, self.node_num, 0, false)
+        let Some(relay_hdr) = relay_header_with_next_hop_opts(parsed, self.node_num, 0, false)
         else {
             self.pool.release(handle);
             return;
@@ -3553,7 +3560,14 @@ impl Router {
         };
         self.pool.release(handle);
         let len = (PACKET_HEADER_LEN + plen) as u8;
-        self.schedule_t1_broadcast(parsed.id, heard_from, len, bytes, airtime_ms, now_ms);
+        // Every node that deferred arms T1, so the insurers need the slot ladder too: firing
+        // together would collide precisely when the ranked relay was the frame that went missing.
+        // Same deterministic order as an unranked relay slot, one half-airtime apart.
+        let (rank, _) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+        let stagger = (rank as u32).saturating_mul(half_airtime_ms);
+        self.schedule_t1_broadcast(
+            parsed.id, heard_from, len, bytes, airtime_ms, stagger, now_ms,
+        );
     }
 
     fn schedule_t1_broadcast(
@@ -3563,6 +3577,7 @@ impl Router {
         len: u8,
         bytes: [u8; MAX_WIRE_LEN],
         airtime_ms: u32,
+        stagger_ms: u32,
         now_ms: u32,
     ) {
         for slot in &self.pending_retransmits {
@@ -3577,7 +3592,9 @@ impl Router {
         else {
             return;
         };
-        let fire_delay = tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms);
+        let fire_delay = tx_delay_ms_worst(self.cw_slot_ms())
+            .saturating_add(airtime_ms)
+            .saturating_add(stagger_ms);
         self.pending_retransmits[idx] = PendingRetransmit {
             active: true,
             canceled: false,
@@ -3994,23 +4011,20 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(STOCK);
         graph.track_node_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
         graph.capability_mut().track_topology(NEIGHBOR, true, 0);
-        graph
-            .edges_mut()
-            .update_edge(0xCC00_00CC, STOCK, NEIGHBOR, 2.0, 0, EdgeSource::Reported, true, 0);
-        graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
-
-        let header = PacketHeader::from_fields(
-            NODENUM_BROADCAST,
+        graph.edges_mut().update_edge(
+            0xCC00_00CC,
+            STOCK,
             NEIGHBOR,
-            99,
+            2.0,
             0,
-            3,
-            3,
-            false,
-            false,
-            0,
+            EdgeSource::Reported,
+            true,
             0,
         );
+        graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
+
+        let header =
+            PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, false, false, 0, 0);
         let wire = encode_wire(header, &[0x01, 0x02]);
         let result = router
             .process_inbound(
@@ -4030,8 +4044,13 @@ mod tests {
 
         let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
         let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
+        // Never inside the defer window; our own rung of the insurance ladder follows it.
         assert!(router.poll_t1_retransmit(1_000 + fire_ms - 1).is_none());
-        assert!(router.poll_t1_retransmit(1_000 + fire_ms).is_some());
+        let ladder =
+            coordinated_relay::half_airtime_ms(airtime) * crate::graph::MAX_EDGES_PER_NODE as u32;
+        assert!(router
+            .poll_t1_retransmit(1_000 + fire_ms + ladder)
+            .is_some());
     }
 
     #[test]

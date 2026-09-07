@@ -1987,9 +1987,9 @@ impl NeighborGraph {
             if covered_by.contains(&neighbor) {
                 continue;
             }
-            let covered = covered_by.iter().any(|&coverer| {
-                crate::graph::known_to_hear(&self.edges, coverer, neighbor)
-            });
+            let covered = covered_by
+                .iter()
+                .any(|&coverer| crate::graph::covers(&self.edges, coverer, neighbor));
             if !covered {
                 return true;
             }
@@ -2922,10 +2922,11 @@ mod tests {
         graph.observe_direct_neighbor(U, -70, 8, 100, 0);
         graph.confirm_direct_neighbor_hears_us(PEER);
         graph.confirm_direct_neighbor_hears_us(U);
-        // The peer reports U at ETX 40 (heard once, barely): that is not coverage.
+        // U confirmed hearing the peer, but at ETX 40 (heard once, barely): not coverage.
         graph
             .edges_mut()
             .update_edge(ME, PEER, U, 40.0, 100, EdgeSource::Mirrored, true, 0);
+        graph.edges_mut().set_edge_hears_us(PEER, U, true);
         assert!(graph.has_unique_coverage(&[PEER]));
         graph
             .edges_mut()
@@ -2948,10 +2949,11 @@ mod tests {
         graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
         // The mute node never earns hears_us, yet it is ours: the peer's copy does not reach it.
         assert!(graph.has_unique_coverage(&[HIGH_PEER]));
-        // Once the transmitter reaches it, it is covered like any other neighbour.
+        // Once the transmitter is confirmed to reach it, it is covered like any other neighbour.
         graph
             .edges_mut()
             .update_edge(ME, HIGH_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
+        graph.edges_mut().set_edge_hears_us(HIGH_PEER, MUTE, true);
         assert!(!graph.has_unique_coverage(&[HIGH_PEER]));
     }
 
@@ -2975,12 +2977,14 @@ mod tests {
         graph
             .edges_mut()
             .update_edge(ME, OTHER, LOW_PEER, 1.5, 100, EdgeSource::Mirrored, true, 0);
+        graph.edges_mut().set_edge_hears_us(OTHER, LOW_PEER, true);
         assert!(graph.has_unique_coverage(&[OTHER]));
-        // A lower-id SR peer with an edge to the mute node owns it under the stock-coverage
+        // A lower-id SR peer confirmed to reach the mute node owns it under the stock-coverage
         // rule: it is no longer our unique coverage even though OTHER's copy never reaches it.
         graph
             .edges_mut()
             .update_edge(ME, LOW_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
+        graph.edges_mut().set_edge_hears_us(LOW_PEER, MUTE, true);
         assert!(!graph.has_unique_coverage(&[OTHER]));
     }
 

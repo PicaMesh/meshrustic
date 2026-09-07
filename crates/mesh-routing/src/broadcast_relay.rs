@@ -2,8 +2,8 @@
 
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{
-    delivery_hop_cost_fixed, is_placeholder_node, known_to_hear, DownstreamTable, EdgeSource,
-    EdgeStore, MAX_EDGES_PER_NODE,
+    covers, delivery_hop_cost_fixed, is_placeholder_node, DownstreamTable, EdgeSource, EdgeStore,
+    MAX_EDGES_PER_NODE,
 };
 use crate::sr_role::role_is_mute;
 
@@ -195,7 +195,7 @@ fn get_coverage_if_relays(
         if relay == my_node && edge.source != EdgeSource::Reported {
             continue;
         }
-        if !known_to_hear(edges, relay, target) {
+        if !covers(edges, relay, target) {
             continue;
         }
         if (count as usize) < MAX_EDGES_PER_NODE {
@@ -213,7 +213,7 @@ fn absorb_relay_coverage(edges: &EdgeStore, covered: &mut CoveredSet, relay: u32
     };
     for i in 0..relay_edges.edge_count as usize {
         let target = relay_edges.edges[i].to;
-        if known_to_hear(edges, relay, target) {
+        if covers(edges, relay, target) {
             covered.insert(target);
         }
     }
@@ -344,7 +344,7 @@ fn build_already_covered(edges: &EdgeStore, source: u32, heard_from: u32) -> Cov
     if let Some(heard_edges) = edges.find_node(heard_from) {
         for i in 0..heard_edges.edge_count as usize {
             let target = heard_edges.edges[i].to;
-            if target != 0 && known_to_hear(edges, heard_from, target) {
+            if target != 0 && covers(edges, heard_from, target) {
                 covered.insert(target);
             }
         }
@@ -744,13 +744,37 @@ mod tests {
         assert!(!plan.should_relay);
     }
 
-    #[test]
-    fn one_way_listed_neighbor_is_not_precovered() {
+    /// Reachable-but-not-heard transmitter: we learned BB's list through a neighbour and have no
+    /// edge of our own to BB. `update_edge` only accepts a report about a node it can reach, so
+    /// the relaying neighbour has to exist or the fixture proves nothing.
+    fn edges_with_remote_transmitter(bb_to_me_etx: f32) -> EdgeStore {
+        const VIA: u32 = 0xDD00_00DD;
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(ME, 0);
-        edges.update_edge(ME, BB, ME, 1.5, 0, EdgeSource::Reported, true, 0);
-        let covered = build_already_covered(&edges, BB, BB);
-        assert!(!covered.contains(ME));
+        edges.update_edge(ME, ME, VIA, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, VIA, BB, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, BB, ME, bb_to_me_etx, 0, EdgeSource::Mirrored, true, 0);
+        assert!(edges.find_node(BB).and_then(|n| n.find_edge(ME)).is_some());
+        assert!(edges.find_node(ME).and_then(|n| n.find_edge(BB)).is_none());
+        edges
+    }
+
+    /// A one-way listing is not pre-coverage: BB hearing us says nothing about us hearing BB.
+    #[test]
+    fn one_way_listed_neighbor_is_not_precovered() {
+        let edges = edges_with_remote_transmitter(1.5);
+        assert!(!build_already_covered(&edges, BB, BB).contains(ME));
+    }
+
+    /// The transmitter's own list is pre-coverage only for the neighbours it actually reaches:
+    /// a hop confirmed once but priced hopeless leaves us responsible for relaying.
+    #[test]
+    fn hopeless_confirmed_neighbor_is_not_precovered() {
+        let mut edges = edges_with_remote_transmitter(40.0);
+        edges.set_edge_hears_us(BB, ME, true);
+        assert!(!build_already_covered(&edges, BB, BB).contains(ME));
+        edges.update_edge(ME, BB, ME, 1.5, 0, EdgeSource::Mirrored, true, 0);
+        assert!(build_already_covered(&edges, BB, BB).contains(ME));
     }
 
     #[test]

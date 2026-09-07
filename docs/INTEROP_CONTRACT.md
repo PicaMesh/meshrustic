@@ -144,20 +144,34 @@ airtime. Every SignalRouting node uses the same figure.
   candidate shifts one slot behind the peer or stock wait (`plan_designated_unicast`). Ranking
   `Err` does not abort that backup. Forward and backup TX stamp **our path** next hop; flood
   (`next_hop = 0`) only on the last relayed `want_ack` retry. Tests:
-  `unicast_designated_*`, `designated_hop_backup_survives_ranking_skip`,
+  `unicast_designated_*`, `designated_hop_backup_survives_ranking_skip` (a coverage skip keeps
+  the backup, at its unranked slot rung rather than all backups sharing slot 1),
   `forwarded_want_ack_unicast_is_retried_then_released_to_flooding`.
 
 ## 3b. Broadcast relay and T1
 
 - **Unique coverage owns a slot.** A broadcast relay slot is taken when we still uniquely reach
-  a neighbour that the transmitter and earlier coverers do not (`known_to_hear`). Otherwise we
-  take no ranked slot. Pending later slots cancel when unique coverage is gone
-  (`has_unique_coverage` / `perhaps_cancel_dupe`). Tests: broadcast coverage cases in
-  `broadcast_relay` / `sr_slot_schedule` / `sr_coverage`.
+  a neighbour that the transmitter and earlier coverers do not. Otherwise we take no ranked slot.
+  Pending later slots cancel when unique coverage is gone (`has_unique_coverage` /
+  `perhaps_cancel_dupe`). Tests: broadcast coverage cases in `broadcast_relay` /
+  `sr_slot_schedule` / `sr_coverage`.
+- **Coverage is evidenced delivery over a link that is not hopeless** (`route::covers`): the
+  receiver must be known to hear the transmitter (`known_to_hear`: `hears_us` on the
+  transmitter's edge, or the receiver listing the transmitter) and the delivery-direction cost
+  must be at or below `COVERAGE_ETX_CEILING_FIXED`. Both halves are needed: an edge alone is
+  one-directional evidence, and `hears_us` is sticky, so a peer that heard the transmitter once
+  keeps the flag while its link decays. The same rule prices pre-coverage from the transmitter's
+  own list, a candidate's coverage set, and the absorbed coverage of earlier slots. Tests:
+  `covers_requires_a_link_that_is_not_hopeless`, `one_way_listed_neighbor_is_not_precovered`,
+  `hopeless_confirmed_neighbor_is_not_precovered`, `poor_link_does_not_count_as_coverage`.
 - **T1 is no-slot insurance, not a second coverage path.** When we defer with no ranked slot
   (`BetterNeighbor`), we arm T1 so that if nobody retransmits, a late copy still reaches the
   source for confirmation (`arm_t1_for_deferred_broadcast`). A ranked commit never arms T1.
   Any heard rebroadcast cancels T1; T1 never fires if we already recorded our own transmission.
+  Insurers stagger: every node that deferred arms T1, so each waits its unranked slot rung
+  (`relay_slot_index`, one half-airtime apart) after the defer window, and the first firing
+  cancels the rest. Firing together would collide exactly when the ranked relay is the frame
+  that went missing.
   Originator T1 in `send_local` remains a separate “did anyone rebroadcast?” timer with the same
   cancel-on-rebroadcast helpers. Tests: `t1_retransmit_fires_after_defer_window`,
   `ranked_broadcast_slot_does_not_arm_t1`.
