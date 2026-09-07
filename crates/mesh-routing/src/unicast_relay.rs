@@ -1,28 +1,24 @@
 //! Cost-ranked relay coordination for unicasts.
 //!
-//! Every SR node that overhears a
-//! unicast computes the same candidate ordering from its graph, so the node best placed to
-//! deliver the packet keys up first and everybody else cancels on its copy. Candidates are
-//! ourselves plus our SR-active direct neighbours, ranked by cost to the destination:
+//! Every SR node that overhears a unicast computes the same candidate ordering from its graph,
+//! so the node best placed to deliver the packet keys up first and everybody else cancels on
+//! its copy. Candidates are ourselves plus our SR-active direct neighbours, ranked by cost to
+//! the destination:
 //!
-//! - direct edge to the destination: the edge's ETX (`0x0064..0x7FFE`);
-//! - known downstream relay of the destination: [`DOWNSTREAM_TIER_COST`], after any direct
-//!   edge but ahead of every indirect candidate (the downstream table is often the only
-//!   knowledge we have of a gateway's branch before its topology report arrives);
-//! - edge to the shared next hop only: the edge's ETX with [`INDIRECT_TIER`] set.
+//! - deliverable hop to the destination ([`can_deliver`]), priced at the receiver when known;
+//! - known downstream relay of the destination: [`DOWNSTREAM_TIER_COST`];
+//! - deliverable hop to the shared next hop only: receiver-priced ETX with [`INDIRECT_TIER`].
 //!
-//! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Each node prices its own
-//! link from its own measurements and a peer's link from the peer's packed report, so two
-//! near-equal costs differ by a few hundredths on every node, in a direction that varies. Exact
-//! comparison then ranked the two colocated nicenanos in opposite orders (each behind the other),
-//! both took the same slot and keyed up together. Within a bucket, ties are broken by node id, low
-//! first on even packet ids and high first on odd ones. Before ranking, the
-//! packet is suppressed outright when the transmitter or an SR neighbour that covers the
-//! transmitter can already deliver it.
+//! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Within a bucket, ties
+//! break by node id (packet-id parity). Before ranking, the packet is suppressed when the
+//! transmitter or an SR neighbour that already covers it can deliver to the destination.
 
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
-use crate::graph::{is_placeholder_node, DownstreamTable, EdgeStore, MAX_EDGES_PER_NODE};
+use crate::graph::{
+    can_deliver, delivery_hop_cost_fixed, is_placeholder_node, DownstreamTable, EdgeStore,
+    MAX_EDGES_PER_NODE,
+};
 use crate::sr_log::SrSkipReason;
 
 pub const MAX_UNICAST_CANDIDATES: usize = MAX_EDGES_PER_NODE + 1;
@@ -55,53 +51,41 @@ pub struct UnicastCandidate {
 }
 
 impl UnicastRelayContext<'_> {
-    fn has_edge(&self, from: u32, to: u32) -> bool {
-        self.edges
-            .find_node(from)
-            .and_then(|n| n.find_edge(to))
-            .is_some()
-    }
-
-    fn edge_cost(&self, from: u32, to: u32) -> Option<u16> {
-        self.edges
-            .find_node(from)
-            .and_then(|n| n.find_edge(to))
-            .map(|e| e.etx_fixed)
-    }
-
     fn downstream_relay(&self, destination: u32, now_ms: u32) -> Option<u32> {
         self.downstream
             .get_relay(destination, now_ms, self.downstream_ttl_ms)
     }
 
-    /// `node` can hand the packet to `destination` without another SR hop.
     fn reaches(&self, node: u32, destination: u32, now_ms: u32) -> bool {
-        self.has_edge(node, destination) || self.downstream_relay(destination, now_ms) == Some(node)
+        can_deliver(self.edges, Some(self.capability), node, destination)
+            || self.downstream_relay(destination, now_ms) == Some(node)
     }
 
     fn candidate_cost(&self, node: u32, destination: u32, my_next_hop: u32, now_ms: u32) -> u16 {
-        if let Some(cost) = self.edge_cost(node, destination) {
+        if let Some(cost) =
+            delivery_hop_cost_fixed(self.edges, Some(self.capability), node, destination)
+        {
             return bucket(cost.min(DOWNSTREAM_TIER_COST - 1));
         }
         if self.downstream_relay(destination, now_ms) == Some(node) {
             return DOWNSTREAM_TIER_COST;
         }
-        // An edge to the shared next hop is a path only when that hop is a real forwarder:
-        // when the route picker fell back to us, a neighbour reaching us gets nowhere.
+        // Shared next hop must be a real forwarder (not us / dest) and reachable from `node`.
         if my_next_hop != 0
             && my_next_hop != destination
             && my_next_hop != node
             && my_next_hop != self.my_node
         {
-            if let Some(cost) = self.edge_cost(node, my_next_hop) {
+            if let Some(cost) =
+                delivery_hop_cost_fixed(self.edges, Some(self.capability), node, my_next_hop)
+            {
                 return bucket(cost.min(INDIRECT_TIER - 1)) | INDIRECT_TIER;
             }
         }
         NO_PATH
     }
 
-    /// An SR-active neighbour of ours that hears `heard_from` and can deliver to `destination`
-    /// is better placed than we are: it holds the packet already and needs no extra hop.
+    /// SR neighbour that already holds the frame (hears `heard_from`) and can finish delivery.
     fn better_positioned_neighbor(&self, heard_from: u32, destination: u32, now_ms: u32) -> bool {
         let Some(mine) = self.edges.find_node(self.my_node) else {
             return false;
@@ -112,7 +96,7 @@ impl UnicastRelayContext<'_> {
                 && n != self.my_node
                 && !is_placeholder_node(n)
                 && self.capability.status(n) == CapabilityStatus::SrActive
-                && self.has_edge(n, heard_from)
+                && can_deliver(self.edges, Some(self.capability), heard_from, n)
                 && self.reaches(n, destination, now_ms)
         })
     }
@@ -289,6 +273,7 @@ mod tests {
         edges.ensure_local_node(ME, NOW);
         for (n, etx) in [(GW, 1.5), (PEER, 1.0), (PHONE, 1.1)] {
             edges.update_edge(ME, ME, n, etx, NOW, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(ME, n, true);
         }
         // The phone lists all three of us; the peer lists us and the phone.
         for n in [ME, PEER, GW] {
@@ -332,6 +317,7 @@ mod tests {
         // The peer's own edges: it hears the gateway too, so it is an indirect candidate.
         f.edges
             .update_edge(PEER, PEER, GW, 1.6, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(PEER, GW, true);
         f.edges
             .update_edge(PEER, PEER, ME, 1.0, NOW, EdgeSource::Reported, true, 0);
         let mut ctx = f.ctx();
@@ -359,6 +345,7 @@ mod tests {
         // The peer now reports a direct edge to the destination.
         f.edges
             .update_edge(ME, PEER, DEST, 3.0, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(PEER, DEST, true);
         let plan = plan_unicast_relay(&f.ctx(), 0xe0c9_25e5, PHONE, PHONE, DEST, GW, NOW, |_| {
             false
         })
@@ -377,8 +364,10 @@ mod tests {
         // Our own link to the gateway prices at 1.31, the peer's reported one at 1.18.
         f.edges
             .update_edge(ME, ME, GW, 1.31, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(ME, GW, true);
         f.edges
             .update_edge(ME, PEER, GW, 1.18, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(PEER, GW, true);
         // Even id: lower node id first, although our own link is the dearer one.
         let even = plan_unicast_relay(&f.ctx(), 0xcfd2_d4da, PHONE, PHONE, DEST, GW, NOW, |_| {
             false
@@ -395,6 +384,7 @@ mod tests {
         // regardless of parity.
         f.edges
             .update_edge(ME, ME, GW, 1.6, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(ME, GW, true);
         let better = plan_unicast_relay(&f.ctx(), 0xcfd2_d4da, PHONE, PHONE, DEST, GW, NOW, |_| {
             false
         })
@@ -407,8 +397,10 @@ mod tests {
         let mut f = field_fixture();
         f.edges
             .update_edge(ME, PEER, DEST, 2.0, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(PEER, DEST, true);
         f.edges
             .update_edge(ME, ME, DEST, 2.0, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(ME, DEST, true);
         let even =
             plan_unicast_relay(&f.ctx(), 0x10, PHONE, PHONE, DEST, DEST, NOW, |_| false).unwrap();
         let odd =
@@ -455,6 +447,20 @@ mod tests {
         .expect("sole candidate");
         assert_eq!(plan.slot_index, 0);
         assert_eq!(plan.candidate_count, 1);
+    }
+
+    #[test]
+    fn one_way_list_to_publishing_dest_is_not_a_direct_path() {
+        let mut f = field_fixture();
+        f.capability.track_topology(DEST, true, NOW);
+        f.edges
+            .update_edge(ME, ME, DEST, 1.0, NOW, EdgeSource::Reported, true, 0);
+        let plan = plan_unicast_relay(&f.ctx(), 0x30, PHONE, PHONE, DEST, GW, NOW, |_| false)
+            .expect("still an indirect/downstream candidate");
+        assert_eq!(
+            plan.ranked[0], GW,
+            "listing DEST without DEST hearing us must not win slot 0"
+        );
     }
 
     #[test]
