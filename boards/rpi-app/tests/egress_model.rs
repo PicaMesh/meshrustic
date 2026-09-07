@@ -67,6 +67,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
 
     let ctx = BroadcastRelayContext {
         my_node: ME,
+        my_node_relays: true,
         edges: graph.edges(),
         capability: graph.capability(),
         downstream: graph.downstream(),
@@ -86,6 +87,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
     graph.confirm_direct_neighbor_hears_us(INBOUND);
     let ctx = BroadcastRelayContext {
         my_node: ME,
+        my_node_relays: true,
         edges: graph.edges(),
         capability: graph.capability(),
         downstream: graph.downstream(),

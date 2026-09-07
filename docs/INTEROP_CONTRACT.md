@@ -136,10 +136,23 @@ airtime. Every SignalRouting node uses the same figure.
   (`heard_from` or has already transmitted this id). A neighbour that *could* hear the
   transmitter is not enough. Tests: `shared_downstream_suppresses_only_when_gateway_holds_copy`,
   `sr_neighbour_must_have_transmitted_to_suppress_us`.
-- **Next hop is the relayer.** If our path next hop is the node we heard from, we drop the
-  relay only when that node can finish delivery to the destination (`can_deliver` or
+- **Next hop is the relayer.** If our *verified* path next hop is the node we heard from, we
+  drop the relay only when that node can finish delivery to the destination (`can_deliver` or
   downstream). Otherwise the next hop is cleared and we stay in the ranking as backup. Tests:
   `unicast_not_relayed_back_to_the_relayer`, `next_hop_is_relayer_clears_when_they_cannot_finish`.
+- **A guessed route is never stamped.** A route the search could only complete by admitting an
+  unconfirmed hop (`Route::verified` false, the inbound-gateway fallback) may carry a unicast,
+  but its next hop is cleared before transmission: the node it names never confirmed it hears
+  the destination, and a designation makes every other candidate stand down and wait for a copy
+  that node may have no way to send. Cleared, we are one ranked candidate among several. Test:
+  `guessed_route_is_never_stamped_as_next_hop`.
+- **A guessed route that runs back is contained.** If the only route is unverified *and* names
+  the node we heard the packet from, the relay is dropped, not merely stripped of its next hop
+  (`SrSkipReason::UnverifiedBacktrack`, logged as `guessed route runs back`). It would carry the
+  packet away from its destination onto our own side of the mesh, where the only path anyone
+  knows is the one it arrived on, and for a `want_ack` unicast it invites the far side to retry
+  through us. A verified route pointing back is the case above: the evidence says that direction
+  reaches the destination. Test: `guessed_route_back_the_way_it_came_is_dropped`.
 - **Designated next hop and backup.** A wire next hop that is not us owns slot 0; every other
   candidate shifts one slot behind the peer or stock wait (`plan_designated_unicast`). Ranking
   `Err` does not abort that backup. Forward and backup TX stamp **our path** next hop; flood
@@ -155,15 +168,36 @@ airtime. Every SignalRouting node uses the same figure.
   Pending later slots cancel when unique coverage is gone (`has_unique_coverage` /
   `perhaps_cancel_dupe`). Tests: broadcast coverage cases in `broadcast_relay` /
   `sr_slot_schedule` / `sr_coverage`.
-- **Coverage is evidenced delivery over a link that is not hopeless** (`route::covers`): the
-  receiver must be known to hear the transmitter (`known_to_hear`: `hears_us` on the
-  transmitter's edge, or the receiver listing the transmitter) and the delivery-direction cost
-  must be at or below `COVERAGE_ETX_CEILING_FIXED`. Both halves are needed: an edge alone is
-  one-directional evidence, and `hears_us` is sticky, so a peer that heard the transmitter once
-  keeps the flag while its link decays. The same rule prices pre-coverage from the transmitter's
-  own list, a candidate's coverage set, and the absorbed coverage of earlier slots. Tests:
-  `covers_requires_a_link_that_is_not_hopeless`, `one_way_listed_neighbor_is_not_precovered`,
-  `hopeless_confirmed_neighbor_is_not_precovered`, `poor_link_does_not_count_as_coverage`.
+- **Coverage is evidence graded by whether the receiver reports** (`route::covers`), over a link
+  that is not hopeless (delivery-direction cost at or below `COVERAGE_ETX_CEILING_FIXED`). A node
+  that publishes topology is held to it: it must be known to hear the transmitter
+  (`known_to_hear`: `hears_us` on the transmitter's edge, or the receiver listing the
+  transmitter), because its silence about the transmitter is itself information. A node that
+  publishes nothing — stock, mute, or not yet classified — can never confirm anything, so the
+  transmitter's own edge to it is all the evidence there will ever be. Holding the second class to
+  the first class's standard made every neighbour of one silent node relay every frame for it.
+  `hears_us` is sticky, hence the cost half: a peer that heard the transmitter once keeps the flag
+  while its link decays. The rule prices pre-coverage from the transmitter's list, each
+  candidate's coverage set, the absorbed coverage of earlier slots, and unique coverage. Tests:
+  `covers_requires_a_link_that_is_not_hopeless`, `covers_a_silent_node_on_the_senders_own_edge`,
+  `one_way_listed_neighbor_is_not_precovered`, `hopeless_confirmed_neighbor_is_not_precovered`,
+  `poor_link_does_not_count_as_coverage`.
+- **A neighbour nobody can be shown to reach belongs to one relayer** (`route::coverage_owner`).
+  Its receive path is all anyone can measure, so the owner is the node hearing it best, compared
+  in `OWNER_COST_BUCKET_FIXED` buckets, with stock ROUTER/REPEATER/ROUTER_CLIENT given way first
+  (they rebroadcast regardless of SR and already hold the earliest slots) and the lowest node id
+  as the final tie-break. Mute and passive nodes never own: they do not relay. Applied both in the
+  slot ranking and in unique coverage, so the branch does not relay N times for the same node.
+  Tests: `mute_neighbour_owner_is_the_best_link_then_the_lowest_id`,
+  `silent_neighbour_is_relayed_for_by_the_best_link_only`,
+  `inbound_only_neighbor_belongs_to_its_owner`.
+- **We log the neighbour we relay for** (`SrLogEvent::CoverageFor`): a relay nobody needs and a
+  relay that saves a node are indistinguishable in a field log otherwise. The name comes from the
+  ranking that made the decision (`BroadcastRelayPlan::coverage_for`, the winning candidate's
+  first neighbour the transmitter did not reach), never recomputed afterwards against a different
+  set of coverers — that named neighbours a ranked peer does reach. `unique_coverage_neighbor`
+  answers the dupe question instead: is any neighbour left uncovered by the nodes that have
+  actually transmitted. Test: `plan_names_the_neighbour_the_relay_is_for`.
 - **T1 is no-slot insurance, not a second coverage path.** When we defer with no ranked slot
   (`BetterNeighbor`), we arm T1 so that if nobody retransmits, a late copy still reaches the
   source for confirmation (`arm_t1_for_deferred_broadcast`). A ranked commit never arms T1.
@@ -197,6 +231,15 @@ airtime. Every SignalRouting node uses the same figure.
   `TOPOLOGY_DIRTY_MIN_MS` after the last one; a header-only version-0 broadcast at boot; direct
   SR neighbours answer a boot broadcast once per `BOOTSTRAP_REPLY_MIN_MS`. Originated packets do
   not reset the timer.
+- **A bootstrap request is answered by any list, not only by its own reply.** The request is
+  recorded with the time it arrived, and the queued reply is dropped if a broadcast carrying
+  neighbours went out after that time (`SrLogEvent::BootstrapReplyAlreadyAnswered`): the
+  requester already has what it asked for, and a second list under the next version number is
+  accepted by every receiver as a fresh report and duplicated by every relayer. The reply is
+  deliberately not gated on the periodic timer, so that a booting neighbour never waits out a
+  broadcast interval; this rule is what keeps that from doubling the list. A header-only boot
+  broadcast of our own does not count as an answer — it names no neighbours. Test:
+  `bootstrap_reply_is_dropped_when_a_list_already_went_out`.
 - **Version acceptance** (`NeighborGraph::merge_topology`): first contact accepts any version;
   then a repeat or a forward move of 1 to 127; a header-only version-0 broadcast, direct or
   relayed, resets the tracked version, active or passive sender; after `TOPOLOGY_RESYNC_MS` without an accepted
@@ -222,7 +265,11 @@ airtime. Every SignalRouting node uses the same figure.
   worst edge (ETX plus age) when a better one arrives (`EdgeStore::update_edge`).
 - **Inferred paths.** Edges and downstream entries learned from relayed packets are priced at a
   nominal link per hop travelled (`INFERRED_LINK_RSSI`, `INFERRED_LINK_SNR` in
-  `observe_relayed_packet`), never at the measured strength of the relay's link to us.
+  `observe_relayed_packet`), never at the measured strength of the relay's link to us. A copy of a
+  packet **we** transmitted teaches nothing: the peer relaying it got it from us, so recording the
+  source as downstream of that peer invents a path back through ourselves, and the two nodes then
+  name each other as next hop for that destination until a unicast bounces between them. Our own
+  transmissions are therefore skipped (`has_our_transmission`).
 
 ## 6. Inbound policing
 

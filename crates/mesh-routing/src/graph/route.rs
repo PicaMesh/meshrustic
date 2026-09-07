@@ -237,17 +237,93 @@ pub fn delivery_hop_cost_fixed(
     hop_cost_fixed(edges, from, to)
 }
 
+/// Bucket width for comparing links when picking a coverage owner: two nodes price the same link
+/// a few hundredths apart, and an exact comparison would hand ownership to a different node on
+/// every graph, so only a real difference counts.
+pub const OWNER_COST_BUCKET_FIXED: u16 = 50;
+
+/// Who relays for `target` when no transmitter can be shown to reach it (`covers` is false for
+/// every candidate)? Exactly one node, or the whole branch relays the same frame for the same
+/// unconfirmed neighbour. `target` never reports (a stock mute node publishes no topology), so its
+/// receive path is all we can measure: the node hearing it best is the likeliest to be heard by it.
+///
+/// Order: a stock relay router we have seen carrying its traffic first (stock nodes rebroadcast
+/// regardless of SR and already take the earliest slots, so an SR node relaying for the same
+/// neighbour is pure duplication), then the best measured link in [`OWNER_COST_BUCKET_FIXED`]
+/// buckets, then the lowest node id. Mute and passive nodes never own: they do not relay.
+/// `me` is our own node and `me_relays` whether our role rebroadcasts: we are absent from our own
+/// capability cache, so our eligibility has to be passed in.
+pub fn coverage_owner(
+    edges: &EdgeStore,
+    capability: &CapabilityCache,
+    me: u32,
+    me_relays: bool,
+    target: u32,
+) -> u32 {
+    if target == 0 || is_placeholder_node(target) {
+        return 0;
+    }
+    let mut owner = 0u32;
+    let mut best = (u8::MAX, u16::MAX);
+    for i in 0..edges.node_count() {
+        let Some(candidate) = edges.node_id_at(i) else {
+            continue;
+        };
+        if candidate == target || is_placeholder_node(candidate) {
+            continue;
+        }
+        // Only what it measured itself: an edge to the target is the evidence that it hears it,
+        // and for a stock node the only way that edge exists is us watching it carry the traffic.
+        let Some(edge) = edges.find_node(candidate).and_then(|n| n.find_edge(target)) else {
+            continue;
+        };
+        let tier = if candidate == me {
+            if !me_relays {
+                continue;
+            }
+            1
+        } else if capability.is_immediate_relay_router(candidate) {
+            0
+        } else if capability.status(candidate) == CapabilityStatus::SrActive {
+            1
+        } else {
+            continue;
+        };
+        let bucket = edge.etx_fixed / OWNER_COST_BUCKET_FIXED;
+        let key = (tier, bucket);
+        if key < best || (key == best && candidate < owner) {
+            best = key;
+            owner = candidate;
+        }
+    }
+    owner
+}
+
 /// Delivery cost above which a confirmed hop still does not count as coverage. `hears_us` is
 /// sticky: a peer that heard the sender once keeps the flag while its link decays, and a rooftop
 /// node kept it with its antenna 20 dB down. Coverage decides whether we may stay silent, so it
 /// has to mean "that frame very likely arrived", not "it arrived once". ETX 7 in fixed point.
 pub const COVERAGE_ETX_CEILING_FIXED: u16 = 700;
 
-/// Does a transmission by `from` reach `to` well enough to relieve us of relaying? The receiver
-/// must be known to hear the sender and the delivery-direction link must not be hopeless.
-pub fn covers(edges: &EdgeStore, from: u32, to: u32) -> bool {
-    known_to_hear(edges, from, to)
-        && hop_cost_fixed(edges, from, to).is_some_and(|c| c <= COVERAGE_ETX_CEILING_FIXED)
+/// Does a transmission by `from` reach `to` well enough to relieve a bystander of relaying?
+///
+/// What counts as evidence depends on whether the receiver ever reports. A node that publishes
+/// topology is held to it: it must be known to hear the sender (`known_to_hear`), because its
+/// silence about the sender is itself information. A node that publishes nothing — stock, mute, or
+/// not yet classified — can never confirm anything, so the sender's own edge to it is all the
+/// evidence there will ever be; demanding more made every neighbour of such a node relay for it on
+/// every frame. Either way the delivery-direction link must not be hopeless.
+pub fn covers(edges: &EdgeStore, capability: Option<&CapabilityCache>, from: u32, to: u32) -> bool {
+    let evidenced = if publishes_topology(capability, to) {
+        known_to_hear(edges, from, to)
+    } else {
+        known_to_hear(edges, from, to)
+            || edges
+                .find_node(from)
+                .and_then(|n| n.find_edge(to))
+                .is_some()
+    };
+    evidenced && hop_cost_fixed(edges, from, to).is_some_and(|c| c <= COVERAGE_ETX_CEILING_FIXED)
 }
 
 /// Lower `cost[m]` to `cost + edge_cost` with `via` as the next hop toward the destination.
@@ -904,16 +980,38 @@ mod tests {
         const TX: u32 = 0xAA;
         const RX: u32 = 0xBB;
         let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(RX, true, 0);
         edges.ensure_local_node(TX, 0);
         edges.update_edge(TX, TX, RX, 40.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(TX, RX, true);
         assert!(known_to_hear(&edges, TX, RX));
         assert!(
-            !covers(&edges, TX, RX),
+            !covers(&edges, Some(&capability), TX, RX),
             "confirmed but hopeless is not coverage"
         );
         edges.update_edge(TX, TX, RX, 1.5, 0, EdgeSource::Reported, true, 0);
-        assert!(covers(&edges, TX, RX));
+        assert!(covers(&edges, Some(&capability), TX, RX));
+    }
+
+    /// A node that publishes nothing can never confirm hearing anyone, so the sender's own edge to
+    /// it is the only evidence there will ever be. Holding it to the reporting standard made every
+    /// neighbour of such a node relay for it on every frame.
+    #[test]
+    fn covers_a_silent_node_on_the_senders_own_edge() {
+        const TX: u32 = 0xAA;
+        const SILENT: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(TX, 0);
+        edges.update_edge(TX, TX, SILENT, 2.0, 0, EdgeSource::Reported, true, 0);
+        assert!(!known_to_hear(&edges, TX, SILENT));
+        assert!(covers(&edges, None, TX, SILENT));
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(SILENT, true, 0);
+        assert!(
+            !covers(&edges, Some(&capability), TX, SILENT),
+            "a reporting node's silence about the sender counts against coverage"
+        );
     }
 
     #[test]

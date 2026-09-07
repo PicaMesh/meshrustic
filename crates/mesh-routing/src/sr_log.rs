@@ -141,6 +141,8 @@ pub enum SrLogEvent {
     TopologyLoggingComplete,
     /// An empty bootstrap broadcast arrived inside the bootstrap-reply cooldown; no list sent.
     BootstrapReplyRateLimited,
+    /// A list went out after the bootstrap request and answered it; the reply was dropped.
+    BootstrapReplyAlreadyAnswered,
     /// The destination of this unicast hears its source directly (per the source's topology):
     /// our relay waits `wait_ms` for the destination's ACK or reply before it may go out.
     UnicastDestHeardDirect {
@@ -174,6 +176,10 @@ pub enum SrLogEvent {
         short_name: [u8; 5],
         role: u32,
         is_new: bool,
+    },
+    /// The neighbour that made a broadcast relay worth its airtime (nobody else reaches it).
+    CoverageFor {
+        neighbor: u32,
     },
     RouteNextHop {
         destination: u32,
@@ -269,6 +275,9 @@ pub enum SrSkipReason {
     /// Routing ACK toward a node its sender heard directly: it retraces the request's link and
     /// a lost ACK is covered by the sender's own retransmission.
     ReplyRetracesLink,
+    /// Unicast whose only route is the unverified inbound-gateway guess, pointing back at the
+    /// node we heard the packet from: carrying it moves the packet away from its destination.
+    UnverifiedBacktrack,
 }
 
 /// Sink for periodic topology graph dumps (may emit many lines).

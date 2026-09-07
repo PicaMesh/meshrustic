@@ -206,7 +206,10 @@ pub struct Router {
     graph: NeighborGraph,
     pending: [PendingRelay; MAX_PENDING_RELAYS],
     pending_topology: PendingTopology,
-    pending_topology_reply: bool,
+    /// Uptime at which a direct SR neighbour's empty bootstrap broadcast asked for our list
+    /// (0 = nothing pending). The timestamp, not a flag: a list that goes out after the
+    /// request has already answered it.
+    pending_topology_reply_ms: u32,
     pending_nodeinfo: PendingNodeInfo,
     pending_telemetry: PendingTelemetry,
     pending_traceroute: PendingTraceroute,
@@ -350,7 +353,7 @@ impl Router {
                 lens: [0; MAX_TOPOLOGY_PACKETS],
                 frames: [[0; MAX_WIRE_LEN]; MAX_TOPOLOGY_PACKETS],
             },
-            pending_topology_reply: false,
+            pending_topology_reply_ms: 0,
             pending_nodeinfo: PendingNodeInfo {
                 active: false,
                 next_tx_ms: 0,
@@ -512,7 +515,7 @@ impl Router {
             self.pending_traceroute.active = false;
             dropped += 1;
         }
-        self.pending_topology_reply = false;
+        self.pending_topology_reply_ms = 0;
         dropped += self.graph.clear_relays();
         self.sr_log.push(SrLogEvent::RadioReconfigured {
             dropped: dropped.min(u8::MAX as usize) as u8,
@@ -1502,16 +1505,27 @@ impl Router {
         if neighbor_list.is_empty() && is_direct && header.signal_routing_active {
             self.sr_log
                 .push(SrLogEvent::TopologyDirtyFromNeighbor { from: parsed.from });
-            self.pending_topology_reply = true;
+            self.pending_topology_reply_ms = now_ms.max(1);
         }
     }
 
     fn poll_scheduled_topology_reply(&mut self, now_ms: u32, slot_ms: u32) {
-        if !self.pending_topology_reply {
+        let requested_ms = self.pending_topology_reply_ms;
+        if requested_ms == 0 {
             return;
         }
-        self.pending_topology_reply = false;
+        self.pending_topology_reply_ms = 0;
         if self.pending_topology.active || !self.graph.can_send_topology() {
+            return;
+        }
+        // Any list we transmitted after the request already answered it: the requester heard
+        // our neighbours, and a second list carries the same 5 to 28 entries under the next
+        // version number, which every receiver then accepts as a fresh report. On a mesh where
+        // two nodes relay for us, one avoidable list is six frames of airtime.
+        let last_list_ms = self.graph.last_topology_list_ms();
+        if last_list_ms != 0 && (1..0x8000_0000).contains(&last_list_ms.wrapping_sub(requested_ms))
+        {
+            self.sr_log.push(SrLogEvent::BootstrapReplyAlreadyAnswered);
             return;
         }
         // At most one bootstrap-triggered list per BOOTSTRAP_REPLY_MIN_MS: a burst of empty
@@ -1629,6 +1643,15 @@ impl Router {
             if relay_plan.should_relay {
                 self.graph
                     .record_node_transmission(self.node_num, parsed.id, now_ms);
+                // Name the neighbour we are spending the airtime on, taken from the ranking
+                // that decided it: a relay nobody needs and a relay that saves a node look
+                // identical in the log without it. Recomputing it here against the transmitter
+                // alone named a neighbour that a ranked peer does reach.
+                if relay_plan.coverage_for != 0 {
+                    self.sr_log.push(SrLogEvent::CoverageFor {
+                        neighbor: relay_plan.coverage_for,
+                    });
+                }
             } else if relay_plan.candidate_count <= 1 {
                 // No SR peer to defer to — take the coordinated relay path below.
             } else {
@@ -1664,12 +1687,18 @@ impl Router {
             return plan;
         }
 
+        // `verified` distinguishes a path whose every hop is backed by evidence that the
+        // receiver hears the transmitter from the inbound-gateway fallback, which only guesses
+        // that somebody past us can finish. Both may carry a packet; only the first may name a
+        // next hop.
+        let mut route_verified = true;
         let picked_hop = if parsed.to != NODENUM_BROADCAST {
             let hop = self
                 .graph
                 .get_next_hop(parsed.to, parsed.from, heard_from, now_ms);
             if hop != 0 {
                 let route = self.graph.get_route(parsed.to, now_ms);
+                route_verified = route.verified;
                 self.sr_log.push(SrLogEvent::RouteNextHop {
                     destination: parsed.to,
                     next_hop: hop,
@@ -1691,6 +1720,42 @@ impl Router {
         } else {
             picked_hop
         };
+
+        // Containment. A guessed route that points back at the node we heard the packet from
+        // carries it away from its destination: onto our own branch, where the only path anyone
+        // knows is the one it just arrived on. Nobody there can finish it, so the copy is pure
+        // airtime and, for a want_ack unicast, an invitation for the far side to retry through
+        // us again. Drop it and leave the packet to the side of the mesh that has a measured
+        // path. A verified route pointing back is a different case, handled below: the evidence
+        // says that direction really does reach the destination.
+        if parsed.to != NODENUM_BROADCAST
+            && !route_verified
+            && next_hop != 0
+            && next_hop == heard_from
+        {
+            self.pool.release(handle);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::UnverifiedBacktrack,
+            });
+            return plan;
+        }
+
+        // A guessed route may still be worth carrying in any other direction, but it must not
+        // be stamped: the node it names never proved it hears the destination, and receivers
+        // treat the byte as a designation, standing down and waiting for a copy from a node
+        // that may have no way to send one. Cleared, we stay one candidate among the ranked
+        // slots and the others keep coordinating.
+        if !route_verified && next_hop != 0 {
+            next_hop = 0;
+            self.sr_log.push(SrLogEvent::RouteNextHop {
+                destination: parsed.to,
+                next_hop: 0,
+                cost_x100: 0,
+                hops: 0,
+                verified: false,
+            });
+        }
         // Hand-off: the previous relay named us and our only route points back at it. Stock
         // floods here (next_hop cleared) rather than dropping the packet, and so do we.
         let designated_repeat = self.designated_repeat_id.take() == Some(parsed.id);
@@ -1705,9 +1770,35 @@ impl Router {
             });
         }
 
+        // The packet names us as its next hop: the sender asked us to carry it, so no
+        // "somebody else is better placed" reason applies. Without this, a designated hop whose
+        // own route pointed back at the node it heard the frame from went silent and only a
+        // backup carried the packet, a slot late (seen on both nicenanos, 2026-09-07).
+        let we_are_designated_hop =
+            parsed.to != NODENUM_BROADCAST && parsed.next_hop == (self.node_num & 0xFF) as u8;
+
+        // Named as next hop while our only route runs back to the node that handed us the
+        // packet: forward it, but never back the way it came. Stamping the relayer would bounce
+        // it (it named us because its own route points at us), so the copy goes out with no next
+        // hop, as a designated repeat of a duplicate already does.
+        if we_are_designated_hop && next_hop != 0 && next_hop == heard_from {
+            next_hop = 0;
+            self.sr_log.push(SrLogEvent::RouteNextHop {
+                destination: parsed.to,
+                next_hop: 0,
+                cost_x100: 0,
+                hops: 0,
+                verified: false,
+            });
+        }
+
         // Relayer already holds the packet and can finish: handing it back is a dupe.
         // If they cannot finish, clear next_hop and stay in the ranking as backup.
-        if parsed.to != NODENUM_BROADCAST && next_hop != 0 && next_hop == heard_from {
+        if parsed.to != NODENUM_BROADCAST
+            && !we_are_designated_hop
+            && next_hop != 0
+            && next_hop == heard_from
+        {
             let finishes = crate::graph::can_deliver(
                 self.graph.edges(),
                 Some(self.graph.capability()),
@@ -2297,6 +2388,8 @@ impl Router {
             evaluated,
             evaluated_len,
             pre_covered,
+            // Unicast plan: coverage does not enter into it.
+            coverage_for: 0,
         }
     }
 
@@ -3914,6 +4007,50 @@ mod tests {
         assert!((t3..=t3 + max).any(|t| router.poll_topology_tx(t).is_some()));
     }
 
+    /// A list that goes out after the bootstrap request has already answered it. Seen on a
+    /// node whose periodic list and a queued bootstrap reply left 170 ms apart, doubling every
+    /// relay of it downstream.
+    #[test]
+    fn bootstrap_reply_is_dropped_when_a_list_already_went_out() {
+        use crate::topology::{build_topology_wire_frame, PACKED_NEIGHBOR_HEADER_SIZE};
+        use mesh_radio::MODEM_SHORT_SLOW;
+        const ME: u32 = 0x677a_1caf;
+        const PEER: u32 = 0x63dc_8f8c;
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut router = Router::with_channel(ME, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+        let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
+        write_packed_header(&mut packed, 1, true);
+        let frame = build_topology_wire_frame(PEER, 0x94, 0x77, 3, &key, &packed, false).unwrap();
+        // The peer asks for our list before our own first list has gone out.
+        router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &frame.1[..frame.0 as usize],
+                },
+                1_000,
+            )
+            .unwrap();
+        router.ensure_boot_broadcasts(2_000, 20);
+        assert!(
+            router.poll_topology_tx(2_000).is_some(),
+            "our own list goes out after the request"
+        );
+        router.run_maintenance(3_000, 20);
+        let max = coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
+        assert!(
+            (3_000..=3_000 + max).all(|t| router.poll_topology_tx(t).is_none()),
+            "the peer already has our list: no second one"
+        );
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::BootstrapReplyAlreadyAnswered)));
+    }
+
     #[test]
     fn relays_third_party_opaque_packet() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -4265,6 +4402,86 @@ mod tests {
         );
     }
 
+    const UNI_PEER: u32 = 0xAB00_00AB;
+
+    /// Graph: DEST is only reachable by guess. GATEWAY reports DEST as a neighbour it hears,
+    /// DEST publishes topology and has never listed GATEWAY, so nothing says DEST hears it —
+    /// the inbound-gateway fallback, not a verified path.
+    fn setup_unverified_gateway_graph(router: &mut Router, listener: Option<u32>) {
+        let graph = router.graph_mut();
+        graph.observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
+        graph.capability_mut().track_topology(UNI_RELAYER, true, 0);
+        graph.capability_mut().track_topology(UNI_DEST, true, 0);
+        graph.confirm_direct_neighbor_hears_us(UNI_RELAYER);
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let us = PackedNeighbor {
+            node_id: UNI_ME,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: false,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        // GATEWAY hears DEST; DEST has never confirmed the reverse.
+        let dest = PackedNeighbor {
+            node_id: UNI_DEST,
+            hears_us: false,
+            ..us
+        };
+        router
+            .graph_mut()
+            .merge_topology(UNI_RELAYER, &header, &[dest, us], true, 0, 0);
+        // A second SR neighbour that reports the gateway, so a packet heard from it counts as
+        // reaching the gateway and the route survives the connectivity check.
+        if let Some(peer) = listener {
+            let graph = router.graph_mut();
+            graph.observe_direct_neighbor(peer, -70, 8, 0, 0);
+            graph.capability_mut().track_topology(peer, true, 0);
+            graph.confirm_direct_neighbor_hears_us(peer);
+            let gw = PackedNeighbor {
+                node_id: UNI_RELAYER,
+                ..us
+            };
+            router
+                .graph_mut()
+                .merge_topology(peer, &header, &[gw, us], true, 0, 0);
+        }
+    }
+
+    /// 2026-09-07: the branch gateway relayed unicasts for outside destinations back into the
+    /// branch, where the only path known was the one the packet arrived on.
+    #[test]
+    fn guessed_route_back_the_way_it_came_is_dropped() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unverified_gateway_graph(router, None);
+        // Heard from the gateway itself: our guess names it as next hop.
+        let wire = unicast_wire(2, 3, 0, 0xBB, 0x701);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled, "carrying it moves the packet away from DEST");
+        assert_eq!(reason, Some(SrSkipReason::UnverifiedBacktrack));
+    }
+
+    #[test]
+    fn guessed_route_is_never_stamped_as_next_hop() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unverified_gateway_graph(router, Some(UNI_PEER));
+        // Heard from the other SR neighbour, so the guess points onward, not back.
+        let wire = unicast_wire_ack(2, 3, 0, 0xAB, 0x702, true);
+        let (sent, _) = forward_unicast(router, &wire, 0);
+        assert_eq!(
+            sent.next_hop, 0,
+            "a node that never confirmed it hears DEST must not be designated"
+        );
+        assert!(
+            !router.has_pending_reliable(0x702),
+            "no designated hop, nothing to retry"
+        );
+    }
+
     fn unicast_wire(
         hop_limit: u8,
         hop_start: u8,
@@ -4595,6 +4812,68 @@ mod tests {
 
     /// 2026-09-06 17:31: Dura's request to FCM6 carried FCM6's own byte as next hop. Both
     /// nicenanos waited the worst-case stock delay for a relayer that cannot exist.
+    /// 2026-09-07: a unicast named A as next hop, A's own route to the destination pointed back
+    /// at the node A heard it from, and A skipped it as "next hop is relayer". The designated hop
+    /// forwards; only bystanders may defer.
+    #[test]
+    fn designated_hop_forwards_even_when_our_route_points_back_at_the_relayer() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // Our route to the destination runs through the node we hear the packet from.
+        assert_eq!(
+            router.graph_mut().route_to(UNI_DEST, 0).next_hop,
+            UNI_RELAYER,
+            "fixture: our route to the destination is via the relayer"
+        );
+        let relayer_byte = (UNI_RELAYER & 0xFF) as u8;
+        let wire = unicast_wire(3, 3, (UNI_ME & 0xFF) as u8, relayer_byte, 0x705);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        let relay = plan
+            .relay
+            .or_else(|| {
+                router
+                    .relay_tx_after(UNI_SOURCE, 0x705, 0)
+                    .and_then(|after| router.poll_ready_relay(after))
+            })
+            .expect("the designated hop must forward");
+        assert!(
+            relay.delay_ms <= crate::channel_access::SLOT_ORIGIN_MS,
+            "designated hop owns slot 0, got {}",
+            relay.delay_ms
+        );
+        let hdr = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert_eq!(
+            hdr.next_hop, 0,
+            "must not hand the packet back to the node it came from"
+        );
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(
+            !logs.iter().any(|e| matches!(
+                e,
+                SrLogEvent::RelaySkip {
+                    reason: SrSkipReason::NextHopIsRelayer,
+                    ..
+                }
+            )),
+            "must not skip a packet addressed through us: {logs:?}"
+        );
+    }
+
     #[test]
     fn next_hop_equal_to_the_destination_names_no_relayer() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -4781,39 +5060,26 @@ mod tests {
         assert_eq!(hdr.relay_node, 0xCC);
     }
 
+    /// The relayer we heard the packet from is the first hop of a verified path, but cannot
+    /// finish it alone: handing the packet back is not a dupe, so we stay in the ranking with
+    /// next_hop cleared. (A guessed route pointing back is the different, contained case.)
     #[test]
     fn next_hop_is_relayer_clears_when_they_cannot_finish() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
-        router
-            .graph_mut()
-            .observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
-        router
-            .graph_mut()
-            .confirm_direct_neighbor_hears_us(UNI_RELAYER);
-        router
-            .graph_mut()
-            .capability_mut()
-            .track_topology(UNI_RELAYER, true, 0);
-        router
-            .graph_mut()
-            .capability_mut()
-            .track_topology(UNI_DEST, true, 0);
-        // Unverified RELAYER→DEST listing (no hears_us): route may still pick RELAYER, but
-        // can_deliver is false and there is no downstream entry, so handing back is not a dupe.
+        {
+            let graph = router.graph_mut();
+            graph.observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
+            graph.confirm_direct_neighbor_hears_us(UNI_RELAYER);
+            graph.capability_mut().track_topology(UNI_RELAYER, true, 0);
+            graph.capability_mut().track_topology(UNI_PEER, true, 0);
+            graph.capability_mut().track_topology(UNI_DEST, true, 0);
+        }
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
-        let dest = PackedNeighbor {
-            node_id: UNI_DEST,
-            rssi: -75,
-            snr: 8,
-            signal_routing_active: false,
-            hears_us: false,
-            etx_variance: 0,
-        };
-        let us = PackedNeighbor {
+        let heard = PackedNeighbor {
             node_id: UNI_ME,
             rssi: -70,
             snr: 8,
@@ -4821,9 +5087,27 @@ mod tests {
             hears_us: true,
             etx_variance: 0,
         };
+        // ME -> RELAYER -> PEER -> DEST, every hop confirmed by the node that receives it.
+        // RELAYER has no edge to DEST of its own, so can_deliver(RELAYER, DEST) is false and
+        // there is no downstream entry either: it cannot finish in one hop.
+        let via_peer = PackedNeighbor {
+            node_id: UNI_PEER,
+            ..heard
+        };
         router
             .graph_mut()
-            .merge_topology(UNI_RELAYER, &header, &[dest, us], true, 0, 0);
+            .merge_topology(UNI_RELAYER, &header, &[via_peer, heard], true, 0, 0);
+        let to_dest = PackedNeighbor {
+            node_id: UNI_DEST,
+            ..heard
+        };
+        let gw = PackedNeighbor {
+            node_id: UNI_RELAYER,
+            ..heard
+        };
+        router
+            .graph_mut()
+            .merge_topology(UNI_PEER, &header, &[to_dest, gw], true, 0, 0);
 
         let wire = unicast_wire(2, 3, 0, 0xBB, 0x506);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
@@ -4832,6 +5116,7 @@ mod tests {
             "cannot finish at RELAYER: stay in ranking, not NextHopIsRelayer"
         );
         assert_ne!(reason, Some(SrSkipReason::NextHopIsRelayer));
+        assert_ne!(reason, Some(SrSkipReason::UnverifiedBacktrack));
     }
 
     /// After a preset switch the requester stays on its preset: retries, T1 insurance, ACKs

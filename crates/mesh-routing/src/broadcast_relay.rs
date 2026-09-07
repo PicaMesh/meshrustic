@@ -2,8 +2,8 @@
 
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{
-    covers, delivery_hop_cost_fixed, is_placeholder_node, DownstreamTable, EdgeSource, EdgeStore,
-    MAX_EDGES_PER_NODE,
+    coverage_owner, covers, delivery_hop_cost_fixed, is_placeholder_node, DownstreamTable,
+    EdgeSource, EdgeStore, MAX_EDGES_PER_NODE,
 };
 use crate::sr_role::role_is_mute;
 
@@ -18,6 +18,9 @@ pub struct RelayCandidate {
     pub coverage_count: u8,
     pub avg_cost_fixed: u16,
     pub tier: u8,
+    /// One neighbour this candidate covers that the transmitter did not reach: the reason the
+    /// relay is worth its airtime, named in the log rather than left to be guessed at.
+    pub coverage_for: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,6 +41,9 @@ pub struct BroadcastRelayPlan {
     pub evaluated_len: u8,
     /// Nodes counted as already covered before ranking (source, heard-from and its good links).
     pub pre_covered: u8,
+    /// A neighbour our relay reaches that the transmitter did not (0 when the relay was taken
+    /// for another reason: sole candidate, downstream, stock coverage).
+    pub coverage_for: u32,
 }
 
 /// Ranking inputs collected during the first pick, for the log.
@@ -165,6 +171,8 @@ impl CoveredSet {
 
 pub struct BroadcastRelayContext<'a> {
     pub my_node: u32,
+    /// Our role rebroadcasts: needed to decide whether we may own an unconfirmed neighbour.
+    pub my_node_relays: bool,
     pub edges: &'a EdgeStore,
     pub capability: &'a CapabilityCache,
     pub downstream: &'a DownstreamTable,
@@ -175,11 +183,12 @@ fn is_non_relaying_legacy(capability: &CapabilityCache, node_id: u32) -> bool {
 }
 
 fn get_coverage_if_relays(
-    edges: &EdgeStore,
-    my_node: u32,
+    ctx: &BroadcastRelayContext<'_>,
     relay: u32,
     out: &mut [u32; MAX_EDGES_PER_NODE],
 ) -> u8 {
+    let edges = ctx.edges;
+    let my_node = ctx.my_node;
     let Some(relay_edges) = edges.find_node(relay) else {
         return 0;
     };
@@ -195,7 +204,12 @@ fn get_coverage_if_relays(
         if relay == my_node && edge.source != EdgeSource::Reported {
             continue;
         }
-        if !covers(edges, relay, target) {
+        // A neighbour nobody can be shown to reach is still worth one relay, but only from its
+        // owner: counting it everywhere made every node on the branch relay every frame for the
+        // same unconfirmed node (an Alert node that publishes nothing, 2026-09-07).
+        if !covers(edges, Some(ctx.capability), relay, target)
+            && coverage_owner(edges, ctx.capability, my_node, ctx.my_node_relays, target) != relay
+        {
             continue;
         }
         if (count as usize) < MAX_EDGES_PER_NODE {
@@ -206,14 +220,19 @@ fn get_coverage_if_relays(
     count
 }
 
-fn absorb_relay_coverage(edges: &EdgeStore, covered: &mut CoveredSet, relay: u32) {
+fn absorb_relay_coverage(
+    edges: &EdgeStore,
+    capability: &CapabilityCache,
+    covered: &mut CoveredSet,
+    relay: u32,
+) {
     covered.insert(relay);
     let Some(relay_edges) = edges.find_node(relay) else {
         return;
     };
     for i in 0..relay_edges.edge_count as usize {
         let target = relay_edges.edges[i].to;
-        if covers(edges, relay, target) {
+        if covers(edges, Some(capability), relay, target) {
             covered.insert(target);
         }
     }
@@ -240,8 +259,7 @@ where
         }
 
         let mut coverage_buf = [0u32; MAX_EDGES_PER_NODE];
-        let coverage_n =
-            get_coverage_if_relays(ctx.edges, ctx.my_node, candidate, &mut coverage_buf);
+        let coverage_n = get_coverage_if_relays(ctx, candidate, &mut coverage_buf);
         let mut unique = [0u32; MAX_EDGES_PER_NODE];
         let mut unique_count = 0u8;
         for &node in &coverage_buf[..coverage_n as usize] {
@@ -330,6 +348,7 @@ where
                 coverage_count: unique_count,
                 avg_cost_fixed,
                 tier,
+                coverage_for: unique[0],
             };
         }
     }
@@ -337,14 +356,19 @@ where
     best
 }
 
-fn build_already_covered(edges: &EdgeStore, source: u32, heard_from: u32) -> CoveredSet {
+fn build_already_covered(
+    edges: &EdgeStore,
+    capability: &CapabilityCache,
+    source: u32,
+    heard_from: u32,
+) -> CoveredSet {
     let mut covered = CoveredSet::new();
     covered.insert(source);
     covered.insert(heard_from);
     if let Some(heard_edges) = edges.find_node(heard_from) {
         for i in 0..heard_edges.edge_count as usize {
             let target = heard_edges.edges[i].to;
-            if target != 0 && covers(edges, heard_from, target) {
+            if target != 0 && covers(edges, Some(capability), heard_from, target) {
                 covered.insert(target);
             }
         }
@@ -524,7 +548,7 @@ where
 {
     let half = half_airtime_ms.max(50);
     let prefer_high = (packet_id & 1) != 0;
-    let mut already_covered = build_already_covered(ctx.edges, source, heard_from);
+    let mut already_covered = build_already_covered(ctx.edges, ctx.capability, source, heard_from);
     let pre_covered_count = already_covered.count;
     let mut candidates = build_candidates(ctx, source, heard_from);
     let peers = candidates; // every SR candidate, kept for the stock-coverage tie-break
@@ -534,6 +558,7 @@ where
     let mut slot_delay = crate::channel_access::SLOT_ORIGIN_MS;
     let mut should_relay = false;
     let mut my_delay = 0u32;
+    let mut coverage_for = 0u32;
     let mut ranked = [0u32; RANKED_LOG];
     let mut ranked_len = 0u8;
     let mut evaluated = EvaluatedList::default();
@@ -555,7 +580,7 @@ where
             candidates.erase(neighbor);
             // Stock takes the early slot — count their coverage now so we only
             // trail if we still have unique nodes after they relay.
-            absorb_relay_coverage(ctx.edges, &mut already_covered, neighbor);
+            absorb_relay_coverage(ctx.edges, ctx.capability, &mut already_covered, neighbor);
             push_ranked(&mut ranked, &mut ranked_len, neighbor);
             slot_delay = slot_delay.saturating_add(half);
         }
@@ -582,7 +607,12 @@ where
         candidates.erase(best.node_id);
 
         if has_transmitted(best.node_id) {
-            absorb_relay_coverage(ctx.edges, &mut already_covered, best.node_id);
+            absorb_relay_coverage(
+                ctx.edges,
+                ctx.capability,
+                &mut already_covered,
+                best.node_id,
+            );
             continue;
         }
 
@@ -591,12 +621,18 @@ where
             should_relay = true;
             reason = RelayReason::Ranked;
             my_delay = slot_delay;
+            coverage_for = best.coverage_for;
             break;
         }
 
         // Earlier-ranked peer is assumed to relay — subtract their coverage so we
         // only take a later slot when we still have unique nodes to reach.
-        absorb_relay_coverage(ctx.edges, &mut already_covered, best.node_id);
+        absorb_relay_coverage(
+            ctx.edges,
+            ctx.capability,
+            &mut already_covered,
+            best.node_id,
+        );
         slot_delay = slot_delay.saturating_add(half);
     }
 
@@ -643,6 +679,7 @@ where
         evaluated: evaluated.items,
         evaluated_len: evaluated.len,
         pre_covered: pre_covered_count,
+        coverage_for,
     }
 }
 
@@ -680,6 +717,7 @@ mod tests {
     ) -> BroadcastRelayContext<'a> {
         BroadcastRelayContext {
             my_node: ME,
+            my_node_relays: true,
             edges,
             capability,
             downstream,
@@ -763,7 +801,13 @@ mod tests {
     #[test]
     fn one_way_listed_neighbor_is_not_precovered() {
         let edges = edges_with_remote_transmitter(1.5);
-        assert!(!build_already_covered(&edges, BB, BB).contains(ME));
+        // We publish topology, so our silence about BB counts: BB listing us is not coverage.
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(ME, true, 0);
+        assert!(!build_already_covered(&edges, &capability, BB, BB).contains(ME));
+        // A node that publishes nothing could never confirm anything, so the listing is all the
+        // evidence there is and it does count.
+        assert!(build_already_covered(&edges, &CapabilityCache::new(), BB, BB).contains(ME));
     }
 
     /// The transmitter's own list is pre-coverage only for the neighbours it actually reaches:
@@ -772,9 +816,11 @@ mod tests {
     fn hopeless_confirmed_neighbor_is_not_precovered() {
         let mut edges = edges_with_remote_transmitter(40.0);
         edges.set_edge_hears_us(BB, ME, true);
-        assert!(!build_already_covered(&edges, BB, BB).contains(ME));
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(ME, true, 0);
+        assert!(!build_already_covered(&edges, &capability, BB, BB).contains(ME));
         edges.update_edge(ME, BB, ME, 1.5, 0, EdgeSource::Mirrored, true, 0);
-        assert!(build_already_covered(&edges, BB, BB).contains(ME));
+        assert!(build_already_covered(&edges, &capability, BB, BB).contains(ME));
     }
 
     #[test]
@@ -855,6 +901,7 @@ mod tests {
         capability.track_role(D, DEVICE_ROLE_REPEATER, 0);
         let ctx = BroadcastRelayContext {
             my_node: C,
+            my_node_relays: true,
             edges: &edges,
             capability: &capability,
             downstream: &downstream,
@@ -991,11 +1038,47 @@ mod tests {
         (edges, capability)
     }
 
+    /// A silent neighbour (mute, publishes nothing) is relayed for by exactly one node: the one
+    /// whose link to it is best, since its receive path is all anyone can measure. Before this,
+    /// every neighbour claimed it and the whole branch relayed every frame.
     #[test]
-    fn stock_coverage_goes_to_the_lowest_id_candidate_only() {
+    fn silent_neighbour_is_relayed_for_by_the_best_link_only() {
+        const SS: u32 = 0xDD00_00DD;
+        const PEER: u32 = 0xEE00_00EE;
         let downstream = DownstreamTable::new();
-        // Peer id above ours: we own SS and relay.
-        let (edges, capability) = stock_fixture(0xEE00_00EE);
+        let relay_for = |ours: f32, theirs: f32| {
+            let (mut edges, capability) = stock_fixture(PEER);
+            edges.update_edge(ME, ME, SS, ours, 0, EdgeSource::Reported, true, 0);
+            edges.update_edge(ME, PEER, SS, theirs, 0, EdgeSource::Reported, true, 0);
+            plan_broadcast_relay(
+                &ctx(&edges, &capability, &downstream),
+                0x99,
+                BB,
+                BB,
+                0xFFFF_FFFF,
+                0,
+                100,
+                never_transmitted,
+            )
+            .should_relay
+        };
+        assert!(relay_for(1.0, 4.0), "our link to it is the best: we relay");
+        assert!(
+            !relay_for(4.0, 1.0),
+            "the peer hears it better: it relays and we stay silent"
+        );
+    }
+
+    /// The plan names the neighbour that earned the relay. The log used to recompute it against
+    /// the transmitter alone, which named a node a ranked peer does reach.
+    #[test]
+    fn plan_names_the_neighbour_the_relay_is_for() {
+        const SS: u32 = 0xDD00_00DD;
+        const PEER: u32 = 0xEE00_00EE;
+        let downstream = DownstreamTable::new();
+        let (mut edges, capability) = stock_fixture(PEER);
+        // Only our link reaches SS, so ranking picks us and SS is what we relay for.
+        edges.update_edge(ME, ME, SS, 1.0, 0, EdgeSource::Reported, true, 0);
         let plan = plan_broadcast_relay(
             &ctx(&edges, &capability, &downstream),
             0x99,
@@ -1007,24 +1090,7 @@ mod tests {
             never_transmitted,
         );
         assert!(plan.should_relay);
-        assert_eq!(plan.reason, RelayReason::StockCoverage);
-        // Peer id below ours: the peer owns SS and we stay silent.
-        let (edges, capability) = stock_fixture(0xAA00_00AA);
-        let plan = plan_broadcast_relay(
-            &ctx(&edges, &capability, &downstream),
-            0x99,
-            BB,
-            BB,
-            0xFFFF_FFFF,
-            0,
-            100,
-            never_transmitted,
-        );
-        assert!(
-            !plan.should_relay,
-            "lower-id peer that also reaches SS must take it"
-        );
-        assert_eq!(plan.reason, RelayReason::None);
+        assert_eq!(plan.coverage_for, SS);
     }
 
     #[test]

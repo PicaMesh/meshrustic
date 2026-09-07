@@ -155,6 +155,7 @@ pub struct NeighborGraph {
     topology_version: u8,
     topology_dirty: bool,
     last_topology_ms: u32,
+    last_topology_list_ms: u32,
     last_maintenance_ms: u32,
     signal_routing_active: bool,
     our_tx: [NodeTxRecord; MAX_OUR_TX_RECORDS],
@@ -207,6 +208,7 @@ impl NeighborGraph {
             topology_version: 0,
             topology_dirty: false,
             last_topology_ms: 0,
+            last_topology_list_ms: 0,
             last_maintenance_ms: 0,
             signal_routing_active: true,
             our_tx: [NodeTxRecord {
@@ -652,6 +654,7 @@ impl NeighborGraph {
     ) -> crate::broadcast_relay::BroadcastRelayPlan {
         let ctx = crate::broadcast_relay::BroadcastRelayContext {
             my_node: self.my_node,
+            my_node_relays: self.is_rebroadcaster(),
             edges: &self.edges,
             capability: &self.capability,
             downstream: &self.downstream,
@@ -1464,6 +1467,14 @@ impl NeighborGraph {
         if gateway == from || gateway == self.my_node {
             return None;
         }
+        // Our own echo teaches us nothing about who is behind whom. A peer that relays a packet we
+        // just transmitted got it from us, so recording the source as downstream of that peer
+        // invents a path back through ourselves: the peer then routes that destination to us while
+        // we route it to the peer, and a unicast bounces between them (seen with the balcony node,
+        // 2026-09-07).
+        if self.has_our_transmission(packet_id) {
+            return None;
+        }
         self.edges.ensure_local_node(self.my_node, now_ms);
         // What we measured is the relay's link to us, not the relay's link to the source. An
         // inferred edge/downstream gets a nominal cost per hop the packet has travelled; with the
@@ -1972,70 +1983,44 @@ impl NeighborGraph {
     /// Do we still reach a neighbour that none of `covered_by` can deliver to?
     /// Ours are `hears_us` neighbours plus stock neighbours we own under the stock-coverage rule.
     pub fn has_unique_coverage(&self, covered_by: &[u32]) -> bool {
-        let Some(node) = self.edges.find_node(self.my_node) else {
-            return false;
-        };
+        self.unique_coverage_neighbor(covered_by).is_some()
+    }
+
+    /// The neighbour that makes our relay worth its airtime: ours to cover and reached by none of
+    /// `covered_by`. Returned rather than reduced to a bool so the decision can be logged: "we
+    /// relayed for X" is the only way to tell a justified relay from a coverage bug in the field.
+    pub fn unique_coverage_neighbor(&self, covered_by: &[u32]) -> Option<u32> {
+        let node = self.edges.find_node(self.my_node)?;
         for i in 0..node.edge_count as usize {
             let edge = node.edges[i];
             let neighbor = edge.to;
             if is_placeholder_node(neighbor) {
                 continue;
             }
-            if !edge.hears_us && !self.is_owned_stock_neighbor(neighbor, edge.hears_us) {
+            // Ours to cover: it proved it hears us, or nobody can prove anything about it and we
+            // are its owner. Otherwise it is another node's responsibility, or nobody's.
+            if !edge.hears_us
+                && crate::graph::coverage_owner(
+                    &self.edges,
+                    &self.capability,
+                    self.my_node,
+                    self.is_rebroadcaster(),
+                    neighbor,
+                ) != self.my_node
+            {
                 continue;
             }
             if covered_by.contains(&neighbor) {
                 continue;
             }
-            let covered = covered_by
-                .iter()
-                .any(|&coverer| crate::graph::covers(&self.edges, coverer, neighbor));
+            let covered = covered_by.iter().any(|&coverer| {
+                crate::graph::covers(&self.edges, Some(&self.capability), coverer, neighbor)
+            });
             if !covered {
-                return true;
+                return Some(neighbor);
             }
         }
-        false
-    }
-
-    /// A legacy neighbour the stock-coverage rule makes our responsibility: mute (it never relays,
-    /// so it can never earn `hears_us`) or a legacy node that proved it hears us, and no SR peer
-    /// with a lower node id has an edge to it. Immediate routers take their own slot.
-    fn is_owned_stock_neighbor(&self, neighbor: u32, hears_us: bool) -> bool {
-        if self.capability.status(neighbor) != CapabilityStatus::Legacy
-            || self.capability.is_immediate_relay_router(neighbor)
-        {
-            return false;
-        }
-        let mute = self
-            .capability
-            .role(neighbor)
-            .map(crate::sr_role::role_is_mute)
-            .unwrap_or(false);
-        if !(mute || hears_us) {
-            return false;
-        }
-        let Some(me) = self.edges.find_node(self.my_node) else {
-            return false;
-        };
-        for i in 0..me.edge_count as usize {
-            let peer_edge = me.edges[i];
-            let peer = peer_edge.to;
-            if peer >= self.my_node
-                || !peer_edge.hears_us
-                || self.capability.status(peer) != CapabilityStatus::SrActive
-            {
-                continue;
-            }
-            let peer_reaches = self
-                .edges
-                .find_node(peer)
-                .and_then(|n| n.find_edge(neighbor))
-                .is_some();
-            if peer_reaches {
-                return false;
-            }
-        }
-        true
+        None
     }
 
     /// Drop every committed relay for `packet_id`: the frame is on the air (or was pulled back).
@@ -2274,8 +2259,18 @@ impl NeighborGraph {
         self.last_topology_ms
     }
 
+    /// Uptime of the last topology broadcast that carried neighbours (0 = never).
+    pub fn last_topology_list_ms(&self) -> u32 {
+        self.last_topology_list_ms
+    }
+
     pub fn commit_topology_broadcast(&mut self, now_ms: u32, dirty_send: bool) {
         self.last_topology_ms = now_ms;
+        // A list with no entries (the boot broadcast) tells a requester nothing about who we
+        // hear, so it does not count as having answered one.
+        if self.neighbor_count() > 0 {
+            self.last_topology_list_ms = now_ms.max(1);
+        }
         self.topology_version = self.topology_version.wrapping_add(1);
         if dirty_send {
             self.topology_dirty = false;
@@ -2957,35 +2952,50 @@ mod tests {
         assert!(!graph.has_unique_coverage(&[HIGH_PEER]));
     }
 
+    /// Ownership of a neighbour nobody can confirm goes by the measured link, with the node id
+    /// only as a tie-break: the lowest id may be the node that hears it worst.
     #[test]
-    fn mute_neighbour_owned_by_a_lower_id_peer_is_not_ours() {
+    fn mute_neighbour_owner_is_the_best_link_then_the_lowest_id() {
         const ME: u32 = 0xAA00_00AA;
-        const LOW_PEER: u32 = 0x1100_0011;
-        const OTHER: u32 = 0xBB00_00BB;
+        const NEAR_PEER: u32 = 0xEE00_00EE; // 0xFF.... would read as a placeholder id
         const MUTE: u32 = 0xCC00_00CC;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
-        for n in [LOW_PEER, OTHER, MUTE] {
+        for n in [NEAR_PEER, MUTE] {
             graph.observe_direct_neighbor(n, -70, 8, 100, 0);
         }
-        for n in [LOW_PEER, OTHER] {
-            graph.confirm_direct_neighbor_hears_us(n);
-            graph.capability_mut().track_topology(n, true, 100);
-        }
+        graph.confirm_direct_neighbor_hears_us(NEAR_PEER);
+        graph.capability_mut().track_topology(NEAR_PEER, true, 100);
         graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
-        // OTHER's copy reaches LOW_PEER but not the mute node: the mute node is ours so far.
+        // A higher-id peer that hears the mute node a bucket better owns it, id notwithstanding.
         graph
             .edges_mut()
-            .update_edge(ME, OTHER, LOW_PEER, 1.5, 100, EdgeSource::Mirrored, true, 0);
-        graph.edges_mut().set_edge_hears_us(OTHER, LOW_PEER, true);
-        assert!(graph.has_unique_coverage(&[OTHER]));
-        // A lower-id SR peer confirmed to reach the mute node owns it under the stock-coverage
-        // rule: it is no longer our unique coverage even though OTHER's copy never reaches it.
+            .update_edge(ME, ME, MUTE, 3.0, 100, EdgeSource::Reported, true, 0);
         graph
             .edges_mut()
-            .update_edge(ME, LOW_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
-        graph.edges_mut().set_edge_hears_us(LOW_PEER, MUTE, true);
-        assert!(!graph.has_unique_coverage(&[OTHER]));
+            .update_edge(ME, NEAR_PEER, MUTE, 1.0, 100, EdgeSource::Mirrored, true, 0);
+        assert_eq!(
+            crate::graph::coverage_owner(graph.edges(), graph.capability(), ME, true, MUTE),
+            NEAR_PEER
+        );
+        // Same bucket: the lowest id decides, so it comes back to us.
+        graph
+            .edges_mut()
+            .update_edge(ME, NEAR_PEER, MUTE, 3.0, 100, EdgeSource::Mirrored, true, 0);
+        assert_eq!(
+            crate::graph::coverage_owner(graph.edges(), graph.capability(), ME, true, MUTE),
+            ME
+        );
+        // A mute node never owns anything: it does not relay.
+        graph.track_node_role(NEAR_PEER, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
+        graph
+            .capability_mut()
+            .track_role(NEAR_PEER, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
+        assert_eq!(
+            crate::graph::coverage_owner(graph.edges(), graph.capability(), ME, false, MUTE),
+            0,
+            "we cannot own it either when our own role does not relay"
+        );
     }
 
     fn topo_header(version: u8) -> crate::topology::PackedHeader {
@@ -3583,16 +3593,27 @@ mod tests {
         assert!(graph.has_unique_coverage(&[COV_A]));
     }
 
+    /// An inbound-only neighbour (we hear it, it never confirms hearing us) is nobody's coverage
+    /// unless we own it: whoever hears it best carries its traffic, and the rest stay silent.
     #[test]
-    fn has_unique_coverage_ignores_inbound_only_neighbors() {
+    fn inbound_only_neighbor_belongs_to_its_owner() {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(COV_ME);
         graph.observe_direct_neighbor(COV_A, -70, 8, 0, 0);
         graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
         graph.confirm_direct_neighbor_hears_us(COV_A);
-        // Empty covered_by would still see COV_A as a gap; assert inbound-only COV_B
-        // does not create unique coverage once COV_A is listed as covered.
-        assert!(!graph.has_unique_coverage(&[COV_A]));
+        graph.capability_mut().track_topology(COV_A, true, 0);
+        // Only we hear COV_B, so covering it is ours.
+        assert_eq!(
+            graph.unique_coverage_neighbor(&[COV_A]),
+            Some(COV_B),
+            "sole neighbour of an inbound-only node covers it"
+        );
+        // COV_A hears it better: it owns it and we have nothing left to cover.
+        graph
+            .edges_mut()
+            .update_edge(COV_ME, COV_A, COV_B, 1.0, 0, EdgeSource::Reported, true, 0);
+        assert_eq!(graph.unique_coverage_neighbor(&[COV_A]), None);
     }
 
     #[test]

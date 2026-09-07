@@ -1192,6 +1192,7 @@ pub mod sr {
                     SrSkipReason::UnicastCovered => b"unicast covered",
                     SrSkipReason::NoRelayPath => b"no relay path",
                     SrSkipReason::ReplyRetracesLink => b"reply retraces link",
+                    SrSkipReason::UnverifiedBacktrack => b"guessed route runs back",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);
@@ -1413,6 +1414,14 @@ pub mod sr {
                 put(&mut line, &mut pos, msg);
                 finish_line(&mut line, pos);
             }
+            SrLogEvent::BootstrapReplyAlreadyAnswered => {
+                let mut line = [0u8; 96];
+                let mut pos = line_prefix(&mut line);
+                let msg =
+                    b"[SR] Bootstrap reply dropped: a list already went out after the request";
+                put(&mut line, &mut pos, msg);
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::RadioReconfigured { dropped } => {
                 let mut line = [0u8; 96];
                 let mut pos = line_prefix(&mut line);
@@ -1494,6 +1503,14 @@ pub mod sr {
                     let tail = b" new=1";
                     put(&mut line, &mut pos, tail);
                 }
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::CoverageFor { neighbor } => {
+                let mut line = [0u8; 96];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[SR] Relaying for !");
+                put_hex8(&mut line, &mut pos, neighbor);
+                put(&mut line, &mut pos, b" (the transmitter did not reach it)");
                 finish_line(&mut line, pos);
             }
             SrLogEvent::RouteNextHop {
