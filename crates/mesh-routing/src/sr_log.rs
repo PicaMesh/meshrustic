@@ -252,7 +252,11 @@ pub enum RelayRetxCancelReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum T1CancelReason {
     RelayHeard,
-    AllHearsUsHeard,
+    /// We transmitted this packet ourselves; the source already had a copy to hear.
+    OwnTransmission,
+    /// At fire time the copy had no purpose left: nothing of ours to reach, and no originator
+    /// waiting to be told it was heard.
+    NothingLeftToDo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

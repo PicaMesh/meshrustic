@@ -253,6 +253,70 @@ pub const OWNER_COST_BUCKET_FIXED: u16 = 50;
 /// buckets, then the lowest node id. Mute and passive nodes never own: they do not relay.
 /// `me` is our own node and `me_relays` whether our role rebroadcasts: we are absent from our own
 /// capability cache, so our eligibility has to be passed in.
+/// Whose copy an originator will actually hear: among the nodes that can be shown to deliver
+/// to it (`covers`, so a publishing source must be known to hear the candidate and a silent one
+/// falls back to the candidate's own edge), the cheapest in the delivery direction, stock
+/// rebroadcasters given way, node id as the tie-break.
+///
+/// Deliberately not [`coverage_owner`]: that ranks a candidate's own edge *to* the target, which
+/// is the only evidence available for a neighbour nobody can be shown to reach, but it is the
+/// wrong direction for a witness — a copy from a node the originator cannot hear acknowledges
+/// nothing. A source that publishes nothing leaves each node with only its own evidence, so
+/// several may elect themselves; that is still fewer than every node that heard the frame.
+pub fn witness_owner(
+    edges: &EdgeStore,
+    capability: &CapabilityCache,
+    me: u32,
+    me_relays: bool,
+    source: u32,
+) -> u32 {
+    if source == 0 || is_placeholder_node(source) {
+        return 0;
+    }
+    let mut owner = 0u32;
+    let mut best = (u8::MAX, u16::MAX);
+    for i in 0..edges.node_count() {
+        let Some(candidate) = edges.node_id_at(i) else {
+            continue;
+        };
+        if candidate == source || is_placeholder_node(candidate) {
+            continue;
+        }
+        let tier = if candidate == me {
+            if !me_relays {
+                continue;
+            }
+            1
+        } else if capability.is_immediate_relay_router(candidate) {
+            0
+        } else if capability.status(candidate) == CapabilityStatus::SrActive {
+            1
+        } else {
+            continue;
+        };
+        // Positive evidence that the source hears this candidate: the source's own list named
+        // it, or we watched the source carry its frame. Not `known_to_hear`: a direct
+        // observation writes both edge directions from one measurement, so that test is
+        // satisfied by our own assumption of symmetry — which is the one thing a witness may
+        // not assume, since a copy the originator cannot hear acknowledges nothing.
+        let Some(edge) = edges.find_node(candidate).and_then(|n| n.find_edge(source)) else {
+            continue;
+        };
+        if !edge.hears_us {
+            continue;
+        }
+        // Priced in the delivery direction: the source's own measurement of the candidate when
+        // it published one, our own edge otherwise.
+        let cost = hop_cost_fixed(edges, candidate, source).unwrap_or(edge.etx_fixed);
+        let key = (tier, cost / OWNER_COST_BUCKET_FIXED);
+        if key < best || (key == best && candidate < owner) {
+            best = key;
+            owner = candidate;
+        }
+    }
+    owner
+}
+
 pub fn coverage_owner(
     edges: &EdgeStore,
     capability: &CapabilityCache,

@@ -1953,31 +1953,64 @@ impl NeighborGraph {
         false
     }
 
-    pub fn all_hears_us_neighbors_heard_packet(
+    /// The neighbour a late copy would still reach: ours to cover, and covered by none of the
+    /// nodes we have actually heard transmit this packet. `None` means the frame is already
+    /// everywhere our radio can put it, whoever was ranked for it.
+    ///
+    /// This is the coverage question asked at the moment of transmitting, against what happened
+    /// rather than what was predicted when we deferred. The previous test asked whether every
+    /// `hears_us` neighbour had itself *relayed* the packet, which two or more neighbours can
+    /// never satisfy: it cancelled nothing in 42 minutes of field logs (2026-09-07).
+    pub fn late_copy_reaches(
         &self,
-        packet_id: u32,
+        source: u32,
         heard_from: u32,
+        packet_id: u32,
         now_ms: u32,
-    ) -> bool {
-        let Some(node) = self.edges.find_node(self.my_node) else {
-            return false;
-        };
-        let mut hears_us_count = 0u8;
-        for i in 0..node.edge_count as usize {
-            let edge = node.edges[i];
-            let neighbor = edge.to;
-            if is_placeholder_node(neighbor) || !edge.hears_us {
-                continue;
-            }
-            hears_us_count = hears_us_count.saturating_add(1);
-            if neighbor == heard_from {
-                continue;
-            }
-            if !self.has_node_transmitted(neighbor, packet_id, now_ms) {
-                return false;
+    ) -> Option<u32> {
+        let mut transmitted = [0u32; MAX_EDGES_PER_NODE + 2];
+        let mut count = 0usize;
+        // The originator put the frame on the air itself, and the node we heard it from either
+        // originated or relayed it: both are transmitters whatever our relay table remembers.
+        for node in [source, heard_from] {
+            if node != 0 && node != self.my_node && !transmitted[..count].contains(&node) {
+                transmitted[count] = node;
+                count += 1;
             }
         }
-        hears_us_count > 0
+        if let Some(node) = self.edges.find_node(self.my_node) {
+            for i in 0..node.edge_count as usize {
+                if count >= transmitted.len() {
+                    break;
+                }
+                let neighbor = node.edges[i].to;
+                if neighbor == 0 || is_placeholder_node(neighbor) {
+                    continue;
+                }
+                if transmitted[..count].contains(&neighbor) {
+                    continue;
+                }
+                if self.has_node_transmitted(neighbor, packet_id, now_ms) {
+                    transmitted[count] = neighbor;
+                    count += 1;
+                }
+            }
+        }
+        self.unique_coverage_neighbor(&transmitted[..count])
+    }
+
+    /// Whose copy acknowledges a `want_ack` broadcast to its originator: the neighbour with the
+    /// best measured link to it, stock rebroadcasters given way, node id as the tie-break — the
+    /// same election that decides who covers an unconfirmed neighbour. One witness answers, so
+    /// the originator's implicit ACK costs one frame instead of one per node that heard it.
+    pub fn is_elected_witness(&self, source: u32) -> bool {
+        crate::graph::witness_owner(
+            &self.edges,
+            &self.capability,
+            self.my_node,
+            self.is_rebroadcaster(),
+            source,
+        ) == self.my_node
     }
 
     /// Do we still reach a neighbour that none of `covered_by` can deliver to?
@@ -2498,11 +2531,14 @@ mod tests {
         assert!(graph.has_node_transmitted(GATEWAY, PACKET_ID, at_t1));
     }
 
+    /// A late copy is worth its airtime only for a neighbour that nobody heard transmitting has
+    /// covered. Placeholders are nobody's coverage.
     #[test]
-    fn all_hears_us_heard_skips_placeholder_neighbor() {
+    fn late_copy_reaches_only_an_uncovered_neighbor() {
         const ME: u32 = 0xAA00_00AA;
         const SOURCE: u32 = 0xCC00_00CC;
         const GATEWAY: u32 = 0xBB00_00BB;
+        const EDGE: u32 = 0xDD00_00DD;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
@@ -2511,9 +2547,37 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(placeholder);
         graph.observe_direct_neighbor(GATEWAY, -70, 8, 1_000, 0);
         graph.confirm_direct_neighbor_hears_us(GATEWAY);
+        graph.capability_mut().track_topology(GATEWAY, true, 0);
         graph.record_node_transmission(GATEWAY, 42, 1_000);
+        // Only the gateway is ours to cover and it transmitted the packet itself.
+        assert_eq!(graph.late_copy_reaches(SOURCE, SOURCE, 42, 2_000), None);
+        // A second neighbour nobody reached is what a late copy is for.
+        graph.observe_direct_neighbor(EDGE, -70, 8, 1_000, 0);
+        graph.confirm_direct_neighbor_hears_us(EDGE);
+        assert_eq!(
+            graph.late_copy_reaches(SOURCE, SOURCE, 42, 2_000),
+            Some(EDGE)
+        );
+    }
 
-        assert!(graph.all_hears_us_neighbors_heard_packet(42, SOURCE, 2_000));
+    /// The other arm of "ours to cover": a silent neighbour that confirms nothing is served by
+    /// its owner, so a late copy carries the packet for it too.
+    #[test]
+    fn late_copy_reaches_a_silent_neighbour_we_own() {
+        const ME: u32 = 0xAA00_00AA;
+        const SOURCE: u32 = 0xCC00_00CC;
+        const SILENT: u32 = 0xDD00_00DD;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_packet(SOURCE, 3, 2, 0xCC, -70, 12, 1_000, 0, None, 42);
+        // SILENT never confirms it hears us and publishes nothing: ours by ownership, and the
+        // source has no edge to it, so nobody who transmitted has covered it.
+        graph.observe_direct_neighbor(SILENT, -70, 8, 1_000, 0);
+        assert_eq!(
+            graph.late_copy_reaches(SOURCE, SOURCE, 42, 2_000),
+            Some(SILENT)
+        );
     }
 
     #[test]

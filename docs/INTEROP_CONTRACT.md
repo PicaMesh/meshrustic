@@ -198,17 +198,49 @@ airtime. Every SignalRouting node uses the same figure.
   set of coverers — that named neighbours a ranked peer does reach. `unique_coverage_neighbor`
   answers the dupe question instead: is any neighbour left uncovered by the nodes that have
   actually transmitted. Test: `plan_names_the_neighbour_the_relay_is_for`.
-- **T1 is no-slot insurance, not a second coverage path.** When we defer with no ranked slot
-  (`BetterNeighbor`), we arm T1 so that if nobody retransmits, a late copy still reaches the
-  source for confirmation (`arm_t1_for_deferred_broadcast`). A ranked commit never arms T1.
+- **Sole candidate.** When the candidate list is only us — nobody else here can carry the frame,
+  or we have not classified any neighbour yet — the ranking's coverage question has nothing to
+  weigh, and our copy is the only witness its transmitter can ever get, so we relay immediately
+  (`RelayReason::Sparse`). This is a node's state for its first topology interval after boot,
+  where behaving like a plain rebroadcaster is right, and it is what makes a two-node mesh work.
+- **A copy of somebody's broadcast serves one of two named purposes, and the choice is made
+  when the copy would go out, not when it is queued.** Deferring always arms T1
+  (`arm_t1_for_deferred_broadcast`); at its rung the frame goes out only if:
+  **reach** — `NeighborGraph::late_copy_reaches` finds a neighbour of ours that none of the
+  nodes we actually heard transmit this packet has covered (the peer we deferred to may simply
+  never have relayed: in 68 of 77 firings on 2026-09-07 the ranked peer was genuinely silent),
+  logged as the `CoverageFor` neighbour; or
+  **witness** — the frame carries `want_ack` and reached us straight from its originator
+  (`hop_start == hop_limit`), and `NeighborGraph::is_elected_witness` makes us its answerer.
+  Stock turns a heard rebroadcast into its implicit ACK and otherwise retransmits
+  `NUM_RELIABLE_RETX` times, so one elected witness replaces three frames from the sender; the
+  election is `witness_owner`, which is deliberately not `coverage_owner`: that one ranks a
+  candidate's own edge *to* the target, the only evidence available for a neighbour nobody can be
+  shown to reach, but the wrong direction here — a witness must be a node the originator can
+  hear. `witness_owner` requires positive evidence of that (the source's own list naming the
+  candidate, or us watching the source carry its frame) and prices the link as the source
+  measures it; edge existence alone will not do, because a direct observation writes both edge
+  directions from one measurement. A source that publishes nothing leaves each node with only
+  its own evidence, so several may elect themselves — still fewer than every node that heard it. A frame that
+  arrived relayed was already witnessed — the relay's own transmission is the rebroadcast its
+  source heard — so no witness is owed for it.
+  Neither purpose left means the copy is airtime and nothing else
+  (`T1CancelReason::NothingLeftToDo`, logged as `nothing left to reach or tell`); before this
+  was checked, 87 such frames went out against 21 coverage relays in 42 minutes. The predicate
+  it replaced asked whether every `hears_us` neighbour had itself *relayed* the packet, which
+  two or more neighbours can never satisfy: it cancelled nothing in those 42 minutes.
+  Our own originated broadcasts keep their own timer and are not judged by this rule; a ranked
+  commit never arms T1.
   Any heard rebroadcast cancels T1; T1 never fires if we already recorded our own transmission.
   Insurers stagger: every node that deferred arms T1, so each waits its unranked slot rung
   (`relay_slot_index`, one half-airtime apart) after the defer window, and the first firing
   cancels the rest. Firing together would collide exactly when the ranked relay is the frame
   that went missing.
   Originator T1 in `send_local` remains a separate “did anyone rebroadcast?” timer with the same
-  cancel-on-rebroadcast helpers. Tests: `t1_retransmit_fires_after_defer_window`,
-  `ranked_broadcast_slot_does_not_arm_t1`.
+  cancel-on-rebroadcast helpers. Tests: `t1_retransmit_fires_after_defer_window` (the peer that
+  absorbed our coverage stayed silent), `t1_stands_down_once_the_peer_it_insured_transmits`,
+  `late_copy_with_no_purpose_is_cancelled_at_fire_time`, `source_witness_is_its_best_linked_neighbour`,
+  `late_copy_reaches_only_an_uncovered_neighbor`, `ranked_broadcast_slot_does_not_arm_t1`.
 
 ## 4. Duplicates and hand-offs
 
