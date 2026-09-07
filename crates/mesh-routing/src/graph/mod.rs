@@ -16,9 +16,9 @@ pub use placeholder::{
     get_placeholder_for_relay, is_placeholder_node, placeholder_node_id, PLACEHOLDER_NODE_PREFIX,
 };
 pub use route::{
-    calculate_route, find_better_positioned_neighbor, is_node_routable, verified_connectivity,
-    RoutableFilter, Route, RouteCache, MAX_CACHED_ROUTES, ROUTE_CACHE_TIMEOUT_MS,
-    UNVERIFIED_HOP_COST_FACTOR,
+    calculate_route, can_deliver, delivery_hop_cost_fixed, find_better_positioned_neighbor,
+    is_node_routable, publishes_topology, verified_connectivity, RoutableFilter, Route,
+    RouteCache, MAX_CACHED_ROUTES, ROUTE_CACHE_TIMEOUT_MS, UNVERIFIED_HOP_COST_FACTOR,
 };
 
 pub const MAX_GRAPH_NODES: usize = 40;

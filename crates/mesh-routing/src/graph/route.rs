@@ -167,11 +167,12 @@ fn prev_of(nodes: &[DNode; MAX_GRAPH_NODES], node_count: usize, id: u32) -> u32 
         .map_or(0, |n| n.prev)
 }
 
-/// Can a frame transmitted by `from` be received by `to`? An edge records hearing: `from`
-/// listing `to` says `from` hears `to`. The reverse is known only when that edge carries
-/// `hears_us` (`to` confirmed it hears `from`) or `to` itself lists `from`. A node that
-/// publishes topology and confirms neither does not hear `from`; a node that publishes none
-/// (stock, or not yet classified) cannot be ruled out.
+/// Can a frame transmitted by `from` be received by `to`?
+///
+/// Edges are one-directional evidence (`from` listing `to` means `from` hears `to`). Delivery
+/// needs the other direction: `hears_us` on that edge, or `to` listing `from`. If `to` publishes
+/// topology and confirms neither, it does not hear `from`; if it publishes none, silence cannot
+/// be treated as proof it does not hear.
 pub fn can_deliver(
     edges: &EdgeStore,
     capability: Option<&CapabilityCache>,
@@ -195,13 +196,34 @@ pub fn can_deliver(
     !publishes_topology(capability, to)
 }
 
-/// Does `node` broadcast neighbour lists (SR active or passive)? Then its list is the
-/// authoritative set of nodes that can deliver to it, and a missing entry means "does not hear".
+/// SR active/passive lists are authoritative: unlisted peers do not hear that node.
 pub fn publishes_topology(capability: Option<&CapabilityCache>, node: u32) -> bool {
     matches!(
         capability.map(|c| c.status(node)),
         Some(CapabilityStatus::SrActive) | Some(CapabilityStatus::Passive)
     )
+}
+
+/// Hop cost for a deliverable `from → to`, priced at the receiver when that measurement exists.
+///
+/// Falls back to the sender's edge when only `hears_us` (or a non-publishing receiver) backs
+/// delivery. `None` if not deliverable, or deliverable only by stock assumption with no edge cost.
+pub fn delivery_hop_cost_fixed(
+    edges: &EdgeStore,
+    capability: Option<&CapabilityCache>,
+    from: u32,
+    to: u32,
+) -> Option<u16> {
+    if !can_deliver(edges, capability, from, to) {
+        return None;
+    }
+    if let Some(edge) = edges.find_node(to).and_then(|n| n.find_edge(from)) {
+        return Some(edge.etx_fixed);
+    }
+    edges
+        .find_node(from)
+        .and_then(|n| n.find_edge(to))
+        .map(|e| e.etx_fixed)
 }
 
 /// Lower `cost[m]` to `cost + edge_cost` with `via` as the next hop toward the destination.
@@ -803,5 +825,54 @@ mod tests {
         let downstream = DownstreamTable::new();
         let route = calculate_route(&edges, &downstream, 0xAA, 0xCC, 0, Some(&filter));
         assert_eq!(route.next_hop, 0xBB);
+    }
+
+    #[test]
+    fn can_deliver_requires_confirmation_when_receiver_publishes_topology() {
+        const TX: u32 = 0xAA;
+        const RX: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(TX, 0);
+        edges.update_edge(TX, TX, RX, 2.0, 0, EdgeSource::Reported, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(RX, true, 0);
+        assert!(!can_deliver(&edges, Some(&capability), TX, RX));
+        edges.set_edge_hears_us(TX, RX, true);
+        assert!(can_deliver(&edges, Some(&capability), TX, RX));
+        assert_eq!(
+            delivery_hop_cost_fixed(&edges, Some(&capability), TX, RX),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn can_deliver_from_receiver_listing_and_prefers_receiver_cost() {
+        const TX: u32 = 0xAA;
+        const RX: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(TX, 0);
+        edges.update_edge(TX, TX, RX, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(TX, RX, TX, 3.0, 0, EdgeSource::Mirrored, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(RX, true, 0);
+        assert!(can_deliver(&edges, Some(&capability), TX, RX));
+        assert_eq!(
+            delivery_hop_cost_fixed(&edges, Some(&capability), TX, RX),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn can_deliver_assumes_stock_receiver_hears_when_unclear() {
+        const TX: u32 = 0xAA;
+        const STOCK: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(TX, 0);
+        edges.update_edge(TX, TX, STOCK, 2.5, 0, EdgeSource::Reported, true, 0);
+        assert!(can_deliver(&edges, None, TX, STOCK));
+        assert_eq!(
+            delivery_hop_cost_fixed(&edges, None, TX, STOCK),
+            Some(250)
+        );
     }
 }
