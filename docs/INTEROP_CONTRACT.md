@@ -27,9 +27,11 @@ airtime. Every SignalRouting node uses the same figure.
   frames back to back because each carries its own contention delay.
 - **Coordinated relay slots start at the turnaround.** Slot k of the SignalRouting ladder fires
   at `SLOT_ORIGIN_MS` plus k half-airtimes (`channel_access::slot_delay_ms`, used by
-  `plan_broadcast_relay` and `NeighborGraph::commit_relay`). All SignalRouting nodes share the
-  origin, so slot order agrees at every preset. Tests:
-  `sr_slot_schedule`, `broadcast_relay` unit tests.
+  `plan_broadcast_relay` and `NeighborGraph::commit_relay`). Undesignated cost-ranked unicast
+  slot 0 uses the same origin (`Router::evaluate_tx_plan`), as does a unicast that names us as
+  next hop (`plan_designated_unicast`). All SignalRouting nodes share the origin, so slot order
+  agrees at every preset. Tests: `sr_slot_schedule`, `broadcast_relay` unit tests,
+  `undesignated_unicast_slot_zero_waits_for_peer_turnaround`.
 - **Waiting for a designated SR next hop.** Before acting in its place, a candidate waits the
   turnaround plus the peer's maximum contention delay plus one airtime
   (`channel_access::peer_relay_wait_ms`, via `Router::sr_peer_relay_wait_ms`). For a stock next
@@ -106,6 +108,12 @@ airtime. Every SignalRouting node uses the same figure.
   as `Route to !X via !Y cost=C hops=H`. `find_better_positioned_neighbor` applies the same
   evidence rule through `route::can_deliver`. Tests: `one_way_edge_is_not_a_route`,
   `route_cost_is_measured_at_the_receiver`.
+- **Delivery vs confirmed coverage.** Route search and unicast ranking treat a hop as
+  deliverable via `route::can_deliver` (optimistic when the receiver does not publish topology).
+  Broadcast absorb, pre-cover and unique-coverage cancel use `route::known_to_hear` only
+  (confirmed `hears_us` or reverse list), so mute or silent neighbours are not counted as
+  covered. Shared helpers: `delivery_hop_cost_fixed`. Tests: `can_deliver_*`,
+  `known_to_hear_ignores_stock_optimism`, `one_way_list_to_publishing_dest_is_not_a_direct_path`.
 - **Inbound-gateway fallback.** When no confirmed path exists (and the downstream table has
   none either), the search runs again allowing hops into a topology-publishing node that never
   confirmed the sender, at `UNVERIFIED_HOP_COST_FACTOR` times their cost, so the node that hears
@@ -113,10 +121,46 @@ airtime. Every SignalRouting node uses the same figure.
   truncated list. The route is marked unverified (`Route::verified`, logged as `unverified`),
   a confirmed path of any length wins over it, and passive nodes are never chosen as the
   gateway. Test: `inbound_gateway_is_the_fallback_only_without_a_confirmed_path`.
-- **A next hop equal to the destination's byte names no relayer.** Stock's `NextHopRouter`
-  learns the destination itself as next hop from a direct reply. Such a unicast is planned as one
-  with no next hop: the cost ranking decides, nobody owns slot 0 (`Router::evaluate_tx_plan`,
-  `relayer_named`). Test: `next_hop_equal_to_the_destination_names_no_relayer`.
+- **A next hop equal to the destination's byte names no relayer.** A unicast whose next hop is
+  the destination's own low byte is planned as one with no named relayer: the cost ranking
+  decides, nobody owns slot 0 (`Router::evaluate_tx_plan`, `relayer_named`). Test:
+  `next_hop_equal_to_the_destination_names_no_relayer`.
+- **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
+  names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
+  the destination (`plan_unicast_relay`); the best placed keys up first and the rest cancel on
+  its copy. Slot 0 waits `SLOT_ORIGIN_MS`; later slots wait for the leader's peer relay window
+  then space by half an airtime. Tests: `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
+  `undesignated_unicast_slot_zero_waits_for_peer_turnaround`.
+- **Soft coverage skips.** `UnicastCovered` for a shared downstream gateway, or for a
+  better-positioned SR neighbour, applies only when that node is known to hold this copy
+  (`heard_from` or has already transmitted this id). A neighbour that *could* hear the
+  transmitter is not enough. Tests: `shared_downstream_suppresses_only_when_gateway_holds_copy`,
+  `sr_neighbour_must_have_transmitted_to_suppress_us`.
+- **Next hop is the relayer.** If our path next hop is the node we heard from, we drop the
+  relay only when that node can finish delivery to the destination (`can_deliver` or
+  downstream). Otherwise the next hop is cleared and we stay in the ranking as backup. Tests:
+  `unicast_not_relayed_back_to_the_relayer`, `next_hop_is_relayer_clears_when_they_cannot_finish`.
+- **Designated next hop and backup.** A wire next hop that is not us owns slot 0; every other
+  candidate shifts one slot behind the peer or stock wait (`plan_designated_unicast`). Ranking
+  `Err` does not abort that backup. Forward and backup TX stamp **our path** next hop; flood
+  (`next_hop = 0`) only on the last relayed `want_ack` retry. Tests:
+  `unicast_designated_*`, `designated_hop_backup_survives_ranking_skip`,
+  `forwarded_want_ack_unicast_is_retried_then_released_to_flooding`.
+
+## 3b. Broadcast relay and T1
+
+- **Unique coverage owns a slot.** A broadcast relay slot is taken when we still uniquely reach
+  a neighbour that the transmitter and earlier coverers do not (`known_to_hear`). Otherwise we
+  take no ranked slot. Pending later slots cancel when unique coverage is gone
+  (`has_unique_coverage` / `perhaps_cancel_dupe`). Tests: broadcast coverage cases in
+  `broadcast_relay` / `sr_slot_schedule` / `sr_coverage`.
+- **T1 is no-slot insurance, not a second coverage path.** When we defer with no ranked slot
+  (`BetterNeighbor`), we arm T1 so that if nobody retransmits, a late copy still reaches the
+  source for confirmation (`arm_t1_for_deferred_broadcast`). A ranked commit never arms T1.
+  Any heard rebroadcast cancels T1; T1 never fires if we already recorded our own transmission.
+  Originator T1 in `send_local` remains a separate “did anyone rebroadcast?” timer with the same
+  cancel-on-rebroadcast helpers. Tests: `t1_retransmit_fires_after_defer_window`,
+  `ranked_broadcast_slot_does_not_arm_t1`.
 
 ## 4. Duplicates and hand-offs
 
