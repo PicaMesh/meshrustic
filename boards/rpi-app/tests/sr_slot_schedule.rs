@@ -1,9 +1,7 @@
 //! Broadcast relay slot scheduling (phased stock → SR → downstream → coverage).
 
 use mesh_routing::channel_access::SLOT_ORIGIN_MS;
-use mesh_routing::{
-    EdgeSource, NeighborGraph, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, POOR_LINK_ETX_THRESHOLD,
-};
+use mesh_routing::{EdgeSource, NeighborGraph, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER};
 
 const ME: u32 = 0xCC00_00CC;
 const BB: u32 = 0xBB00_00BB;
@@ -84,7 +82,7 @@ fn best_candidate_assigned_earlier_slot() {
 }
 
 #[test]
-fn poor_etx_neighbor_not_precovered() {
+fn one_way_listed_neighbor_is_not_precovered() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(ME);
     graph.set_device_role(DEVICE_ROLE_ROUTER);
@@ -94,16 +92,11 @@ fn poor_etx_neighbor_not_precovered() {
     graph
         .edges_mut()
         .update_edge(ME, DD, BB, 2.0, 0, EdgeSource::Reported, true, 0);
-    graph.edges_mut().update_edge(
-        ME,
-        BB,
-        ME,
-        POOR_LINK_ETX_THRESHOLD + 1.0,
-        0,
-        EdgeSource::Reported,
-        true,
-        0,
-    );
+    graph
+        .edges_mut()
+        .update_edge(ME, BB, ME, 1.5, 0, EdgeSource::Reported, true, 0);
+    graph.capability_mut().track_topology(ME, true, 0);
+    graph.capability_mut().track_topology(BB, true, 0);
     let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
     assert!(plan.should_relay);
 }

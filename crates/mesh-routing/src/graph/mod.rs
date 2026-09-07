@@ -17,8 +17,8 @@ pub use placeholder::{
 };
 pub use route::{
     calculate_route, can_deliver, delivery_hop_cost_fixed, find_better_positioned_neighbor,
-    is_node_routable, publishes_topology, verified_connectivity, RoutableFilter, Route,
-    RouteCache, MAX_CACHED_ROUTES, ROUTE_CACHE_TIMEOUT_MS, UNVERIFIED_HOP_COST_FACTOR,
+    is_node_routable, known_to_hear, publishes_topology, verified_connectivity, RoutableFilter,
+    Route, RouteCache, MAX_CACHED_ROUTES, ROUTE_CACHE_TIMEOUT_MS, UNVERIFIED_HOP_COST_FACTOR,
 };
 
 pub const MAX_GRAPH_NODES: usize = 40;

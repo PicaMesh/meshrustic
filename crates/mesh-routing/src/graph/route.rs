@@ -179,6 +179,17 @@ pub fn can_deliver(
     from: u32,
     to: u32,
 ) -> bool {
+    if known_to_hear(edges, from, to) {
+        return true;
+    }
+    !publishes_topology(capability, to)
+}
+
+/// Confirmed hearing only: `to` hears `from` via `hears_us` or by listing `from`.
+///
+/// Broadcast coverage uses this instead of [`can_deliver`] so mute/legacy neighbours are not
+/// treated as covered merely because they do not publish topology.
+pub fn known_to_hear(edges: &EdgeStore, from: u32, to: u32) -> bool {
     if edges
         .find_node(from)
         .and_then(|n| n.find_edge(to))
@@ -186,14 +197,10 @@ pub fn can_deliver(
     {
         return true;
     }
-    if edges
+    edges
         .find_node(to)
         .and_then(|n| n.find_edge(from))
         .is_some()
-    {
-        return true;
-    }
-    !publishes_topology(capability, to)
 }
 
 /// SR active/passive lists are authoritative: unlisted peers do not hear that node.
@@ -874,5 +881,18 @@ mod tests {
             delivery_hop_cost_fixed(&edges, None, TX, STOCK),
             Some(250)
         );
+    }
+
+    #[test]
+    fn known_to_hear_ignores_stock_optimism() {
+        const TX: u32 = 0xAA;
+        const STOCK: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(TX, 0);
+        edges.update_edge(TX, TX, STOCK, 2.0, 0, EdgeSource::Reported, true, 0);
+        assert!(!known_to_hear(&edges, TX, STOCK));
+        assert!(can_deliver(&edges, None, TX, STOCK));
+        edges.set_edge_hears_us(TX, STOCK, true);
+        assert!(known_to_hear(&edges, TX, STOCK));
     }
 }

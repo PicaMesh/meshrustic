@@ -51,7 +51,6 @@ pub use bridge::{
 };
 pub use broadcast_relay::{
     plan_broadcast_relay, BroadcastRelayContext, BroadcastRelayPlan, RelayCandidate, RelayReason,
-    POOR_LINK_ETX_THRESHOLD,
 };
 pub use capability::{
     CapabilityCache, CapabilityStatus, CAPABILITY_TTL_MS, MAX_CAPABILITY_RECORDS,
@@ -63,7 +62,7 @@ pub use coordinated_relay::{
 pub use graph::{
     calculate_etx, calculate_route, can_deliver, delivery_hop_cost_fixed, etx_to_fixed,
     etx_to_signal, find_better_positioned_neighbor, fixed_to_etx, get_placeholder_for_relay,
-    is_node_routable, is_placeholder_node, placeholder_node_id, publishes_topology,
+    is_node_routable, is_placeholder_node, known_to_hear, placeholder_node_id, publishes_topology,
     verified_connectivity, DownstreamTable, EdgeSource, RoutableFilter, Route, RouteCache,
     MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE, PLACEHOLDER_NODE_PREFIX,
     UNVERIFIED_HOP_COST_FACTOR,

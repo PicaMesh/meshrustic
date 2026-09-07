@@ -1969,11 +1969,8 @@ impl NeighborGraph {
         hears_us_count > 0
     }
 
-    /// True when at least one direct neighbor is not covered by the union of `covered_by` edge sets.
-    /// Do we still reach a neighbour that none of `covered_by` (the transmitter and every relayer
-    /// heard so far) reaches? Ours are the `hears_us` neighbours plus the stock neighbours we own
-    /// under the stock-coverage rule; a coverer's edge counts only when its link is not poor,
-    /// the same threshold the slot ranking applies to pre-coverage.
+    /// Do we still reach a neighbour that none of `covered_by` can deliver to?
+    /// Ours are `hears_us` neighbours plus stock neighbours we own under the stock-coverage rule.
     pub fn has_unique_coverage(&self, covered_by: &[u32]) -> bool {
         let Some(node) = self.edges.find_node(self.my_node) else {
             return false;
@@ -1991,10 +1988,7 @@ impl NeighborGraph {
                 continue;
             }
             let covered = covered_by.iter().any(|&coverer| {
-                self.edges
-                    .find_node(coverer)
-                    .and_then(|n| n.find_edge(neighbor))
-                    .is_some_and(|e| e.etx() < crate::broadcast_relay::POOR_LINK_ETX_THRESHOLD)
+                crate::graph::known_to_hear(&self.edges, coverer, neighbor)
             });
             if !covered {
                 return true;

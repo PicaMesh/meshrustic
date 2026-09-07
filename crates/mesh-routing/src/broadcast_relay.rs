@@ -2,12 +2,11 @@
 
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{
-    is_placeholder_node, DownstreamTable, EdgeSource, EdgeStore, MAX_EDGES_PER_NODE,
+    delivery_hop_cost_fixed, is_placeholder_node, known_to_hear, DownstreamTable, EdgeSource,
+    EdgeStore, MAX_EDGES_PER_NODE,
 };
 use crate::sr_role::role_is_mute;
 
-/// ETX above this threshold is not treated as good pre-coverage from `heard_from`.
-pub const POOR_LINK_ETX_THRESHOLD: f32 = 7.0;
 const BIDI_ETX_CEILING: f32 = 20.0;
 const DOWNSTREAM_TTL_MS: u32 = 7_200_000;
 const MAX_COVERED: usize = MAX_EDGES_PER_NODE + 8;
@@ -191,16 +190,12 @@ fn get_coverage_if_relays(
         if target == 0 || is_placeholder_node(target) {
             continue;
         }
-        // Rank ourselves from the edges peers can see, i.e. what our topology broadcast
-        // carries (Reported edges). Mirrored edges learned from relayed packets are real
-        // but invisible to peers; counting them made every node rate its own coverage
-        // above the others' and two nodes then both settled on the same slot.
+        // Mirrored edges are invisible to peers; counting them made colocated nodes disagree
+        // on slot order.
         if relay == my_node && edge.source != EdgeSource::Reported {
             continue;
         }
-        // Count nodes that can hear this relay (not our own egress set — that
-        // under-counted SR peers that cover remote topology we do not hear).
-        if !edge.hears_us {
+        if !known_to_hear(edges, relay, target) {
             continue;
         }
         if (count as usize) < MAX_EDGES_PER_NODE {
@@ -217,7 +212,10 @@ fn absorb_relay_coverage(edges: &EdgeStore, covered: &mut CoveredSet, relay: u32
         return;
     };
     for i in 0..relay_edges.edge_count as usize {
-        covered.insert(relay_edges.edges[i].to);
+        let target = relay_edges.edges[i].to;
+        if known_to_hear(edges, relay, target) {
+            covered.insert(target);
+        }
     }
 }
 
@@ -262,21 +260,18 @@ where
                 0,
             );
         }
-        // Zero unique coverage never wins a slot (including self). Sparse sole-candidate
-        // flood and stock-trailing slots are handled after the ranking loop.
+        // Sparse sole-candidate and stock-trailing slots are handled after ranking.
         if unique_count == 0 {
             continue;
         }
 
-        let Some(candidate_edges) = ctx.edges.find_node(candidate) else {
-            continue;
-        };
-
         let mut total_cost = 0f32;
         let mut valid_costs = 0u8;
         for &target in &unique[..unique_count as usize] {
-            if let Some(edge) = candidate_edges.find_edge(target) {
-                total_cost += edge.etx();
+            if let Some(fixed) =
+                delivery_hop_cost_fixed(ctx.edges, Some(ctx.capability), candidate, target)
+            {
+                total_cost += fixed as f32 / 100.0;
                 valid_costs += 1;
             }
         }
@@ -284,8 +279,7 @@ where
             continue;
         }
 
-        // Bucketed to half an ETX: own links and peer-reported links price a few hundredths
-        // apart, and an exact comparison let colocated nodes rank each other in opposite orders.
+        // Own vs peer-reported ETX differ by hundredths; exact compare inverted colocated ranks.
         let avg_cost_fixed = if valid_costs > 0 {
             let fixed = (total_cost / valid_costs as f32 * 100.0) as u16;
             fixed / crate::unicast_relay::COST_BUCKET_FIXED
@@ -294,7 +288,6 @@ where
             0
         };
         if let Some(ev) = evaluated.as_deref_mut() {
-            // Fill in the cost of the entry pushed above now that it is known.
             let n = ev.len as usize;
             if n > 0 && ev.items[n - 1].0 == candidate {
                 ev.items[n - 1].3 = avg_cost_fixed;
@@ -302,7 +295,11 @@ where
         }
         let mut tier = 0u8;
         if source_node != 0 {
-            if let Some(edge) = candidate_edges.find_edge(source_node) {
+            if let Some(edge) = ctx
+                .edges
+                .find_node(candidate)
+                .and_then(|n| n.find_edge(source_node))
+            {
                 if edge.hears_us && edge.etx() < BIDI_ETX_CEILING {
                     tier = 1;
                 }
@@ -346,9 +343,9 @@ fn build_already_covered(edges: &EdgeStore, source: u32, heard_from: u32) -> Cov
     covered.insert(heard_from);
     if let Some(heard_edges) = edges.find_node(heard_from) {
         for i in 0..heard_edges.edge_count as usize {
-            let edge = heard_edges.edges[i];
-            if edge.to != 0 && edge.etx() < POOR_LINK_ETX_THRESHOLD {
-                covered.insert(edge.to);
+            let target = heard_edges.edges[i].to;
+            if target != 0 && known_to_hear(edges, heard_from, target) {
+                covered.insert(target);
             }
         }
     }
@@ -748,14 +745,52 @@ mod tests {
     }
 
     #[test]
-    fn poor_etx_neighbor_not_precovered() {
+    fn one_way_listed_neighbor_is_not_precovered() {
         let mut edges = EdgeStore::new();
-        let mut capability = CapabilityCache::new();
-        let _downstream = DownstreamTable::new();
-        setup_stock_topology(&mut edges, &mut capability);
-        edges.update_edge(ME, BB, ME, 10.0, 0, EdgeSource::Reported, true, 0);
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, BB, ME, 1.5, 0, EdgeSource::Reported, true, 0);
         let covered = build_already_covered(&edges, BB, BB);
         assert!(!covered.contains(ME));
+    }
+
+    #[test]
+    fn one_way_absorb_does_not_suppress_unique_coverage_slot() {
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        const FF: u32 = 0xAA00_00FF;
+        const PEER: u32 = 0xEE00_00EE;
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, PEER, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, FF, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(ME, PEER, true);
+        edges.set_edge_hears_us(ME, FF, true);
+        // Peer lists FF one-way (peer hears FF; FF does not hear peer). Ranking must not
+        // treat FF as covered after the peer is assumed to relay.
+        edges.update_edge(ME, PEER, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, PEER, FF, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(PEER, BB, true);
+        edges.update_edge(ME, BB, PEER, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(BB, PEER, true);
+        capability.track_topology(PEER, true, 0);
+        capability.track_topology(ME, true, 0);
+        capability.track_topology(FF, true, 0);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            never_transmitted,
+        );
+        assert!(
+            plan.should_relay,
+            "FF still unique to us after one-way absorb of the peer"
+        );
     }
 
     #[test]
