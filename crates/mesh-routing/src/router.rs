@@ -1757,11 +1757,10 @@ impl Router {
                 return plan;
             }
             Some(Ok(mut ranked)) if !relayer_named => {
-                // Slot 0 keys up at once. Later slots first wait for the leader's relay to
-                // clear the air (its contention delay plus one airtime, as for a designated SR
-                // hop), then space out by half an airtime.
+                // Slot 0 still needs the peer turnaround; keying up at delay 0 loses every
+                // receiver still reading the frame we are answering.
                 ranked.slot_delay_ms = if ranked.slot_index == 0 {
-                    0
+                    crate::channel_access::SLOT_ORIGIN_MS
                 } else {
                     self.sr_peer_relay_wait_ms(slot_ms)
                         .saturating_add((ranked.slot_index as u32 - 1).saturating_mul(half_airtime))
@@ -5275,6 +5274,57 @@ mod tests {
             .unwrap();
         assert!(dupe.duplicate);
         assert!(router.relay_tx_after(UNI_SOURCE, 0x701, 0).is_none());
+    }
+
+    #[test]
+    fn undesignated_unicast_slot_zero_waits_for_peer_turnaround() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_DEST, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_DEST);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_DEST, true, 0);
+        // No named next hop: we are the sole cost-ranked candidate (direct to DEST).
+        let wire = unicast_wire(3, 3, 0, 0xDD, 0x702);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        let origin = crate::channel_access::SLOT_ORIGIN_MS;
+        let tx_after = plan
+            .relay
+            .map(|r| r.delay_ms)
+            .or_else(|| router.relay_tx_after(UNI_SOURCE, 0x702, 0))
+            .expect("slot 0 planned");
+        assert!(
+            tx_after >= origin,
+            "undesignated slot 0 must wait peer turnaround: {tx_after} < {origin}"
+        );
+        assert!(
+            router.poll_ready_relay(origin.saturating_sub(1)).is_none(),
+            "must not release inside the turnaround"
+        );
+        assert!(
+            router
+                .poll_ready_relay(origin + coordinated_relay::DEFAULT_SLOT_MS)
+                .is_some(),
+            "slot 0 ready at origin"
+        );
     }
 
     #[test]
