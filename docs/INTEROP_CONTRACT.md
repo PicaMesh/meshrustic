@@ -351,6 +351,19 @@ airtime. Every SignalRouting node uses the same figure.
   receivers ignore the flags. Tests:
   `chunked_topology_clears_unlisted_hears_us_only_after_last_chunk`,
   `large_neighbourhood_splits_into_flagged_chunks`.
+- **Three ways a neighbour proves it hears us, one definition.** Its topology list names us; we
+  watch it carry a frame of ours; or a frame of its own reaches us **direct** and names our byte
+  as its next hop. The third is new: a next hop is learned from traffic received, so a peer could
+  only have chosen to route through us by hearing us. All three go through
+  `NeighborGraph::confirm_direct_neighbor_hears_us`, which reports whether the flag actually
+  changed. It must be a direct frame — on a relayed one the next-hop byte was stamped by the
+  relayer and says nothing about the originator — and never a broadcast, where the field carries
+  no designation. Without this a reply to a neighbour whose list has not reached us yet cannot be
+  framed as a last hop, so it goes out with a spare hop and gets relayed: field 2026-09-08, a
+  traceroute reply to a neighbour 47 dB down was carried by two further relays because its
+  requester had rebooted and had not yet published a list naming us. Tests:
+  `a_direct_frame_routed_through_us_proves_the_sender_hears_us`,
+  `a_relayed_frame_naming_us_proves_nothing_about_its_sender`.
 - **Three classes of edge, and only two of them are evidence.** An edge is `Reported` (we
   measured it ourselves), `Mirrored` (a peer published a measurement of one of its own links) or
   `Inferred` (nobody measured it: we minted it because a relayed frame crossed the link, priced at

@@ -2209,17 +2209,7 @@ impl NeighborGraph {
         if packet_from != self.my_node && !self.is_committed_relay_for_id(packet_id) {
             return false;
         }
-        let already = self
-            .edges
-            .find_node(self.my_node)
-            .and_then(|n| n.find_edge(gateway))
-            .map(|e| e.hears_us)
-            .unwrap_or(false);
-        if already {
-            return false;
-        }
-        self.confirm_direct_neighbor_hears_us(gateway);
-        true
+        self.confirm_direct_neighbor_hears_us(gateway)
     }
 
     pub fn has_active_relay_commits(&self) -> bool {
@@ -2237,8 +2227,25 @@ impl NeighborGraph {
         !crate::sr_role::role_is_mute(self.device_role)
     }
 
-    pub fn confirm_direct_neighbor_hears_us(&mut self, neighbor: u32) {
+    /// Record that `neighbor` hears us, reporting whether that is new information. One
+    /// definition for every source of the evidence: a peer carrying our traffic, a peer listing
+    /// us, or a peer routing through us.
+    pub fn confirm_direct_neighbor_hears_us(&mut self, neighbor: u32) -> bool {
+        if neighbor == 0 || neighbor == self.my_node {
+            return false;
+        }
+        let Some(edge) = self
+            .edges
+            .find_node(self.my_node)
+            .and_then(|n| n.find_edge(neighbor))
+        else {
+            return false;
+        };
+        if edge.hears_us {
+            return false;
+        }
         self.edges.set_edge_hears_us(self.my_node, neighbor, true);
+        true
     }
 
     pub fn clear_expired_commits(&mut self, now_ms: u32) {

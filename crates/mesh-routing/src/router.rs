@@ -670,7 +670,7 @@ impl Router {
     }
 
     pub fn confirm_direct_neighbor_hears_us(&mut self, neighbor: u32) {
-        self.graph.confirm_direct_neighbor_hears_us(neighbor);
+        let _ = self.graph.confirm_direct_neighbor_hears_us(neighbor);
     }
 
     pub fn get_next_hop(
@@ -888,6 +888,25 @@ impl Router {
         }
 
         if direct {
+            // A frame that reached us direct and names our byte as its next hop proves the
+            // sender hears us: a next hop is learned from traffic received, so it could only
+            // have chosen us by hearing us. Same class of evidence as watching a peer carry our
+            // frame, and the sender's own list carries it too — but the list can be an interval
+            // away, and until then a reply to that neighbour cannot be framed as a last hop, so
+            // it goes out with a spare hop and gets relayed (field 2026-09-08: a traceroute
+            // reply to a neighbour 47 dB down was carried by two further relays because its
+            // requester had not yet published a list naming us).
+            let our_byte = (self.node_num & 0xFF) as u8;
+            if parsed.to != NODENUM_BROADCAST
+                && parsed.from != self.node_num
+                && parsed.next_hop != 0
+                && parsed.next_hop == our_byte
+                && self.graph.confirm_direct_neighbor_hears_us(parsed.from)
+            {
+                self.sr_log.push(SrLogEvent::RelayConfirmedHearsUs {
+                    node_id: parsed.from,
+                });
+            }
             self.try_resolve_placeholder(&parsed, now_ms);
             let relay_byte = (parsed.from & 0xFF) as u8;
             if relay_byte != 0 {
@@ -5039,6 +5058,87 @@ mod tests {
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(scheduled, "named for us: carry it");
         assert_ne!(reason, Some(SrSkipReason::UnverifiedBacktrack));
+    }
+
+    #[test]
+    fn a_direct_frame_routed_through_us_proves_the_sender_hears_us() {
+        const SENDER: u32 = 0x4600_0046;
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router
+            .graph_mut()
+            .set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+
+        // Addressed to us, arrived direct, and the sender named our byte as its next hop: it can
+        // only have learned to route through us by hearing us.
+        let header = PacketHeader::from_fields(
+            UNI_ME,
+            SENDER,
+            0x901,
+            0x77,
+            7,
+            7,
+            true,
+            false,
+            (UNI_ME & 0xFF) as u8,
+            (SENDER & 0xFF) as u8,
+        );
+        let wire = encode_wire(header, &[0xDE, 0xAD]);
+        let _ = router.process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -50,
+                snr: 12,
+                bytes: &wire,
+            },
+            1_000,
+        );
+        assert!(
+            router.graph_mut().edge_hears_us_for_test(SENDER),
+            "a peer that routes through us hears us"
+        );
+    }
+
+    #[test]
+    fn a_relayed_frame_naming_us_proves_nothing_about_its_sender() {
+        const SENDER: u32 = 0x4700_0047;
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router
+            .graph_mut()
+            .set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(SENDER, -50, 12, 500, 0);
+
+        // Our byte is named, but the frame was relayed: the byte was stamped by the relayer, and
+        // it says nothing about whether the originator hears us.
+        let header = PacketHeader::from_fields(
+            UNI_ME,
+            SENDER,
+            0x902,
+            0x77,
+            5,
+            7,
+            true,
+            false,
+            (UNI_ME & 0xFF) as u8,
+            0xBB,
+        );
+        let wire = encode_wire(header, &[0xDE, 0xAD]);
+        let _ = router.process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -50,
+                snr: 12,
+                bytes: &wire,
+            },
+            1_000,
+        );
+        assert!(
+            !router.graph_mut().edge_hears_us_for_test(SENDER),
+            "a relayed frame carries the relayer's next hop, not the sender's"
+        );
     }
 
     #[test]
