@@ -2019,6 +2019,11 @@ impl NeighborGraph {
             // would arrive at all. `hears_us` is sticky, so without this a neighbour behind a
             // decayed link stayed "ours to cover" and kept a queued relay the ranking refuses
             // (31 of 183 slots sat at the heard-once sentinel, field 2026-09-08).
+            //
+            // The ranking additionally drops our own non-`Reported` edges, because a peer cannot
+            // see what we only heard about and the two must agree on slot order. That filter is
+            // absent here on purpose: no production path leaves a Mirrored edge on a real
+            // neighbour of ours, which `no_production_path_leaves_a_mirrored_self_edge` pins.
             if !crate::graph::covers(&self.edges, Some(&self.capability), self.my_node, neighbor) {
                 continue;
             }
@@ -3585,6 +3590,45 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(COV_A);
         graph.confirm_direct_neighbor_hears_us(COV_B);
         assert!(graph.has_unique_coverage(&[COV_A]));
+    }
+
+    /// The ranking ignores our own non-`Reported` edges, because peers cannot see what we only
+    /// heard about; the cancel path does not filter them. That asymmetry is inert only while no
+    /// production path leaves a Mirrored edge on one of our own real neighbours — this pins that
+    /// invariant, so a future path that breaks it fails here instead of silently making the two
+    /// paths disagree about who we cover.
+    #[test]
+    fn no_production_path_leaves_a_mirrored_self_edge() {
+        const ME: u32 = 0xAA00_00AA;
+        const SRC: u32 = 0xCC00_00CC;
+        const GATEWAY: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        // A frame relayed by a real gateway: the relayed-packet path writes a Mirrored edge for
+        // the gateway's own reach, and our edge to it must still be a direct measurement.
+        graph.observe_packet(SRC, 3, 2, 0xBB, -70, 12, 1_000, 0, Some(GATEWAY), 0x99);
+        let self_edge = graph
+            .edges()
+            .find_node(ME)
+            .and_then(|n| n.find_edge(GATEWAY))
+            .expect("we learned the gateway");
+        assert_eq!(
+            self_edge.source,
+            EdgeSource::Reported,
+            "our own edge is what we measured, not what we were told"
+        );
+        // The same through placeholder resolution: an unresolved relay byte becomes a real node.
+        let placeholder = placeholder_node_id(0xDD);
+        graph.observe_packet(SRC, 3, 2, 0xDD, -70, 12, 2_000, 0, None, 0x9A);
+        assert!(graph.edges().find_node(placeholder).is_some());
+        assert!(graph.resolve_placeholder(placeholder, 0xEE00_00DD, 3_000));
+        let resolved = graph
+            .edges()
+            .find_node(ME)
+            .and_then(|n| n.find_edge(0xEE00_00DD))
+            .expect("the real node inherited our edge");
+        assert_eq!(resolved.source, EdgeSource::Reported);
     }
 
     /// `hears_us` is sticky: a neighbour that confirmed hearing us once keeps the flag while its

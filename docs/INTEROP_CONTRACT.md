@@ -211,9 +211,18 @@ airtime. Every SignalRouting node uses the same figure.
   ceiling, and one node's insurance fired 65 times in 109 minutes to carry those packets
   instead. Test: `a_hopeless_link_owns_nothing`. Applied both in the
   slot ranking and in unique coverage, so the branch does not relay N times for the same node.
+  Unique coverage additionally ignores our own non-`Reported` edges in the *ranking* only, so that
+  peers computing slot order from the reported topology reach our conclusion; the dupe-cancel path
+  does not need the same filter, because no production path leaves a Mirrored edge on a real
+  neighbour of ours (test `no_production_path_leaves_a_mirrored_self_edge`).
   **Only a silent neighbour has an owner**: one that publishes topology and does not list a
   candidate has reported that the candidate cannot reach it, and that silence is evidence, so
-  nobody owns it (test `a_publisher_has_no_owner`). This is also why the ranking keeps
+  nobody owns it (test `a_publisher_has_no_owner`). The consequence is deliberate and worth
+  stating plainly: a topology-publishing neighbour — SR-active or passive — that never lists us
+  is nobody's coverage and gets no relay from anyone, because every node's own report says none
+  of us reaches it. Not everything in the graph is coverable, and the alternative is spending a
+  slot against the node's own report; it becomes coverable the moment it lists somebody, which
+  sets `hears_us` on that node's edge and satisfies `covers`. This is also why the ranking keeps
   `delivery_hop_cost_fixed` for pricing — `can_deliver` failing is that same report, not a
   missing measurement.
   **The stock-coverage phase is gone**, and with it a second owner election and its own

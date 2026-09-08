@@ -300,9 +300,14 @@ where
                 valid_costs += 1;
             }
         }
-        if unique_count > 0 && valid_costs == 0 {
-            continue;
-        }
+        // Admission guarantees a price: `covers` needs an edge in one direction or the other,
+        // ownership needs the candidate's own edge, and neither admits a target `can_deliver`
+        // would refuse — a publisher that never confirmed the candidate fails `covers`, and
+        // ownership skips publishers entirely.
+        debug_assert!(
+            unique_count == 0 || valid_costs > 0,
+            "an admitted target always has a delivery price"
+        );
 
         // Own vs peer-reported ETX differ by hundredths; exact compare inverted colocated ranks.
         let avg_cost_fixed = if valid_costs > 0 {
