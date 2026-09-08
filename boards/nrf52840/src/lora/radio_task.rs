@@ -278,15 +278,9 @@ pub async fn radio_task(
         }
 
         if Instant::now().duration_since(last_stats) >= Duration::from_secs(30) {
-            if let Ok((rx_pkt, crc, hdr)) = slot.driver.chip_stats() {
-                defmt::info!(
-                    "[Radio0] stats rx_pkt={} crc_err={} hdr_err={}",
-                    rx_pkt,
-                    crc,
-                    hdr
-                );
-                crate::usb_log::log::radio::stats(rx_pkt, crc, hdr);
-            }
+            // One line, one read: `log_chip_status` fetches the same counters and prints them
+            // with the chip mode, so asking for them separately cost a second SPI round trip
+            // and a log line that its output already contained.
             let _ = slot.driver.log_chip_status();
             last_stats = Instant::now();
         }

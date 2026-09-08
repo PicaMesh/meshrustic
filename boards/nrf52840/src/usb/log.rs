@@ -746,21 +746,6 @@ pub mod radio {
         pos += n;
         finish_line(&mut line, pos);
     }
-
-    pub fn stats(rx_pkt: u16, crc_err: u16, hdr_err: u16) {
-        let mut line = [0u8; 96];
-        let mut pos = line_prefix(&mut line);
-        let prefix = b"[Radio0] stats rx=";
-        put(&mut line, &mut pos, prefix);
-        put_u32(&mut line, &mut pos, rx_pkt as u32);
-        let mid = b" crc=";
-        put(&mut line, &mut pos, mid);
-        put_u32(&mut line, &mut pos, crc_err as u32);
-        let tail = b" hdr=";
-        put(&mut line, &mut pos, tail);
-        put_u32(&mut line, &mut pos, hdr_err as u32);
-        finish_line(&mut line, pos);
-    }
 }
 
 pub mod rate_limit {
