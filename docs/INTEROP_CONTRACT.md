@@ -110,10 +110,12 @@ airtime. Every SignalRouting node uses the same figure.
   `route_cost_is_measured_at_the_receiver`.
 - **Delivery vs confirmed coverage.** Route search and unicast ranking treat a hop as
   deliverable via `route::can_deliver` (optimistic when the receiver does not publish topology).
-  Broadcast absorb, pre-cover and unique-coverage cancel use `route::known_to_hear` only
-  (confirmed `hears_us` or reverse list), so mute or silent neighbours are not counted as
-  covered. Shared helpers: `delivery_hop_cost_fixed`. Tests: `can_deliver_*`,
-  `known_to_hear_ignores_stock_optimism`, `one_way_list_to_publishing_dest_is_not_a_direct_path`.
+  Broadcast absorb, pre-cover, ranking coverage, and unique-coverage cancel use `route::covers`
+  (`known_to_hear` plus a delivery-direction cost at or below `COVERAGE_ETX_CEILING_FIXED`), so
+  mute/silent neighbours and sticky-but-hopeless `hears_us` links are not counted as covered.
+  Shared helpers: `delivery_hop_cost_fixed`, `hop_cost_fixed`. Tests: `can_deliver_*`,
+  `known_to_hear_ignores_stock_optimism`, `covers_requires_a_link_that_is_not_hopeless`,
+  `one_way_list_to_publishing_dest_is_not_a_direct_path`.
 - **Inbound-gateway fallback.** When no confirmed path exists (and the downstream table has
   none either), the search runs again allowing hops into a topology-publishing node that never
   confirmed the sender, at `UNVERIFIED_HOP_COST_FACTOR` times their cost, so the node that hears
