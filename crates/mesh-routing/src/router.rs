@@ -143,6 +143,11 @@ const MAX_PENDING_RETRANSMITS: usize = 4;
 struct PendingRetransmit {
     active: bool,
     canceled: bool,
+    /// The frame left the router but may still be waiting behind listen-before-talk. A copy
+    /// heard now must pull it back out of the radio queue, exactly as a committed relay does:
+    /// without this an insurer that fired before hearing the first one put a second copy on the
+    /// air 0.4 to 1.0 s later (six times in 109 min, field 2026-09-08).
+    fired: bool,
     packet_id: u32,
     fire_after_ms: u32,
     len: u8,
@@ -374,6 +379,7 @@ impl Router {
             pending_retransmits: [PendingRetransmit {
                 active: false,
                 canceled: false,
+                fired: false,
                 packet_id: 0,
                 fire_after_ms: 0,
                 len: 0,
@@ -1671,6 +1677,7 @@ impl Router {
                         half_airtime,
                         now_ms,
                     );
+                    self.log_slot_scheduling(&parsed, relay_plan, half_airtime);
                     self.sr_log.push(SrLogEvent::RelaySkip {
                         from: parsed.from,
                         reason: SrSkipReason::BetterNeighbor,
@@ -1682,6 +1689,7 @@ impl Router {
                     // and costs no delivery — the asymmetry between two colocated nodes is
                     // 3.2% with it and 2.9% without.
                     self.pool.release(handle);
+                    self.log_slot_scheduling(&parsed, relay_plan, half_airtime);
                     self.sr_log.push(SrLogEvent::RelaySkip {
                         from: parsed.from,
                         reason: SrSkipReason::AlreadyCovered,
@@ -3329,6 +3337,12 @@ impl Router {
     pub fn note_tx_done(&mut self, packet_id: u32) {
         if packet_id != 0 {
             self.graph.cancel_relay_for_id(packet_id);
+            // On the air: nothing left to pull back.
+            for slot in &mut self.pending_retransmits {
+                if slot.packet_id == packet_id {
+                    slot.fired = false;
+                }
+            }
         }
     }
 
@@ -3617,6 +3631,7 @@ impl Router {
             };
             let id = slot.packet_id;
             slot.active = false;
+            slot.fired = true;
             self.sr_log.push(SrLogEvent::T1Fired { id });
             return Some(plan);
         }
@@ -3692,6 +3707,7 @@ impl Router {
         self.pending_retransmits[idx] = PendingRetransmit {
             active: true,
             canceled: false,
+            fired: false,
             packet_id,
             fire_after_ms: now_ms.wrapping_add(fire_delay),
             len,
@@ -3703,17 +3719,56 @@ impl Router {
         });
     }
 
+    /// The ranking inputs behind a deferral. Logged on the defer path as well as on the commit
+    /// path: without it a field log shows that we stood down but not who we stood down for, and
+    /// a slot handed to a node that cannot deliver is invisible.
+    fn log_slot_scheduling(
+        &mut self,
+        parsed: &ParsedPacket,
+        plan: &crate::broadcast_relay::BroadcastRelayPlan,
+        half_airtime: u32,
+    ) {
+        self.sr_log.push(SrLogEvent::SlotScheduling {
+            id: parsed.id,
+            half_airtime_ms: half_airtime,
+            candidates: plan.candidate_count,
+            slot_index: plan.slot_index,
+            ranked: plan.ranked,
+            ranked_len: plan.ranked_len,
+            reason: plan.reason,
+            evaluated: plan.evaluated,
+            evaluated_len: plan.evaluated_len,
+            pre_covered: plan.pre_covered,
+        });
+    }
+
     fn cancel_t1_retransmit(&mut self, packet_id: u32, reason: T1CancelReason) {
+        let mut pull_back = false;
+        let mut canceled = false;
         for slot in &mut self.pending_retransmits {
-            if slot.active && !slot.canceled && slot.packet_id == packet_id {
+            if slot.packet_id != packet_id {
+                continue;
+            }
+            if slot.active && !slot.canceled {
                 slot.active = false;
                 slot.canceled = true;
-                self.sr_log.push(SrLogEvent::T1Canceled {
-                    id: packet_id,
-                    reason,
-                });
-                return;
+                canceled = true;
+            } else if slot.fired {
+                // Already handed to the radio: only the TX queue can still stop it.
+                slot.fired = false;
+                pull_back = true;
+                canceled = true;
             }
+            break;
+        }
+        if pull_back {
+            self.note_tx_cancel(packet_id);
+        }
+        if canceled {
+            self.sr_log.push(SrLogEvent::T1Canceled {
+                id: packet_id,
+                reason,
+            });
         }
     }
 }
@@ -4206,6 +4261,116 @@ mod tests {
         assert!(router
             .poll_t1_retransmit(1_000 + fire_ms + ladder)
             .is_some());
+    }
+
+    /// A copy heard after our insurance fired must still stop it: the frame has left the router
+    /// but waits behind listen-before-talk, and only the radio queue can pull it back. Field
+    /// 2026-09-08: six copies went out 0.4 to 1.0 s behind another insurer's for want of this.
+    #[test]
+    fn a_copy_heard_after_t1_fired_pulls_the_frame_back() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(0xCC00_00CC));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        const NEIGHBOR: u32 = 0xBB00_00BB;
+        const STOCK: u32 = 0xDD00_00DD;
+        const EDGE: u32 = 0xEE00_00EE;
+        {
+            let graph = router.graph_mut();
+            graph.observe_direct_neighbor(NEIGHBOR, -70, 8, 0, 0);
+            graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
+            graph.observe_direct_neighbor(EDGE, -70, 8, 0, 0);
+            graph.confirm_direct_neighbor_hears_us(NEIGHBOR);
+            graph.confirm_direct_neighbor_hears_us(STOCK);
+            graph.confirm_direct_neighbor_hears_us(EDGE);
+            graph.track_node_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
+            graph.capability_mut().track_topology(NEIGHBOR, true, 0);
+            for target in [NEIGHBOR, EDGE] {
+                graph.edges_mut().update_edge(
+                    0xCC00_00CC,
+                    STOCK,
+                    target,
+                    2.0,
+                    0,
+                    EdgeSource::Reported,
+                    true,
+                    0,
+                );
+                graph.edges_mut().set_edge_hears_us(STOCK, target, true);
+            }
+        }
+        let wire = encode_wire(
+            PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, false, false, 0, 0),
+            &[0x01, 0x02],
+        );
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 10,
+                    bytes: &wire,
+                },
+                1_000,
+            )
+            .unwrap();
+        let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
+        assert!(router
+            .evaluate_tx_plan(&result, 0.0, airtime, 1_000)
+            .relay
+            .is_none());
+        let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
+        let ladder =
+            coordinated_relay::half_airtime_ms(airtime) * crate::graph::MAX_EDGES_PER_NODE as u32;
+        let fire_at = (1_000 + coordinated_relay::tx_delay_ms_worst(slot_ms) + airtime
+            ..=1_000 + coordinated_relay::tx_delay_ms_worst(slot_ms) + airtime + ladder)
+            .find(|&t| router.poll_t1_retransmit(t).is_some())
+            .expect("insurance fires: the repeater never relayed");
+        let mut cancels = heapless::Vec::new();
+        router.take_tx_cancels(&mut cancels);
+        assert!(cancels.is_empty(), "nothing to pull back yet");
+        // Another insurer's copy lands while ours is still queued.
+        let relayed = encode_wire(
+            PacketHeader::from_fields(
+                NODENUM_BROADCAST,
+                NEIGHBOR,
+                99,
+                0,
+                2,
+                3,
+                false,
+                false,
+                0,
+                (EDGE & 0xFF) as u8,
+            ),
+            &[0x01, 0x02],
+        );
+        let _ = router.process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -70,
+                snr: 8,
+                bytes: &relayed,
+            },
+            fire_at + 200,
+        );
+        router.take_tx_cancels(&mut cancels);
+        assert!(
+            cancels.contains(&99),
+            "the queued insurance frame must be pulled out of the radio queue"
+        );
+        // And once the radio reports it went out, there is nothing left to cancel.
+        router.note_tx_done(99);
+        let _ = router.process_inbound(
+            &InboundPacket {
+                radio_id: 0,
+                rssi: -70,
+                snr: 8,
+                bytes: &relayed,
+            },
+            fire_at + 400,
+        );
+        router.take_tx_cancels(&mut cancels);
+        assert!(cancels.is_empty(), "already on the air: no pull-back");
     }
 
     /// The same deferral once the peer's copy is actually heard: only observation of the air

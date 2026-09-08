@@ -201,6 +201,10 @@ airtime. Every SignalRouting node uses the same figure.
   Tests: `mute_neighbour_owner_is_the_best_link_then_the_lowest_id`,
   `silent_neighbour_is_relayed_for_by_the_best_link_only`,
   `inbound_only_neighbor_belongs_to_its_owner`.
+- **The ranking inputs are logged on the defer path too**, not only when we relay
+  (`log_slot_scheduling`): a log that shows we stood down without showing who we stood down for
+  cannot tell a correct deferral from a slot handed to a node that cannot deliver. That gap is
+  why the 2026-09-08 ownership defect had to be found through a peer's log instead of our own.
 - **We log the neighbour we relay for** (`SrLogEvent::CoverageFor`): a relay nobody needs and a
   relay that saves a node are indistinguishable in a field log otherwise. The name comes from the
   ranking that made the decision (`BroadcastRelayPlan::coverage_for`, the winning candidate's
@@ -229,6 +233,13 @@ airtime. Every SignalRouting node uses the same figure.
   30 min on three field nodes (2026-09-08): this declines about 100 copies per node and cut T1
   traffic roughly tenfold, while delivery between two colocated nodes was unchanged (3.2%
   asymmetric ids with it, 2.9% without).
+- **A heard copy stops the insurance even after it fired.** The frame leaves the router but can
+  still be waiting behind listen-before-talk, so a copy heard in that window pulls it back out
+  of the radio TX queue (`note_tx_cancel`, the same path a committed relay uses); once the radio
+  reports the transmission there is nothing left to cancel. Without it an insurer that fired
+  before hearing the first one put a second copy on the air 0.4 to 1.0 s later — six times in
+  109 minutes (2026-09-08) — because the insurance rungs are half an airtime apart, which is
+  shorter than the enqueue-to-air latency. Test: `a_copy_heard_after_t1_fired_pulls_the_frame_back`.
 - **Once armed, only a heard copy stands it down** (`T1CancelReason::RelayHeard`, or our own
   transmission). The coverage question is deliberately *not* asked again at fire time: it
   answers "who needs a relay", not "did the expected frame actually arrive". Two of the seven
