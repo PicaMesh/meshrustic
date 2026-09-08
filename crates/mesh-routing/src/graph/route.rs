@@ -306,8 +306,12 @@ pub fn witness_owner(
             continue;
         }
         // Priced in the delivery direction: the source's own measurement of the candidate when
-        // it published one, our own edge otherwise.
+        // it published one, our own edge otherwise. A link past the coverage ceiling carries no
+        // acknowledgement either.
         let cost = hop_cost_fixed(edges, candidate, source).unwrap_or(edge.etx_fixed);
+        if cost > COVERAGE_ETX_CEILING_FIXED {
+            continue;
+        }
         let key = (tier, cost / OWNER_COST_BUCKET_FIXED);
         if key < best || (key == best && candidate < owner) {
             best = key;
@@ -341,6 +345,16 @@ pub fn coverage_owner(
         let Some(edge) = edges.find_node(candidate).and_then(|n| n.find_edge(target)) else {
             continue;
         };
+        // Ownership decides *who* covers a neighbour nobody can be shown to reach; it must not
+        // decide *whether* the neighbour is reachable at all. A link past the coverage ceiling
+        // (the "heard once" ETX 40 sentinel included) delivers nothing, so its holder owns
+        // nothing: the ranking would otherwise credit it with unique coverage and hand it the
+        // first slot, and the packet would wait a full defer window for a relay that cannot
+        // come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
+        // ceiling, and the branch's insurance fired 65 times in 109 min to cover them.
+        if edge.etx_fixed > COVERAGE_ETX_CEILING_FIXED {
+            continue;
+        }
         let tier = if candidate == me {
             if !me_relays {
                 continue;
@@ -1075,6 +1089,38 @@ mod tests {
         assert!(
             !covers(&edges, Some(&capability), TX, SILENT),
             "a reporting node's silence about the sender counts against coverage"
+        );
+    }
+
+    /// Ownership picks who carries a neighbour nobody can be shown to reach. It must not make
+    /// an unreachable neighbour look reachable: over a link past the coverage ceiling nobody
+    /// owns it, or the ranking credits unique coverage to a node that cannot deliver and hands
+    /// it the first slot. Field 2026-09-08: 74 of 183 slots went out over such links.
+    #[test]
+    fn a_hopeless_link_owns_nothing() {
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        const SILENT: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(PEER, true, 0);
+        // The peer is a neighbour of ours, so its reports about others are accepted.
+        edges.update_edge(ME, ME, PEER, 1.0, 0, EdgeSource::Reported, true, 0);
+        // Both of us can be shown to hear SILENT, the peer over a sound link.
+        edges.update_edge(ME, PEER, SILENT, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, ME, SILENT, 40.0, 0, EdgeSource::Reported, true, 0);
+        assert_eq!(
+            coverage_owner(&edges, &capability, ME, true, SILENT),
+            PEER,
+            "the sound link owns it"
+        );
+        // The peer's link decays to the heard-once sentinel too: now nobody owns it.
+        edges.update_edge(ME, PEER, SILENT, 40.0, 0, EdgeSource::Mirrored, true, 0);
+        assert_eq!(
+            coverage_owner(&edges, &capability, ME, true, SILENT),
+            0,
+            "a link past the ceiling delivers nothing, so it owns nothing"
         );
     }
 

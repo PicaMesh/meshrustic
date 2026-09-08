@@ -188,7 +188,15 @@ airtime. Every SignalRouting node uses the same figure.
   Its receive path is all anyone can measure, so the owner is the node hearing it best, compared
   in `OWNER_COST_BUCKET_FIXED` buckets, with stock ROUTER/REPEATER/ROUTER_CLIENT given way first
   (they rebroadcast regardless of SR and already hold the earliest slots) and the lowest node id
-  as the final tie-break. Mute and passive nodes never own: they do not relay. Applied both in the
+  as the final tie-break. Mute and passive nodes never own: they do not relay. **Ownership stops
+  at the coverage ceiling**: a link past `COVERAGE_ETX_CEILING_FIXED` (the "heard once" ETX 40
+  sentinel included) delivers nothing, so its holder owns nothing and the neighbour is simply
+  out of reach. Ownership decides *who* carries such a neighbour, never *whether* it is
+  reachable — without that bound the ranking credited unique coverage to a node that cannot
+  deliver and handed it the first slot, so the packet waited a full defer window for a relay
+  that could not come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
+  ceiling, and one node's insurance fired 65 times in 109 minutes to carry those packets
+  instead. Test: `a_hopeless_link_owns_nothing`. Applied both in the
   slot ranking and in unique coverage, so the branch does not relay N times for the same node.
   Tests: `mute_neighbour_owner_is_the_best_link_then_the_lowest_id`,
   `silent_neighbour_is_relayed_for_by_the_best_link_only`,
