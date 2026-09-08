@@ -122,6 +122,10 @@ pub enum SrLogEvent {
         node_id: u32,
         hears_us: bool,
         last_mirrored: bool,
+        /// Price of the edge and whether it rests on a measurement. Two nodes diffing their dumps
+        /// can see which links they disagree about, and whether a guess is behind it.
+        etx_fixed: u16,
+        measured: bool,
     },
     NetworkTopologyDownstreamHeader {
         count: u16,

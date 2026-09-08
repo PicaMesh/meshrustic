@@ -180,14 +180,17 @@ fn relayed_topology_adds_sender_edges_and_downstream_without_destination_node() 
 }
 
 #[test]
-fn maintenance_removes_activity_only_nodes() {
+fn activity_alone_never_creates_a_node() {
     use mesh_routing::DEVICE_ROLE_CLIENT;
 
+    // Hearing a frame from a far node tells us it is alive, not that we know a link to it. An
+    // edgeless node used to be created here and removed by the next maintenance pass, which took
+    // every peer's published edge to that node with it.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
     graph.update_node_activity(0xBB, 1_000);
-    assert!(graph.has_graph_node(0xBB));
+    assert!(!graph.has_graph_node(0xBB));
     graph.run_maintenance(61_000);
     assert!(!graph.has_graph_node(0xBB));
 }
@@ -294,10 +297,10 @@ fn topology_log_omits_self_as_neighbor() {
 }
 
 #[test]
-fn direct_neighbor_count_uses_reported_to_us() {
+fn direct_neighbor_count_counts_what_we_publish() {
+    // Our neighbour set is what we measured a link to, not who holds an edge back to us.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
-    graph.update_node_activity(0xBB, 100);
     graph.edges_mut().update_edge(
         0xAA,
         0xBB,
@@ -308,7 +311,7 @@ fn direct_neighbor_count_uses_reported_to_us() {
         true,
         0,
     );
-    assert_eq!(graph.neighbor_count(), 1);
+    assert_eq!(graph.neighbor_count(), 0);
     assert_eq!(
         graph.fill_neighbor_entries(&mut [NeighborEntry::default(); MAX_EDGES_PER_NODE]),
         0

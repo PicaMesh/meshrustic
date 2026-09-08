@@ -26,9 +26,10 @@ fn multi_packet_chunk_size_golden() {
     for i in 0..MAX_NEIGHBORS as u32 {
         graph.observe_direct_neighbor(0x1000 + i, -70, 8, 0, 0);
     }
-    // Graph node cap (MAX_NEIGHBORS slots including self) limits direct neighbors to one less.
-    // Topology pack includes only reported edges with a cached direct signal.
-    assert_eq!(graph.neighbor_count() as usize, MAX_NEIGHBORS - 1);
+    // Our neighbour set is our own measured edges, so all MAX_NEIGHBORS of them count and are
+    // published — the graph node cap applies to nodes we hold edge lists for, not to our own
+    // edges. Topology pack includes only reported edges with a cached direct signal.
+    assert_eq!(graph.neighbor_count() as usize, MAX_NEIGHBORS);
     let mut packed_neighbors = [NeighborEntry::default(); MAX_NEIGHBORS];
     let pack_count = graph.topology_neighbors_for_pack(&mut packed_neighbors);
     assert_eq!(

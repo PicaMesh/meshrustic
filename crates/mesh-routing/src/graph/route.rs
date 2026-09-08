@@ -214,14 +214,27 @@ pub fn publishes_topology(capability: Option<&CapabilityCache>, node: u32) -> bo
 }
 
 /// Cost of the hop `from → to`, priced at the receiver when it published a measurement of the
-/// sender, else at the sender's own measurement. `None` when neither has an edge.
+/// sender, else at the sender's own measurement. `None` when neither has a *measured* edge.
+///
+/// An [`EdgeSource::Inferred`] edge is skipped: it was minted at a nominal price because a frame
+/// once crossed the link, which says a path exists and nothing about what it costs. Everything
+/// that decides whether a transmission may be skipped reads this price — [`covers`],
+/// [`witness_owner`], [`coverage_owner`] and both slot rankings through
+/// [`delivery_hop_cost_fixed`] — so a guess must not produce one. The route search prices its own
+/// hops from the edges directly and keeps using inferred edges for reachability, which is what
+/// they exist for.
 pub fn hop_cost_fixed(edges: &EdgeStore, from: u32, to: u32) -> Option<u16> {
-    if let Some(edge) = edges.find_node(to).and_then(|n| n.find_edge(from)) {
+    if let Some(edge) = edges
+        .find_node(to)
+        .and_then(|n| n.find_edge(from))
+        .filter(|e| e.source.is_measured())
+    {
         return Some(edge.etx_fixed);
     }
     edges
         .find_node(from)
         .and_then(|n| n.find_edge(to))
+        .filter(|e| e.source.is_measured())
         .map(|e| e.etx_fixed)
 }
 
@@ -301,7 +314,11 @@ pub fn witness_owner(
         // observation writes both edge directions from one measurement, so that test is
         // satisfied by our own assumption of symmetry — which is the one thing a witness may
         // not assume, since a copy the originator cannot hear acknowledges nothing.
-        let Some(edge) = edges.find_node(candidate).and_then(|n| n.find_edge(source)) else {
+        let Some(edge) = edges
+            .find_node(candidate)
+            .and_then(|n| n.find_edge(source))
+            .filter(|e| e.source.is_measured())
+        else {
             continue;
         };
         if !edge.hears_us {
@@ -358,7 +375,11 @@ pub fn coverage_owner(
         }
         // Only what it measured itself: an edge to the target is the evidence that it hears it,
         // and for a stock node the only way that edge exists is us watching it carry the traffic.
-        let Some(edge) = edges.find_node(candidate).and_then(|n| n.find_edge(target)) else {
+        let Some(edge) = edges
+            .find_node(candidate)
+            .and_then(|n| n.find_edge(target))
+            .filter(|e| e.source.is_measured())
+        else {
             continue;
         };
         // Ownership decides *who* covers a neighbour nobody can be shown to reach; it must not
@@ -1187,5 +1208,46 @@ mod tests {
         assert!(can_deliver(&edges, None, TX, STOCK));
         edges.set_edge_hears_us(TX, STOCK, true);
         assert!(known_to_hear(&edges, TX, STOCK));
+    }
+    #[test]
+    fn coverage_is_not_priced_on_a_guess() {
+        // An edge minted because a frame crossed the link says a path exists and nothing about
+        // what it costs, so it cannot excuse us from relaying.
+        const ME: u32 = 0xAA;
+        const GW: u32 = 0xBB;
+        const FAR: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, GW, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, GW, FAR, 1.57, 0, EdgeSource::Inferred, true, 0);
+        let capability = CapabilityCache::new();
+
+        assert_eq!(hop_cost_fixed(&edges, GW, FAR), None);
+        assert!(!covers(&edges, Some(&capability), GW, FAR));
+        assert_eq!(coverage_owner(&edges, &capability, ME, true, FAR), 0);
+
+        // The same link, published by the gateway inside the ceiling, is coverage.
+        edges.update_edge(ME, GW, FAR, 2.0, 0, EdgeSource::Mirrored, true, 0);
+        assert_eq!(hop_cost_fixed(&edges, GW, FAR), Some(200));
+        assert!(covers(&edges, Some(&capability), GW, FAR));
+    }
+
+    #[test]
+    fn a_route_still_travels_over_a_guess() {
+        // Reachability is what an inferred edge is for: the search prices hops from the edges
+        // themselves, so a guessed link still carries a unicast.
+        const ME: u32 = 0xAA;
+        const GW: u32 = 0xBB;
+        const FAR: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, GW, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, GW, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, GW, FAR, 1.57, 0, EdgeSource::Inferred, true, 0);
+        edges.update_edge(ME, FAR, GW, 1.57, 0, EdgeSource::Inferred, true, 0);
+        let downstream = DownstreamTable::new();
+
+        let route = calculate_route(&edges, &downstream, ME, FAR, 0, None);
+        assert_eq!(route.next_hop, GW, "the guessed hop still routes");
     }
 }

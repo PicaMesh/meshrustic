@@ -1206,6 +1206,14 @@ impl NeighborGraph {
                     let listed = pending.ids;
                     self.edges
                         .clear_hears_us_to_unlisted(sender, &listed[..count]);
+                    // The list is authoritative about the sender's own edges too, not only about
+                    // who hears it: an entry that has gone is a link the sender no longer has.
+                    // Without this a neighbour it dropped survived to NEIGHBOR_TTL_MS and stayed
+                    // in its coverage set (field 2026-09-08: a rebooted peer's dropped entry
+                    // still counted 22 minutes later, and only on one of two colocated nodes).
+                    if self.edges.retain_listed_edges(sender, &listed[..count]) {
+                        self.route_cache.clear();
+                    }
                 }
                 self.pending_listed[slot].valid = false;
             }
@@ -1346,6 +1354,13 @@ impl NeighborGraph {
             EdgeSource::Reported,
             heard_on,
         );
+        // The reverse direction is our assumption of symmetry, not something we can measure: we
+        // have no way to know how well the neighbour hears us. Recording it as `Reported` gave
+        // our own guess the top rank, so the neighbour's published measurement of us could never
+        // land and we priced the link from the guess while every peer priced it from our list
+        // (field 2026-09-08: each node's own coverage total was one-sidedly higher than any
+        // peer's view of it). It stays in the graph as evidence a link exists in both
+        // directions; it just no longer prices one.
         let _ = self.edges.update_edge_from_observation(
             self.my_node,
             node_id,
@@ -1353,7 +1368,7 @@ impl NeighborGraph {
             rssi,
             snr,
             now_ms,
-            EdgeSource::Reported,
+            EdgeSource::Inferred,
             heard_on,
         );
         self.upsert_direct_signal(node_id, rssi, snr, now_ms);
@@ -1486,7 +1501,11 @@ impl NeighborGraph {
         // measured value a two-hop path through a node a metre away priced at 1.05 and two
         // colocated nodes routed a far hub through each other.
         let hops_used = hop_start.saturating_sub(hop_limit).max(1);
-        let etx = calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR) * hops_used as f32;
+        // A downstream entry stands for a path, so it is priced per hop the packet travelled. An
+        // inferred edge stands for one hop — the gateway's link to the source — so it is priced
+        // as one, whatever route the packet took to reach us.
+        let nominal_hop = calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR);
+        let path_etx = nominal_hop * hops_used as f32;
 
         let is_new_gateway =
             self.observe_relay_gateway_signal(gateway, rssi, snr, now_ms, heard_on);
@@ -1494,14 +1513,20 @@ impl NeighborGraph {
         let single_hop = hops_used == 1;
         let source_sr_active = matches!(self.capability.status(from), CapabilityStatus::SrActive);
 
-        if !source_sr_active || single_hop {
+        // The edge we would write is `gateway → from`, and the gateway is the only node that can
+        // publish it. Invent it only when the gateway never will: a stock node, or a placeholder
+        // we have not resolved yet. Keyed on the gateway, not on the source, because the source's
+        // own list carries the other direction and says nothing about this one.
+        let gateway_never_publishes = self.capability.status(gateway) == CapabilityStatus::Legacy
+            || is_placeholder_node(gateway);
+        if gateway_never_publishes {
             let result_relay_to_dest = self.edges.update_edge(
                 self.my_node,
                 gateway,
                 from,
-                etx,
+                nominal_hop,
                 now_ms,
-                EdgeSource::Mirrored,
+                EdgeSource::Inferred,
                 true,
                 heard_on,
             );
@@ -1539,8 +1564,15 @@ impl NeighborGraph {
             && (single_hop || !source_sr_active)
             && !self.is_downstream_relay_for(gateway, from, now_ms)
         {
-            self.downstream
-                .update(self.my_node, from, gateway, etx, now_ms, false, heard_on);
+            self.downstream.update(
+                self.my_node,
+                from,
+                gateway,
+                path_etx,
+                now_ms,
+                false,
+                heard_on,
+            );
             self.route_cache.clear();
         }
 
@@ -2416,6 +2448,8 @@ impl NeighborGraph {
                         node_id: edge.to,
                         hears_us: edge.hears_us,
                         last_mirrored: seen == mirrored,
+                        etx_fixed: edge.etx_fixed,
+                        measured: edge.source.is_measured(),
                     });
                 }
             }
@@ -3503,6 +3537,52 @@ mod tests {
     }
 
     #[test]
+    fn a_neighbours_own_report_of_us_beats_our_symmetry_guess() {
+        // We cannot measure how well a neighbour hears us. Our assumption must not outrank the
+        // neighbour's own published measurement, and must not price the link either.
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(PEER, -30, 12, 1_000, 0);
+
+        let reverse = graph
+            .edges()
+            .find_node(PEER)
+            .and_then(|n| n.find_edge(ME))
+            .expect("the reverse direction is still in the graph");
+        assert_eq!(reverse.source, EdgeSource::Inferred);
+        // Priced from our own measurement, which is the number our peers hold from our list.
+        let own = graph
+            .edges()
+            .find_node(ME)
+            .and_then(|n| n.find_edge(PEER))
+            .expect("our own edge");
+        assert_eq!(
+            crate::graph::hop_cost_fixed(graph.edges(), ME, PEER),
+            Some(own.etx_fixed)
+        );
+
+        // The peer reports it hears us over a much worse link: its measurement lands.
+        graph
+            .edges_mut()
+            .update_edge(ME, PEER, ME, 6.0, 2_000, EdgeSource::Mirrored, true, 0);
+        let reported = graph
+            .edges()
+            .find_node(PEER)
+            .and_then(|n| n.find_edge(ME))
+            .unwrap();
+        assert_eq!(reported.source, EdgeSource::Mirrored);
+        assert_eq!(
+            crate::graph::hop_cost_fixed(graph.edges(), ME, PEER),
+            Some(crate::graph::etx_to_fixed(6.0)),
+            "the receiver's own measurement prices the delivery"
+        );
+        assert_eq!(graph.neighbor_count(), 1, "still one direct neighbour");
+    }
+
+    #[test]
     fn a_publisher_silent_for_two_intervals_stops_being_ours_to_carry() {
         const ME: u32 = 0xAA00_00AA;
         const PUB: u32 = 0xBB00_00BB;
@@ -3629,8 +3709,11 @@ mod tests {
 
         let placeholder = placeholder_node_id(0xCD);
         assert!(!graph.has_graph_node(placeholder));
+        // What a relayed frame teaches is reachability, and that lives in the downstream table.
+        // The edge `relay -> source` belongs to the relay to publish, so it is not invented here
+        // for a gateway that may yet publish one.
         assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 200), Some(relay));
-        assert!(graph.test_has_edge(relay, 0xBB00_00BB));
+        assert!(!graph.test_has_edge(relay, 0xBB00_00BB));
     }
 
     #[test]

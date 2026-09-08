@@ -351,6 +351,47 @@ airtime. Every SignalRouting node uses the same figure.
   receivers ignore the flags. Tests:
   `chunked_topology_clears_unlisted_hears_us_only_after_last_chunk`,
   `large_neighbourhood_splits_into_flagged_chunks`.
+- **Three classes of edge, and only two of them are evidence.** An edge is `Reported` (we
+  measured it ourselves), `Mirrored` (a peer published a measurement of one of its own links) or
+  `Inferred` (nobody measured it: we minted it because a relayed frame crossed the link, priced at
+  `INFERRED_LINK_RSSI`/`INFERRED_LINK_SNR` per hop travelled). The classes rank in that order and
+  a weaker one never displaces a stronger one, whichever arrives last — neither by overwriting it
+  (`EdgeStore::update_edge`) nor by evicting it from a full edge list. Before this rule a single
+  relayed frame repriced a link its own gateway had published as hopeless, from ETX 15.9 to the
+  nominal 1.57, and two nodes holding identical reports disagreed about coverage according to
+  which relayed frames each had happened to hear.
+- **Coverage is priced on measurements only; reachability may use a guess.** `hop_cost_fixed`
+  skips `Inferred` edges and returns no price when only a guess exists, so `covers`,
+  `coverage_owner`, `witness_owner` and both slot rankings (through `delivery_hop_cost_fixed`)
+  refuse to let a guess excuse a transmission — no price means no coverage, which means we relay.
+  The route search prices its own hops straight from the edges and still travels over an inferred
+  edge, which is the one thing inferring an edge is for. A candidate's coverage set is likewise
+  what that candidate published, and for ourselves what we publish: `Inferred` edges are in
+  nobody's set, in the ranking, in absorb and in the dupe-cancel path alike.
+- **A link we invent is only ever a link nobody will publish.** A relayed frame teaches an edge
+  `gateway → source` only when the gateway is a stock (`Legacy`) node or an unresolved
+  placeholder. The gateway is the sole node that can publish that edge, so inventing one for a
+  gateway that publishes topology overwrote what it had already told us. Reachability learned from
+  relayed frames lives in the downstream table, which is gated separately, on the source and the
+  hop count, because no publisher supplies it.
+- **The reverse direction of our own measurement is an assumption, not a measurement.** Observing
+  a neighbour writes `us → neighbour` as `Reported` and `neighbour → us` as `Inferred`: we cannot
+  measure how well it hears us. Recorded as `Reported` it outranked and permanently blocked the
+  neighbour's own published measurement of us, and priced our link from our own guess while every
+  peer priced it from our published list, so each node credited itself with more coverage than any
+  peer credited it with. Our direct-neighbour count is therefore the set we measured and publish,
+  not the set that holds an edge back to us.
+- **Noting that a node is alive never creates a graph node for it.** A relayed frame proves the
+  source exists, not that we know a link to it. `update_node_activity` refreshes an existing node
+  only: creating an edgeless one meant the next maintenance pass removed it and, with it, every
+  peer's published edge pointing at it, which returned only on that peer's next broadcast. Field
+  2026-09-08: about a hundred aging passes in 45 minutes on a graph that never changed size, and a
+  gateway's coverage set wandering packet to packet.
+- **A complete list is authoritative about the sender's own edges, not only about `hears_us`.**
+  When the last chunk of a non-empty list is in hand, edges from that sender to nodes the list no
+  longer names are removed (`EdgeStore::retain_listed_edges`), leaving our own measurements and
+  placeholders alone. Before this, an entry a rebooted peer had dropped stayed in its coverage set
+  until `NEIGHBOR_TTL_MS`.
 - **A publisher that goes quiet loses our direct link.** A node whose lists we accept promises
   one every `TOPOLOGY_BROADCAST_MS`; heard nothing at all from it for `PUBLISHER_SILENCE_MS` (two
   intervals, the same silence horizon as `TOPOLOGY_RESYNC_MS`) and we retract our own two edges to

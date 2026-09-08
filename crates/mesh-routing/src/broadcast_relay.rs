@@ -196,9 +196,14 @@ fn get_coverage_if_relays(
         if target == 0 || is_placeholder_node(target) {
             continue;
         }
-        // Mirrored edges are invisible to peers; counting them made colocated nodes disagree
-        // on slot order.
+        // A candidate's coverage set is what it published, and for ourselves what we publish.
+        // Mirrored edges are invisible to peers; counting them made colocated nodes disagree on
+        // slot order. An edge we invented from a relayed frame is invisible to everyone,
+        // including the candidate it is attributed to, so it belongs in nobody's set.
         if relay == my_node && edge.source != EdgeSource::Reported {
+            continue;
+        }
+        if !edge.source.is_measured() {
             continue;
         }
         // A neighbour nobody can be shown to reach is still worth one relay, but only from its
@@ -225,9 +230,12 @@ fn absorb_relay_coverage(ctx: &BroadcastRelayContext<'_>, covered: &mut CoveredS
         return;
     };
     for i in 0..relay_edges.edge_count as usize {
-        let target = relay_edges.edges[i].to;
-        if admits_coverage(ctx, relay, target) {
-            covered.insert(target);
+        let edge = relay_edges.edges[i];
+        if !edge.source.is_measured() {
+            continue;
+        }
+        if admits_coverage(ctx, relay, edge.to) {
+            covered.insert(edge.to);
         }
     }
 }

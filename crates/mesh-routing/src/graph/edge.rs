@@ -18,6 +18,28 @@ pub enum EdgeSource {
     #[default]
     Mirrored = 0,
     Reported = 1,
+    /// No measurement at all: minted because a relayed frame crossed this link, priced at
+    /// [`INFERRED_LINK_RSSI`](crate::neighbor_graph::INFERRED_LINK_RSSI) per hop. Good enough to
+    /// say a path exists, never good enough to price coverage or to displace a measurement.
+    Inferred = 2,
+}
+
+impl EdgeSource {
+    /// How much this class is worth as evidence: our own measurement beats a peer's published
+    /// measurement, which beats a guess. Deliberately not the discriminant, which is wire-free
+    /// and kept stable.
+    pub const fn rank(self) -> u8 {
+        match self {
+            EdgeSource::Inferred => 0,
+            EdgeSource::Mirrored => 1,
+            EdgeSource::Reported => 2,
+        }
+    }
+
+    /// A guess: it carries no measurement, so it cannot price a delivery.
+    pub const fn is_measured(self) -> bool {
+        !matches!(self, EdgeSource::Inferred)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,7 +286,9 @@ impl EdgeStore {
             .find(|&i| self.nodes[from_idx].edges[i].to == to)
         {
             let edge = &mut self.nodes[from_idx].edges[edge_idx];
-            if edge.source == EdgeSource::Reported && source == EdgeSource::Mirrored {
+            // A weaker class never overwrites a stronger one, whichever arrived last: that is
+            // what makes two nodes holding the same reports agree on the same number.
+            if source.rank() < edge.source.rank() {
                 return EDGE_NO_CHANGE;
             }
             let old_etx = edge.etx();
@@ -309,9 +333,15 @@ impl EdgeStore {
             // (score = ETX + age/300 s, so stale links lose first). Dropping the new edge instead
             // meant a hub never learned neighbours that appeared after its 40 slots filled.
             let node = &mut self.nodes[from_idx];
-            let mut worst_idx = 0usize;
+            let mut worst_idx = usize::MAX;
             let mut worst_score = f32::MIN;
             for (i, edge) in node.edges.iter().enumerate().take(node.edge_count as usize) {
+                // Only edges this write is at least as well evidenced as may be displaced: a
+                // guess at the nominal price outscores every real link and would otherwise
+                // evict the measurements the ranking depends on.
+                if source.rank() < edge.source.rank() {
+                    continue;
+                }
                 let age_s = now_ms.wrapping_sub(edge.last_update_ms) as f32 / 1000.0;
                 let score = edge.etx() + age_s / 300.0;
                 if score > worst_score {
@@ -319,7 +349,7 @@ impl EdgeStore {
                     worst_idx = i;
                 }
             }
-            if etx >= worst_score {
+            if worst_idx == usize::MAX || etx >= worst_score {
                 return EDGE_NO_CHANGE;
             }
             node.edges[worst_idx] = Edge {
@@ -365,6 +395,36 @@ impl EdgeStore {
         }
     }
 
+    /// Drop `sender`'s edges to nodes its complete list no longer names. Only the sender can
+    /// report its own links, so a complete list is the whole truth about them; our own
+    /// measurements (`Reported`) and anything about the local node are left alone, and so is a
+    /// placeholder, which is a routing artefact rather than a claim by the sender.
+    pub fn retain_listed_edges(&mut self, sender: u32, listed_ids: &[u32]) -> bool {
+        let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == sender)
+        else {
+            return false;
+        };
+        let mut write = 0u8;
+        let mut removed = false;
+        for e in 0..self.nodes[idx].edge_count as usize {
+            let edge = self.nodes[idx].edges[e];
+            let keep = edge.to == 0
+                || edge.source == EdgeSource::Reported
+                || super::is_placeholder_node(edge.to)
+                || listed_ids.contains(&edge.to);
+            if !keep {
+                removed = true;
+                continue;
+            }
+            if write as usize != e {
+                self.nodes[idx].edges[write as usize] = edge;
+            }
+            write += 1;
+        }
+        self.nodes[idx].edge_count = write;
+        removed
+    }
+
     pub fn clear_hears_us_to_unlisted(&mut self, sender: u32, listed_ids: &[u32]) {
         for i in 0..self.node_count as usize {
             let node_id = self.nodes[i].node_id;
@@ -383,18 +443,15 @@ impl EdgeStore {
         }
     }
 
+    /// Nodes we measured a direct link to — the set we publish. Counting peers that hold a
+    /// `Reported` edge back to us instead made this depend on our own symmetry assumption.
     pub fn count_direct_neighbors(&self, my_node: u32) -> u8 {
         let mut count = 0u8;
-        for i in 0..self.node_count as usize {
-            let node_id = self.nodes[i].node_id;
-            if node_id == my_node {
-                continue;
-            }
-            for e in 0..self.nodes[i].edge_count as usize {
-                let edge = self.nodes[i].edges[e];
-                if edge.to == my_node && edge.source == EdgeSource::Reported {
+        if let Some(node) = self.find_node(my_node) {
+            for e in 0..node.edge_count as usize {
+                let edge = node.edges[e];
+                if edge.to != 0 && edge.to != my_node && edge.source == EdgeSource::Reported {
                     count = count.saturating_add(1);
-                    break;
                 }
             }
         }
@@ -540,7 +597,11 @@ impl EdgeStore {
         if node_id == 0 || node_id == my_node {
             return false;
         }
-        let Some(node) = self.find_or_create_node(node_id, now_ms, my_node) else {
+        // Refresh only: creating an edgeless node here made every relayed source a graph entry
+        // that `age_edges` removed on the next tick, and `remove_node_edges_to` then deleted
+        // every peer's published edge to it (field 2026-09-08: ~100 aging passes in 45 min on a
+        // graph of 9 nodes, and a gateway's coverage set wandering packet to packet).
+        let Some(node) = self.find_node_mut(node_id) else {
             return false;
         };
         node.last_full_update_ms = now_ms;
@@ -597,16 +658,144 @@ mod tests {
     }
 
     #[test]
-    fn age_removes_nodes_with_no_outgoing_edges() {
+    fn a_guess_never_overwrites_a_published_measurement() {
+        // A gateway published a hopeless link; a relayed frame across it must not reprice it.
+        const ME: u32 = 0xAA;
+        const GW: u32 = 0xBB;
+        const FAR: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 1_000);
+        edges.update_edge(ME, ME, GW, 1.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, GW, FAR, 15.87, 1_000, EdgeSource::Mirrored, true, 0);
+
+        assert_eq!(
+            edges.update_edge(ME, GW, FAR, 1.57, 2_000, EdgeSource::Inferred, true, 0),
+            EDGE_NO_CHANGE
+        );
+        let edge = edges.find_node(GW).unwrap().find_edge(FAR).unwrap();
+        assert_eq!(edge.etx_fixed, etx_to_fixed(15.87));
+        assert_eq!(edge.source, EdgeSource::Mirrored);
+
+        // The published measurement still wins when it arrives second.
+        edges.update_edge(ME, GW, 0xDD, 1.57, 1_000, EdgeSource::Inferred, true, 0);
+        edges.update_edge(ME, GW, 0xDD, 15.87, 2_000, EdgeSource::Mirrored, true, 0);
+        let replaced = edges.find_node(GW).unwrap().find_edge(0xDD).unwrap();
+        assert_eq!(replaced.source, EdgeSource::Mirrored);
+        assert_eq!(replaced.etx_fixed, etx_to_fixed(15.87));
+    }
+
+    #[test]
+    fn a_guess_never_evicts_a_measurement_from_a_full_list() {
+        // The nominal inferred price outscores every real link, so without a class test it
+        // would evict the measurements the ranking depends on.
+        const ME: u32 = 0xAA;
+        const GW: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 1_000);
+        edges.update_edge(ME, ME, GW, 1.0, 1_000, EdgeSource::Reported, true, 0);
+        for i in 0..MAX_EDGES_PER_NODE {
+            edges.update_edge(
+                ME,
+                GW,
+                0x1000 + i as u32,
+                6.0,
+                1_000,
+                EdgeSource::Mirrored,
+                true,
+                0,
+            );
+        }
+        assert_eq!(
+            edges.find_node(GW).unwrap().edge_count as usize,
+            MAX_EDGES_PER_NODE
+        );
+
+        assert_eq!(
+            edges.update_edge(ME, GW, 0x9999, 1.57, 1_000, EdgeSource::Inferred, true, 0),
+            EDGE_NO_CHANGE
+        );
+        assert!(edges.find_node(GW).unwrap().find_edge(0x9999).is_none());
+        // A published measurement still displaces a worse published one.
+        assert_eq!(
+            edges.update_edge(ME, GW, 0x9999, 1.57, 1_000, EdgeSource::Mirrored, true, 0),
+            EDGE_NEW
+        );
+    }
+
+    #[test]
+    fn a_complete_list_removes_the_entries_it_dropped() {
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 1_000);
+        edges.update_edge(ME, ME, PEER, 1.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, PEER, 0xC1, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, PEER, 0xC2, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
+
+        assert!(edges.retain_listed_edges(PEER, &[0xC1]));
+        assert!(edges.find_node(PEER).unwrap().find_edge(0xC1).is_some());
+        assert!(
+            edges.find_node(PEER).unwrap().find_edge(0xC2).is_none(),
+            "an entry the peer dropped is a link it no longer has"
+        );
+        assert!(
+            !edges.retain_listed_edges(PEER, &[0xC1]),
+            "idempotent once the list matches"
+        );
+    }
+
+    #[test]
+    fn age_removes_nodes_whose_last_edge_expired() {
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
-        let _ = edges.update_node_activity(0xBB, 1_000, 0xAA);
-        assert_eq!(edges.node_count(), 2);
+        edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xBB, 0xCC, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
+        assert_eq!(
+            edges.node_count(),
+            2,
+            "CC is an edge target, not a graph node"
+        );
+
+        // Every edge of BB is past the TTL, so BB itself goes with them.
+        let mut downstream = DownstreamTable::new();
+        let now = 1_000 + 7_200_001;
+        assert!(edges.age_edges(0xAA, now, 7_200_000, Some(&mut downstream)));
+        assert!(edges.find_node(0xBB).is_none());
+    }
+
+    #[test]
+    fn noting_activity_never_invents_a_node() {
+        // Hearing a relayed frame from a far node says it is alive, not that we know a link to
+        // it. Creating an edgeless node here made the next aging pass delete every peer's
+        // published edge to it.
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(0xAA, 1_000);
+        assert!(!edges.update_node_activity(0xBB, 1_000, 0xAA));
+        assert_eq!(edges.node_count(), 1);
+    }
+
+    #[test]
+    fn a_peers_published_edge_to_a_leaf_survives_aging() {
+        // The leaf publishes nothing and has no outgoing edge, so it is not a graph node. The
+        // gateway's measurement of it must still be there after maintenance.
+        const ME: u32 = 0xAA;
+        const GW: u32 = 0xBB;
+        const LEAF: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 1_000);
+        edges.update_edge(ME, ME, GW, 1.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, GW, LEAF, 12.0, 1_000, EdgeSource::Mirrored, true, 0);
+        let _ = edges.update_node_activity(LEAF, 1_000, ME);
 
         let mut downstream = DownstreamTable::new();
-        assert!(edges.age_edges(0xAA, 61_000, 7_200_000, Some(&mut downstream)));
-        assert_eq!(edges.node_count(), 1);
-        assert!(edges.find_node(0xBB).is_none());
+        edges.age_edges(ME, 61_000, 7_200_000, Some(&mut downstream));
+        assert!(
+            edges
+                .find_node(GW)
+                .and_then(|n| n.find_edge(LEAF))
+                .is_some(),
+            "the gateway's own measurement of the leaf must survive"
+        );
     }
 
     #[test]
@@ -628,26 +817,38 @@ mod tests {
     fn age_clears_downstream_when_relay_node_removed() {
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
-        let _ = edges.update_node_activity(0xBB, 1_000, 0xAA);
+        edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Reported, true, 0);
         let mut downstream = DownstreamTable::new();
         downstream.update(0xAA, 0xDD, 0xBB, 2.0, 1_000, false, 0);
         assert_eq!(downstream.count(), 1);
 
-        assert!(edges.age_edges(0xAA, 61_000, 7_200_000, Some(&mut downstream)));
+        let now = 1_000 + 7_200_001;
+        assert!(edges.age_edges(0xAA, now, 7_200_000, Some(&mut downstream)));
         assert_eq!(downstream.count(), 0);
     }
 
     #[test]
-    fn direct_neighbor_count_uses_reported_to_us() {
+    fn direct_neighbor_count_counts_what_we_publish() {
+        // Our neighbour set is what we measured and publish. Counting peers that hold an edge
+        // back to us instead counted our own assumption of symmetry.
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
-        let _ = edges.update_node_activity(0xBB, 1_000, 0xAA);
-        edges.update_edge(0xAA, 0xBB, 0xAA, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xAA, 0xCC, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(0xAA, 0xCC, 0xAA, 2.0, 1_000, EdgeSource::Reported, true, 0);
         assert_eq!(edges.count_direct_neighbors(0xAA), 1);
         assert_eq!(
             edges.direct_neighbor_ids(0xAA, &mut [0; MAX_EDGES_PER_NODE]),
-            0
+            1
         );
+
+        // A peer's edge to us, with none of our own, is not a neighbour of ours.
+        let mut lopsided = EdgeStore::new();
+        lopsided.ensure_local_node(0xAA, 1_000);
+        lopsided.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        lopsided.update_edge(0xAA, 0xBB, 0xAA, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        let node = lopsided.find_node_mut(0xAA).unwrap();
+        node.edge_count = 0;
+        assert_eq!(lopsided.count_direct_neighbors(0xAA), 0);
     }
 
     #[test]

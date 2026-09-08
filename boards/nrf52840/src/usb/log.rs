@@ -896,6 +896,8 @@ pub mod sr {
                 node_id,
                 hears_us,
                 last_mirrored,
+                etx_fixed,
+                measured,
             } => {
                 let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
@@ -908,8 +910,13 @@ pub mod sr {
                 let branch = if last_mirrored { b"\\- !" } else { b"+- !" };
                 put(&mut line, &mut pos, branch);
                 put_hex8(&mut line, &mut pos, node_id);
-                let mid = b" via topo";
+                let mid: &[u8] = if measured {
+                    b" via topo etx="
+                } else {
+                    b" via guess etx="
+                };
                 put(&mut line, &mut pos, mid);
+                put_u32(&mut line, &mut pos, etx_fixed as u32);
                 if hears_us {
                     let tail = b" hearsUs";
                     put(&mut line, &mut pos, tail);
