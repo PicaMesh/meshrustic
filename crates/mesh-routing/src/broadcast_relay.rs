@@ -41,6 +41,10 @@ pub struct BroadcastRelayPlan {
     pub evaluated_len: u8,
     /// Nodes counted as already covered before ranking (source, heard-from and its good links).
     pub pre_covered: u8,
+    /// Transmissions we expect ahead of ours: stock relay routers that have not transmitted
+    /// this packet yet, plus the ranked SR peers whose coverage we absorbed. Zero means nothing
+    /// is expected, so there is nothing for a late copy to stand in for.
+    pub slots_given: u8,
     /// A neighbour our relay reaches that the transmitter did not (0 when the relay was taken
     /// for another reason: sole candidate, downstream, stock coverage).
     pub coverage_for: u32,
@@ -559,6 +563,7 @@ where
     let mut should_relay = false;
     let mut my_delay = 0u32;
     let mut coverage_for = 0u32;
+    let mut slots_given = 0u8;
     let mut ranked = [0u32; RANKED_LOG];
     let mut ranked_len = 0u8;
     let mut evaluated = EvaluatedList::default();
@@ -582,6 +587,11 @@ where
             // trail if we still have unique nodes after they relay.
             absorb_relay_coverage(ctx.edges, ctx.capability, &mut already_covered, neighbor);
             push_ranked(&mut ranked, &mut ranked_len, neighbor);
+            // Its slot is still spent — a stock router transmits on its own schedule — but a
+            // copy already on the air is not a transmission we are still waiting for.
+            if !has_transmitted(neighbor) {
+                slots_given = slots_given.saturating_add(1);
+            }
             slot_delay = slot_delay.saturating_add(half);
         }
     }
@@ -633,6 +643,7 @@ where
             &mut already_covered,
             best.node_id,
         );
+        slots_given = slots_given.saturating_add(1);
         slot_delay = slot_delay.saturating_add(half);
     }
 
@@ -680,6 +691,7 @@ where
         evaluated_len: evaluated.len,
         pre_covered: pre_covered_count,
         coverage_for,
+        slots_given,
     }
 }
 

@@ -203,32 +203,29 @@ airtime. Every SignalRouting node uses the same figure.
   weigh, and our copy is the only witness its transmitter can ever get, so we relay immediately
   (`RelayReason::Sparse`). This is a node's state for its first topology interval after boot,
   where behaving like a plain rebroadcaster is right, and it is what makes a two-node mesh work.
-- **A copy of somebody's broadcast serves one of two named purposes, and the choice is made
-  when the copy would go out, not when it is queued.** Deferring always arms T1
-  (`arm_t1_for_deferred_broadcast`); at its rung the frame goes out only if:
-  **reach** — `NeighborGraph::late_copy_reaches` finds a neighbour of ours that none of the
-  nodes we actually heard transmit this packet has covered (the peer we deferred to may simply
-  never have relayed: in 68 of 77 firings on 2026-09-07 the ranked peer was genuinely silent),
-  logged as the `CoverageFor` neighbour; or
-  **witness** — the frame carries `want_ack` and reached us straight from its originator
+- **T1 stands in for a transmission that was expected and did not happen, and for nothing
+  else.** Deferring arms it when either is true, both known at that moment:
+  **a slot was given** — `BroadcastRelayPlan::slots_given > 0`, i.e. a stock relay router or a
+  ranked SR peer is expected to relay, so if their copy never comes ours is the redundancy that
+  covers the loss; or
+  **a witness is owed** — the frame carries `want_ack`, reached us straight from its originator
   (`hop_start == hop_limit`), and `NeighborGraph::is_elected_witness` makes us its answerer.
-  Stock turns a heard rebroadcast into its implicit ACK and otherwise retransmits
-  `NUM_RELIABLE_RETX` times, so one elected witness replaces three frames from the sender; the
-  election is `witness_owner`, which is deliberately not `coverage_owner`: that one ranks a
-  candidate's own edge *to* the target, the only evidence available for a neighbour nobody can be
-  shown to reach, but the wrong direction here — a witness must be a node the originator can
-  hear. `witness_owner` requires positive evidence of that (the source's own list naming the
-  candidate, or us watching the source carry its frame) and prices the link as the source
-  measures it; edge existence alone will not do, because a direct observation writes both edge
-  directions from one measurement. A source that publishes nothing leaves each node with only
-  its own evidence, so several may elect themselves — still fewer than every node that heard it. A frame that
-  arrived relayed was already witnessed — the relay's own transmission is the rebroadcast its
-  source heard — so no witness is owed for it.
-  Neither purpose left means the copy is airtime and nothing else
-  (`T1CancelReason::NothingLeftToDo`, logged as `nothing left to reach or tell`); before this
-  was checked, 87 such frames went out against 21 coverage relays in 42 minutes. The predicate
-  it replaced asked whether every `hears_us` neighbour had itself *relayed* the packet, which
-  two or more neighbours can never satisfy: it cancelled nothing in those 42 minutes.
+  Stock's reliable router turns a heard rebroadcast of its own packet into an implicit ACK
+  and otherwise retransmits it three times, so one elected witness replaces three
+  frames from the sender. A frame that arrived relayed was already witnessed — the relay's own
+  transmission is the rebroadcast its source heard — so no witness is owed for it.
+  Neither reason means no transmission is expected and nobody is waiting to be told
+  (`SrSkipReason::AlreadyCovered`, logged as `no slot given, no witness owed`). Measured over
+  30 min on three field nodes (2026-09-08): this declines about 100 copies per node and cut T1
+  traffic roughly tenfold, while delivery between two colocated nodes was unchanged (3.2%
+  asymmetric ids with it, 2.9% without).
+- **Once armed, only a heard copy stands it down** (`T1CancelReason::RelayHeard`, or our own
+  transmission). The coverage question is deliberately *not* asked again at fire time: it
+  answers "who needs a relay", not "did the expected frame actually arrive". Two of the seven
+  late copies measured on 2026-09-08 carried frames to nodes the graph believed were covered —
+  `0x3fd7bd50` reached MR22, and `0x750cc87a` reached two nodes, only via the late copy — because
+  the covering link was marginal (−84 to −93 dBm) and the frame was lost on it. Coverage is
+  topology; per-frame loss is invisible to it, and T1 is the layer that absorbs it.
   Our own originated broadcasts keep their own timer and are not judged by this rule; a ranked
   commit never arms T1.
   Any heard rebroadcast cancels T1; T1 never fires if we already recorded our own transmission.
@@ -237,10 +234,10 @@ airtime. Every SignalRouting node uses the same figure.
   cancels the rest. Firing together would collide exactly when the ranked relay is the frame
   that went missing.
   Originator T1 in `send_local` remains a separate “did anyone rebroadcast?” timer with the same
-  cancel-on-rebroadcast helpers. Tests: `t1_retransmit_fires_after_defer_window` (the peer that
-  absorbed our coverage stayed silent), `t1_stands_down_once_the_peer_it_insured_transmits`,
-  `late_copy_with_no_purpose_is_cancelled_at_fire_time`, `source_witness_is_its_best_linked_neighbour`,
-  `late_copy_reaches_only_an_uncovered_neighbor`, `ranked_broadcast_slot_does_not_arm_t1`.
+  cancel-on-rebroadcast helpers. Tests: `t1_retransmit_fires_after_defer_window`,
+  `t1_stands_down_when_the_peers_copy_is_heard`, `no_expected_transmission_arms_no_insurance`,
+  `elected_witness_answers_when_no_slot_was_given`,
+  `source_witness_is_the_neighbour_the_source_can_hear`, `ranked_broadcast_slot_does_not_arm_t1`.
 
 ## 4. Duplicates and hand-offs
 

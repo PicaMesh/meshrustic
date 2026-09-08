@@ -254,9 +254,6 @@ pub enum T1CancelReason {
     RelayHeard,
     /// We transmitted this packet ourselves; the source already had a copy to hear.
     OwnTransmission,
-    /// At fire time the copy had no purpose left: nothing of ours to reach, and no originator
-    /// waiting to be told it was heard.
-    NothingLeftToDo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +276,9 @@ pub enum SrSkipReason {
     /// Routing ACK toward a node its sender heard directly: it retraces the request's link and
     /// a lost ACK is covered by the sender's own retransmission.
     ReplyRetracesLink,
+    /// Broadcast we were not given a slot for and owe no acknowledgement: no transmission is
+    /// expected, so there is nothing for a late copy to stand in for.
+    AlreadyCovered,
     /// Unicast whose only route is the unverified inbound-gateway guess, pointing back at the
     /// node we heard the packet from: carrying it moves the packet away from its destination.
     UnverifiedBacktrack,

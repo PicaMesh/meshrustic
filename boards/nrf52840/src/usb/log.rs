@@ -1193,6 +1193,7 @@ pub mod sr {
                     SrSkipReason::NoRelayPath => b"no relay path",
                     SrSkipReason::ReplyRetracesLink => b"reply retraces link",
                     SrSkipReason::UnverifiedBacktrack => b"guessed route runs back",
+                    SrSkipReason::AlreadyCovered => b"no slot given, no witness owed",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);
@@ -1644,7 +1645,6 @@ pub mod sr {
                 let reason_text: &[u8] = match reason {
                     T1CancelReason::RelayHeard => b"relay heard",
                     T1CancelReason::OwnTransmission => b"we transmitted it ourselves",
-                    T1CancelReason::NothingLeftToDo => b"nothing left to reach or tell",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

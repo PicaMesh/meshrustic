@@ -78,7 +78,7 @@ fn healthy_topology_defers_when_stock_router_covers() {
     );
     assert!(
         router.has_pending_work(),
-        "deferred broadcast arms T1; whether it goes out is decided when it fires"
+        "a slot was given to the stock repeater, so its silence is insured"
     );
     let slot_ms = coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_DEFAULT_PRESET);
     let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms)
@@ -87,17 +87,12 @@ fn healthy_topology_defers_when_stock_router_covers() {
         router.poll_t1_retransmit(fire_ms - 1).is_none(),
         "T1 must not fire inside the defer window"
     );
-    // The stock repeater is the only neighbour of ours besides the source, and the source
-    // reaches it directly: our late copy would carry the packet to nobody, and this broadcast
-    // asked for no acknowledgement, so the insurance stands down at its rung.
+    // Insurers take rungs one half-airtime apart; ours is somewhere in that ladder. Only a
+    // heard copy stands it down: the graph said the repeater covers everything, and whether
+    // its frame actually arrived is not something the graph can answer.
     let ladder = coordinated_relay::half_airtime_ms(coordinated_relay::DEFAULT_SLOT_MS)
         * mesh_routing::MAX_EDGES_PER_NODE as u32;
-    for t in (fire_ms..=fire_ms + ladder + coordinated_relay::DEFAULT_SLOT_MS).step_by(17) {
-        assert!(
-            router.poll_t1_retransmit(t).is_none(),
-            "nothing of ours left to reach and no witness owed"
-        );
-    }
+    assert!(router.poll_t1_retransmit(fire_ms + ladder).is_some());
 }
 
 #[test]
