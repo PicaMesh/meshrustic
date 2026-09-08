@@ -110,9 +110,13 @@ airtime. Every SignalRouting node uses the same figure.
   `route_cost_is_measured_at_the_receiver`.
 - **Delivery vs confirmed coverage.** Route search and unicast ranking treat a hop as
   deliverable via `route::can_deliver` (optimistic when the receiver does not publish topology).
-  Broadcast absorb, pre-cover, ranking coverage, and unique-coverage cancel use `route::covers`
-  (`known_to_hear` plus a delivery-direction cost at or below `COVERAGE_ETX_CEILING_FIXED`), so
-  mute/silent neighbours and sticky-but-hopeless `hears_us` links are not counted as covered.
+  Broadcast absorb, pre-cover, ranking coverage, and unique-coverage cancel share one admission
+  rule: `route::covers` — evidence graded by whether the receiver reports (§3b), over a link at
+  or below `COVERAGE_ETX_CEILING_FIXED` — or, for a neighbour nobody can be shown to reach,
+  `route::coverage_owner` naming that relay. Absorb credits exactly what admission credited
+  (`admits_coverage`, test `an_owner_taking_a_slot_absorbs_the_neighbour_it_owns`): crediting only `covers` left an owned neighbour uncovered after its owner
+  took a slot, and a later phase relayed for it again. A sticky-but-hopeless `hears_us` link is
+  not coverage in any of them.
   Shared helpers: `delivery_hop_cost_fixed`, `hop_cost_fixed`. Tests: `can_deliver_*`,
   `known_to_hear_ignores_stock_optimism`, `covers_requires_a_link_that_is_not_hopeless`,
   `one_way_list_to_publishing_dest_is_not_a_direct_path`.
@@ -142,19 +146,27 @@ airtime. Every SignalRouting node uses the same figure.
   drop the relay only when that node can finish delivery to the destination (`can_deliver` or
   downstream). Otherwise the next hop is cleared and we stay in the ranking as backup. Tests:
   `unicast_not_relayed_back_to_the_relayer`, `next_hop_is_relayer_clears_when_they_cannot_finish`.
-- **A guessed route is never stamped.** A route the search could only complete by admitting an
-  unconfirmed hop (`Route::verified` false, the inbound-gateway fallback) may carry a unicast,
+- **A guessed route is never stamped.** The verdict belongs to the hop the picker returned, not
+  to the searched route: `NeighborGraph::get_next_hop_verified` reports `false` for a
+  better-positioned neighbour, the downstream table, best-effort self relay and direct delivery,
+  and `Route::verified` is false until the strict search sets it, so an empty route never claims
+  one (test `only_the_confirmed_search_reports_a_verified_route`). Such a route may carry a
+  unicast,
   but its next hop is cleared before transmission: the node it names never confirmed it hears
   the destination, and a designation makes every other candidate stand down and wait for a copy
   that node may have no way to send. Cleared, we are one ranked candidate among several. Test:
   `guessed_route_is_never_stamped_as_next_hop`.
 - **A guessed route that runs back is contained.** If the only route is unverified *and* names
-  the node we heard the packet from, the relay is dropped, not merely stripped of its next hop
+  the node we heard the packet from, and the frame was not addressed to us as its next hop, the
+  relay is dropped, not merely stripped of its next hop
   (`SrSkipReason::UnverifiedBacktrack`, logged as `guessed route runs back`). It would carry the
   packet away from its destination onto our own side of the mesh, where the only path anyone
   knows is the one it arrived on, and for a `want_ack` unicast it invites the far side to retry
   through us. A verified route pointing back is the case above: the evidence says that direction
-  reaches the destination. Test: `guessed_route_back_the_way_it_came_is_dropped`.
+  reaches the destination. A frame that named us is forwarded with the next hop cleared instead:
+  the sender is waiting on us specifically and its retries would designate us again, so one copy
+  from us costs less than three from it. Tests: `guessed_route_back_the_way_it_came_is_dropped`,
+  `a_frame_named_for_us_is_forwarded_even_on_a_guessed_backtrack`.
 - **Designated next hop and backup.** A wire next hop that is not us owns slot 0; every other
   candidate shifts one slot behind the peer or stock wait (`plan_designated_unicast`). Ranking
   `Err` does not abort that backup. Forward and backup TX stamp **our path** next hop; flood
@@ -183,7 +195,8 @@ airtime. Every SignalRouting node uses the same figure.
   candidate's coverage set, the absorbed coverage of earlier slots, and unique coverage. Tests:
   `covers_requires_a_link_that_is_not_hopeless`, `covers_a_silent_node_on_the_senders_own_edge`,
   `one_way_listed_neighbor_is_not_precovered`, `hopeless_confirmed_neighbor_is_not_precovered`,
-  `poor_link_does_not_count_as_coverage`.
+  `poor_link_does_not_count_as_coverage`,
+  `a_sticky_confirmation_behind_a_decayed_link_is_not_ours_to_cover`.
 - **A neighbour nobody can be shown to reach belongs to one relayer** (`route::coverage_owner`).
   Its receive path is all anyone can measure, so the owner is the node hearing it best, compared
   in `OWNER_COST_BUCKET_FIXED` buckets, with stock ROUTER/REPEATER/ROUTER_CLIENT given way first
@@ -198,7 +211,25 @@ airtime. Every SignalRouting node uses the same figure.
   ceiling, and one node's insurance fired 65 times in 109 minutes to carry those packets
   instead. Test: `a_hopeless_link_owns_nothing`. Applied both in the
   slot ranking and in unique coverage, so the branch does not relay N times for the same node.
-  Tests: `mute_neighbour_owner_is_the_best_link_then_the_lowest_id`,
+  **Only a silent neighbour has an owner**: one that publishes topology and does not list a
+  candidate has reported that the candidate cannot reach it, and that silence is evidence, so
+  nobody owns it (test `a_publisher_has_no_owner`). This is also why the ranking keeps
+  `delivery_hop_cost_fixed` for pricing — `can_deliver` failing is that same report, not a
+  missing measurement.
+  **The stock-coverage phase is gone**, and with it a second owner election and its own
+  legacy-role predicates. It relayed for a mute or legacy neighbour "nobody ranked ahead
+  covers" — but it applied no ETX ceiling and iterated our Mirrored edges as well, so it relayed
+  in exactly the three states the coverage model calls undeliverable: a link past the ceiling, a
+  link at the heard-once sentinel, and a neighbour we never measured directly. Where our link is
+  sound the ranking already carries it, because coverage admits a silent neighbour on our own
+  edge. This is a deliberate narrowing, not a no-op: over an ETX-8 link a copy arrives about one
+  time in eight, and the phase spent a slot on it. Field: `via=stock` fired once in about ten
+  days of logs (2026-09-06), in a state where every candidate had zero unique coverage, and a
+  peer's duplicate cancelled it 200 ms later. Tests:
+  `mute_stock_neighbour_only_we_reach_is_carried_by_the_ranking`,
+  `a_mute_neighbour_past_the_ceiling_is_nobody_s_relay`.
+  Tests: `a_hopeless_link_owns_nothing`,
+  `mute_neighbour_owner_is_the_best_link_then_the_lowest_id`,
   `silent_neighbour_is_relayed_for_by_the_best_link_only`,
   `inbound_only_neighbor_belongs_to_its_owner`.
 - **The ranking inputs are logged on the defer path too**, not only when we relay
@@ -250,7 +281,7 @@ airtime. Every SignalRouting node uses the same figure.
   Our own originated broadcasts keep their own timer and are not judged by this rule; a ranked
   commit never arms T1.
   Any heard rebroadcast cancels T1; T1 never fires if we already recorded our own transmission.
-  Insurers stagger: every node that deferred arms T1, so each waits its unranked slot rung
+  Insurers stagger: every node that armed T1 waits its unranked slot rung
   (`relay_slot_index`, one half-airtime apart) after the defer window, and the first firing
   cancels the rest. Firing together would collide exactly when the ranked relay is the frame
   that went missing.

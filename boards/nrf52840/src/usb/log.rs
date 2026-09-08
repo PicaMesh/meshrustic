@@ -1105,7 +1105,6 @@ pub mod sr {
                     RelayReason::None => b"",
                     RelayReason::Ranked => b", via=rank",
                     RelayReason::Downstream => b", via=downstream",
-                    RelayReason::StockCoverage => b", via=stock",
                     RelayReason::Sparse => b", via=sparse",
                     RelayReason::UnicastCost => b", via=cost",
                 };

@@ -642,7 +642,7 @@ impl NeighborGraph {
         0
     }
 
-    /// Phased broadcast relay schedule (stock slots → ranked SR → downstream → stock coverage).
+    /// Phased broadcast relay schedule (stock early slots → ranked SR → downstream).
     pub fn plan_broadcast_relay(
         &self,
         packet_id: u32,
@@ -1789,6 +1789,23 @@ impl NeighborGraph {
         heard_from: u32,
         now_ms: u32,
     ) -> u32 {
+        self.get_next_hop_verified(destination, source_node, heard_from, now_ms)
+            .0
+    }
+
+    /// The next hop to stamp on a relayed unicast, and whether it came from a path the strict
+    /// search confirmed end to end. Every other source of a hop here — a better-positioned
+    /// neighbour, the downstream table, best-effort self relay, direct delivery — is a guess and
+    /// reports `false`, so a caller can refuse to designate a node that never proved it hears
+    /// the destination. Reading `Route::verified` instead described the searched route rather
+    /// than the hop actually returned.
+    pub fn get_next_hop_verified(
+        &mut self,
+        destination: u32,
+        source_node: u32,
+        heard_from: u32,
+        now_ms: u32,
+    ) -> (u32, bool) {
         self.get_next_hop_inner(destination, source_node, heard_from, now_ms, true)
     }
 
@@ -1799,9 +1816,9 @@ impl NeighborGraph {
         heard_from: u32,
         now_ms: u32,
         allow_opportunistic: bool,
-    ) -> u32 {
+    ) -> (u32, bool) {
         if destination == 0 || destination == self.my_node {
-            return 0;
+            return (0, false);
         }
 
         let route = self.get_route(destination, now_ms);
@@ -1827,14 +1844,14 @@ impl NeighborGraph {
                         route_cost,
                     );
                     if better != 0 {
-                        return better;
+                        return (better, false);
                     }
                 }
-                return route.next_hop;
+                return (route.next_hop, route.verified);
             }
 
             if self.edge_hears_us(route.next_hop) {
-                return route.next_hop;
+                return (route.next_hop, route.verified);
             }
 
             if allow_opportunistic {
@@ -1849,11 +1866,11 @@ impl NeighborGraph {
                     f32::MAX,
                 );
                 if better != 0 {
-                    return better;
+                    return (better, false);
                 }
             }
 
-            return self.my_node;
+            return (self.my_node, false);
         }
 
         if let Some(relay_for_dest) = self.get_downstream_relay(destination, now_ms) {
@@ -1866,7 +1883,7 @@ impl NeighborGraph {
                 connectivity_unknown = unknown;
             }
             if relay_can_hear && !connectivity_unknown && self.has_direct_edge(relay_for_dest) {
-                return relay_for_dest;
+                return (relay_for_dest, false);
             }
         }
 
@@ -1882,12 +1899,12 @@ impl NeighborGraph {
                 f32::MAX,
             );
             if better != 0 {
-                return better;
+                return (better, false);
             }
         }
 
         if heard_from != source_node && self.has_direct_edge(destination) {
-            return destination;
+            return (destination, false);
         }
 
         if self.is_downstream_relay_for(self.my_node, destination, now_ms) {
@@ -1900,7 +1917,7 @@ impl NeighborGraph {
                 false,
                 0,
             );
-            return destination;
+            return (destination, false);
         }
 
         if let Some(dest_node) = self.edges.find_node(destination) {
@@ -1914,11 +1931,11 @@ impl NeighborGraph {
                     false,
                     0,
                 );
-                return destination;
+                return (destination, false);
             }
         }
 
-        0
+        (0, false)
     }
 
     pub(crate) fn has_direct_edge(&self, peer: u32) -> bool {
@@ -1967,8 +1984,9 @@ impl NeighborGraph {
         ) == self.my_node
     }
 
-    /// Do we still reach a neighbour that none of `covered_by` can deliver to?
-    /// Ours are `hears_us` neighbours plus stock neighbours we own under the stock-coverage rule.
+    /// Do we still reach a neighbour that none of `covered_by` can deliver to? Ours are the
+    /// neighbours that confirmed hearing us, plus those nobody can be shown to reach that we
+    /// own — and in both cases only while a copy from us would actually arrive.
     pub fn has_unique_coverage(&self, covered_by: &[u32]) -> bool {
         self.unique_coverage_neighbor(covered_by).is_some()
     }
@@ -1995,6 +2013,13 @@ impl NeighborGraph {
                     neighbor,
                 ) != self.my_node
             {
+                continue;
+            }
+            // Confirmation or ownership says whose it is; `covers` says whether a copy from us
+            // would arrive at all. `hears_us` is sticky, so without this a neighbour behind a
+            // decayed link stayed "ours to cover" and kept a queued relay the ranking refuses
+            // (31 of 183 slots sat at the heard-once sentinel, field 2026-09-08).
+            if !crate::graph::covers(&self.edges, Some(&self.capability), self.my_node, neighbor) {
                 continue;
             }
             if covered_by.contains(&neighbor) {
@@ -3560,6 +3585,38 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(COV_A);
         graph.confirm_direct_neighbor_hears_us(COV_B);
         assert!(graph.has_unique_coverage(&[COV_A]));
+    }
+
+    /// `hears_us` is sticky: a neighbour that confirmed hearing us once keeps the flag while its
+    /// link decays. Ours to cover is not the same as reachable, so the cancel path asks `covers`
+    /// too — otherwise a queued relay is kept for a node the ranking refuses to serve.
+    #[test]
+    fn a_sticky_confirmation_behind_a_decayed_link_is_not_ours_to_cover() {
+        const ME: u32 = 0xAA00_00AA;
+        const SRC: u32 = 0xCC00_00CC;
+        const EDGE: u32 = 0xEE00_00EE;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(EDGE, -70, 8, 1_000, 0);
+        graph.confirm_direct_neighbor_hears_us(EDGE);
+        assert_eq!(
+            graph.unique_coverage_neighbor(&[SRC]),
+            Some(EDGE),
+            "a sound confirmed link is ours"
+        );
+        // The link decays to the heard-once sentinel in both directions, as a fresh observation
+        // of a barely-audible neighbour writes it; the confirmation stays.
+        for (from, to) in [(ME, EDGE), (EDGE, ME)] {
+            graph
+                .edges_mut()
+                .update_edge(ME, from, to, 40.0, 1_000, EdgeSource::Reported, true, 0);
+        }
+        assert_eq!(
+            graph.unique_coverage_neighbor(&[SRC]),
+            None,
+            "confirmed but unreachable: no relay is worth its airtime"
+        );
     }
 
     /// An inbound-only neighbour (we hear it, it never confirms hearing us) is nobody's coverage

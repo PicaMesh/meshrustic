@@ -187,8 +187,10 @@ pub fn can_deliver(
 
 /// Confirmed hearing only: `to` hears `from` via `hears_us` or by listing `from`.
 ///
-/// Broadcast coverage uses this instead of [`can_deliver`] so mute/legacy neighbours are not
-/// treated as covered merely because they do not publish topology.
+/// This is the strict half of [`covers`], which is what broadcast coverage actually calls: a
+/// receiver that publishes topology must be known to hear the transmitter, while a silent one
+/// falls back to the transmitter's own edge, since that is all anyone can measure about it.
+/// Unlike [`can_deliver`], being unable to publish is not by itself evidence of hearing.
 pub fn known_to_hear(edges: &EdgeStore, from: u32, to: u32) -> bool {
     if edges
         .find_node(from)
@@ -321,6 +323,17 @@ pub fn witness_owner(
     owner
 }
 
+/// Which single node carries a neighbour that nobody can be *shown* to reach: the one hearing it
+/// best, compared in [`OWNER_COST_BUCKET_FIXED`] buckets, with stock rebroadcasters given way
+/// first (they relay regardless of SR and hold the earliest slots) and the lowest node id as the
+/// final tie-break. Mute and passive roles never own, because they never relay, and a link past
+/// [`COVERAGE_ETX_CEILING_FIXED`] owns nothing because it delivers nothing.
+///
+/// Only a *silent* neighbour has an owner. A neighbour that publishes topology and does not list
+/// a candidate has told us that candidate cannot reach it, and that silence is evidence: nobody
+/// owns it, and a relay spent on it would be spent against its own report. Contrast
+/// [`witness_owner`], which elects an answerer for an originator and therefore prices the other
+/// direction of the link.
 pub fn coverage_owner(
     edges: &EdgeStore,
     capability: &CapabilityCache,
@@ -329,6 +342,9 @@ pub fn coverage_owner(
     target: u32,
 ) -> u32 {
     if target == 0 || is_placeholder_node(target) {
+        return 0;
+    }
+    if publishes_topology(Some(capability), target) {
         return 0;
     }
     let mut owner = 0u32;
@@ -559,7 +575,9 @@ pub fn calculate_route(
         cost_fixed: ROUTE_COST_UNKNOWN,
         timestamp_ms: now_ms,
         hops: 0,
-        verified: true,
+        // Nothing is a confirmed path until the strict search says so: an empty route must not
+        // claim verification, or a caller reading this flag believes a guess.
+        verified: false,
     };
     if my_node == 0 || destination == 0 || destination == my_node {
         return result;
@@ -571,6 +589,7 @@ pub fn calculate_route(
         result.cost_fixed = cost;
         result.next_hop = next_hop;
         result.hops = hops;
+        result.verified = true;
     }
 
     if result.next_hop != 0 {
@@ -1090,6 +1109,39 @@ mod tests {
             !covers(&edges, Some(&capability), TX, SILENT),
             "a reporting node's silence about the sender counts against coverage"
         );
+    }
+
+    /// A neighbour that publishes topology and omits a candidate has reported that the candidate
+    /// cannot reach it. That silence is evidence, so nobody owns it — otherwise the ranking
+    /// credits coverage against the node's own report and burns a slot on it.
+    #[test]
+    fn a_publisher_has_no_owner() {
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        const TARGET: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, PEER, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, TARGET, 2.0, 0, EdgeSource::Reported, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(PEER, true, 0);
+        // Silent so far: someone owns it.
+        assert_eq!(coverage_owner(&edges, &capability, ME, true, TARGET), ME);
+        // It publishes its own list and does not name us: nobody owns it.
+        capability.track_topology(TARGET, true, 0);
+        assert_eq!(coverage_owner(&edges, &capability, ME, true, TARGET), 0);
+    }
+
+    /// An unverified route must not be reported as confirmed, and an empty one must not either.
+    #[test]
+    fn only_the_confirmed_search_reports_a_verified_route() {
+        const ME: u32 = 0xAA;
+        const DEST: u32 = 0xCC;
+        let edges = EdgeStore::new();
+        let downstream = DownstreamTable::new();
+        let empty = calculate_route(&edges, &downstream, ME, DEST, 0, None);
+        assert_eq!(empty.next_hop, 0);
+        assert!(!empty.verified, "no route at all is not a confirmed route");
     }
 
     /// Ownership picks who carries a neighbour nobody can be shown to reach. It must not make

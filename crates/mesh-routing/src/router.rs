@@ -1718,18 +1718,21 @@ impl Router {
         // next hop.
         let mut route_verified = true;
         let picked_hop = if parsed.to != NODENUM_BROADCAST {
-            let hop = self
-                .graph
-                .get_next_hop(parsed.to, parsed.from, heard_from, now_ms);
+            // The verdict belongs to the hop we were handed, not to the searched route: the
+            // picker also answers with a better-positioned neighbour, the downstream table or
+            // ourselves, and none of those is a confirmed path.
+            let (hop, hop_verified) =
+                self.graph
+                    .get_next_hop_verified(parsed.to, parsed.from, heard_from, now_ms);
             if hop != 0 {
                 let route = self.graph.get_route(parsed.to, now_ms);
-                route_verified = route.verified;
+                route_verified = hop_verified;
                 self.sr_log.push(SrLogEvent::RouteNextHop {
                     destination: parsed.to,
                     next_hop: hop,
                     cost_x100: route.cost_fixed,
                     hops: route.hops,
-                    verified: route.verified,
+                    verified: hop_verified,
                 });
             }
             hop
@@ -1746,15 +1749,24 @@ impl Router {
             picked_hop
         };
 
+        // The packet names us as its next hop: the sender asked us to carry it, so no
+        // "somebody else is better placed" reason applies. Without this, a designated hop whose
+        // own route pointed back at the node it heard the frame from went silent and only a
+        // backup carried the packet, a slot late (seen on both nicenanos, 2026-09-07).
+        let we_are_designated_hop =
+            parsed.to != NODENUM_BROADCAST && parsed.next_hop == (self.node_num & 0xFF) as u8;
+
         // Containment. A guessed route that points back at the node we heard the packet from
-        // carries it away from its destination: onto our own branch, where the only path anyone
-        // knows is the one it just arrived on. Nobody there can finish it, so the copy is pure
-        // airtime and, for a want_ack unicast, an invitation for the far side to retry through
-        // us again. Drop it and leave the packet to the side of the mesh that has a measured
-        // path. A verified route pointing back is a different case, handled below: the evidence
-        // says that direction really does reach the destination.
+        // carries the packet away from its destination: onto our own branch, where the only path
+        // anyone knows is the one it just arrived on. Nobody there can finish it, so the copy is
+        // pure airtime and, for a want_ack unicast, an invitation for the far side to retry
+        // through us again. Drop it — unless we were named as the next hop: the sender is
+        // waiting on us specifically, its retries would designate us again, and one frame from
+        // us costs less than three from it. That case falls through to the clear below, which is
+        // also what a verified route pointing back does.
         if parsed.to != NODENUM_BROADCAST
             && !route_verified
+            && !we_are_designated_hop
             && next_hop != 0
             && next_hop == heard_from
         {
@@ -1794,13 +1806,6 @@ impl Router {
                 verified: true,
             });
         }
-
-        // The packet names us as its next hop: the sender asked us to carry it, so no
-        // "somebody else is better placed" reason applies. Without this, a designated hop whose
-        // own route pointed back at the node it heard the frame from went silent and only a
-        // backup carried the packet, a slot late (seen on both nicenanos, 2026-09-07).
-        let we_are_designated_hop =
-            parsed.to != NODENUM_BROADCAST && parsed.next_hop == (self.node_num & 0xFF) as u8;
 
         // Named as next hop while our only route runs back to the node that handed us the
         // packet: forward it, but never back the way it came. Stamping the relayer would bounce
@@ -5019,6 +5024,21 @@ mod tests {
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(!scheduled, "carrying it moves the packet away from DEST");
         assert_eq!(reason, Some(SrSkipReason::UnverifiedBacktrack));
+    }
+
+    /// The same frame, but the sender named us as its next hop: it is waiting on us
+    /// specifically and its retries would designate us again, so one copy from us costs less
+    /// than three from it. Forwarded with the next hop cleared, never dropped.
+    #[test]
+    fn a_frame_named_for_us_is_forwarded_even_on_a_guessed_backtrack() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unverified_gateway_graph(router, None);
+        // Heard from the gateway, whose byte our guess names — but the frame names us.
+        let wire = unicast_wire(2, 3, (UNI_ME & 0xFF) as u8, 0xBB, 0x703);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(scheduled, "named for us: carry it");
+        assert_ne!(reason, Some(SrSkipReason::UnverifiedBacktrack));
     }
 
     #[test]
