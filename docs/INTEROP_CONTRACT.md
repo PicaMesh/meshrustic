@@ -413,8 +413,18 @@ airtime. Every SignalRouting node uses the same figure.
   decision still counts that neighbour as ours to carry, so a node that has left the air draws a
   relay out of us for every frame whose sender we cannot show reached it. Only our own claim is
   retracted — the node stays in the graph, so a peer that still hears it keeps it reachable and a
-  unicast for it still finds that route. Stock and legacy neighbours keep the full
+  unicast for it still finds that route. **Coverage goes further than our own edge**: past the
+  same horizon the node is nobody's coverage target (`route::is_silent_publisher`, applied inside
+  `admits_coverage`, so the ranking, absorb and the cancel path all follow). A peer's published
+  edge to it outlives our retraction by up to a broadcast interval, so without that every node
+  credits its peers with covering a node that has gone — and each of those peers, having retracted
+  it under the same rule, declines the slot it was handed. Field 2026-09-08: the branch gateway
+  died, and both desk nodes then handed 95% of frames to a peer for a node none of them still
+  reached, leaving the insurance to carry everything three seconds late. The judgement is on when
+  we last heard the node itself, not on a peer naming it in a list; hearing it again restores it.
+  Stock and legacy neighbours keep the full
   `NEIGHBOR_TTL_MS`: they promise no cadence, so their silence is not evidence. Tests:
+  `a_publisher_we_stopped_hearing_is_nobody_s_target`,
   `a_publisher_silent_for_two_intervals_stops_being_ours_to_carry`,
   `a_silent_stock_neighbour_keeps_the_full_ttl`,
   `a_pruned_publisher_is_still_reachable_through_a_peer`,

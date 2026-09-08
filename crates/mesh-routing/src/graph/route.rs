@@ -420,6 +420,35 @@ pub fn coverage_owner(
 /// has to mean "that frame very likely arrived", not "it arrived once". ETX 7 in fixed point.
 pub const COVERAGE_ETX_CEILING_FIXED: u16 = 700;
 
+/// Has a topology publisher gone quiet long enough that it is nobody's coverage target?
+///
+/// A publisher promises a list every broadcast interval, so silence past
+/// [`PUBLISHER_SILENCE_MS`](crate::neighbor_graph::PUBLISHER_SILENCE_MS) means it is gone.
+/// Maintenance retracts *our own* link to such a node, but a peer's published edge to it outlives
+/// that by up to a broadcast interval — so without this test every node credits its peers with
+/// covering a node that has gone, and each of those peers, having retracted it under the same
+/// rule, declines the slot it was handed. Field 2026-09-08: the branch gateway died and both desk
+/// nodes handed 95% of frames to a peer for a node none of them still reached, leaving the
+/// insurance to carry everything three seconds late.
+///
+/// Judged on when we last heard the node itself, which is what the graph records per node — a
+/// peer mentioning it in a list is not hearing it.
+pub fn is_silent_publisher(
+    edges: &EdgeStore,
+    capability: Option<&CapabilityCache>,
+    node: u32,
+    now_ms: u32,
+) -> bool {
+    if !publishes_topology(capability, node) {
+        return false;
+    }
+    let Some(entry) = edges.find_node(node) else {
+        return false;
+    };
+    let silent = now_ms.wrapping_sub(entry.last_full_update_ms);
+    silent > crate::neighbor_graph::PUBLISHER_SILENCE_MS && silent < 0x8000_0000
+}
+
 /// Does a transmission by `from` reach `to` well enough to relieve a bystander of relaying?
 ///
 /// What counts as evidence depends on whether the receiver ever reports. A node that publishes

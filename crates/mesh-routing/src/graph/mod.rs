@@ -17,10 +17,10 @@ pub use placeholder::{
 };
 pub use route::{
     calculate_route, can_deliver, coverage_owner, covers, delivery_hop_cost_fixed,
-    find_better_positioned_neighbor, hop_cost_fixed, is_node_routable, known_to_hear,
-    publishes_topology, verified_connectivity, witness_owner, RoutableFilter, Route, RouteCache,
-    COVERAGE_ETX_CEILING_FIXED, MAX_CACHED_ROUTES, OWNER_COST_BUCKET_FIXED, ROUTE_CACHE_TIMEOUT_MS,
-    UNVERIFIED_HOP_COST_FACTOR,
+    find_better_positioned_neighbor, hop_cost_fixed, is_node_routable, is_silent_publisher,
+    known_to_hear, publishes_topology, verified_connectivity, witness_owner, RoutableFilter, Route,
+    RouteCache, COVERAGE_ETX_CEILING_FIXED, MAX_CACHED_ROUTES, OWNER_COST_BUCKET_FIXED,
+    ROUTE_CACHE_TIMEOUT_MS, UNVERIFIED_HOP_COST_FACTOR,
 };
 
 pub const MAX_GRAPH_NODES: usize = 40;

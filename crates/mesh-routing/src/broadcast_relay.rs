@@ -2,8 +2,8 @@
 
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{
-    coverage_owner, covers, delivery_hop_cost_fixed, is_placeholder_node, DownstreamTable,
-    EdgeSource, EdgeStore, MAX_EDGES_PER_NODE,
+    coverage_owner, covers, delivery_hop_cost_fixed, is_placeholder_node, is_silent_publisher,
+    DownstreamTable, EdgeSource, EdgeStore, MAX_EDGES_PER_NODE,
 };
 
 const BIDI_ETX_CEILING: f32 = 20.0;
@@ -182,6 +182,7 @@ pub struct BroadcastRelayContext<'a> {
 fn get_coverage_if_relays(
     ctx: &BroadcastRelayContext<'_>,
     relay: u32,
+    now_ms: u32,
     out: &mut [u32; MAX_EDGES_PER_NODE],
 ) -> u8 {
     let edges = ctx.edges;
@@ -209,7 +210,7 @@ fn get_coverage_if_relays(
         // A neighbour nobody can be shown to reach is still worth one relay, but only from its
         // owner: counting it everywhere made every node on the branch relay every frame for the
         // same unconfirmed node (an Alert node that publishes nothing, 2026-09-07).
-        if !admits_coverage(ctx, relay, target) {
+        if !admits_coverage(ctx, relay, target, now_ms) {
             continue;
         }
         if (count as usize) < MAX_EDGES_PER_NODE {
@@ -224,7 +225,12 @@ fn get_coverage_if_relays(
 /// admitted it in [`get_coverage_if_relays`]. Crediting only `covers` while admission also
 /// accepted ownership left an owned neighbour uncovered after its owner took a slot, so a later
 /// phase relayed for it a second time.
-fn absorb_relay_coverage(ctx: &BroadcastRelayContext<'_>, covered: &mut CoveredSet, relay: u32) {
+fn absorb_relay_coverage(
+    ctx: &BroadcastRelayContext<'_>,
+    covered: &mut CoveredSet,
+    relay: u32,
+    now_ms: u32,
+) {
     covered.insert(relay);
     let Some(relay_edges) = ctx.edges.find_node(relay) else {
         return;
@@ -234,7 +240,7 @@ fn absorb_relay_coverage(ctx: &BroadcastRelayContext<'_>, covered: &mut CoveredS
         if !edge.source.is_measured() {
             continue;
         }
-        if admits_coverage(ctx, relay, edge.to) {
+        if admits_coverage(ctx, relay, edge.to, now_ms) {
             covered.insert(edge.to);
         }
     }
@@ -242,7 +248,13 @@ fn absorb_relay_coverage(ctx: &BroadcastRelayContext<'_>, covered: &mut CoveredS
 
 /// Does `relay` carry `target` if it transmits: it can be shown to deliver, or `target` is a
 /// neighbour nobody can be shown to reach and `relay` is the one node that owns it.
-fn admits_coverage(ctx: &BroadcastRelayContext<'_>, relay: u32, target: u32) -> bool {
+fn admits_coverage(ctx: &BroadcastRelayContext<'_>, relay: u32, target: u32, now_ms: u32) -> bool {
+    // A publisher that has gone quiet is nobody's target, however good the link a peer published
+    // to it: our own link to it is already retracted, and crediting peers with reaching it hands
+    // them a slot they will decline.
+    if is_silent_publisher(ctx.edges, Some(ctx.capability), target, now_ms) {
+        return false;
+    }
     covers(ctx.edges, Some(ctx.capability), relay, target)
         || coverage_owner(
             ctx.edges,
@@ -259,6 +271,7 @@ fn find_best_relay_candidate<F>(
     already_covered: &CoveredSet,
     prefer_high_node_id: bool,
     source_node: u32,
+    now_ms: u32,
     has_transmitted: F,
     mut evaluated: Option<&mut EvaluatedList>,
 ) -> RelayCandidate
@@ -274,7 +287,7 @@ where
         }
 
         let mut coverage_buf = [0u32; MAX_EDGES_PER_NODE];
-        let coverage_n = get_coverage_if_relays(ctx, candidate, &mut coverage_buf);
+        let coverage_n = get_coverage_if_relays(ctx, candidate, now_ms, &mut coverage_buf);
         let mut unique = [0u32; MAX_EDGES_PER_NODE];
         let mut unique_count = 0u8;
         for &node in &coverage_buf[..coverage_n as usize] {
@@ -495,7 +508,7 @@ where
             candidates.erase(neighbor);
             // Stock takes the early slot — count their coverage now so we only
             // trail if we still have unique nodes after they relay.
-            absorb_relay_coverage(ctx, &mut already_covered, neighbor);
+            absorb_relay_coverage(ctx, &mut already_covered, neighbor, now_ms);
             push_ranked(&mut ranked, &mut ranked_len, neighbor);
             // Its slot is still spent — a stock router transmits on its own schedule — but a
             // copy already on the air is not a transmission we are still waiting for.
@@ -513,6 +526,7 @@ where
             &already_covered,
             prefer_high,
             source,
+            now_ms,
             &has_transmitted,
             if first_pick {
                 Some(&mut evaluated)
@@ -527,7 +541,7 @@ where
         candidates.erase(best.node_id);
 
         if has_transmitted(best.node_id) {
-            absorb_relay_coverage(ctx, &mut already_covered, best.node_id);
+            absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
             continue;
         }
 
@@ -542,7 +556,7 @@ where
 
         // Earlier-ranked peer is assumed to relay — subtract their coverage so we
         // only take a later slot when we still have unique nodes to reach.
-        absorb_relay_coverage(ctx, &mut already_covered, best.node_id);
+        absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
         slots_given = slots_given.saturating_add(1);
         slot_delay = slot_delay.saturating_add(half);
     }
@@ -628,6 +642,56 @@ mod tests {
         }
     }
 
+    /// A publisher we have stopped hearing is nobody's target, however good the edge a peer
+    /// published to it. Field 2026-09-08: the branch gateway died, maintenance retracted our own
+    /// link at the silence horizon, and the peers' lists kept naming it for another interval —
+    /// so every node credited its peers with covering it and handed them a slot each declined.
+    #[test]
+    fn a_publisher_we_stopped_hearing_is_nobody_s_target() {
+        const GONE: u32 = 0xDEAD_0001;
+        const NEAR: u32 = 0xBEEF_0002;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        let t0 = 1_000u32;
+        edges.ensure_local_node(ME, t0);
+        edges.update_edge(ME, ME, NEAR, 1.0, t0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, NEAR, true);
+        // The peer published a healthy link to the node, and the node itself once published too.
+        edges.update_edge(ME, NEAR, GONE, 2.0, t0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, GONE, NEAR, 2.0, t0, EdgeSource::Mirrored, true, 0);
+        capability.track_topology(NEAR, true, t0);
+        capability.track_topology(GONE, true, t0);
+
+        let c = ctx(&edges, &capability, &downstream);
+        let mut buf = [0u32; MAX_EDGES_PER_NODE];
+
+        // Inside the horizon the peer covers it.
+        let inside = t0 + crate::neighbor_graph::PUBLISHER_SILENCE_MS;
+        let n = get_coverage_if_relays(&c, NEAR, inside, &mut buf);
+        assert!(
+            buf[..n as usize].contains(&GONE),
+            "still heard: the peer's published link is coverage"
+        );
+
+        // Past it, no peer covers it, so nobody is handed a slot for it.
+        let past = inside + 1;
+        let n = get_coverage_if_relays(&c, NEAR, past, &mut buf);
+        assert!(
+            !buf[..n as usize].contains(&GONE),
+            "gone quiet: a peer's list outlives the node it names"
+        );
+        let mut covered = CoveredSet::new();
+        absorb_relay_coverage(&c, &mut covered, NEAR, past);
+        assert!(!covered.contains(GONE), "absorb credits the same set");
+
+        // Hearing it again restores it: the entry's own timestamp is the evidence.
+        edges.update_node_activity(GONE, past, ME);
+        let c = ctx(&edges, &capability, &downstream);
+        let n = get_coverage_if_relays(&c, NEAR, past, &mut buf);
+        assert!(buf[..n as usize].contains(&GONE), "back on the air");
+    }
+
     /// With a second candidate present — so the sole-candidate rule cannot fire — a mute stock
     /// neighbour only we reach is carried by the ranking while our link is inside the coverage
     /// ceiling, and not at all once it is past it. The deleted stock-coverage phase relayed in
@@ -709,7 +773,7 @@ mod tests {
             PEER
         );
         let mut covered = CoveredSet::new();
-        absorb_relay_coverage(&ctx, &mut covered, PEER);
+        absorb_relay_coverage(&ctx, &mut covered, PEER, 0);
         assert!(
             covered.contains(SILENT),
             "the owner carries what it owns, so nobody else relays for it"
