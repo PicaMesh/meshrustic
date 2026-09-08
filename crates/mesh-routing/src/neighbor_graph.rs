@@ -34,6 +34,11 @@ pub const INFERRED_LINK_RSSI: i32 = -70;
 pub const INFERRED_LINK_SNR: f32 = 5.0;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
 pub const NEIGHBOR_TTL_MS: u32 = 7_200_000;
+/// A node that publishes topology promises a list every [`TOPOLOGY_BROADCAST_MS`]. Miss two of
+/// them with nothing else heard from it and it is gone: [`NEIGHBOR_TTL_MS`] is how long a graph is
+/// worth remembering, not how long we owe a neighbour airtime. Stock and legacy neighbours keep
+/// the full TTL, because they promise no cadence and their silence says nothing.
+pub const PUBLISHER_SILENCE_MS: u32 = TOPOLOGY_RESYNC_MS;
 
 /// Legacy SHORT_SLOW contention window; live retention uses `transmission_record_window_ms`.
 pub const NODE_TX_RECORD_MS: u32 = 2_000;
@@ -2216,6 +2221,47 @@ impl NeighborGraph {
         }
     }
 
+    /// Drop the direct link to a publisher that has gone silent for [`PUBLISHER_SILENCE_MS`].
+    ///
+    /// Our own edges are never aged directly: they disappear only when the neighbour's own node
+    /// entry expires, which takes [`NEIGHBOR_TTL_MS`]. Until then every coverage decision still
+    /// counts that neighbour as ours to carry, so a node that left the air keeps drawing a relay
+    /// out of us for every frame whose sender we cannot show reached it (field 2026-09-08: a
+    /// neighbour off the air at 15:40 was still being relayed for 120 minutes later). Coverage
+    /// must rest on evidence the neighbour is there, and for a publisher, silence is that
+    /// evidence.
+    fn prune_silent_publishers(&mut self, now_ms: u32) -> bool {
+        let mut gone = [0u32; MAX_NEIGHBORS];
+        let mut count = 0usize;
+        if let Some(node) = self.edges.find_node(self.my_node) {
+            for i in 0..node.edge_count as usize {
+                let edge = node.edges[i];
+                if edge.to == 0 || is_placeholder_node(edge.to) {
+                    continue;
+                }
+                if !matches!(
+                    self.capability.status(edge.to),
+                    CapabilityStatus::SrActive | CapabilityStatus::Passive
+                ) {
+                    continue;
+                }
+                let silent = now_ms.wrapping_sub(edge.last_update_ms);
+                if silent > PUBLISHER_SILENCE_MS && silent < 0x8000_0000 && count < MAX_NEIGHBORS {
+                    gone[count] = edge.to;
+                    count += 1;
+                }
+            }
+        }
+        for &node_id in &gone[..count] {
+            // Only our own claim of a direct link goes. The node itself stays: a peer that still
+            // hears it keeps it reachable, and a unicast for it must still find that route.
+            self.edges.remove_edge(self.my_node, node_id);
+            self.edges.remove_edge(node_id, self.my_node);
+            self.downstream.clear_for_destination(node_id);
+        }
+        count > 0
+    }
+
     pub fn run_maintenance(&mut self, now_ms: u32) -> MaintenanceReport {
         self.edges.ensure_local_node(self.my_node, now_ms);
         let before = self.neighbor_count();
@@ -2225,6 +2271,7 @@ impl NeighborGraph {
             NEIGHBOR_TTL_MS,
             Some(&mut self.downstream),
         );
+        let publishers_pruned = self.prune_silent_publishers(now_ms);
         self.prune_direct_signals(now_ms);
         let relay_in_graph = |relay: u32| self.edges.find_node(relay).is_some();
         let downstream_aged = self.downstream.age(now_ms, NEIGHBOR_TTL_MS, relay_in_graph);
@@ -2238,7 +2285,7 @@ impl NeighborGraph {
         if before != after {
             self.topology_dirty = true;
             self.route_cache.clear();
-        } else if edges_aged || downstream_aged {
+        } else if edges_aged || downstream_aged || publishers_pruned {
             self.route_cache.clear();
         }
 
@@ -3453,6 +3500,104 @@ mod tests {
             graph.get_downstream_relay(0xBB00_00BB, 200),
             Some(placeholder)
         );
+    }
+
+    #[test]
+    fn a_publisher_silent_for_two_intervals_stops_being_ours_to_carry() {
+        const ME: u32 = 0xAA00_00AA;
+        const PUB: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(PUB, -70, 8, 1_000, 0);
+        graph.capability_mut().track_topology(PUB, true, 1_000);
+        assert!(graph.is_our_direct_neighbor(PUB));
+
+        graph.run_maintenance(1_000 + PUBLISHER_SILENCE_MS);
+        assert!(
+            graph.is_our_direct_neighbor(PUB),
+            "still inside the silence horizon"
+        );
+
+        graph.run_maintenance(1_001 + PUBLISHER_SILENCE_MS);
+        assert!(
+            !graph.is_our_direct_neighbor(PUB),
+            "a publisher that missed two lists is not a neighbour we owe airtime"
+        );
+    }
+
+    #[test]
+    fn a_pruned_publisher_is_still_reachable_through_a_peer() {
+        const ME: u32 = 0xAA00_00AA;
+        const GW: u32 = 0xDD00_00DD;
+        const PUB: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(GW, -60, 10, 1_000, 0);
+        graph.observe_direct_neighbor(PUB, -70, 8, 1_000, 0);
+        graph.capability_mut().track_topology(PUB, true, 1_000);
+        graph.capability_mut().track_topology(GW, true, 1_000);
+        // The gateway keeps reporting the link in both directions.
+        for (from, to) in [(GW, PUB), (PUB, GW)] {
+            graph
+                .edges_mut()
+                .update_edge(ME, from, to, 1.5, 1_000, EdgeSource::Reported, true, 0);
+        }
+
+        graph.run_maintenance(1_001 + PUBLISHER_SILENCE_MS);
+        assert!(
+            !graph.is_our_direct_neighbor(PUB),
+            "our own claim is retracted"
+        );
+        assert!(
+            graph.edges().find_node(PUB).is_some(),
+            "the node itself stays in the graph"
+        );
+        assert!(
+            graph
+                .edges()
+                .find_node(GW)
+                .and_then(|n| n.find_edge(PUB))
+                .is_some(),
+            "a peer that still hears it keeps the link it reported"
+        );
+    }
+
+    #[test]
+    fn a_silent_stock_neighbour_keeps_the_full_ttl() {
+        const ME: u32 = 0xAA00_00AA;
+        const STOCK: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(STOCK, -70, 8, 1_000, 0);
+        graph
+            .capability_mut()
+            .track_role(STOCK, DEVICE_ROLE_REPEATER, 1_000);
+
+        graph.run_maintenance(1_001 + PUBLISHER_SILENCE_MS);
+        assert!(
+            graph.is_our_direct_neighbor(STOCK),
+            "a node that promises no cadence tells us nothing by going quiet"
+        );
+    }
+
+    #[test]
+    fn a_publisher_heard_on_any_frame_stays_our_neighbour() {
+        const ME: u32 = 0xAA00_00AA;
+        const PUB: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.capability_mut().track_topology(PUB, true, 1_000);
+        // Any direct frame refreshes the edge, not only a topology list.
+        for t in 0..4 {
+            let now = 1_000 + t * (PUBLISHER_SILENCE_MS / 2);
+            graph.observe_direct_neighbor(PUB, -70, 8, now, 0);
+            graph.run_maintenance(now);
+        }
+        assert!(graph.is_our_direct_neighbor(PUB));
     }
 
     #[test]

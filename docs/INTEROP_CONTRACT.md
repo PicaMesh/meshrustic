@@ -351,6 +351,20 @@ airtime. Every SignalRouting node uses the same figure.
   receivers ignore the flags. Tests:
   `chunked_topology_clears_unlisted_hears_us_only_after_last_chunk`,
   `large_neighbourhood_splits_into_flagged_chunks`.
+- **A publisher that goes quiet loses our direct link.** A node whose lists we accept promises
+  one every `TOPOLOGY_BROADCAST_MS`; heard nothing at all from it for `PUBLISHER_SILENCE_MS` (two
+  intervals, the same silence horizon as `TOPOLOGY_RESYNC_MS`) and we retract our own two edges to
+  it (`NeighborGraph::prune_silent_publishers`). `NEIGHBOR_TTL_MS` is how long a topology is worth
+  remembering, not how long we owe a neighbour airtime: until the edge goes, every coverage
+  decision still counts that neighbour as ours to carry, so a node that has left the air draws a
+  relay out of us for every frame whose sender we cannot show reached it. Only our own claim is
+  retracted — the node stays in the graph, so a peer that still hears it keeps it reachable and a
+  unicast for it still finds that route. Stock and legacy neighbours keep the full
+  `NEIGHBOR_TTL_MS`: they promise no cadence, so their silence is not evidence. Tests:
+  `a_publisher_silent_for_two_intervals_stops_being_ours_to_carry`,
+  `a_silent_stock_neighbour_keeps_the_full_ttl`,
+  `a_pruned_publisher_is_still_reachable_through_a_peer`,
+  `a_publisher_heard_on_any_frame_stays_our_neighbour`.
 - **Edge capacity.** Forty edges per node and forty graph nodes; a full edge list replaces its
   worst edge (ETX plus age) when a better one arrives (`EdgeStore::update_edge`).
 - **Inferred paths.** Edges and downstream entries learned from relayed packets are priced at a

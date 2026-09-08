@@ -489,6 +489,30 @@ impl EdgeStore {
         self.remove_node_edges_to(target);
     }
 
+    /// Remove one directed edge, leaving both endpoints in the graph.
+    pub fn remove_edge(&mut self, from: u32, to: u32) -> bool {
+        let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == from)
+        else {
+            return false;
+        };
+        let count = self.nodes[idx].edge_count;
+        let mut write = 0u8;
+        let mut removed = false;
+        for e in 0..count as usize {
+            let edge = self.nodes[idx].edges[e];
+            if edge.to == to {
+                removed = true;
+                continue;
+            }
+            if write as usize != e {
+                self.nodes[idx].edges[write as usize] = edge;
+            }
+            write += 1;
+        }
+        self.nodes[idx].edge_count = write;
+        removed
+    }
+
     pub fn remove_node(&mut self, node_id: u32) -> bool {
         if node_id == 0 {
             return false;
