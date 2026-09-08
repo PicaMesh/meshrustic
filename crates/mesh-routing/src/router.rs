@@ -4307,6 +4307,62 @@ mod tests {
         )));
     }
 
+    /// Two nodes and nothing else: the sender's broadcast reaches no new node if we relay it,
+    /// but our copy is the only signal it can ever get that the mesh received it. The ranking
+    /// has nothing to weigh here (we are the only candidate), so the sole-candidate rule
+    /// relays immediately — the insurance timer never enters this case, whatever `want_ack`
+    /// says. Field-proven: `candidates=1 ... via=sparse` followed by a committed relay.
+    #[test]
+    fn two_node_mesh_relays_and_confirms_to_the_sender() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        const ME: u32 = 0xCC00_00CC;
+        const SRC: u32 = 0xBB00_00BB;
+        let router = ROUTER.init(Router::new(ME));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        {
+            let graph = router.graph_mut();
+            graph.observe_direct_neighbor(SRC, -70, 8, 0, 0);
+            graph.confirm_direct_neighbor_hears_us(SRC);
+            graph.capability_mut().track_topology(SRC, true, 0);
+        }
+        // want_ack clear: no witness is owed, and none is needed to make us relay.
+        let wire = encode_wire(
+            PacketHeader::from_fields(NODENUM_BROADCAST, SRC, 0x79, 0, 3, 3, false, false, 0, 0),
+            &[0x01, 0x02],
+        );
+        let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 10,
+                    bytes: &wire,
+                },
+                1_000,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, airtime, 1_000);
+        let relayed = plan.relay.is_some()
+            || router
+                .relay_tx_after(SRC, 0x79, 0)
+                .and_then(|tx| router.poll_ready_relay(tx))
+                .is_some();
+        assert!(
+            relayed,
+            "sole candidate: the sender gets its copy back, T1 not involved"
+        );
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::SlotScheduling {
+                reason: crate::broadcast_relay::RelayReason::Sparse,
+                ..
+            }
+        )));
+    }
+
     /// Nobody was given a slot and no originator is waiting to be told: no transmission is
     /// expected, so there is nothing for a late copy to stand in for. Measured over 30 min on
     /// three field nodes (2026-09-08): this declines ~100 copies per node and costs no
