@@ -1076,8 +1076,12 @@ pub mod sr {
                 evaluated,
                 evaluated_len,
                 pre_covered,
+                uncovered,
+                uncovered_len,
             } => {
-                let mut line = [0u8; 320];
+                // 320 clipped the cand= tail once unc= was added, and the tail is the part two nodes
+                // are compared on.
+                let mut line = [0u8; 384];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Slot scheduling for pkt 0x";
                 put(&mut line, &mut pos, prefix);
@@ -1090,6 +1094,16 @@ pub mod sr {
                 put_u32(&mut line, &mut pos, candidates as u32);
                 put(&mut line, &mut pos, b", pre=");
                 put_u32(&mut line, &mut pos, pre_covered as u32);
+                if uncovered_len > 0 {
+                    put(&mut line, &mut pos, b", unc=");
+                    for (i, node) in uncovered.iter().take(uncovered_len as usize).enumerate() {
+                        if i > 0 {
+                            put(&mut line, &mut pos, b",");
+                        }
+                        put(&mut line, &mut pos, b"!");
+                        put_hex8(&mut line, &mut pos, *node);
+                    }
+                }
                 let tail2 = b", slot=";
                 put(&mut line, &mut pos, tail2);
                 put_u32(&mut line, &mut pos, slot_index as u32);

@@ -2108,27 +2108,39 @@ impl Router {
             broadcast_plan.as_ref().or(unicast_plan.as_ref()),
         );
         let delay_ms = tx_after_ms.wrapping_sub(now_ms);
-        let (ranked, ranked_len, reason, evaluated, evaluated_len, pre_covered) =
-            broadcast_plan.as_ref().or(unicast_plan.as_ref()).map_or(
+        let (
+            ranked,
+            ranked_len,
+            reason,
+            evaluated,
+            evaluated_len,
+            pre_covered,
+            uncovered,
+            uncovered_len,
+        ) = broadcast_plan.as_ref().or(unicast_plan.as_ref()).map_or(
+            (
+                [0u32; crate::broadcast_relay::RANKED_LOG],
+                0,
+                crate::broadcast_relay::RelayReason::None,
+                [(0u32, 0u8, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
+                0,
+                0,
+                [0u32; crate::broadcast_relay::UNCOVERED_LOG],
+                0,
+            ),
+            |p| {
                 (
-                    [0u32; crate::broadcast_relay::RANKED_LOG],
-                    0,
-                    crate::broadcast_relay::RelayReason::None,
-                    [(0u32, 0u8, 0u8, 0u16); crate::broadcast_relay::RANKED_LOG],
-                    0,
-                    0,
-                ),
-                |p| {
-                    (
-                        p.ranked,
-                        p.ranked_len,
-                        p.reason,
-                        p.evaluated,
-                        p.evaluated_len,
-                        p.pre_covered,
-                    )
-                },
-            );
+                    p.ranked,
+                    p.ranked_len,
+                    p.reason,
+                    p.evaluated,
+                    p.evaluated_len,
+                    p.pre_covered,
+                    p.uncovered,
+                    p.uncovered_len,
+                )
+            },
+        );
         self.sr_log.push(SrLogEvent::SlotScheduling {
             id: parsed.id,
             half_airtime_ms: half_airtime,
@@ -2140,6 +2152,8 @@ impl Router {
             evaluated,
             evaluated_len,
             pre_covered,
+            uncovered,
+            uncovered_len,
         });
         self.sr_log.push(SrLogEvent::RelayCommitted {
             id: parsed.id,
@@ -2438,6 +2452,8 @@ impl Router {
             evaluated_len,
             pre_covered,
             // Unicast plan: coverage does not enter into it.
+            uncovered: [0; crate::broadcast_relay::UNCOVERED_LOG],
+            uncovered_len: 0,
             coverage_for: 0,
             slots_given: 0,
         }
@@ -3763,6 +3779,8 @@ impl Router {
             evaluated: plan.evaluated,
             evaluated_len: plan.evaluated_len,
             pre_covered: plan.pre_covered,
+            uncovered: plan.uncovered,
+            uncovered_len: plan.uncovered_len,
         });
     }
 

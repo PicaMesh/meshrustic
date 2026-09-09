@@ -52,6 +52,10 @@ pub enum SrLogEvent {
         evaluated_len: u8,
         /// Nodes counted as already covered before ranking.
         pre_covered: u8,
+        /// Our own neighbours the transmission did not cover — what earns us a slot and what T1
+        /// insures. Named, so two nodes' disagreement can be attributed rather than counted.
+        uncovered: [u32; crate::broadcast_relay::UNCOVERED_LOG],
+        uncovered_len: u8,
     },
     RelayCommitted {
         id: u32,

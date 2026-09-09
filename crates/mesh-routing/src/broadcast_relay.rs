@@ -40,6 +40,11 @@ pub struct BroadcastRelayPlan {
     pub evaluated_len: u8,
     /// Nodes counted as already covered before ranking (source, heard-from and its good links).
     pub pre_covered: u8,
+    /// Our own neighbours this transmission did *not* cover, first `uncovered_len` valid. This is
+    /// exactly what earns us a slot and what T1 insures, so two nodes that disagree about a
+    /// packet can be compared by name rather than by the `pre_covered` count alone.
+    pub uncovered: [u32; UNCOVERED_LOG],
+    pub uncovered_len: u8,
     /// Transmissions we expect ahead of ours: stock relay routers that have not transmitted
     /// this packet yet, plus the ranked SR peers whose coverage we absorbed. Zero means nothing
     /// is expected, so there is nothing for a late copy to stand in for.
@@ -73,6 +78,8 @@ pub fn push_evaluated(
 
 /// How many slot holders the plan records for logging.
 pub const RANKED_LOG: usize = 4;
+/// Uncovered neighbours named in the log line; enough to identify a disagreement.
+pub const UNCOVERED_LOG: usize = 3;
 
 /// Why the plan decided we relay (for the log; `None` when we defer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -478,6 +485,18 @@ where
     let prefer_high = (packet_id & 1) != 0;
     let mut already_covered = build_already_covered(ctx.edges, ctx.capability, source, heard_from);
     let pre_covered_count = already_covered.count;
+    let mut uncovered = [0u32; UNCOVERED_LOG];
+    let mut uncovered_len = 0u8;
+    {
+        let mut mine = [0u32; MAX_EDGES_PER_NODE];
+        let n = get_coverage_if_relays(ctx, ctx.my_node, now_ms, &mut mine);
+        for &target in &mine[..n as usize] {
+            if !already_covered.contains(target) && (uncovered_len as usize) < UNCOVERED_LOG {
+                uncovered[uncovered_len as usize] = target;
+                uncovered_len += 1;
+            }
+        }
+    }
     let mut candidates = build_candidates(ctx, source, heard_from);
     let initial_candidates = candidates.count;
     let mut reason = RelayReason::None;
@@ -596,6 +615,8 @@ where
         evaluated: evaluated.items,
         evaluated_len: evaluated.len,
         pre_covered: pre_covered_count,
+        uncovered,
+        uncovered_len,
         coverage_for,
         slots_given,
     }
@@ -1171,6 +1192,32 @@ mod tests {
         );
         assert!(plan.should_relay);
         assert_eq!(plan.coverage_for, SS);
+        // The log names what the transmission missed, so two nodes that disagree about a packet
+        // can be compared by name instead of by the pre-covered count alone.
+        assert_eq!(&plan.uncovered[..plan.uncovered_len as usize], &[SS]);
+    }
+
+    /// A transmission that reached everything of ours leaves nothing to name.
+    #[test]
+    fn plan_names_nothing_when_the_transmitter_covered_it_all() {
+        const SS: u32 = 0xDD00_00DD;
+        const PEER: u32 = 0xEE00_00EE;
+        let downstream = DownstreamTable::new();
+        let (mut edges, capability) = stock_fixture(PEER);
+        edges.update_edge(ME, ME, SS, 1.0, 0, EdgeSource::Reported, true, 0);
+        // The transmitter reaches SS too, so it is pre-covered.
+        edges.update_edge(ME, BB, SS, 2.0, 0, EdgeSource::Reported, true, 0);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            never_transmitted,
+        );
+        assert_eq!(plan.uncovered_len, 0);
     }
 
     #[test]
