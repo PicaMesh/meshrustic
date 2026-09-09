@@ -78,8 +78,11 @@ pub fn push_evaluated(
 
 /// How many slot holders the plan records for logging.
 pub const RANKED_LOG: usize = 4;
-/// Uncovered neighbours named in the log line; enough to identify a disagreement.
-pub const UNCOVERED_LOG: usize = 3;
+/// Uncovered neighbours named in the log line. Six, not three: with a shorter list each node
+/// prints a *prefix* of its own edge order, so two nodes comparing a packet cannot tell a real
+/// disagreement from two different truncations of the same set — which cost a wrong lead on
+/// 2026-09-09. Six covers the whole neighbourhood this fits in one line.
+pub const UNCOVERED_LOG: usize = 6;
 
 /// Why the plan decided we relay (for the log; `None` when we defer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
