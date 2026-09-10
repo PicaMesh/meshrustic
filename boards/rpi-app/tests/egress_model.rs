@@ -24,10 +24,10 @@ fn field_egress_coverage_ignores_inbound_only_neighbor() {
     graph.confirm_direct_neighbor_hears_us(EGRESS);
     graph.confirm_direct_neighbor_hears_us(EGRESS2);
 
-    assert!(graph.has_unique_coverage(&[EGRESS]));
+    assert!(graph.has_unique_coverage(&[EGRESS], 0));
     graph.confirm_direct_neighbor_hears_us(INBOUND);
-    assert!(graph.has_unique_coverage(&[EGRESS]));
-    assert!(!graph.has_unique_coverage(&[EGRESS, EGRESS2, INBOUND]));
+    assert!(graph.has_unique_coverage(&[EGRESS], 0));
+    assert!(!graph.has_unique_coverage(&[EGRESS, EGRESS2, INBOUND], 0));
 }
 
 #[test]

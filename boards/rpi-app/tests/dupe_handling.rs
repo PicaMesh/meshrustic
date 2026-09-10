@@ -18,8 +18,20 @@ fn wire_bytes(header: PacketHeader, payload: &[u8]) -> heapless::Vec<u8, 280> {
     out
 }
 
+/// A ROUTER cancels a committed relay when the copy it heard covered everything it would have
+/// carried.
+///
+/// This asserted the opposite until the coverage verdict was given precedence over the role. The
+/// two answer different questions — coverage asks whether anyone still needs our copy, the role
+/// asks whether a router may fall silent on its own account — and letting the role win meant a
+/// ROUTER cancelled its insurance on hearing a copy and then transmitted anyway: one extra frame
+/// with the backstop already surrendered. Here the node knows no neighbours at all, so it has
+/// nothing unique to carry and the copy covers it entirely.
+///
+/// The role still governs traffic SR did not commit to, and a relay with unique coverage is kept
+/// whatever the role — both pinned in the router's own unit tests.
 #[test]
-fn router_role_router_keeps_relay_commit_on_dupe() {
+fn router_role_cancels_committed_relay_once_covered() {
     const US: u32 = 0xAABB_CCDD;
     let mut router = Router::with_channel(
         US,
@@ -60,8 +72,8 @@ fn router_role_router_keeps_relay_commit_on_dupe() {
 
     let _dupe = router.process_inbound(&inbound, 100).expect("dupe rx");
     assert!(
-        router.relay_tx_after(0x1234_5678, 42, 0).is_some(),
-        "ROUTER must not cancel committed relay on dupe"
+        router.relay_tx_after(0x1234_5678, 42, 0).is_none(),
+        "with nothing unique left to carry, a ROUTER stands down like anyone else"
     );
 }
 

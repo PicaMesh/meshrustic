@@ -2024,19 +2024,31 @@ impl NeighborGraph {
     /// Do we still reach a neighbour that none of `covered_by` can deliver to? Ours are the
     /// neighbours that confirmed hearing us, plus those nobody can be shown to reach that we
     /// own — and in both cases only while a copy from us would actually arrive.
-    pub fn has_unique_coverage(&self, covered_by: &[u32]) -> bool {
-        self.unique_coverage_neighbor(covered_by).is_some()
+    pub fn has_unique_coverage(&self, covered_by: &[u32], now_ms: u32) -> bool {
+        self.unique_coverage_neighbor(covered_by, now_ms).is_some()
     }
 
     /// The neighbour that makes our relay worth its airtime: ours to cover and reached by none of
     /// `covered_by`. Returned rather than reduced to a bool so the decision can be logged: "we
     /// relayed for X" is the only way to tell a justified relay from a coverage bug in the field.
-    pub fn unique_coverage_neighbor(&self, covered_by: &[u32]) -> Option<u32> {
+    pub fn unique_coverage_neighbor(&self, covered_by: &[u32], now_ms: u32) -> Option<u32> {
         let node = self.edges.find_node(self.my_node)?;
         for i in 0..node.edge_count as usize {
             let edge = node.edges[i];
             let neighbor = edge.to;
             if is_placeholder_node(neighbor) {
+                continue;
+            }
+            // A publisher we have stopped hearing is nobody's coverage target, so it cannot be
+            // ours either. Admission has applied this since the silence rule was introduced and
+            // this path did not, so a queued relay was kept for a node the ranking had already
+            // agreed nobody could carry — the two decisions read one rule now.
+            if crate::graph::is_silent_publisher(
+                &self.edges,
+                Some(&self.capability),
+                neighbor,
+                now_ms,
+            ) {
                 continue;
             }
             // Ours to cover: it proved it hears us, or nobody can prove anything about it and we
@@ -2141,14 +2153,28 @@ impl NeighborGraph {
     }
 
     /// Broadcast dupe coverage: accumulate the relayer and return true only when no unique coverage remains.
-    pub fn all_neighbors_covered(&mut self, from: u32, packet_id: u32, dupe_relayer: u32) -> bool {
+    /// Has the copy we just heard carried everything our own relay would have carried?
+    ///
+    /// A relayer we cannot name keeps the relay, deliberately. The resolver never yields zero — an
+    /// unknown relay byte becomes a placeholder — and a placeholder is excluded from coverage
+    /// everywhere, so it is credited with carrying nothing and our unique nodes stay uncovered.
+    /// That is the conservative direction and the one the priority order wants: we do not know what
+    /// an unidentifiable copy reached, so we do not stand down on the strength of it. Our own echo
+    /// is the same: it says nothing about who else received the frame.
+    pub fn all_neighbors_covered(
+        &mut self,
+        from: u32,
+        packet_id: u32,
+        dupe_relayer: u32,
+        now_ms: u32,
+    ) -> bool {
         if dupe_relayer == 0 || dupe_relayer == self.my_node {
             return false;
         }
         self.accumulate_heard_transmitter(from, packet_id, dupe_relayer);
         let mut covered_by = [0u32; 1 + MAX_HEARD_TRANSMITTERS];
         let count = self.build_coverage_transmitters(from, packet_id, &mut covered_by);
-        !self.has_unique_coverage(&covered_by[..count as usize])
+        !self.has_unique_coverage(&covered_by[..count as usize], now_ms)
     }
 
     /// Distinct accumulated relayers for a committed broadcast relay (testing / diagnostics).
@@ -3009,11 +3035,11 @@ mod tests {
             .edges_mut()
             .update_edge(ME, PEER, U, 40.0, 100, EdgeSource::Mirrored, true, 0);
         graph.edges_mut().set_edge_hears_us(PEER, U, true);
-        assert!(graph.has_unique_coverage(&[PEER]));
+        assert!(graph.has_unique_coverage(&[PEER], 0));
         graph
             .edges_mut()
             .update_edge(ME, PEER, U, 1.5, 100, EdgeSource::Mirrored, true, 0);
-        assert!(!graph.has_unique_coverage(&[PEER]));
+        assert!(!graph.has_unique_coverage(&[PEER], 0));
     }
 
     #[test]
@@ -3030,13 +3056,13 @@ mod tests {
         graph.capability_mut().track_topology(HIGH_PEER, true, 100);
         graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
         // The mute node never earns hears_us, yet it is ours: the peer's copy does not reach it.
-        assert!(graph.has_unique_coverage(&[HIGH_PEER]));
+        assert!(graph.has_unique_coverage(&[HIGH_PEER], 0));
         // Once the transmitter is confirmed to reach it, it is covered like any other neighbour.
         graph
             .edges_mut()
             .update_edge(ME, HIGH_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
         graph.edges_mut().set_edge_hears_us(HIGH_PEER, MUTE, true);
-        assert!(!graph.has_unique_coverage(&[HIGH_PEER]));
+        assert!(!graph.has_unique_coverage(&[HIGH_PEER], 0));
     }
 
     /// Ownership of a neighbour nobody can confirm goes by the measured link, with the node id
@@ -3816,6 +3842,48 @@ mod tests {
     const COV_A: u32 = 0xA000_000A;
     const COV_B: u32 = 0xB000_000B;
 
+    /// The cancel path applies the same silence rule as admission, so the two agree.
+    ///
+    /// Admission has excluded a publisher we stopped hearing since the silence rule was
+    /// introduced: nobody can be shown to reach it, so nobody is credited for it and nobody is
+    /// handed a slot for it. The cancel path did not, so it went on counting that node as ours to
+    /// carry and kept a queued relay alive for a target the ranking had already agreed was
+    /// nobody's. One rule, read the same way on both sides.
+    #[test]
+    fn cancel_path_applies_the_silence_rule() {
+        const ME: u32 = 0xCC00_00CC;
+        const PEER: u32 = 0xBB00_00BB;
+        const GONE: u32 = 0xDEAD_0001;
+        let t0 = 1_000u32;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -60, 12, t0, 0);
+        graph.observe_direct_neighbor(GONE, -70, 8, t0, 0);
+        graph.confirm_direct_neighbor_hears_us(PEER);
+        graph.confirm_direct_neighbor_hears_us(GONE);
+        // Both publish, so both are held to their own lists.
+        graph.capability_mut().track_topology(PEER, true, t0);
+        graph.capability_mut().track_topology(GONE, true, t0);
+
+        // While we still hear it, the silent-to-be node is ours to carry and the peer's copy does
+        // not cover it, so a queued relay survives the duplicate.
+        let inside = t0 + crate::neighbor_graph::PUBLISHER_SILENCE_MS;
+        assert_eq!(
+            graph.unique_coverage_neighbor(&[PEER], inside),
+            Some(GONE),
+            "still heard: ours to carry, so the relay is kept"
+        );
+
+        // Past the silence horizon it is nobody's target, so nothing unique remains and the
+        // duplicate cancels our relay.
+        let past = inside + 1;
+        assert_eq!(
+            graph.unique_coverage_neighbor(&[PEER], past),
+            None,
+            "gone quiet: not ours to carry, so the relay is released"
+        );
+    }
+
     #[test]
     fn has_unique_coverage_detects_gap() {
         let mut graph = NeighborGraph::new();
@@ -3824,7 +3892,7 @@ mod tests {
         graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
         graph.confirm_direct_neighbor_hears_us(COV_A);
         graph.confirm_direct_neighbor_hears_us(COV_B);
-        assert!(graph.has_unique_coverage(&[COV_A]));
+        assert!(graph.has_unique_coverage(&[COV_A], 0));
     }
 
     /// The ranking ignores our own non-`Reported` edges, because peers cannot see what we only
@@ -3880,7 +3948,7 @@ mod tests {
         graph.observe_direct_neighbor(EDGE, -70, 8, 1_000, 0);
         graph.confirm_direct_neighbor_hears_us(EDGE);
         assert_eq!(
-            graph.unique_coverage_neighbor(&[SRC]),
+            graph.unique_coverage_neighbor(&[SRC], 0),
             Some(EDGE),
             "a sound confirmed link is ours"
         );
@@ -3892,7 +3960,7 @@ mod tests {
                 .update_edge(ME, from, to, 40.0, 1_000, EdgeSource::Reported, true, 0);
         }
         assert_eq!(
-            graph.unique_coverage_neighbor(&[SRC]),
+            graph.unique_coverage_neighbor(&[SRC], 0),
             None,
             "confirmed but unreachable: no relay is worth its airtime"
         );
@@ -3910,7 +3978,7 @@ mod tests {
         graph.capability_mut().track_topology(COV_A, true, 0);
         // Only we hear COV_B, so covering it is ours.
         assert_eq!(
-            graph.unique_coverage_neighbor(&[COV_A]),
+            graph.unique_coverage_neighbor(&[COV_A], 0),
             Some(COV_B),
             "sole neighbour of an inbound-only node covers it"
         );
@@ -3918,7 +3986,7 @@ mod tests {
         graph
             .edges_mut()
             .update_edge(COV_ME, COV_A, COV_B, 1.0, 0, EdgeSource::Reported, true, 0);
-        assert_eq!(graph.unique_coverage_neighbor(&[COV_A]), None);
+        assert_eq!(graph.unique_coverage_neighbor(&[COV_A], 0), None);
     }
 
     #[test]
@@ -3941,7 +4009,7 @@ mod tests {
         write_packed_header(&mut packed, 1, true);
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
         graph.merge_topology(COV_A, &header, &[remote], true, 100, 0);
-        assert!(!graph.has_unique_coverage(&[COV_A]));
+        assert!(!graph.has_unique_coverage(&[COV_A], 0));
     }
 
     #[test]

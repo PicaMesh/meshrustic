@@ -60,7 +60,7 @@ fn unique_coverage_keeps_relay() {
     commit_broadcast_relay(&mut graph, NEIGHBOR_A);
 
     assert!(
-        !graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_A),
+        !graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_A, 0),
         "B is not in A's edge set — relay should stay"
     );
 }
@@ -74,7 +74,7 @@ fn all_covered_cancels_relay() {
     commit_broadcast_relay(&mut graph, NEIGHBOR_A);
 
     assert!(
-        graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_A),
+        graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_A, 0),
         "A covers B — dupe cancel should proceed"
     );
 }
@@ -93,12 +93,12 @@ fn heard_transmitters_accumulate_distinct() {
     commit_broadcast_relay(&mut graph, NEIGHBOR_A);
 
     assert_eq!(graph.relay_heard_transmitter_count(SOURCE, PACKET_ID), 0);
-    assert!(!graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_C));
+    assert!(!graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_C, 0));
     assert_eq!(graph.relay_heard_transmitter_count(SOURCE, PACKET_ID), 1);
 
-    assert!(!graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_C));
+    assert!(!graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_C, 0));
     assert_eq!(graph.relay_heard_transmitter_count(SOURCE, PACKET_ID), 1);
 
-    assert!(graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_E));
+    assert!(graph.all_neighbors_covered(SOURCE, PACKET_ID, NEIGHBOR_E, 0));
     assert_eq!(graph.relay_heard_transmitter_count(SOURCE, PACKET_ID), 2);
 }

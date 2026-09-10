@@ -2596,9 +2596,15 @@ impl Router {
     }
 
     /// True when every direct neighbor is covered by accumulated transmitters (broadcast dupe cancel).
-    pub fn all_neighbors_covered(&mut self, from: u32, packet_id: u32, dupe_relayer: u32) -> bool {
+    pub fn all_neighbors_covered(
+        &mut self,
+        from: u32,
+        packet_id: u32,
+        dupe_relayer: u32,
+        now_ms: u32,
+    ) -> bool {
         self.graph
-            .all_neighbors_covered(from, packet_id, dupe_relayer)
+            .all_neighbors_covered(from, packet_id, dupe_relayer, now_ms)
     }
 
     /// True when router has scheduled TX work (relays, topology, ACKs, retransmits).
@@ -3634,7 +3640,7 @@ impl Router {
                 // Coverage decides, not the role: the frame may still be pullable from the radio
                 // queue, and a covered relay that goes out anyway is a duplicate we chose.
                 if let Some(heard_from) = heard_relayer {
-                    if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from) {
+                    if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from, now_ms) {
                         return;
                     }
                 }
@@ -3647,7 +3653,7 @@ impl Router {
                 return;
             }
             if let Some(heard_from) = heard_relayer {
-                if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from) {
+                if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from, now_ms) {
                     return;
                 }
             }
