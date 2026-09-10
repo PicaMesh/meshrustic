@@ -3619,23 +3619,31 @@ impl Router {
             return;
         }
 
+        // Set once the coverage test has decided our committed copy is no longer needed. That
+        // verdict is about the packet — the nodes we would have carried have been carried by
+        // somebody else, so transmitting adds a duplicate and nothing else — so it overrides the
+        // role gate, which answers a different question: whether a router may fall silent for
+        // reasons of its own. Without this a node configured ROUTER or ROUTER_LATE cancelled its
+        // insurance and then transmitted anyway.
+        let mut sr_coverage_cancel = false;
+
         if committed {
             if !has_pending {
                 // Released to the radio (or already sent). Someone relayed, so T1 is moot.
                 self.cancel_t1_retransmit(parsed.id, T1CancelReason::RelayHeard);
-                if self.graph.role_allows_canceling_dupe() {
-                    if let Some(heard_from) = heard_relayer {
-                        if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from) {
-                            return;
-                        }
+                // Coverage decides, not the role: the frame may still be pullable from the radio
+                // queue, and a covered relay that goes out anyway is a duplicate we chose.
+                if let Some(heard_from) = heard_relayer {
+                    if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from) {
+                        return;
                     }
-                    self.graph.cancel_relay(parsed.from, parsed.id);
-                    self.note_tx_cancel(parsed.id);
-                    self.sr_log.push(SrLogEvent::BroadcastDupeCancel {
-                        id: parsed.id,
-                        from: parsed.from,
-                    });
                 }
+                self.graph.cancel_relay(parsed.from, parsed.id);
+                self.note_tx_cancel(parsed.id);
+                self.sr_log.push(SrLogEvent::BroadcastDupeCancel {
+                    id: parsed.id,
+                    from: parsed.from,
+                });
                 return;
             }
             if let Some(heard_from) = heard_relayer {
@@ -3643,9 +3651,12 @@ impl Router {
                     return;
                 }
             }
+            sr_coverage_cancel = true;
         }
 
-        if self.graph.role_allows_canceling_dupe() {
+        // Non-SR traffic keeps stock's behaviour for our role; a committed relay the coverage test
+        // has released does not.
+        if sr_coverage_cancel || self.graph.role_allows_canceling_dupe() {
             if rebroadcast {
                 self.graph.cancel_relay_on_rebroadcast(
                     parsed.from,
@@ -4885,6 +4896,120 @@ mod tests {
             router.poll_t1_retransmit(1_000 + fire_ms).is_none(),
             "a node that took a relay slot must not also arm T1"
         );
+    }
+
+    /// A covered relay is cancelled whatever our role, and the role still governs other traffic.
+    ///
+    /// The coverage test answers "has somebody already carried the nodes we would have carried";
+    /// the role gate answers "may a router fall silent for reasons of its own". They are different
+    /// questions and the first has to win, or a node configured ROUTER or ROUTER_LATE cancels its
+    /// insurance on hearing a copy and then transmits anyway — one extra frame with the backstop
+    /// already given up.
+    #[test]
+    fn coverage_cancels_a_committed_relay_whatever_our_role() {
+        for role in [
+            crate::nodeinfo::DEVICE_ROLE_CLIENT,
+            crate::nodeinfo::DEVICE_ROLE_ROUTER,
+            crate::nodeinfo::DEVICE_ROLE_ROUTER_LATE,
+        ] {
+            // A fresh router per role. Built as a local rather than through a StaticCell, which
+            // can only be initialised once and so cannot serve a loop.
+            let mut router = Router::new(0x677a_1caf);
+            router.set_device_role(role);
+
+            // One neighbour that hears us, so a broadcast from a second node gives us a rung.
+            let neighbor_wire = encode_wire(
+                PacketHeader::from_fields(0xFFFF_FFFF, 0x1111_1111, 1, 0, 3, 3, false, false, 0, 0),
+                &[0x01],
+            );
+            router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -65,
+                        snr: 12,
+                        bytes: &neighbor_wire,
+                    },
+                    900,
+                )
+                .unwrap();
+            router.confirm_direct_neighbor_hears_us(0x1111_1111);
+
+            let header = PacketHeader::from_fields(
+                NODENUM_BROADCAST,
+                0x2222_2222,
+                99,
+                0,
+                3,
+                3,
+                false,
+                false,
+                0,
+                0,
+            );
+            let wire = encode_wire(header, &[0x01, 0x02]);
+            let result = router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -70,
+                        snr: 10,
+                        bytes: &wire,
+                    },
+                    1_000,
+                )
+                .unwrap();
+            let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
+            let _plan = router.evaluate_tx_plan(&result, 0.0, airtime, 1_000);
+            assert!(
+                router.has_pending_work(),
+                "role {role}: a rung should have been taken"
+            );
+
+            // The neighbour relays it. Its copy covers the only node we could have reached, so
+            // ours is redundant whatever our own role says about falling silent.
+            let dupe = encode_wire(
+                PacketHeader::from_fields(
+                    NODENUM_BROADCAST,
+                    0x2222_2222,
+                    99,
+                    0,
+                    3,
+                    2,
+                    false,
+                    false,
+                    0,
+                    (0x1111_1111u32 & 0xFF) as u8,
+                ),
+                &[0x01, 0x02],
+            );
+            let _ = router.process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -66,
+                    snr: 11,
+                    bytes: &dupe,
+                },
+                1_050,
+            );
+            assert!(
+                !router.has_pending_work(),
+                "role {role}: a covered relay must be cancelled, role notwithstanding"
+            );
+        }
+    }
+
+    /// The role gate still applies where SR has not committed: stock behaviour for stock traffic.
+    #[test]
+    fn role_still_governs_traffic_we_did_not_commit_to() {
+        let mut router = Router::new(0x677a_1caf);
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        assert!(
+            !router.graph.role_allows_canceling_dupe(),
+            "a ROUTER still declines to cancel on its own account"
+        );
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_CLIENT);
+        assert!(router.graph.role_allows_canceling_dupe());
     }
 
     #[test]
