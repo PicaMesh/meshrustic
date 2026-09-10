@@ -1931,10 +1931,16 @@ impl Router {
                 return plan;
             }
             Some(Ok(mut ranked)) if !relayer_named => {
-                // Slot 0 still needs the peer turnaround; keying up at delay 0 loses every
-                // receiver still reading the frame we are answering.
+                // Slot 0 starts where stock's own contention window starts. Its own name and its
+                // own derivation: the broadcast ladder's origin answers a different question, and
+                // this one had been sharing that constant's value by accident.
+                //
+                // From the CAD slot time, which is what stock's boundary is expressed in. Note the
+                // `slot_ms` in scope here is a packet airtime despite its name — the board passes
+                // `packet_time_ms(..., 64, ...)` — so using it would give a floor ten times too
+                // large.
                 ranked.slot_delay_ms = if ranked.slot_index == 0 {
-                    crate::channel_access::SLOT_ORIGIN_MS
+                    crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms())
                 } else {
                     self.sr_peer_relay_wait_ms(slot_ms)
                         .saturating_add((ranked.slot_index as u32 - 1).saturating_mul(half_airtime))
@@ -2386,6 +2392,9 @@ impl Router {
         rssi: i16,
         snr: i8,
         half_airtime: u32,
+        // The packet airtime, not a slot time. The caller's variable is named `slot_ms` and is
+        // neither — it is `packet_time_ms(config, 64, ...)` — which is why the two waits below take
+        // it and the stock contention floor above does not.
         airtime_ms: u32,
         now_ms: u32,
         ranking: Option<Result<crate::broadcast_relay::BroadcastRelayPlan, SrSkipReason>>,
@@ -2402,7 +2411,9 @@ impl Router {
             });
             return BroadcastRelayPlan {
                 should_relay: true,
-                slot_delay_ms: crate::channel_access::SLOT_ORIGIN_MS,
+                // Named for a designated next hop as well: the same floor, for the same reason,
+                // and from the CAD slot time rather than the airtime this parameter carries.
+                slot_delay_ms: crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()),
                 slot_index: 0,
                 candidate_count: 1,
                 ..Default::default()
@@ -5546,8 +5557,11 @@ mod tests {
             )),
             "hand-off takes slot 0; log: {logs:?}"
         );
-        // Slot 0 still sits behind the short post-reception hold, so it is pending, not inline.
-        let origin = crate::channel_access::SLOT_ORIGIN_MS;
+        // Slot 0 still sits behind a floor, so it is pending, not inline — now stock's own
+        // contention floor rather than the broadcast ladder's origin.
+        let origin = crate::coordinated_relay::relay_floor_ms(
+            crate::coordinated_relay::slot_time_for_preset(router.modem_preset()),
+        );
         assert!(
             router.poll_ready_relay(50 + origin - 1).is_none(),
             "slot 0 sits at the ladder origin, inside the peers' turnaround"
@@ -6373,25 +6387,38 @@ mod tests {
             )
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        let origin = crate::channel_access::SLOT_ORIGIN_MS;
+        // Slot 0 sits at stock's own contention floor, `2 * CWmax * slot_time`, not at the
+        // broadcast ladder's origin — the two answer different questions and had been sharing a
+        // value by accident. Below this floor no stock non-router ever transmits, so a relay that
+        // keyed up earlier would go out while a stock neighbour was still reading the frame we are
+        // answering: it could not hear our copy, would not cancel its own, and the duplicate we
+        // were avoiding would happen regardless.
+        // The CAD slot time for our preset — the quantity stock's boundary is expressed in. Not
+        // the value passed to evaluate_tx_plan, which is a packet airtime despite being called
+        // `slot_ms`; deriving the floor from that gave a value ten times too large and this test
+        // still passed, because it computed the same wrong thing.
+        let floor = coordinated_relay::relay_floor_ms(coordinated_relay::slot_time_for_preset(
+            router.modem_preset(),
+        ));
         let tx_after = plan
             .relay
             .map(|r| r.delay_ms)
             .or_else(|| router.relay_tx_after(UNI_SOURCE, 0x702, 0))
             .expect("slot 0 planned");
         assert!(
-            tx_after >= origin,
-            "undesignated slot 0 must wait peer turnaround: {tx_after} < {origin}"
+            tx_after >= floor,
+            "undesignated slot 0 must wait stock's contention floor: {tx_after} < {floor}"
         );
         assert!(
-            router.poll_ready_relay(origin.saturating_sub(1)).is_none(),
-            "must not release inside the turnaround"
+            router.poll_ready_relay(floor.saturating_sub(1)).is_none(),
+            "must not release below the floor"
         );
+        let jitter_max = coordinated_relay::tie_break_range_ms(coordinated_relay::half_airtime_ms(
+            coordinated_relay::DEFAULT_SLOT_MS,
+        ));
         assert!(
-            router
-                .poll_ready_relay(origin + coordinated_relay::DEFAULT_SLOT_MS)
-                .is_some(),
-            "slot 0 ready at origin"
+            router.poll_ready_relay(floor + jitter_max).is_some(),
+            "slot 0 ready at the floor plus its tie-break"
         );
     }
 

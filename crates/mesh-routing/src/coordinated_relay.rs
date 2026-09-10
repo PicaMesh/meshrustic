@@ -32,6 +32,26 @@ pub const MIN_RUNG_SPACING_MS: u32 = 50;
 /// [`slot_tie_break_ms`].
 pub const MIN_TIE_BREAK_RANGE_MS: u32 = 20;
 
+/// Earliest a relay may key up: stock's own boundary between the router window and the contention
+/// window every other role draws from, `2 · CWmax · slot_time`.
+///
+/// This is stock's number, not one of ours. A stock node relaying a packet — unicast or broadcast,
+/// there is no separate path — takes `getTxDelayMsecWeighted`, which for any role but ROUTER is
+/// `2·CWmax·slot + random(0, 2^CWsize)·slot`. So this is the floor below which no stock non-router
+/// ever transmits, and the point past which no stock ROUTER can still key up.
+///
+/// Starting here puts an SR relay at the head of the window stock nodes contend in — behind the
+/// routers, ahead of every random client draw, and deterministic where stock is random. Below it we
+/// would be transmitting while a stock neighbour is still reading out the frame we are answering,
+/// which is the case stock's own transmit-delay comment warns about: it cannot then hear our copy,
+/// so it does not cancel its own and the duplicate we were avoiding happens anyway.
+///
+/// Preset-derived, so it scales with spreading factor and bandwidth: 128 ms at SHORT_TURBO, 160 at
+/// SHORT_SLOW, 448 at LONG_FAST.
+pub fn relay_floor_ms(slot_time_ms: u32) -> u32 {
+    2 * CW_MAX as u32 * slot_time_ms
+}
+
 /// Broadcast relay slot spacing: half of packet airtime, floored at [`MIN_RUNG_SPACING_MS`].
 ///
 /// The one place the floor is applied. Three sites used to re-apply it independently, one of them
