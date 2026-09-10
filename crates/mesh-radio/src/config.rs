@@ -62,10 +62,22 @@ pub struct ModemParams {
     pub coding_rate: u8,
 }
 
+/// Modem parameters per preset, matching stock Meshtastic's own table field for field.
+///
+/// Five rows disagreed before: SHORT_TURBO's wide bandwidth, and LONG_TURBO, LONG_MODERATE and
+/// LONG_SLOW in spreading factor, bandwidth or coding rate — LONG_MODERATE was a copy of
+/// MEDIUM_SLOW's row, and LONG_TURBO was grouped with SHORT_TURBO, which is where its spreading
+/// factor 7 came from. VERY_LONG_SLOW was grouped with LONG_SLOW while stock has no case for it at
+/// all, so it takes the same default as any unknown value. Symbol time, airtime, the relay slot
+/// spacing and the CAD slot time all derive from these, so a wrong row is wrong everywhere
+/// downstream.
+///
+/// Changing them changes the radio configuration: two nodes on either side of this cannot hear
+/// each other at the four affected presets. The fleet runs SHORT_SLOW, which was already correct.
 pub fn modem_preset_params(preset: u8, wide_lora: bool) -> ModemParams {
     match preset {
-        MODEM_SHORT_TURBO | MODEM_LONG_TURBO => ModemParams {
-            bandwidth_khz: if wide_lora { 812.5 } else { 500.0 },
+        MODEM_SHORT_TURBO => ModemParams {
+            bandwidth_khz: if wide_lora { 1625.0 } else { 500.0 },
             spreading_factor: 7,
             coding_rate: 5,
         },
@@ -89,21 +101,27 @@ pub fn modem_preset_params(preset: u8, wide_lora: bool) -> ModemParams {
             spreading_factor: 10,
             coding_rate: 5,
         },
+        MODEM_LONG_TURBO => ModemParams {
+            bandwidth_khz: if wide_lora { 1625.0 } else { 500.0 },
+            spreading_factor: 11,
+            coding_rate: 8,
+        },
         MODEM_LONG_MODERATE => ModemParams {
-            bandwidth_khz: if wide_lora { 812.5 } else { 250.0 },
-            spreading_factor: 10,
-            coding_rate: 5,
+            bandwidth_khz: if wide_lora { 406.25 } else { 125.0 },
+            spreading_factor: 11,
+            coding_rate: 8,
         },
         MODEM_LONG_FAST => ModemParams {
             bandwidth_khz: if wide_lora { 812.5 } else { 250.0 },
             spreading_factor: 11,
             coding_rate: 5,
         },
-        MODEM_LONG_SLOW | MODEM_VERY_LONG_SLOW => ModemParams {
-            bandwidth_khz: if wide_lora { 812.5 } else { 250.0 },
+        MODEM_LONG_SLOW => ModemParams {
+            bandwidth_khz: if wide_lora { 406.25 } else { 125.0 },
             spreading_factor: 12,
-            coding_rate: 5,
+            coding_rate: 8,
         },
+        // VERY_LONG_SLOW included: stock has no case for it, so it lands on the LONG_FAST default.
         _ => ModemParams {
             bandwidth_khz: if wide_lora { 812.5 } else { 250.0 },
             spreading_factor: 11,
@@ -226,5 +244,79 @@ impl RadioConfig {
             MODEM_LONG_TURBO => "LONG_TURBO",
             _ => "CUSTOM",
         }
+    }
+}
+
+#[cfg(test)]
+mod preset_table_tests {
+    use super::*;
+
+    /// Every preset, both bandwidth columns, against stock Meshtastic's own table.
+    ///
+    /// Written as literals taken from stock rather than from what this file computes, so the test
+    /// fails if either side moves. Four rows were wrong before — LONG_MODERATE was a copy of
+    /// MEDIUM_SLOW, LONG_TURBO was grouped with SHORT_TURBO and inherited its spreading factor,
+    /// LONG_SLOW had the wrong bandwidth and coding rate, and SHORT_TURBO's wide bandwidth was
+    /// 812.5 instead of 1625 — and VERY_LONG_SLOW was grouped with LONG_SLOW although stock has no
+    /// case for it and lands it on the LONG_FAST default.
+    #[test]
+    fn modem_presets_match_stock() {
+        // (preset, narrow bw, wide bw, sf, cr)
+        let expected: &[(u8, f32, f32, u8, u8)] = &[
+            (MODEM_SHORT_TURBO, 500.0, 1625.0, 7, 5),
+            (MODEM_SHORT_FAST, 250.0, 812.5, 7, 5),
+            (MODEM_SHORT_SLOW, 250.0, 812.5, 8, 5),
+            (MODEM_MEDIUM_FAST, 250.0, 812.5, 9, 5),
+            (MODEM_MEDIUM_SLOW, 250.0, 812.5, 10, 5),
+            (MODEM_LONG_TURBO, 500.0, 1625.0, 11, 8),
+            (MODEM_LONG_MODERATE, 125.0, 406.25, 11, 8),
+            (MODEM_LONG_FAST, 250.0, 812.5, 11, 5),
+            (MODEM_LONG_SLOW, 125.0, 406.25, 12, 8),
+            // Absent from stock's switch, so it takes the same default as any unknown value.
+            (MODEM_VERY_LONG_SLOW, 250.0, 812.5, 11, 5),
+        ];
+        for &(preset, narrow, wide, sf, cr) in expected {
+            let n = modem_preset_params(preset, false);
+            assert_eq!(
+                n.bandwidth_khz, narrow,
+                "narrow bandwidth for preset {preset}"
+            );
+            assert_eq!(
+                n.spreading_factor, sf,
+                "spreading factor for preset {preset}"
+            );
+            assert_eq!(n.coding_rate, cr, "coding rate for preset {preset}");
+            let w = modem_preset_params(preset, true);
+            assert_eq!(w.bandwidth_khz, wide, "wide bandwidth for preset {preset}");
+            assert_eq!(
+                w.spreading_factor, sf,
+                "wide spreading factor for preset {preset}"
+            );
+            assert_eq!(w.coding_rate, cr, "wide coding rate for preset {preset}");
+        }
+    }
+
+    /// LONG_MODERATE must stop being a copy of MEDIUM_SLOW's row, which is how it was wrong.
+    #[test]
+    fn long_moderate_is_not_medium_slow() {
+        let lm = modem_preset_params(MODEM_LONG_MODERATE, false);
+        let ms = modem_preset_params(MODEM_MEDIUM_SLOW, false);
+        assert_ne!(
+            (lm.bandwidth_khz, lm.spreading_factor, lm.coding_rate),
+            (ms.bandwidth_khz, ms.spreading_factor, ms.coding_rate)
+        );
+    }
+
+    /// LONG_TURBO must stop inheriting SHORT_TURBO's spreading factor.
+    #[test]
+    fn long_turbo_is_not_short_turbo() {
+        let lt = modem_preset_params(MODEM_LONG_TURBO, false);
+        let st = modem_preset_params(MODEM_SHORT_TURBO, false);
+        assert_eq!(
+            lt.bandwidth_khz, st.bandwidth_khz,
+            "both are 500 kHz narrow"
+        );
+        assert_ne!(lt.spreading_factor, st.spreading_factor);
+        assert_ne!(lt.coding_rate, st.coding_rate);
     }
 }
