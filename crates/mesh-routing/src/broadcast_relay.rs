@@ -49,6 +49,17 @@ pub struct BroadcastRelayPlan {
     /// this packet yet, plus the ranked SR peers whose coverage we absorbed. Zero means nothing
     /// is expected, so there is nothing for a late copy to stand in for.
     pub slots_given: u8,
+    /// How many of `slots_given` are reserved positions held by stock relay routers rather than
+    /// rungs held by ranked SR peers. The two are different reasons to stay quiet — one expects a
+    /// node we do not coordinate with, the other a node we do — and a log that merges them cannot
+    /// say which. Needed to check that removing the reservation does not silently drop the
+    /// insurance arm it used to earn.
+    pub reserved_slots: u8,
+    /// How many of the leading `ranked` entries came from the reservation pre-pass rather than
+    /// the ranking loop. Not the same as `reserved_slots`: a router that already transmitted this
+    /// packet is still listed, and still consumed the accumulator, but is no longer a
+    /// transmission we are waiting for. Lets the order line say which entries are reservations.
+    pub reserved_ranked: u8,
     /// A neighbour our relay reaches that the transmitter did not (0 when the relay was taken
     /// for another reason: sole candidate or downstream).
     pub coverage_for: u32,
@@ -509,6 +520,8 @@ where
     let mut my_delay = 0u32;
     let mut coverage_for = 0u32;
     let mut slots_given = 0u8;
+    let mut reserved_slots = 0u8;
+    let mut reserved_ranked = 0u8;
     let mut ranked = [0u32; RANKED_LOG];
     let mut ranked_len = 0u8;
     let mut evaluated = EvaluatedList::default();
@@ -532,10 +545,12 @@ where
             // trail if we still have unique nodes after they relay.
             absorb_relay_coverage(ctx, &mut already_covered, neighbor, now_ms);
             push_ranked(&mut ranked, &mut ranked_len, neighbor);
+            reserved_ranked = reserved_ranked.saturating_add(1);
             // Its slot is still spent — a stock router transmits on its own schedule — but a
             // copy already on the air is not a transmission we are still waiting for.
             if !has_transmitted(neighbor) {
                 slots_given = slots_given.saturating_add(1);
+                reserved_slots = reserved_slots.saturating_add(1);
             }
             slot_delay = slot_delay.saturating_add(half);
         }
@@ -622,6 +637,8 @@ where
         uncovered_len,
         coverage_for,
         slots_given,
+        reserved_slots,
+        reserved_ranked,
     }
 }
 
@@ -664,6 +681,56 @@ mod tests {
             capability,
             downstream,
         }
+    }
+
+    /// A reservation and a rung are different reasons to stay quiet, and the plan must say which.
+    ///
+    /// Both raise `slots_given`, so a log that carries only that total cannot tell a stock router
+    /// we cannot coordinate with from an SR peer we can — and it is the reservation whose removal
+    /// would silently drop the insurance arm it used to earn. `reserved_ranked` additionally
+    /// counts the leading order entries that are reservations, which is not the same number: a
+    /// router that already transmitted still holds its place in the order but is no longer a
+    /// transmission we are waiting for.
+    #[test]
+    fn reservation_and_rung_are_counted_apart() {
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        setup_stock_topology(&mut edges, &mut capability);
+        // A second neighbour of the transmitter, SR-active, so the ranking has something to rank
+        // besides the reserved router.
+        edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, EE, BB, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, EE, true);
+        capability.track_topology(EE, true, 0);
+        let ctx = ctx(&edges, &capability, &downstream);
+
+        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, never_transmitted);
+        assert!(
+            plan.reserved_slots > 0,
+            "the stock repeater that hears the transmitter holds a reserved position"
+        );
+        assert!(
+            plan.slots_given >= plan.reserved_slots,
+            "reservations are a subset of the transmissions we expect"
+        );
+        assert_eq!(
+            plan.reserved_ranked as usize, 1,
+            "exactly the leading order entry is the reservation"
+        );
+        assert_eq!(plan.ranked[0], DD, "reservations are listed before rungs");
+
+        // The same topology with the router's copy already on the air: it keeps its place in the
+        // order, so the marker still applies, but it is no longer awaited.
+        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, |node| node == DD);
+        assert_eq!(
+            plan.reserved_slots, 0,
+            "a copy already on the air is not a transmission we are waiting for"
+        );
+        assert_eq!(
+            plan.reserved_ranked as usize, 1,
+            "but it still occupies its position in the order"
+        );
     }
 
     /// A publisher we have stopped hearing is nobody's target, however good the edge a peer

@@ -611,6 +611,14 @@ impl Router {
         self.channel_hash
     }
 
+    /// Our own configured device role, as the graph holds it.
+    ///
+    /// The role decides which ladder positions we take and whether peers reserve air for us, so a
+    /// capture that does not record it cannot be checked against the ladder it produced.
+    pub fn device_role(&self) -> u32 {
+        self.graph.device_role()
+    }
+
     pub fn route_to(&mut self, destination: u32, now_ms: u32) -> crate::graph::Route {
         self.graph.route_to(destination, now_ms)
     }
@@ -1697,9 +1705,18 @@ impl Router {
                         now_ms,
                     );
                     self.log_slot_scheduling(&parsed, relay_plan, half_airtime);
+                    // Name which kind of transmission we are standing down for. A reserved stock
+                    // router and a ranked SR peer are different expectations — one we cannot
+                    // predict or coordinate with, the other we can — and merging them into one
+                    // reason makes the reservation's effect invisible in a capture.
+                    let reason = if relay_plan.reserved_slots > 0 {
+                        SrSkipReason::RouterExpected
+                    } else {
+                        SrSkipReason::BetterNeighbor
+                    };
                     self.sr_log.push(SrLogEvent::RelaySkip {
                         from: parsed.from,
-                        reason: SrSkipReason::BetterNeighbor,
+                        reason,
                     });
                 } else {
                     // Nobody was given a slot and nobody is waiting to be told: there is no
@@ -2141,6 +2158,12 @@ impl Router {
                 )
             },
         );
+        // Taken separately rather than widened into the tuple above: three more elements would
+        // push it past readability for no gain.
+        let plan_for_log = broadcast_plan.as_ref().or(unicast_plan.as_ref());
+        let slots_given = plan_for_log.map_or(0, |p| p.slots_given);
+        let reserved_slots = plan_for_log.map_or(0, |p| p.reserved_slots);
+        let reserved_ranked = plan_for_log.map_or(0, |p| p.reserved_ranked);
         self.sr_log.push(SrLogEvent::SlotScheduling {
             id: parsed.id,
             half_airtime_ms: half_airtime,
@@ -2154,6 +2177,9 @@ impl Router {
             pre_covered,
             uncovered,
             uncovered_len,
+            slots_given,
+            reserved_slots,
+            reserved_ranked,
         });
         self.sr_log.push(SrLogEvent::RelayCommitted {
             id: parsed.id,
@@ -2456,6 +2482,9 @@ impl Router {
             uncovered_len: 0,
             coverage_for: 0,
             slots_given: 0,
+            // No reservation on a unicast ladder: the router window is a broadcast rule.
+            reserved_slots: 0,
+            reserved_ranked: 0,
         }
     }
 
@@ -3781,6 +3810,9 @@ impl Router {
             pre_covered: plan.pre_covered,
             uncovered: plan.uncovered,
             uncovered_len: plan.uncovered_len,
+            slots_given: plan.slots_given,
+            reserved_slots: plan.reserved_slots,
+            reserved_ranked: plan.reserved_ranked,
         });
     }
 

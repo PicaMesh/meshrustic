@@ -26,6 +26,29 @@ pub const DEVICE_ROLE_LOST_AND_FOUND: u32 = 9;
 pub const DEVICE_ROLE_TAK_TRACKER: u32 = 10;
 pub const DEVICE_ROLE_ROUTER_LATE: u32 = 11;
 pub const DEVICE_ROLE_CLIENT_BASE: u32 = 12;
+/// Wire name of a device role, for logs. Unknown values render as `role=<n>` by the caller.
+///
+/// The role a node advertises decides which band it takes and whether it is reserved for, so a
+/// capture that does not record our own role cannot be checked against the ladder it produced.
+pub fn device_role_name(role: u32) -> Option<&'static str> {
+    Some(match role {
+        DEVICE_ROLE_CLIENT => "CLIENT",
+        DEVICE_ROLE_CLIENT_MUTE => "CLIENT_MUTE",
+        DEVICE_ROLE_ROUTER => "ROUTER",
+        DEVICE_ROLE_ROUTER_CLIENT => "ROUTER_CLIENT",
+        DEVICE_ROLE_REPEATER => "REPEATER",
+        DEVICE_ROLE_TRACKER => "TRACKER",
+        DEVICE_ROLE_SENSOR => "SENSOR",
+        DEVICE_ROLE_TAK => "TAK",
+        DEVICE_ROLE_CLIENT_HIDDEN => "CLIENT_HIDDEN",
+        DEVICE_ROLE_LOST_AND_FOUND => "LOST_AND_FOUND",
+        DEVICE_ROLE_TAK_TRACKER => "TAK_TRACKER",
+        DEVICE_ROLE_ROUTER_LATE => "ROUTER_LATE",
+        DEVICE_ROLE_CLIENT_BASE => "CLIENT_BASE",
+        _ => return None,
+    })
+}
+
 /// Pro Micro DIY + TCXO board (`NRF52_PROMICRO_DIY` in mesh.proto).
 pub const HW_MODEL_NRF52_PROMICRO_DIY: u32 = 63;
 /// Generic private / DIY hardware model id on the wire.

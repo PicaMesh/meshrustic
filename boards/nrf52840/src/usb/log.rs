@@ -241,6 +241,25 @@ pub mod mesh {
         finish_line(&mut line, pos);
     }
 
+    /// `[meshrustic] role=CLIENT (0)` — our own configured device role at boot.
+    ///
+    /// The role decides which ladder positions we take and whether peers reserve for us, so a
+    /// capture without it cannot be checked against the ladder it produced. Neither tree logged
+    /// it before.
+    pub fn device_role(role: u32) {
+        let mut line = [0u8; 64];
+        let mut pos = line_prefix(&mut line);
+        put(&mut line, &mut pos, b"[meshrustic] role=");
+        match mesh_routing::nodeinfo::device_role_name(role) {
+            Some(name) => put(&mut line, &mut pos, name.as_bytes()),
+            None => put(&mut line, &mut pos, b"unknown"),
+        }
+        put(&mut line, &mut pos, b" (");
+        put_u32(&mut line, &mut pos, role);
+        put(&mut line, &mut pos, b")");
+        finish_line(&mut line, pos);
+    }
+
     /// Flash load result + configurable admin public-key count.
     /// `[meshrustic] reset reason=0x0004 (SREQ)` — RESETREAS bits as read at boot; SREQ is what
     /// the panic handler's `sys_reset` leaves behind, so a panic reboot is visible in the log.
@@ -1078,10 +1097,13 @@ pub mod sr {
                 pre_covered,
                 uncovered,
                 uncovered_len,
+                slots_given,
+                reserved_slots,
+                reserved_ranked,
             } => {
                 // 320 clipped the cand= tail once unc= was added, and the tail is the part two nodes
-                // are compared on.
-                let mut line = [0u8; 384];
+                // are compared on; slots= and the R: markers added ~24 more.
+                let mut line = [0u8; 416];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Slot scheduling for pkt 0x";
                 put(&mut line, &mut pos, prefix);
@@ -1107,6 +1129,16 @@ pub mod sr {
                 let tail2 = b", slot=";
                 put(&mut line, &mut pos, tail2);
                 put_u32(&mut line, &mut pos, slot_index as u32);
+                // Transmissions expected ahead of ours, and how many are stock reservations. This
+                // is what T1 arming turns on; without it a capture cannot say whether two nodes
+                // agreed about the insurance a packet earned.
+                put(&mut line, &mut pos, b", slots=");
+                put_u32(&mut line, &mut pos, slots_given as u32);
+                if reserved_slots > 0 {
+                    put(&mut line, &mut pos, b"(res=");
+                    put_u32(&mut line, &mut pos, reserved_slots as u32);
+                    put(&mut line, &mut pos, b")");
+                }
                 let via: &[u8] = match reason {
                     RelayReason::None => b"",
                     RelayReason::Ranked => b", via=rank",
@@ -1121,6 +1153,12 @@ pub mod sr {
                     for (i, node) in ranked.iter().take(ranked_len as usize).enumerate() {
                         if i > 0 {
                             put(&mut line, &mut pos, b">");
+                        }
+                        // Leading entries are reservations for stock routers, not rungs we
+                        // assigned. Marked, because the two are compared across nodes and a flat
+                        // list cannot tell them apart.
+                        if (i as u8) < reserved_ranked {
+                            put(&mut line, &mut pos, b"R:");
                         }
                         put(&mut line, &mut pos, b"!");
                         put_hex8(&mut line, &mut pos, *node);
@@ -1192,6 +1230,7 @@ pub mod sr {
                     SrSkipReason::OwnRebroadcast => b"own rebroadcast",
                     SrSkipReason::UnknownDestination => b"unknown dest",
                     SrSkipReason::BetterNeighbor => b"better neighbor",
+                    SrSkipReason::RouterExpected => b"stock router expected",
                     SrSkipReason::NextHopIsRelayer => b"next hop is relayer",
                     SrSkipReason::DeadEndHop => b"dead end hop",
                     SrSkipReason::UnicastCovered => b"unicast covered",

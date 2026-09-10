@@ -85,8 +85,12 @@ async fn main(spawner: Spawner) {
     wdt_config.action_during_debug_halt = wdt::HaltConfig::PAUSE;
     let radio_wdt = match wdt::Watchdog::try_new::<1>(p.WDT, wdt_config) {
         Ok((_wdt, [handle])) => Some(handle),
-        // Already running with a different setup (nothing we ship does this): we cannot pet an
-        // unknown configuration, so run without and say so.
+        // Already running with a different setup. Firmware flashed before ours can leave the WDT
+        // enabled, and the nRF52 keeps it running through the soft reset that ends a UF2 flash —
+        // only a power-on reset clears it. We cannot pet a configuration we did not create, so
+        // that timer keeps expiring and resetting the node until it is power-cycled. Run without
+        // one of our own and say so, naming the remedy: the boot log is the only place this is
+        // visible, and the symptom (a reset every minute or two) looks like a crash otherwise.
         Err(_) => None,
     };
     // Adafruit UF2 bootloader leaves RESETREAS set; clear so a later soft-reset
@@ -110,7 +114,7 @@ async fn main(spawner: Spawner) {
     usb_log::log::push_line(if radio_wdt.is_some() {
         "[meshrustic] watchdog armed: 30 s, pet by the radio task"
     } else {
-        "[meshrustic] watchdog NOT armed: WDT already running with another configuration"
+        "[meshrustic] watchdog NOT armed: earlier firmware left the WDT running; resets until power-cycled"
     });
     usb_log::log::mesh::config_boot(load_src == ConfigLoadSource::Flash, admin_keys);
     defmt::info!(
@@ -144,6 +148,9 @@ async fn main(spawner: Spawner) {
         config.node_num,
         config.public_key,
     ));
+    // After the identity is set, so the line reports the role the graph will actually rank with
+    // rather than a default the router has not adopted yet.
+    usb_log::log::mesh::device_role(router.device_role());
 
     spawner.spawn(usb_log::usb_task(p.USBD)).unwrap();
     let saadc_config = saadc::Config::default();

@@ -56,6 +56,14 @@ pub enum SrLogEvent {
         /// insures. Named, so two nodes' disagreement can be attributed rather than counted.
         uncovered: [u32; crate::broadcast_relay::UNCOVERED_LOG],
         uncovered_len: u8,
+        /// Transmissions expected ahead of ours, and how many of those are reserved positions
+        /// held by stock relay routers. This is the quantity T1 arming turns on, and it was
+        /// logged nowhere — so whether two nodes agreed about the insurance a packet earned
+        /// could not be read from a capture at all.
+        slots_given: u8,
+        reserved_slots: u8,
+        /// How many leading `ranked` entries are reservations, so the order line can mark them.
+        reserved_ranked: u8,
     },
     RelayCommitted {
         id: u32,
@@ -272,7 +280,13 @@ pub enum SrSkipReason {
     RateLimited,
     OwnRebroadcast,
     UnknownDestination,
+    /// Broadcast a ranked SR peer was given a rung for: a node we coordinate with is expected to
+    /// carry it, and our copy would be the redundancy if theirs is lost.
     BetterNeighbor,
+    /// Broadcast a stock relay router holds a reserved position for. A different reason to stay
+    /// quiet from `BetterNeighbor`: the expected transmitter is a node we do not coordinate with
+    /// and whose firing time we cannot compute, so the only evidence it relayed is hearing it.
+    RouterExpected,
     /// Unicast whose next hop is the node we just heard it from.
     NextHopIsRelayer,
     /// Unicast that would leave us with hop_limit 0 without a direct link to the target.
