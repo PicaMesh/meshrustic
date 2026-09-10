@@ -1658,6 +1658,20 @@ impl Router {
             && parsed.from != self.node_num
             && self.graph.topology_healthy_for_broadcast()
         {
+            // Eligibility for the acknowledgement pass is policy and belongs here, where the
+            // portnum and the header are known; the ladder it produces is mechanism and belongs in
+            // the ranking. Scoped to a text broadcast that arrived straight from its originator:
+            // that is the class whose delivery a person is shown, and a frame that reached us
+            // through a relay was rebroadcast by definition, so its originator already has its
+            // confirmation.
+            let ack_eligible = result.decoded_portnum
+                == Some(mesh_protocol::portnum::num::TEXT_MESSAGE_APP)
+                && is_direct_packet(
+                    parsed.from,
+                    parsed.hop_start,
+                    parsed.hop_limit,
+                    parsed.relay_node,
+                );
             Some(self.graph.plan_broadcast_relay(
                 parsed.id,
                 parsed.from,
@@ -1665,6 +1679,7 @@ impl Router {
                 parsed.to,
                 now_ms,
                 half_airtime,
+                ack_eligible,
             ))
         } else {
             None
@@ -1684,17 +1699,17 @@ impl Router {
                     });
                 }
             } else {
-                // Two reasons can still put a late copy on the air, and both are known now.
-                // A transmission we expect: the ranking gave a slot to a stock relay router or
-                // a ranked SR peer, and if their copy never comes ours is the
-                // redundancy that covers the loss. Or a witness owed: the originator asked to
-                // be told (`want_ack`) and heard us directly, so our copy is the rebroadcast
-                // stock turns into its implicit ACK — one elected neighbour answers instead of
-                // every one that heard it, and without it the sender retransmits three times.
-                let witness_owed = parsed.want_ack
-                    && parsed.hop_start == parsed.hop_limit
-                    && self.graph.is_elected_witness(parsed.from);
-                if relay_plan.slots_given > 0 || witness_owed {
+                // A late copy still goes on the air when a transmission is expected: the ranking
+                // gave a rung to a stock relay router or a ranked SR peer, or the acknowledgement
+                // pass put somebody ahead of us, and if their copy never comes ours is the
+                // redundancy that covers the loss.
+                //
+                // The `want_ack` witness term that used to widen this is gone. Stock strips that
+                // flag from every broadcast before transmission, so it was never set on the wire —
+                // 0 of 83,727 broadcast receptions carry it — and the election behind it has been
+                // replaced by the acknowledgement pass, which does not need the flag to know a
+                // message is one somebody is waiting on.
+                if relay_plan.slots_given > 0 {
                     self.arm_t1_for_deferred_broadcast(
                         &parsed,
                         handle,
@@ -4721,139 +4736,6 @@ mod tests {
                 ..
             }
         )));
-    }
-
-    /// The same frame with `want_ack`: stock turns a heard rebroadcast into its implicit ACK
-    /// and otherwise retransmits three times, so the elected witness answers even when the
-    /// ranking gave nobody a slot.
-    #[test]
-    fn elected_witness_answers_when_no_slot_was_given() {
-        use crate::topology::{decode_packed_neighbors, write_packed_header, PackedNeighbor};
-        static ROUTER: StaticCell<Router> = StaticCell::new();
-        const ME: u32 = 0xCC00_00CC;
-        const SRC: u32 = 0xBB00_00BB;
-        const PEER: u32 = 0xAB00_00AB;
-        let router = ROUTER.init(Router::new(ME));
-        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
-        {
-            let graph = router.graph_mut();
-            graph.observe_direct_neighbor(SRC, -70, 8, 0, 0);
-            graph.observe_direct_neighbor(PEER, -70, 8, 0, 0);
-            graph.confirm_direct_neighbor_hears_us(SRC);
-            graph.confirm_direct_neighbor_hears_us(PEER);
-            graph.capability_mut().track_topology(SRC, true, 0);
-            graph.capability_mut().track_topology(PEER, true, 0);
-        }
-        let mut packed = [0u8; 16];
-        write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
-        let entry = PackedNeighbor {
-            node_id: PEER,
-            rssi: -90,
-            snr: 2,
-            signal_routing_active: true,
-            hears_us: true,
-            etx_variance: 0,
-        };
-        // The source hears us best, so the witness election falls to us.
-        let us = PackedNeighbor {
-            node_id: ME,
-            rssi: -60,
-            snr: 10,
-            ..entry
-        };
-        router
-            .graph_mut()
-            .merge_topology(SRC, &header, &[entry, us], true, 0, 0);
-        assert!(router.graph.is_elected_witness(SRC));
-
-        let wire = encode_wire(
-            PacketHeader::from_fields(NODENUM_BROADCAST, SRC, 0x78, 0, 3, 3, true, false, 0, 0),
-            &[0x01, 0x02],
-        );
-        let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
-        let result = router
-            .process_inbound(
-                &InboundPacket {
-                    radio_id: 0,
-                    rssi: -70,
-                    snr: 10,
-                    bytes: &wire,
-                },
-                1_000,
-            )
-            .unwrap();
-        assert!(router
-            .evaluate_tx_plan(&result, 0.0, airtime, 1_000)
-            .relay
-            .is_none());
-        let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
-        let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
-        let ladder =
-            coordinated_relay::half_airtime_ms(airtime) * crate::graph::MAX_EDGES_PER_NODE as u32;
-        assert!(
-            (1_000 + fire_ms..=1_000 + fire_ms + ladder)
-                .any(|t| router.poll_t1_retransmit(t).is_some()),
-            "a want_ack originator that elected us gets its one witness"
-        );
-    }
-
-    /// The witness election picks one answerer for a `want_ack` broadcast: stock turns a heard
-    /// rebroadcast into its implicit ACK and otherwise retransmits three times. The evidence is
-    /// the delivery direction — the originator must be able to hear the answer, so a peer we
-    /// hear better than it hears us does not win on our side of the link.
-    #[test]
-    fn source_witness_is_the_neighbour_the_source_can_hear() {
-        use crate::topology::{decode_packed_neighbors, write_packed_header, PackedNeighbor};
-        static ROUTER: StaticCell<Router> = StaticCell::new();
-        const ME: u32 = 0xCC00_00CC;
-        const SRC: u32 = 0xBB00_00BB;
-        const PEER: u32 = 0xAB00_00AB;
-        let router = ROUTER.init(Router::new(ME));
-        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
-        {
-            let graph = router.graph_mut();
-            graph.observe_direct_neighbor(SRC, -70, 8, 0, 0);
-            graph.observe_direct_neighbor(PEER, -70, 8, 0, 0);
-            graph.confirm_direct_neighbor_hears_us(PEER);
-            graph.capability_mut().track_topology(SRC, true, 0);
-            graph.capability_mut().track_topology(PEER, true, 0);
-        }
-        // The source publishes a list naming only PEER as a neighbour that hears it: we are not
-        // in it, so our copy would acknowledge nothing however well we hear the source.
-        let mut packed = [0u8; 16];
-        write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
-        let peer_entry = PackedNeighbor {
-            node_id: PEER,
-            rssi: -90,
-            snr: 2,
-            signal_routing_active: true,
-            hears_us: true,
-            etx_variance: 0,
-        };
-        router
-            .graph_mut()
-            .merge_topology(SRC, &header, &[peer_entry], true, 0, 0);
-        assert!(
-            !router.graph.is_elected_witness(SRC),
-            "the source cannot hear us: our copy is no acknowledgement"
-        );
-        // Once the source lists us too, the election is between two nodes it hears, and the
-        // better link in the delivery direction wins.
-        let us_entry = PackedNeighbor {
-            node_id: ME,
-            rssi: -60,
-            snr: 10,
-            ..peer_entry
-        };
-        router
-            .graph_mut()
-            .merge_topology(SRC, &header, &[peer_entry, us_entry], true, 0, 0);
-        assert!(
-            router.graph.is_elected_witness(SRC),
-            "the source hears us best: we answer for it"
-        );
     }
 
     #[test]

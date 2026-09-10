@@ -31,7 +31,7 @@ fn setup_stock_graph(graph: &mut NeighborGraph) {
 fn stock_router_gets_first_slot() {
     let mut graph = NeighborGraph::new();
     setup_stock_graph(&mut graph);
-    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
+    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF, false);
     assert!(!plan.should_relay);
     assert_eq!(plan.slot_delay_ms, 0, "no relay planned, no delay");
 }
@@ -75,7 +75,7 @@ fn best_candidate_assigned_earlier_slot() {
         .update_edge(ME, ME, GG, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(ME, GG, true);
 
-    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
+    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF, false);
     assert!(plan.should_relay);
     assert_eq!(plan.slot_delay_ms, SLOT_ORIGIN_MS + HALF);
     assert_eq!(plan.slot_index, 1);
@@ -97,7 +97,7 @@ fn one_way_listed_neighbor_is_not_precovered() {
         .update_edge(ME, BB, ME, 1.5, 0, EdgeSource::Reported, true, 0);
     graph.capability_mut().track_topology(ME, true, 0);
     graph.capability_mut().track_topology(BB, true, 0);
-    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
+    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF, false);
     assert!(plan.should_relay);
 }
 
@@ -106,6 +106,6 @@ fn we_relay_when_downstream_relay_for_source() {
     let mut graph = NeighborGraph::new();
     setup_stock_graph(&mut graph);
     graph.downstream_mut().update(ME, BB, ME, 1.0, 0, false, 0);
-    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF);
+    let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF, false);
     assert!(plan.should_relay);
 }

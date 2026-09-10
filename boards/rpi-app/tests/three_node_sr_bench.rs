@@ -81,7 +81,7 @@ fn three_node_middle_node_defers_to_stock_router() {
     let half = mesh_routing::coordinated_relay::half_airtime_ms(
         mesh_routing::coordinated_relay::DEFAULT_SLOT_MS,
     );
-    let plan = c.plan_broadcast_relay(0x99, B, B, 0xFFFF_FFFF, 0, half);
+    let plan = c.plan_broadcast_relay(0x99, B, B, 0xFFFF_FFFF, 0, half, false);
     assert!(
         !plan.should_relay,
         "middle node must defer to stock router with no unique coverage"

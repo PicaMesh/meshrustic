@@ -656,6 +656,7 @@ impl NeighborGraph {
         broadcast_dest: u32,
         now_ms: u32,
         half_airtime_ms: u32,
+        ack_eligible: bool,
     ) -> crate::broadcast_relay::BroadcastRelayPlan {
         let ctx = crate::broadcast_relay::BroadcastRelayContext {
             my_node: self.my_node,
@@ -673,6 +674,7 @@ impl NeighborGraph {
             now_ms,
             half_airtime_ms,
             |node| self.has_node_transmitted(node, packet_id, now_ms),
+            ack_eligible,
         )
     }
 
@@ -2007,20 +2009,6 @@ impl NeighborGraph {
         false
     }
 
-    /// Whose copy acknowledges a `want_ack` broadcast to its originator: the neighbour with the
-    /// best measured link to it, stock rebroadcasters given way, node id as the tie-break — the
-    /// same election that decides who covers an unconfirmed neighbour. One witness answers, so
-    /// the originator's implicit ACK costs one frame instead of one per node that heard it.
-    pub fn is_elected_witness(&self, source: u32) -> bool {
-        crate::graph::witness_owner(
-            &self.edges,
-            &self.capability,
-            self.my_node,
-            self.is_rebroadcaster(),
-            source,
-        ) == self.my_node
-    }
-
     /// Do we still reach a neighbour that none of `covered_by` can deliver to? Ours are the
     /// neighbours that confirmed hearing us, plus those nobody can be shown to reach that we
     /// own — and in both cases only while a copy from us would actually arrive.
@@ -3007,14 +2995,14 @@ mod tests {
             0,
         );
 
-        let even = graph.plan_broadcast_relay(0xcc21_2ebc, SRC, GW, 0xffff_ffff, 200, 91);
+        let even = graph.plan_broadcast_relay(0xcc21_2ebc, SRC, GW, 0xffff_ffff, 200, 91, false);
         assert_eq!(
             &even.ranked[..1],
             &[B],
             "even packet id: lower node id relays"
         );
         assert!(!even.should_relay);
-        let odd = graph.plan_broadcast_relay(0xcc21_2ebd, SRC, GW, 0xffff_ffff, 200, 91);
+        let odd = graph.plan_broadcast_relay(0xcc21_2ebd, SRC, GW, 0xffff_ffff, 200, 91, false);
         assert!(odd.should_relay, "odd packet id: higher node id relays");
         assert_eq!(odd.slot_index, 0);
     }

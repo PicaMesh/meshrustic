@@ -1166,6 +1166,7 @@ pub mod sr {
                     RelayReason::Downstream => b", via=downstream",
                     RelayReason::Sparse => b", via=sparse",
                     RelayReason::UnicastCost => b", via=cost",
+                    RelayReason::Acknowledgement => b", via=ack",
                 };
                 put(&mut line, &mut pos, via);
                 if ranked_len > 0 {
@@ -1275,7 +1276,7 @@ pub mod sr {
                     SrSkipReason::NoRelayPath => b"no relay path",
                     SrSkipReason::ReplyRetracesLink => b"reply retraces link",
                     SrSkipReason::UnverifiedBacktrack => b"guessed route runs back",
-                    SrSkipReason::AlreadyCovered => b"no slot given, no witness owed",
+                    SrSkipReason::AlreadyCovered => b"no rung given, nothing expected",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

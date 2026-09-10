@@ -63,6 +63,7 @@ fn healthy_topology_defers_when_stock_router_covers() {
         mesh_protocol::NODENUM_BROADCAST,
         0,
         half,
+        false,
     );
     assert!(
         !relay_plan.should_relay,

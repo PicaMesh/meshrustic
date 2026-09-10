@@ -184,6 +184,28 @@ impl CapabilityCache {
         )
     }
 
+    /// Will this node rebroadcast regardless and *not* stand down on hearing our copy?
+    ///
+    /// A separate question from whether it relays early, and from whether it is a relay router at
+    /// all: stock refuses to cancel a duplicate for ROUTER and ROUTER_LATE, so relaying behind one
+    /// of those adds a frame rather than replacing one. Added as its own name rather than by
+    /// narrowing the relay-router test, which also answers candidate admission and the owner
+    /// elections and must not move.
+    ///
+    /// CLIENT_BASE is deliberately absent. Stock also refuses to cancel there, but only for
+    /// traffic involving a favourited node, and a favourite list is local configuration that never
+    /// reaches the wire — no peer can evaluate it. The occasional duplicate alongside one is
+    /// accepted.
+    pub fn will_not_cancel_for_us(&self, node_id: u32) -> bool {
+        if self.status(node_id) == CapabilityStatus::SrActive {
+            return false;
+        }
+        let Some(role) = self.role(node_id) else {
+            return false;
+        };
+        matches!(role, DEVICE_ROLE_ROUTER | DEVICE_ROLE_ROUTER_LATE)
+    }
+
     pub fn is_legacy(&self, node_id: u32) -> bool {
         self.status(node_id) == CapabilityStatus::Legacy
     }

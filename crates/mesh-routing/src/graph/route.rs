@@ -219,7 +219,7 @@ pub fn publishes_topology(capability: Option<&CapabilityCache>, node: u32) -> bo
 /// An [`EdgeSource::Inferred`] edge is skipped: it was minted at a nominal price because a frame
 /// once crossed the link, which says a path exists and nothing about what it costs. Everything
 /// that decides whether a transmission may be skipped reads this price — [`covers`],
-/// [`witness_owner`], [`coverage_owner`] and both slot rankings through
+/// [`acknowledgement_price_fixed`], [`coverage_owner`] and both slot rankings through
 /// [`delivery_hop_cost_fixed`] — so a guess must not produce one. The route search prices its own
 /// hops from the edges directly and keeps using inferred edges for reachability, which is what
 /// they exist for.
@@ -278,66 +278,39 @@ pub const OWNER_COST_BUCKET_FIXED: u16 = 50;
 /// wrong direction for a witness — a copy from a node the originator cannot hear acknowledges
 /// nothing. A source that publishes nothing leaves each node with only its own evidence, so
 /// several may elect themselves; that is still fewer than every node that heard the frame.
-pub fn witness_owner(
-    edges: &EdgeStore,
-    capability: &CapabilityCache,
-    me: u32,
-    me_relays: bool,
-    source: u32,
-) -> u32 {
-    if source == 0 || is_placeholder_node(source) {
-        return 0;
+/// What an acknowledgement from `candidate` is worth to `source`: the cost in the direction the
+/// source would have to hear it, or `None` when it would not be heard at all.
+///
+/// This is the price the acknowledgement pass ranks on, and it is the opposite direction from
+/// coverage. Coverage asks whether a relay reaches a target; an acknowledgement asks whether the
+/// *originator* hears the relay, because a copy the originator cannot hear tells it nothing and
+/// its retry ladder runs anyway.
+///
+/// The evidence demanded is positive and one-directional: the source's own list named the
+/// candidate, or we watched the source's traffic carried by it. Deliberately not the symmetric
+/// test — a direct observation writes both edge directions from one measurement, so that would be
+/// satisfied by our own assumption of symmetry, and symmetry is the one thing an acknowledgement
+/// may not assume. Priced from the source's own measurement where it published one and from the
+/// candidate's own edge otherwise, and refused past the coverage ceiling, where nothing arrives.
+pub fn acknowledgement_price_fixed(edges: &EdgeStore, candidate: u32, source: u32) -> Option<u16> {
+    if source == 0 || candidate == 0 || candidate == source {
+        return None;
     }
-    let mut owner = 0u32;
-    let mut best = (u8::MAX, u16::MAX);
-    for i in 0..edges.node_count() {
-        let Some(candidate) = edges.node_id_at(i) else {
-            continue;
-        };
-        if candidate == source || is_placeholder_node(candidate) {
-            continue;
-        }
-        let tier = if candidate == me {
-            if !me_relays {
-                continue;
-            }
-            1
-        } else if capability.is_immediate_relay_router(candidate) {
-            0
-        } else if capability.status(candidate) == CapabilityStatus::SrActive {
-            1
-        } else {
-            continue;
-        };
-        // Positive evidence that the source hears this candidate: the source's own list named
-        // it, or we watched the source carry its frame. Not `known_to_hear`: a direct
-        // observation writes both edge directions from one measurement, so that test is
-        // satisfied by our own assumption of symmetry — which is the one thing a witness may
-        // not assume, since a copy the originator cannot hear acknowledges nothing.
-        let Some(edge) = edges
-            .find_node(candidate)
-            .and_then(|n| n.find_edge(source))
-            .filter(|e| e.source.is_measured())
-        else {
-            continue;
-        };
-        if !edge.hears_us {
-            continue;
-        }
-        // Priced in the delivery direction: the source's own measurement of the candidate when
-        // it published one, our own edge otherwise. A link past the coverage ceiling carries no
-        // acknowledgement either.
-        let cost = hop_cost_fixed(edges, candidate, source).unwrap_or(edge.etx_fixed);
-        if cost > COVERAGE_ETX_CEILING_FIXED {
-            continue;
-        }
-        let key = (tier, cost / OWNER_COST_BUCKET_FIXED);
-        if key < best || (key == best && candidate < owner) {
-            best = key;
-            owner = candidate;
-        }
+    if is_placeholder_node(source) || is_placeholder_node(candidate) {
+        return None;
     }
-    owner
+    let edge = edges
+        .find_node(candidate)
+        .and_then(|n| n.find_edge(source))
+        .filter(|e| e.source.is_measured())?;
+    if !edge.hears_us {
+        return None;
+    }
+    let cost = hop_cost_fixed(edges, candidate, source).unwrap_or(edge.etx_fixed);
+    if cost > COVERAGE_ETX_CEILING_FIXED {
+        return None;
+    }
+    Some(cost)
 }
 
 /// Which single node carries a neighbour that nobody can be *shown* to reach: the one hearing it
@@ -349,7 +322,7 @@ pub fn witness_owner(
 /// Only a *silent* neighbour has an owner. A neighbour that publishes topology and does not list
 /// a candidate has told us that candidate cannot reach it, and that silence is evidence: nobody
 /// owns it, and a relay spent on it would be spent against its own report. Contrast
-/// [`witness_owner`], which elects an answerer for an originator and therefore prices the other
+/// [`acknowledgement_price_fixed`], which prices an answer to an originator and therefore reads the other
 /// direction of the link.
 pub fn coverage_owner(
     edges: &EdgeStore,

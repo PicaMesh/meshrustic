@@ -81,6 +81,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
         0,
         100,
         |_| false,
+        false,
     );
     assert_eq!(plan_without.candidate_count, 2);
 
@@ -101,6 +102,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
         0,
         100,
         |_| false,
+        false,
     );
     assert_eq!(plan_with.candidate_count, 3);
 }

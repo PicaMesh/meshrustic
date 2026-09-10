@@ -114,6 +114,9 @@ pub enum RelayReason {
     Sparse,
     /// Unicast: we hold a slot in the cost-to-destination ranking.
     UnicastCost,
+    /// Nobody had coverage to offer for a message its originator is waiting on, so we answer it:
+    /// stock turns a heard rebroadcast into its delivery confirmation and otherwise retransmits.
+    Acknowledgement,
 }
 
 fn push_ranked(plan_ranked: &mut [u32; RANKED_LOG], len: &mut u8, node: u32) {
@@ -297,6 +300,134 @@ fn admits_coverage(ctx: &BroadcastRelayContext<'_>, relay: u32, target: u32, now
             ctx.my_node_relays,
             target,
         ) == relay
+}
+
+/// Outcome of the acknowledgement pass: who answers, in what order, and whether we are one.
+struct AcknowledgementPlan {
+    should_relay: bool,
+    my_delay: u32,
+    slots_given: u8,
+    ranked: [u32; RANKED_LOG],
+    ranked_len: u8,
+}
+
+/// Answer a message its originator is waiting on, when the coverage ranking had nothing to offer.
+///
+/// Ordered by how well *the source* hears each candidate, best first — the opposite of stock's
+/// reverse-ETX flood order, which puts the worst-heard node first because it is optimising
+/// propagation. Here the purpose is that the originator hears the answer, so a copy it cannot hear
+/// achieves nothing.
+///
+/// The candidate set is the intersection of two conditions, and both are needed. We must be able to
+/// hear the candidate, or its copy cannot cancel our own rung and every candidate transmits. And
+/// there must be positive evidence that the source hears it, or the answer does not arrive. Two
+/// nodes with disjoint neighbourhoods may therefore each answer; that is bounded, and still far
+/// fewer copies than every node that heard the frame.
+fn plan_acknowledgement(
+    ctx: &BroadcastRelayContext<'_>,
+    packet_id: u32,
+    source: u32,
+    heard_from: u32,
+    half: u32,
+) -> Option<AcknowledgementPlan> {
+    if !ctx.my_node_relays {
+        return None;
+    }
+    let my_edges = ctx.edges.find_node(ctx.my_node)?;
+
+    // Stand down for a neighbour that will rebroadcast regardless and will not cancel for us: its
+    // copy is the acknowledgement and ours would only add to it. A stock CLIENT is not such a
+    // node — it floods later than our rung and cancels on hearing us, so answering first removes
+    // its copy rather than adding to ours.
+    for i in 0..my_edges.edge_count as usize {
+        let neighbor = my_edges.edges[i].to;
+        if neighbor == 0 || neighbor == source {
+            continue;
+        }
+        if !ctx.capability.will_not_cancel_for_us(neighbor) {
+            continue;
+        }
+        if stock_can_hear_transmitter(ctx.edges, neighbor, heard_from) {
+            return None;
+        }
+    }
+
+    // Rank the candidates we can hear that the source can be shown to hear, ourselves included.
+    let mut entries = [(0u32, 0u16); MAX_CANDIDATES];
+    let mut count = 0usize;
+    let consider = |node: u32, entries: &mut [(u32, u16); MAX_CANDIDATES], count: &mut usize| {
+        if *count >= MAX_CANDIDATES || node == 0 || node == source {
+            return;
+        }
+        if node != ctx.my_node {
+            let usable = ctx.capability.status(node) == CapabilityStatus::SrActive
+                || ctx.capability.is_immediate_relay_router(node);
+            if !usable {
+                return;
+            }
+        }
+        if let Some(price) = crate::graph::acknowledgement_price_fixed(ctx.edges, node, source) {
+            entries[*count] = (node, price);
+            *count += 1;
+        }
+    };
+    consider(ctx.my_node, &mut entries, &mut count);
+    for i in 0..my_edges.edge_count as usize {
+        consider(my_edges.edges[i].to, &mut entries, &mut count);
+    }
+    if count == 0 {
+        return None;
+    }
+
+    // Bucketed price first, then the ladder's own tie-break so the work rotates across packets
+    // rather than always falling to the same node.
+    let prefer_high = (packet_id & 1) != 0;
+    let bucket = |cost: u16| cost / crate::unicast_relay::COST_BUCKET_FIXED;
+    let better = |a: (u32, u16), b: (u32, u16)| {
+        let (ba, bb) = (bucket(a.1), bucket(b.1));
+        if ba != bb {
+            return ba < bb;
+        }
+        if prefer_high {
+            a.0 > b.0
+        } else {
+            a.0 < b.0
+        }
+    };
+    for i in 1..count {
+        let mut j = i;
+        while j > 0 && better(entries[j], entries[j - 1]) {
+            entries.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+
+    let mut plan = AcknowledgementPlan {
+        should_relay: false,
+        my_delay: 0,
+        slots_given: 0,
+        ranked: [0; RANKED_LOG],
+        ranked_len: 0,
+    };
+    let mut delay = crate::channel_access::SLOT_ORIGIN_MS;
+    for &(node, _) in entries.iter().take(count) {
+        if (plan.ranked_len as usize) < RANKED_LOG {
+            plan.ranked[plan.ranked_len as usize] = node;
+            plan.ranked_len += 1;
+        }
+        if node == ctx.my_node {
+            plan.should_relay = true;
+            plan.my_delay = delay;
+            break;
+        }
+        // A rung ahead of ours we are waiting on, so T1 insures the answer if it never comes.
+        plan.slots_given = plan.slots_given.saturating_add(1);
+        delay = delay.saturating_add(half);
+    }
+    if !plan.should_relay {
+        return None;
+    }
+    Some(plan)
 }
 
 fn push_absorbed(list: &mut [(u32, u8); RANKED_LOG], len: &mut u8, relay: u32, credit: u8) {
@@ -511,6 +642,7 @@ pub fn plan_broadcast_relay<F>(
     now_ms: u32,
     half_airtime_ms: u32,
     has_transmitted: F,
+    ack_eligible: bool,
 ) -> BroadcastRelayPlan
 where
     F: Fn(u32) -> bool,
@@ -642,6 +774,26 @@ where
         my_delay = slot_delay;
     }
 
+    // Nobody had coverage to offer, and the originator is waiting to be told its message reached
+    // the mesh. Stock's only delivery confirmation for a broadcast is hearing somebody rebroadcast
+    // it, so suppressing every copy removes the signal it depends on and it retransmits into
+    // silence — the phone reports a failure for a message that in fact arrived everywhere.
+    //
+    // The ranking cannot answer this: it drops a candidate with no unique coverage, because the
+    // cost it ranks on is the mean delivery cost over the unique targets and there is nothing to
+    // price. So this is a second pass with its own price, run only when the ladder came out empty.
+    if !should_relay && slots_given == 0 && ack_eligible {
+        if let Some(ack) = plan_acknowledgement(ctx, packet_id, source, heard_from, half) {
+            should_relay = ack.should_relay;
+            reason = RelayReason::Acknowledgement;
+            my_delay = ack.my_delay;
+            slots_given = ack.slots_given;
+            for i in 0..ack.ranked_len {
+                push_ranked(&mut ranked, &mut ranked_len, ack.ranked[i as usize]);
+            }
+        }
+    }
+
     let slot_index = my_delay
         .saturating_sub(crate::channel_access::SLOT_ORIGIN_MS)
         .checked_div(half)
@@ -732,7 +884,7 @@ mod tests {
         capability.track_topology(EE, true, 0);
         let ctx = ctx(&edges, &capability, &downstream);
 
-        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, never_transmitted);
+        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, never_transmitted, false);
         assert!(
             plan.reserved_slots > 0,
             "the stock repeater that hears the transmitter holds a reserved position"
@@ -749,7 +901,7 @@ mod tests {
 
         // The same topology with the router's copy already on the air: it keeps its place in the
         // order, so the marker still applies, but it is no longer awaited.
-        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, |node| node == DD);
+        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, |node| node == DD, false);
         assert_eq!(
             plan.reserved_slots, 0,
             "a copy already on the air is not a transmission we are waiting for"
@@ -757,6 +909,109 @@ mod tests {
         assert_eq!(
             plan.reserved_ranked as usize, 1,
             "but it still occupies its position in the order"
+        );
+    }
+
+    /// When nobody has coverage to offer, somebody still answers a message its sender awaits.
+    ///
+    /// The ranking cannot do this: it drops a candidate with no unique coverage because the cost it
+    /// ranks on is the mean delivery cost over the unique targets, and there is nothing to price.
+    /// Without a second pass every node stays quiet, the originator never hears a rebroadcast —
+    /// stock's only delivery confirmation for a broadcast — and it reports a failure for a message
+    /// that arrived everywhere. Field 2026-09-09: four copies of one channel message and "Failed to
+    /// deliver to mesh" on the phone.
+    ///
+    /// The topology below is the one that produces an empty ladder: the source lists both of its
+    /// neighbours, so pre-coverage accounts for both and neither has anything unique left, and
+    /// there are two candidates so the sole-candidate rule does not fire either.
+    #[test]
+    fn somebody_answers_when_the_ladder_is_empty() {
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        let t0 = 1_000u32;
+        edges.ensure_local_node(ME, t0);
+        // We hear the source and the peer; the peer hears the source.
+        edges.update_edge(ME, ME, BB, 1.0, t0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, EE, 1.0, t0, EdgeSource::Reported, true, 0);
+        // The peer must be a candidate, or the sole-candidate rule relays before this pass is
+        // reached and the test proves nothing.
+        edges.set_edge_hears_us(ME, EE, true);
+        edges.update_edge(ME, EE, BB, 1.0, t0, EdgeSource::Mirrored, true, 0);
+        capability.track_topology(BB, true, t0);
+        capability.track_topology(EE, true, t0);
+        // The source published both of us, and that it hears us both: pre-coverage takes both off
+        // the table, and the answer has the evidence it needs.
+        edges.update_edge(ME, BB, ME, 1.0, t0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, BB, EE, 1.0, t0, EdgeSource::Mirrored, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(EE, BB, true);
+
+        let ctx = ctx(&edges, &capability, &downstream);
+
+        // Not eligible: nothing unique, nothing owed, so nobody speaks.
+        let plan =
+            plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, t0, 50, never_transmitted, false);
+        assert!(
+            !plan.should_relay,
+            "with nothing unique to carry and no acknowledgement owed, we stay quiet"
+        );
+
+        // Eligible: the same frame is answered, and the ladder names both answerers in order.
+        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, t0, 50, never_transmitted, true);
+        assert_eq!(plan.reason, RelayReason::Acknowledgement);
+        assert_eq!(
+            plan.ranked_len, 2,
+            "both candidates the source hears are ranked"
+        );
+        assert!(
+            plan.should_relay,
+            "we are one of them, so we answer at our own rung"
+        );
+    }
+
+    /// The answer is ordered by how well the *source* hears each candidate, not by coverage.
+    ///
+    /// Coverage asks whether a relay reaches a target; an acknowledgement asks whether the
+    /// originator hears the relay. A copy the originator cannot hear tells it nothing and its retry
+    /// ladder runs regardless, so the candidate the source hears best answers first and the others
+    /// fall in behind — standing down when they hear that answer.
+    #[test]
+    fn the_source_hears_the_first_answerer_best() {
+        // Same topology as above, but the source hears the peer far better than us.
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        let t0 = 1_000u32;
+        edges.ensure_local_node(ME, t0);
+        edges.update_edge(ME, ME, BB, 6.0, t0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, EE, 1.0, t0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, EE, true);
+        edges.update_edge(ME, EE, BB, 1.0, t0, EdgeSource::Mirrored, true, 0);
+        capability.track_topology(BB, true, t0);
+        capability.track_topology(EE, true, t0);
+        edges.update_edge(ME, BB, ME, 6.0, t0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, BB, EE, 1.0, t0, EdgeSource::Mirrored, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        edges.set_edge_hears_us(EE, BB, true);
+
+        let ctx = ctx(&edges, &capability, &downstream);
+        // The packet id is even, so the tie-break would prefer the *lower* node id — us. Price
+        // must override it, or the ordering is not the one the design claims.
+        let plan = plan_broadcast_relay(&ctx, 2, BB, BB, u32::MAX, t0, 50, never_transmitted, true);
+        assert_eq!(plan.reason, RelayReason::Acknowledgement);
+        assert_eq!(
+            plan.ranked[0], EE,
+            "the source hears the peer six times better, so the peer answers first"
+        );
+        assert!(plan.should_relay, "we answer too, behind it");
+        assert!(
+            plan.slot_delay_ms > crate::channel_access::SLOT_ORIGIN_MS,
+            "our answer waits behind its rung and cancels if that answer arrives"
+        );
+        assert!(
+            plan.slots_given > 0,
+            "a rung ahead of ours is a transmission we wait on, so T1 insures it"
         );
     }
 
@@ -848,6 +1103,7 @@ mod tests {
                 0,
                 100,
                 never_transmitted,
+                false,
             )
         };
         let inside = plan_at(6.0);
@@ -923,6 +1179,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert!(plan.should_relay, "nobody else reaches it");
         assert_eq!(plan.reason, RelayReason::Ranked, "carried by the ranking");
@@ -938,7 +1195,7 @@ mod tests {
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, A, 2.0, 0, EdgeSource::Reported, true, 0);
         let ctx = ctx(&edges, &capability, &downstream);
-        let plan = plan_broadcast_relay(&ctx, 0x77, A, A, 0xFFFF_FFFF, 0, 100, |_| false);
+        let plan = plan_broadcast_relay(&ctx, 0x77, A, A, 0xFFFF_FFFF, 0, 100, |_| false, false);
         assert!(plan.should_relay);
     }
 
@@ -975,6 +1232,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         // Immediate REPEATER takes the early slot; with no remaining unique coverage we defer.
         assert!(!plan.should_relay);
@@ -1054,6 +1312,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert!(
             plan.should_relay,
@@ -1077,6 +1336,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert!(plan.should_relay);
     }
@@ -1104,7 +1364,7 @@ mod tests {
             capability: &capability,
             downstream: &downstream,
         };
-        let plan = plan_broadcast_relay(&ctx, 0x99, B, B, 0xFFFF_FFFF, 0, 100, |_| false);
+        let plan = plan_broadcast_relay(&ctx, 0x99, B, B, 0xFFFF_FFFF, 0, 100, |_| false, false);
         assert!(
             !plan.should_relay,
             "got should_relay delay={} cands={}",
@@ -1144,6 +1404,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert!(
             !plan.should_relay,
@@ -1201,6 +1462,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         // Counting the mirrored edges we would claim 4 unique nodes and take slot 0 while EE,
         // seeing only our 2 reported ones, ranks itself first: both in slot 0. Reported-only
@@ -1257,6 +1519,7 @@ mod tests {
                 0,
                 100,
                 never_transmitted,
+                false,
             )
             .should_relay
         };
@@ -1286,6 +1549,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert!(plan.should_relay);
         assert_eq!(plan.coverage_for, SS);
@@ -1313,6 +1577,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert_eq!(plan.uncovered_len, 0);
     }
@@ -1332,6 +1597,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert!(!plan.should_relay);
     }
@@ -1372,6 +1638,7 @@ mod tests {
             0,
             100,
             never_transmitted,
+            false,
         );
         assert!(plan.should_relay);
         assert_eq!(
