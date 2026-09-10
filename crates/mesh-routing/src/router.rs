@@ -2164,6 +2164,11 @@ impl Router {
         let slots_given = plan_for_log.map_or(0, |p| p.slots_given);
         let reserved_slots = plan_for_log.map_or(0, |p| p.reserved_slots);
         let reserved_ranked = plan_for_log.map_or(0, |p| p.reserved_ranked);
+        let absorbed = plan_for_log
+            .map_or([(0u32, 0u8); crate::broadcast_relay::RANKED_LOG], |p| {
+                p.absorbed
+            });
+        let absorbed_len = plan_for_log.map_or(0, |p| p.absorbed_len);
         self.sr_log.push(SrLogEvent::SlotScheduling {
             id: parsed.id,
             half_airtime_ms: half_airtime,
@@ -2180,6 +2185,8 @@ impl Router {
             slots_given,
             reserved_slots,
             reserved_ranked,
+            absorbed,
+            absorbed_len,
         });
         self.sr_log.push(SrLogEvent::RelayCommitted {
             id: parsed.id,
@@ -2485,6 +2492,8 @@ impl Router {
             // No reservation on a unicast ladder: the router window is a broadcast rule.
             reserved_slots: 0,
             reserved_ranked: 0,
+            absorbed: [(0, 0); crate::broadcast_relay::RANKED_LOG],
+            absorbed_len: 0,
         }
     }
 
@@ -3813,6 +3822,8 @@ impl Router {
             slots_given: plan.slots_given,
             reserved_slots: plan.reserved_slots,
             reserved_ranked: plan.reserved_ranked,
+            absorbed: plan.absorbed,
+            absorbed_len: plan.absorbed_len,
         });
     }
 

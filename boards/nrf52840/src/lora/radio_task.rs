@@ -76,6 +76,8 @@ pub async fn radio_task(
     let mut last_stats = Instant::now();
     let mut last_maintenance = Instant::now();
     let mut last_duty_log = Instant::now();
+    // Edge-triggered: one line per hold, not one per poll.
+    let mut tx_held_logged = false;
     let boot_instant = Instant::now();
     let mut sr_log_buf: heapless::Vec<SrLogEvent, MAX_SR_LOG> = heapless::Vec::new();
     let mut reboot_deadline: Option<Instant> = None;
@@ -104,6 +106,23 @@ pub async fn radio_task(
         // due time inside the router and is picked up on the next pass.
         let rx_busy = slot.rx_busy().unwrap_or(false);
         let may_release = !rx_busy && access.may_transmit(now_ms) && slot.rx_queue.is_empty();
+        // Attribute a held frame to the gate that held it. Without this a relay that left later
+        // than its rung is only visible as a residual, with no way to tell the post-reception
+        // hold from a reception in progress or from frames still queued for the router — and the
+        // hold is the one the ladder's timing depends on. Logged once per hold, on the edge, so a
+        // long hold does not fill the log.
+        if !may_release && router.has_pending_work() {
+            if !tx_held_logged {
+                crate::usb_log::log::radio::tx_held(
+                    access.remaining_ms(now_ms),
+                    rx_busy,
+                    !slot.rx_queue.is_empty(),
+                );
+                tx_held_logged = true;
+            }
+        } else {
+            tx_held_logged = false;
+        }
         if may_release {
             if let Some(relay) = router.poll_ready_relay(now_ms) {
                 enqueue_tx(relay, slot, router, node_num, b"relay");

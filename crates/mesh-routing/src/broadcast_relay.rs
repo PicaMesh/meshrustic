@@ -60,6 +60,12 @@ pub struct BroadcastRelayPlan {
     /// packet is still listed, and still consumed the accumulator, but is no longer a
     /// transmission we are waiting for. Lets the order line say which entries are reservations.
     pub reserved_ranked: u8,
+    /// Who absorbed coverage before we were ranked, and how many nodes each newly covered:
+    /// `(relay, credit)`. This is why a later candidate finds nothing unique and stays quiet, and
+    /// it was computed at three sites and logged at none — so a capture could not say whether a
+    /// reservation earned the suppression it caused.
+    pub absorbed: [(u32, u8); RANKED_LOG],
+    pub absorbed_len: u8,
     /// A neighbour our relay reaches that the transmitter did not (0 when the relay was taken
     /// for another reason: sole candidate or downstream).
     pub coverage_for: u32,
@@ -246,15 +252,21 @@ fn get_coverage_if_relays(
 /// admitted it in [`get_coverage_if_relays`]. Crediting only `covers` while admission also
 /// accepted ownership left an owned neighbour uncovered after its owner took a slot, so a later
 /// phase relayed for it a second time.
+/// Credit `relay` with everything it carries, and report how many nodes that newly covered.
+///
+/// The count is what makes absorption visible: it is the reason a later candidate finds nothing
+/// unique and stays quiet, and until now it was computed at three call sites and logged at none —
+/// so a capture could not say whether a reservation actually earned its suppression.
 fn absorb_relay_coverage(
     ctx: &BroadcastRelayContext<'_>,
     covered: &mut CoveredSet,
     relay: u32,
     now_ms: u32,
-) {
+) -> u8 {
+    let before = covered.count;
     covered.insert(relay);
     let Some(relay_edges) = ctx.edges.find_node(relay) else {
-        return;
+        return covered.count.saturating_sub(before);
     };
     for i in 0..relay_edges.edge_count as usize {
         let edge = relay_edges.edges[i];
@@ -265,6 +277,7 @@ fn absorb_relay_coverage(
             covered.insert(edge.to);
         }
     }
+    covered.count.saturating_sub(before)
 }
 
 /// Does `relay` carry `target` if it transmits: it can be shown to deliver, or `target` is a
@@ -284,6 +297,13 @@ fn admits_coverage(ctx: &BroadcastRelayContext<'_>, relay: u32, target: u32, now
             ctx.my_node_relays,
             target,
         ) == relay
+}
+
+fn push_absorbed(list: &mut [(u32, u8); RANKED_LOG], len: &mut u8, relay: u32, credit: u8) {
+    if (*len as usize) < RANKED_LOG {
+        list[*len as usize] = (relay, credit);
+        *len += 1;
+    }
 }
 
 fn find_best_relay_candidate<F>(
@@ -522,6 +542,8 @@ where
     let mut slots_given = 0u8;
     let mut reserved_slots = 0u8;
     let mut reserved_ranked = 0u8;
+    let mut absorbed = [(0u32, 0u8); RANKED_LOG];
+    let mut absorbed_len = 0u8;
     let mut ranked = [0u32; RANKED_LOG];
     let mut ranked_len = 0u8;
     let mut evaluated = EvaluatedList::default();
@@ -543,7 +565,8 @@ where
             candidates.erase(neighbor);
             // Stock takes the early slot — count their coverage now so we only
             // trail if we still have unique nodes after they relay.
-            absorb_relay_coverage(ctx, &mut already_covered, neighbor, now_ms);
+            let credit = absorb_relay_coverage(ctx, &mut already_covered, neighbor, now_ms);
+            push_absorbed(&mut absorbed, &mut absorbed_len, neighbor, credit);
             push_ranked(&mut ranked, &mut ranked_len, neighbor);
             reserved_ranked = reserved_ranked.saturating_add(1);
             // Its slot is still spent — a stock router transmits on its own schedule — but a
@@ -578,7 +601,8 @@ where
         candidates.erase(best.node_id);
 
         if has_transmitted(best.node_id) {
-            absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
+            let credit = absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
+            push_absorbed(&mut absorbed, &mut absorbed_len, best.node_id, credit);
             continue;
         }
 
@@ -593,7 +617,8 @@ where
 
         // Earlier-ranked peer is assumed to relay — subtract their coverage so we
         // only take a later slot when we still have unique nodes to reach.
-        absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
+        let credit = absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
+        push_absorbed(&mut absorbed, &mut absorbed_len, best.node_id, credit);
         slots_given = slots_given.saturating_add(1);
         slot_delay = slot_delay.saturating_add(half);
     }
@@ -639,6 +664,8 @@ where
         slots_given,
         reserved_slots,
         reserved_ranked,
+        absorbed,
+        absorbed_len,
     }
 }
 

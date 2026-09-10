@@ -323,6 +323,25 @@ pub mod radio {
         put_hex2, put_hex4, put_hex8, put_i32, put_u32, MAX_LOG_LINE,
     };
 
+    /// `[Radio0] TX held: hold=214ms rx_busy=0 rx_queued=1` — which gate is keeping a due frame
+    /// off the air, and for how long.
+    ///
+    /// Three gates share one boolean at the release site and none of them was logged, so a
+    /// relay that left later than its rung could not be attributed: the post-reception hold, a
+    /// reception in progress, and frames still waiting for the router. Rate-limited by the
+    /// caller — this fires on every pass while a hold runs.
+    pub fn tx_held(hold_ms: u32, rx_busy: bool, rx_queued: bool) {
+        let mut line = [0u8; 96];
+        let mut pos = line_prefix(&mut line);
+        put(&mut line, &mut pos, b"[Radio0] TX held: hold=");
+        put_u32(&mut line, &mut pos, hold_ms);
+        put(&mut line, &mut pos, b"ms rx_busy=");
+        put(&mut line, &mut pos, if rx_busy { b"1" } else { b"0" });
+        put(&mut line, &mut pos, b" rx_queued=");
+        put(&mut line, &mut pos, if rx_queued { b"1" } else { b"0" });
+        finish_line(&mut line, pos);
+    }
+
     pub fn init_ok(module: &str, node_num: u32, preset: &str, freq_mhz: f32) {
         let mut line = [0u8; 192];
         let mut pos = line_prefix(&mut line);
@@ -1100,10 +1119,12 @@ pub mod sr {
                 slots_given,
                 reserved_slots,
                 reserved_ranked,
+                absorbed,
+                absorbed_len,
             } => {
                 // 320 clipped the cand= tail once unc= was added, and the tail is the part two nodes
-                // are compared on; slots= and the R: markers added ~24 more.
-                let mut line = [0u8; 416];
+                // are compared on; slots=, the R: markers and abs= added ~130 more.
+                let mut line = [0u8; 544];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Slot scheduling for pkt 0x";
                 put(&mut line, &mut pos, prefix);
@@ -1162,6 +1183,23 @@ pub mod sr {
                         }
                         put(&mut line, &mut pos, b"!");
                         put_hex8(&mut line, &mut pos, *node);
+                    }
+                }
+                if absorbed_len > 0 {
+                    // Who took coverage off the table before we were ranked, and how many nodes
+                    // each newly covered: !node+credit. A candidate with nothing unique left is
+                    // explained by these entries and by nothing else in the line.
+                    put(&mut line, &mut pos, b", abs=");
+                    for (i, (node, credit)) in
+                        absorbed.iter().take(absorbed_len as usize).enumerate()
+                    {
+                        if i > 0 {
+                            put(&mut line, &mut pos, b",");
+                        }
+                        put(&mut line, &mut pos, b"!");
+                        put_hex8(&mut line, &mut pos, *node);
+                        put(&mut line, &mut pos, b"+");
+                        put_u32(&mut line, &mut pos, *credit as u32);
                     }
                 }
                 if evaluated_len > 0 {
