@@ -105,6 +105,42 @@ mod tests {
     use mesh_protocol::PacketHeader;
     use static_cell::StaticCell;
 
+    /// The shared relay builder passes an acknowledgement request through, and must keep doing so.
+    ///
+    /// Relayed unicasts carry it legitimately — 1,865 of 5,018 observed on this mesh do — and the
+    /// reliable path depends on it surviving a relay. Only the T1 insurance copy clears the flag,
+    /// at its own call site, because a retransmission is not a new request. Pinned here so a
+    /// future change cannot move that clear into the builder, where it would silently break every
+    /// relayed unicast.
+    #[test]
+    fn relay_builder_passes_want_ack_through_and_only_t1_clears_it() {
+        let asking =
+            PacketHeader::from_fields(0x2222_2222, 0x1111_1111, 7, 0x01, 3, 3, true, false, 0, 0);
+        let parsed = asking.parse();
+        assert!(
+            parsed.want_ack,
+            "the frame we heard asks to be acknowledged"
+        );
+        let relayed = relay_header_with_next_hop_opts(&parsed, 0xAAAA_AAAA, 0, false)
+            .expect("a relay header");
+        assert!(
+            relayed.want_ack(),
+            "a relayed unicast keeps the request: the destination still owes the answer"
+        );
+
+        // What the insurance copy does with the same header, at its own call site.
+        let mut insured = relayed;
+        insured.clear_want_ack();
+        assert!(!insured.want_ack(), "the insurance copy asks for nothing");
+        // Nothing else about the frame moved.
+        assert_eq!(insured.to, relayed.to);
+        assert_eq!(insured.from, relayed.from);
+        assert_eq!(insured.id, relayed.id);
+        assert_eq!(insured.hop_limit(), relayed.hop_limit());
+        assert_eq!(insured.hop_start(), relayed.hop_start());
+        assert_eq!(insured.via_mqtt(), relayed.via_mqtt());
+    }
+
     #[test]
     fn relay_preserves_opaque_payload_bytes() {
         static POOL: StaticCell<PacketPool> = StaticCell::new();

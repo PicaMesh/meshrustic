@@ -91,6 +91,15 @@ impl PacketHeader {
         self.flags & PACKET_FLAGS_WANT_ACK_MASK != 0
     }
 
+    /// Drop the acknowledgement request from a frame we are about to re-send on somebody's behalf.
+    ///
+    /// A retransmission copy is not a new request: the record that answers the original is held by
+    /// the originator, and a copy that still asks for an acknowledgement can be taken by the
+    /// sending path as a fresh reliable transmission and restart its retry interval.
+    pub fn clear_want_ack(&mut self) {
+        self.flags &= !PACKET_FLAGS_WANT_ACK_MASK;
+    }
+
     pub fn via_mqtt(&self) -> bool {
         self.flags & PACKET_FLAGS_VIA_MQTT_MASK != 0
     }

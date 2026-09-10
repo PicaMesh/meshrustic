@@ -3748,11 +3748,18 @@ impl Router {
             self.pool.release(handle);
             return;
         }
-        let Some(relay_hdr) = relay_header_with_next_hop_opts(parsed, self.node_num, 0, false)
+        let Some(mut relay_hdr) = relay_header_with_next_hop_opts(parsed, self.node_num, 0, false)
         else {
             self.pool.release(handle);
             return;
         };
+        // The insurance copy carries no acknowledgement request, whatever the frame we heard
+        // carried. Cleared here rather than in the shared relay builder, which is also the
+        // ordinary path for relayed unicasts — those legitimately keep the flag, and stripping it
+        // there would break the reliable path for every one of them. A copy that still asks to be
+        // acknowledged can be read by a sending path as a fresh reliable transmission and restart
+        // the originator's retry interval, which is how one insured broadcast went out four times.
+        relay_hdr.clear_want_ack();
         let mut bytes = [0u8; MAX_WIRE_LEN];
         relay_hdr.encode_to(
             (&mut bytes[..PACKET_HEADER_LEN])
