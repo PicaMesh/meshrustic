@@ -83,11 +83,21 @@ is actually waiting for.
   turnaround plus the peer's maximum contention delay plus one airtime
   (`channel_access::peer_relay_wait_ms`, via `Router::sr_peer_relay_wait_ms`). For a stock next
   hop the wait is stock's worst-case delay plus one airtime (`tx_delay_ms_worst`).
-- **Waiting for a destination's ACK.** When the source's topology lists the destination as
-  hearing it, every relay candidate first waits the turnaround plus twice the maximum contention
-  delay plus the ACK airtime (`channel_access::dest_ack_wait_ms`, via `Router::dest_ack_wait_ms`);
-  a reply heard cancels the queued relay (`Router::perhaps_cancel_dupe`). Test:
+- **Waiting for a destination's ACK.** When we heard the frame straight from its source and the
+  source's topology lists the destination as hearing it, every relay candidate first waits the
+  turnaround plus twice the maximum contention delay plus the ACK airtime
+  (`channel_access::dest_ack_wait_ms`, via `Router::dest_ack_wait_ms`); a reply heard cancels the
+  queued relay (`Router::perhaps_cancel_dupe`). Tests:
   `peer_waits_derive_from_the_turnaround`, `dest_ack_wait_includes_processing_allowance`.
+- **Unicast waits are floors on one instant, so they compose by `max`.** The contention floor,
+  the destination's ACK wait and the wait for a leader's copy to leave the air are all measured
+  from the frame we just heard, and each says "not before this". The applicable ones are combined
+  by taking the largest, never by adding: waiting for the destination's answer already carries us
+  well past stock's contention boundary, and summing the two delayed every relay on a confirmed
+  link by a whole contention window — 448 ms at LONG_FAST — for nothing. Rung spacing is then
+  added *on top of* the surviving floor rather than folded into the comparison, because a floor
+  large enough to swallow the spacing would drop two adjacent rungs onto the same millisecond.
+  Test: `the_destination_ack_wait_absorbs_the_contention_floor_rather_than_stacking`.
 
 ## 2. Header fields on frames we originate
 
@@ -181,8 +191,10 @@ is actually waiting for.
 - **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
   names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
   the destination (`plan_unicast_relay`); the best placed keys up first and the rest cancel on
-  its copy. Slot 0 waits `coordinated_relay::relay_floor_ms`, stock's own contention floor;
-  later slots wait for the leader's peer relay window then space by half an airtime. Tests:
+  its copy. Slot 0 waits the largest floor that applies to it — stock's own contention floor
+  (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where that is longer;
+  later slots take the larger of that floor and the leader's peer relay window, then space by
+  half an airtime. Tests:
   `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
   `undesignated_unicast_slot_zero_waits_stocks_contention_floor`.
 - **Soft coverage skips.** `UnicastCovered` for a shared downstream gateway, or for a
@@ -216,8 +228,15 @@ is actually waiting for.
   from us costs less than three from it. Tests: `guessed_route_back_the_way_it_came_is_dropped`,
   `a_frame_named_for_us_is_forwarded_even_on_a_guessed_backtrack`.
 - **Designated next hop and backup.** A wire next hop that is not us owns slot 0; every other
-  candidate shifts one slot behind the peer or stock wait (`plan_designated_unicast`). Ranking
-  `Err` does not abort that backup. Forward and backup TX stamp **our path** next hop; flood
+  candidate shifts one slot behind the peer or stock wait (`plan_designated_unicast`). When the
+  designated hop is us we take slot 0 at the largest floor in force, not at once. The
+  reservation others wait out is how long until that node's copy has left the air, and the two
+  cases start their clocks in different places: an **SR** peer obeys this same model, so it keys
+  up at the floor and needs its own contention delay plus one airtime *on top of* it; a **stock**
+  node knows nothing of the floor and starts contending the moment it hears the frame, so its
+  copy is clear after its own worst case plus one airtime, and the floor only applies as a lower
+  bound. Adding the floor to the stock case would count the same silence twice. Ranking `Err`
+  does not abort that backup. Forward and backup TX stamp **our path** next hop; flood
   (`next_hop = 0`) only on the last relayed `want_ack` retry. Tests:
   `unicast_designated_*`, `designated_hop_backup_survives_ranking_skip` (a coverage skip keeps
   the backup, at its unranked slot rung rather than all backups sharing slot 1),

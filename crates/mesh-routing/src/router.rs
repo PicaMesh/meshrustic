@@ -1898,6 +1898,30 @@ impl Router {
             next_hop = 0;
         }
 
+        // Every wait below is a floor on when our relay may key up, measured from the frame we
+        // just heard. Floors compose by `max`, never by addition: waiting for the destination's
+        // answer already carries us past stock's contention boundary, and adding the two delayed
+        // every relay on a confirmed link by a whole contention window for nothing.
+        //
+        // This floor applies when we heard the frame straight from its source and the source's
+        // own topology says the destination hears it: the destination most likely has the packet
+        // already, and its ACK or reply cancels our queued relay. Computed here so the ranking
+        // can fold it into the base before rank spacing is added — applied afterwards it would
+        // collapse two adjacent rungs onto the same millisecond.
+        let dest_ack_floor = if parsed.to != NODENUM_BROADCAST
+            && heard_from == parsed.from
+            && self
+                .graph
+                .edges()
+                .find_node(parsed.from)
+                .and_then(|n| n.find_edge(parsed.to))
+                .is_some_and(|e| e.hears_us)
+        {
+            self.dest_ack_wait_ms(slot_ms)
+        } else {
+            0
+        };
+
         // Unicasts coordinate by cost to the destination: every SR node that overheard the
         // packet ranks itself and its SR neighbours the same way, the best placed one keys up
         // first and the rest cancel on its copy. Node id used to decide this order, which let
@@ -1940,9 +1964,10 @@ impl Router {
                 // `packet_time_ms(..., 64, ...)` — so using it would give a floor ten times too
                 // large.
                 ranked.slot_delay_ms = if ranked.slot_index == 0 {
-                    crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms())
+                    crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).max(dest_ack_floor)
                 } else {
                     self.sr_peer_relay_wait_ms(slot_ms)
+                        .max(dest_ack_floor)
                         .saturating_add((ranked.slot_index as u32 - 1).saturating_mul(half_airtime))
                 };
                 Some(ranked)
@@ -1960,13 +1985,14 @@ impl Router {
                 result.snr,
                 half_airtime,
                 slot_ms,
+                dest_ack_floor,
                 now_ms,
                 unicast_ranking,
             ))
         } else {
             None
         };
-        let mut unicast_plan = unicast_plan.or(designated_plan);
+        let unicast_plan = unicast_plan.or(designated_plan);
 
         // Heard straight from the source, and the source's own topology says the destination
         // hears it: the destination most likely has the packet already. A routing ACK on that
@@ -1992,15 +2018,13 @@ impl Router {
                     });
                     return plan;
                 }
-                if edge.hears_us {
-                    if let Some(p) = unicast_plan.as_mut() {
-                        let wait = self.dest_ack_wait_ms(slot_ms);
-                        p.slot_delay_ms = p.slot_delay_ms.saturating_add(wait);
-                        self.sr_log.push(SrLogEvent::UnicastDestHeardDirect {
-                            id: parsed.id,
-                            wait_ms: wait,
-                        });
-                    }
+                // The wait itself is already folded into every candidate's base above; this
+                // only records that it applied, so a capture shows why the ladder sits late.
+                if edge.hears_us && unicast_plan.is_some() {
+                    self.sr_log.push(SrLogEvent::UnicastDestHeardDirect {
+                        id: parsed.id,
+                        wait_ms: dest_ack_floor,
+                    });
                 }
             }
         }
@@ -2396,6 +2420,9 @@ impl Router {
         // neither — it is `packet_time_ms(config, 64, ...)` — which is why the two waits below take
         // it and the stock contention floor above does not.
         airtime_ms: u32,
+        // Zero unless the destination is expected to answer for itself; a floor like the others,
+        // so it composes by `max`.
+        dest_ack_floor: u32,
         now_ms: u32,
         ranking: Option<Result<crate::broadcast_relay::BroadcastRelayPlan, SrSkipReason>>,
     ) -> crate::broadcast_relay::BroadcastRelayPlan {
@@ -2413,7 +2440,8 @@ impl Router {
                 should_relay: true,
                 // Named for a designated next hop as well: the same floor, for the same reason,
                 // and from the CAD slot time rather than the airtime this parameter carries.
-                slot_delay_ms: crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()),
+                slot_delay_ms: crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms())
+                    .max(dest_ack_floor),
                 slot_index: 0,
                 candidate_count: 1,
                 ..Default::default()
@@ -2438,13 +2466,28 @@ impl Router {
                 self.graph.capability_status(n) == crate::capability::CapabilityStatus::SrActive
             })
             .unwrap_or(false);
-        // An SR peer queues its relay behind its own contention delay (up to 2^CW slots at
-        // the current utilisation) and then needs one airtime to send it; a half-airtime
-        // reservation let us pre-empt a healthy designated node by 200 ms in the field.
+        // How long until the designated node's copy has left the air, which is what the rest of
+        // us are waiting out. The two cases start their clocks in different places, so they
+        // compose differently:
+        //   - an SR peer obeys this same model, so it keys up at the floor and then needs its
+        //     own contention delay (up to 2^CW slots at the current utilisation) plus one
+        //     airtime on top. A half-airtime reservation let us pre-empt a healthy designated
+        //     node by 200 ms in the field.
+        //   - a stock node knows nothing of the floor and starts contending the moment it hears
+        //     the frame, so its copy is clear after its own worst case plus one airtime. Adding
+        //     the floor to that would count the same silence twice; we simply never go before
+        //     our own floor either, which is a max.
+        let base = dest_ack_floor.max(crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()));
         let slot0_wait = if sr_active {
-            self.sr_peer_relay_wait_ms(airtime_ms)
+            base.saturating_add(
+                crate::coordinated_relay::tx_delay_ms_contention_max_at(
+                    self.channel_util_pct,
+                    self.cw_slot_ms(),
+                )
+                .saturating_add(airtime_ms),
+            )
         } else {
-            tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
+            base.max(tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms))
         };
         // Ranking Err → unranked backup behind the designated wait (silent designated hop).
         let (rank, count, ranked, ranked_len, reason, evaluated, evaluated_len, pre_covered) =
@@ -6434,6 +6477,90 @@ mod tests {
             .unwrap();
         assert!(dupe.duplicate);
         assert!(router.relay_tx_after(UNI_SOURCE, 0x701, 0).is_none());
+    }
+
+    /// Two floors on the same instant compose by `max`, not by addition. When the source's own
+    /// topology says the destination hears it, we wait for that answer — and that wait already
+    /// carries us well past stock's contention boundary, so adding the boundary on top delayed
+    /// every relay on a confirmed link by a whole contention window and bought nothing.
+    #[test]
+    fn the_destination_ack_wait_absorbs_the_contention_floor_rather_than_stacking() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_DEST, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_DEST);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_DEST, true, 0);
+        // The source has to be a known neighbour for its relay byte to resolve to it, or the
+        // frame does not count as heard straight from the source.
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_SOURCE, -70, 8, 0, 0);
+        // The source publishes an edge to the destination and flags that it is heard back: the
+        // destination is expected to answer for itself.
+        router.graph_mut().edges_mut().update_edge(
+            UNI_ME,
+            UNI_SOURCE,
+            UNI_DEST,
+            2.0,
+            0,
+            EdgeSource::Reported,
+            true,
+            0,
+        );
+        router
+            .graph_mut()
+            .edges_mut()
+            .set_edge_hears_us(UNI_SOURCE, UNI_DEST, true);
+
+        // Relay byte is the source's own, so this arrived straight from it.
+        let wire = unicast_wire(3, 3, 0, 0xDD, 0x703);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let airtime = coordinated_relay::DEFAULT_SLOT_MS;
+        let plan = router.evaluate_tx_plan(&result, 0.0, airtime, 0);
+        let ack_wait = router.dest_ack_wait_ms(airtime);
+        let floor = coordinated_relay::relay_floor_ms(coordinated_relay::slot_time_for_preset(
+            router.modem_preset(),
+        ));
+        assert!(
+            ack_wait > floor,
+            "premise: the ACK wait is the longer floor ({ack_wait} vs {floor})"
+        );
+        let tx_after = plan
+            .relay
+            .map(|r| r.delay_ms)
+            .or_else(|| router.relay_tx_after(UNI_SOURCE, 0x703, 0))
+            .expect("slot 0 planned");
+        // The rung tie-break rides on top of every committed relay, so the wait is the ACK
+        // floor plus at most that range — and, decisively, well short of the two summed.
+        let tie_break =
+            coordinated_relay::tie_break_range_ms(coordinated_relay::half_airtime_ms(airtime));
+        assert!(
+            tx_after >= ack_wait && tx_after <= ack_wait + tie_break,
+            "slot 0 waits the ACK floor: {tx_after} not in {ack_wait}..={}",
+            ack_wait + tie_break
+        );
+        assert!(
+            tx_after < floor + ack_wait,
+            "the two floors must not stack: {tx_after} reached {floor} + {ack_wait}"
+        );
     }
 
     #[test]
