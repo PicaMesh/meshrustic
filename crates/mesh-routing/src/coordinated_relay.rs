@@ -85,13 +85,24 @@ pub fn tie_break_range_ms(half_airtime_ms: u32) -> u32 {
     (half_airtime_ms / 2).max(MIN_TIE_BREAK_RANGE_MS)
 }
 
-/// Tie-breaker added to an SR relay slot: deterministic per (packet, node), within
-/// ±¼ half-airtime. Small enough that two candidates in adjacent slots
-/// can never swap order, large enough that two nodes computing the same slot do not key up in
-/// the same instant. Returns the signed offset in ms.
-pub fn slot_tie_break_ms(half_airtime_ms: u32, id: u32, node_num: u32) -> i32 {
+/// Tie-breaker added to an SR relay rung: deterministic per (packet, node), strictly positive and
+/// no larger than [`tie_break_range_ms`].
+///
+/// Strictly positive, so a rung can be pushed later than its position but never earlier. The offset
+/// used to be signed and centred on zero, which let rung 0 fire *before* the ladder's origin — at
+/// SHORT_SLOW as early as 148 ms against a router window whose last slot is 150, so the two
+/// overlapped and the bands they are meant to separate did not.
+///
+/// Deliberately not zero either. Across two 12 h captures all 38 broadcast double relays had both
+/// nodes at rung 0 with the same half-airtime, separated *only* by this offset — mean 6.55 ms,
+/// max 18, two pairs already at 0. Removing it would make all 38 simultaneous key-ups, where
+/// neither copy cancels the other and a third node may decode neither: worse than a duplicate.
+///
+/// The cost is a mean rung delay half the range higher than before — about 12 ms at SHORT_SLOW —
+/// which buys the band separation and the de-correlation together.
+pub fn slot_tie_break_ms(half_airtime_ms: u32, id: u32, node_num: u32) -> u32 {
     let range = tie_break_range_ms(half_airtime_ms);
-    ((node_num ^ id) % range) as i32 - (range / 2) as i32
+    ((node_num ^ id) % range) + 1
 }
 
 /// Meshtastic `getTxDelayMsec`: `random(0, 2^CWsize) * slotTime`, CWsize from channel
@@ -166,44 +177,19 @@ mod tests {
                     for node in [0xbdac_ce55u32, 0x046b_553a] {
                         let j = slot_tie_break_ms(half, id, node);
                         assert!(
-                            j >= -((range / 2) as i32) && j < (range - range / 2) as i32,
-                            "preset {preset} len {len}: offset {j} outside ±{range}/2"
+                            j >= 1 && j <= range,
+                            "preset {preset} len {len}: offset {j} outside 1..={range}"
                         );
-                        // The earlier rung, however late, still precedes the next however early.
-                        let latest_this = (range - range / 2 - 1) as i32;
-                        let earliest_next = half as i32 - (range / 2) as i32;
-                        assert!(
-                            earliest_next > latest_this,
-                            "preset {preset} len {len}: rungs overlap"
-                        );
+                        // Strictly positive, so a rung never precedes its own position — which is
+                        // what let rung 0 fall inside the router window before.
+                        // And the earlier rung, however late, still precedes the next.
+                        assert!(half + 1 > range, "preset {preset} len {len}: rungs overlap");
                     }
                 }
             }
         }
     }
 
-    #[test]
-    fn slot_tie_break_never_reorders_adjacent_slots() {
-        for half in [50u32, 81, 150] {
-            let range = (half / 2).max(20) as i32;
-            for id in [0x1u32, 0x1234_5678, 0xe23d_7d52, 0xffff_ffff] {
-                for node in [0xbdac_ce55u32, 0x046b_553a, 0x63dc_8f8c] {
-                    let j = slot_tie_break_ms(half, id, node);
-                    assert!(
-                        j >= -(range / 2) && j < range - range / 2,
-                        "jitter {j} outside ±{range}/2"
-                    );
-                    // Worst case: earlier slot maximally late, next slot maximally early.
-                    let earliest_next = half as i32 - range / 2;
-                    let latest_this = range - range / 2 - 1;
-                    assert!(
-                        earliest_next > latest_this,
-                        "adjacent slots overlap at half={half}"
-                    );
-                }
-            }
-        }
-    }
     use mesh_radio::{RadioConfig, MODEM_SHORT_SLOW};
 
     #[test]

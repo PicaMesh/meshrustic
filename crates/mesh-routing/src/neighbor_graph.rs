@@ -1612,7 +1612,9 @@ impl NeighborGraph {
         // is added; the router-style SNR contention delay (up to 2·CW slots, several times a
         // half-airtime) used to be added here and randomised the order, which is how two
         // colocated nodes in slots 1 and 4 ended up keying up 50 ms apart.
-        let delay = (spacing as i64 + slot_tie_break_ms(half, id, node_num) as i64).max(0) as u32;
+        // The offset is strictly positive now, so a rung can only be pushed later than its
+        // position — the saturating floor the signed version needed is gone with it.
+        let delay = spacing.saturating_add(slot_tie_break_ms(half, id, node_num));
         let tx_after_ms = now_ms.wrapping_add(delay);
         if let Some(idx) = self.find_relay(from, id, radio_id) {
             let commit = &mut self.relay_states[idx];

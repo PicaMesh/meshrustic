@@ -5552,8 +5552,14 @@ mod tests {
             router.poll_ready_relay(50 + origin - 1).is_none(),
             "slot 0 sits at the ladder origin, inside the peers' turnaround"
         );
+        // The rung's tie-break offset is strictly positive and can reach the whole range, so the
+        // poll has to clear the origin plus that range — derived, not a fixed margin, or the test
+        // passes or fails on which offset this packet id happens to hash to.
+        let jitter_max = coordinated_relay::tie_break_range_ms(coordinated_relay::half_airtime_ms(
+            coordinated_relay::DEFAULT_SLOT_MS,
+        ));
         let relay = router
-            .poll_ready_relay(50 + origin + coordinated_relay::DEFAULT_SLOT_MS)
+            .poll_ready_relay(50 + origin + jitter_max)
             .expect("hand-off relay ready at slot 0");
         let hdr = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
             .unwrap()
