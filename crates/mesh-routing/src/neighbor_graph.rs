@@ -1595,7 +1595,9 @@ impl NeighborGraph {
         node_num: u32,
         broadcast_plan: Option<&crate::broadcast_relay::BroadcastRelayPlan>,
     ) -> (u32, u8, u8) {
-        let half = half_airtime_ms.max(50);
+        // Same floor as the ranking used, by name: this value feeds both the fallback
+        // spacing and the jitter, so a local literal here could disagree with the rung order.
+        let half = half_airtime_ms.max(crate::coordinated_relay::MIN_RUNG_SPACING_MS);
         let (slot_index, candidates, spacing) = if let Some(plan) = broadcast_plan {
             (plan.slot_index, plan.candidate_count, plan.slot_delay_ms)
         } else {

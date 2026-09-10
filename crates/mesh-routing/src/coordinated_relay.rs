@@ -10,9 +10,36 @@ pub const SNR_MAX: i32 = 10;
 /// Fallback slot time when preset airtime is unavailable (SHORT_SLOW CAD slot ≈10 ms).
 pub const DEFAULT_SLOT_MS: u32 = 20;
 
-/// Broadcast relay slot spacing: half of packet airtime, minimum 50 ms.
+/// Minimum spacing between two relay rungs, whatever the airtime says.
+///
+/// Absolute, in an otherwise preset-derived geometry, and it binds about half the time: at
+/// SHORT_SLOW it applies to every frame up to 54 bytes, which was 354 of 703 and 305 of 628 relays
+/// across two 12 h captures. Expressing it in slot times was tried and withdrawn — the jitter range
+/// below is derived from the *floored* half, so a slot-time floor would shrink two colocated nodes'
+/// rung-0 separation from a measured 6.55 ms mean to a modelled 4.3–5.7 ms, through the band at
+/// which they demonstrably stop hearing each other.
+///
+/// So it stays, with a stated purpose rather than an inherited number: 50 ms is the smallest
+/// separation at which two colocated nodes reliably hear one another. Revisiting it needs a
+/// measurement of the separation at which a cancel actually fires, not a substitution of one
+/// constant for another.
+pub const MIN_RUNG_SPACING_MS: u32 = 50;
+
+/// Minimum de-correlation between two nodes that computed the same rung.
+///
+/// Absolute for the same reason, and coupled to [`MIN_RUNG_SPACING_MS`]: the range must stay
+/// strictly below the spacing or two adjacent rungs can swap order. See
+/// [`slot_tie_break_ms`].
+pub const MIN_TIE_BREAK_RANGE_MS: u32 = 20;
+
+/// Broadcast relay slot spacing: half of packet airtime, floored at [`MIN_RUNG_SPACING_MS`].
+///
+/// The one place the floor is applied. Three sites used to re-apply it independently, one of them
+/// inside the relay-commit path where it feeds both the fallback spacing *and* the jitter — so
+/// changing the obvious one would have left the others disagreeing, and at the short presets that
+/// inverts rung order.
 pub fn half_airtime_ms(packet_airtime_ms: u32) -> u32 {
-    (packet_airtime_ms / 2).max(50)
+    (packet_airtime_ms / 2).max(MIN_RUNG_SPACING_MS)
 }
 
 /// LoRa CAD slot time for a modem preset (EU_868 narrow band).
@@ -49,12 +76,21 @@ pub fn tx_delay_ms_router(snr: i8, slot_ms: u32, from: u32, id: u32, node_num: u
     jitter_slots(from, id, node_num, span) * slot_ms
 }
 
+/// Range of the rung tie-break: a quarter of the rung spacing either side, floored.
+///
+/// Named so the invariant it must satisfy can be stated and tested in one place: strictly below the
+/// rung spacing, or two adjacent rungs can swap and the earlier-ranked node transmits second —
+/// which voids the coverage absorption the ranking performed on its behalf.
+pub fn tie_break_range_ms(half_airtime_ms: u32) -> u32 {
+    (half_airtime_ms / 2).max(MIN_TIE_BREAK_RANGE_MS)
+}
+
 /// Tie-breaker added to an SR relay slot: deterministic per (packet, node), within
 /// ±¼ half-airtime. Small enough that two candidates in adjacent slots
 /// can never swap order, large enough that two nodes computing the same slot do not key up in
 /// the same instant. Returns the signed offset in ms.
 pub fn slot_tie_break_ms(half_airtime_ms: u32, id: u32, node_num: u32) -> i32 {
-    let range = (half_airtime_ms / 2).max(20);
+    let range = tie_break_range_ms(half_airtime_ms);
     ((node_num ^ id) % range) as i32 - (range / 2) as i32
 }
 
@@ -103,6 +139,48 @@ pub fn transmission_record_window_ms(modem_preset: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tie-break range must stay strictly below the rung spacing, at every preset and frame
+    /// size — not only at the three values the older test happened to try.
+    ///
+    /// If it ever reaches the spacing, two adjacent rungs can swap: the earlier-ranked node
+    /// transmits second, and the coverage the ranking absorbed on its behalf is never carried. The
+    /// two floors are what make this non-obvious — the range is derived from the *floored* half, so
+    /// changing either constant alone can break it, which is why both are named and pinned here.
+    #[test]
+    fn tie_break_range_stays_below_rung_spacing_everywhere() {
+        // Every preset, and frame sizes from a bare header to the maximum payload.
+        for preset in 0u8..=9 {
+            let cfg = mesh_radio::eu868_config_for_preset(preset);
+            for len in [16usize, 29, 48, 55, 106, 200, 237, 253] {
+                let airtime = mesh_radio::packet_time_ms(&cfg, len, false);
+                let half = half_airtime_ms(airtime);
+                let range = tie_break_range_ms(half);
+                assert!(
+                    range < half,
+                    "preset {preset} len {len}: tie-break range {range} must stay under the rung \
+                     spacing {half}, or adjacent rungs can swap"
+                );
+                // And the offset it produces must fit inside that range on both sides.
+                for id in [0x1u32, 0x1234_5678, 0xffff_ffff] {
+                    for node in [0xbdac_ce55u32, 0x046b_553a] {
+                        let j = slot_tie_break_ms(half, id, node);
+                        assert!(
+                            j >= -((range / 2) as i32) && j < (range - range / 2) as i32,
+                            "preset {preset} len {len}: offset {j} outside ±{range}/2"
+                        );
+                        // The earlier rung, however late, still precedes the next however early.
+                        let latest_this = (range - range / 2 - 1) as i32;
+                        let earliest_next = half as i32 - (range / 2) as i32;
+                        assert!(
+                            earliest_next > latest_this,
+                            "preset {preset} len {len}: rungs overlap"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn slot_tie_break_never_reorders_adjacent_slots() {

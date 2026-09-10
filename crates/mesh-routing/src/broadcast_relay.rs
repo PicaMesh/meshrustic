@@ -647,7 +647,8 @@ pub fn plan_broadcast_relay<F>(
 where
     F: Fn(u32) -> bool,
 {
-    let half = half_airtime_ms.max(50);
+    // Floored once, in coordinated_relay: a second application here would drift from it.
+    let half = half_airtime_ms.max(crate::coordinated_relay::MIN_RUNG_SPACING_MS);
     let prefer_high = (packet_id & 1) != 0;
     let mut already_covered = build_already_covered(ctx.edges, ctx.capability, source, heard_from);
     let pre_covered_count = already_covered.count;
