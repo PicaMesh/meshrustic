@@ -8,30 +8,77 @@ holds itself to. Rules are prose; code lives in the code.
 
 ## 1. Channel access and timing
 
-Model: after any frame ends, the radios that received it are not listening for up to about
-170 ms (measured on Meshtastic-based peers as their per-packet processing time) while they read it out and
-re-arm. Every timing rule below follows from that one figure, `PEER_TURNAROUND_MS`
-(250 ms) in `channel_access`, plus the preset's slot time, its contention window and the frame
-airtime. Every SignalRouting node uses the same figure.
+Model: every wait below is built from stock's own contention geometry — the preset's CAD slot
+time and its contention window (`coordinated_relay`) — the frame airtime, and a fixed guard after
+somebody else's frame: the turnaround, `PEER_TURNAROUND_MS` (250 ms) in `channel_access`. Every
+SignalRouting node uses the same figures, so ladders computed independently agree.
 
+**The turnaround is margin, not a measured deaf window.** Peers take up to about 170 ms of
+per-packet processing between a frame ending and the decoded packet reaching their router, and
+that figure was once read here as time off air. It is not: both radio paths re-arm the receiver
+before delivering the frame upward, so a peer is listening again long before it has finished with
+the frame it just took. Nothing below depends on the 170 ms figure, and each wait states what it
+is actually waiting for.
+
+- **The modem preset table is stock's, row for row.** Bandwidth, spreading factor and coding
+  rate for every preset, in both the normal and wide-LoRa variants, match stock's own table
+  (`mesh_radio::modem_preset_params`), and a preset stock has no case for lands on the same
+  default stock gives it. This is the hardest interop surface there is: a wrong row is not a
+  degraded link but no link at all, because two nodes on either side of it are not on the same
+  channel. Five rows were wrong — SHORT_TURBO's wide bandwidth, LONG_TURBO and VERY_LONG_SLOW
+  ungrouped, LONG_MODERATE a copy of MEDIUM_SLOW, and LONG_SLOW's coding rate — and every
+  quantity below derives from them, so the error reached the symbol time, the airtime, the rung
+  spacing and the slot time alike. Tests: `modem_presets_match_stock`,
+  `long_moderate_is_not_medium_slow`, `long_turbo_is_not_short_turbo`.
+- **The CAD slot time truncates once, where stock truncates.** Stock computes its slot time as a
+  CAD duration plus a fixed propagation-and-MAC allowance and lets integer arithmetic drop the
+  remainder at the end; `mesh_radio::slot_time_ms` does the same, carrying the symbol time at
+  1000× and truncating only on the final division. Rounding at a different point moves the slot
+  time by a millisecond at some presets, and since the contention bands are whole multiples of
+  it, a one-millisecond disagreement scales into a band that no longer lines up with stock's.
+  The result is pinned per preset (8, 8, 10, 12, 17, 17, 48, 28, 89, and the LONG_FAST default
+  for VERY_LONG_SLOW) by `slot_time_matches_stock_at_every_preset`.
 - **No frame within the turnaround after a reception.** After any received frame, or a
   transmission deferred because a frame was arriving, the node keys up no sooner than the
   turnaround or the contention backoff, whichever is longer. Implemented by
   `ChannelAccess::note_rx` and `ChannelAccess::may_transmit`; the board's radio task consults it
   before releasing router frames and passes the same verdict to `RadioSlot::service`, so a
-  frame already queued in the radio cannot key up on its own. Derived from stock's per-packet
-  `getTxDelayMsec` contention delay and the measured peer processing time. Tests:
+  frame already queued in the radio cannot key up on its own. The contention half is stock's
+  own per-packet `getTxDelayMsec` delay; the turnaround half is the guard above. Tests:
   `channel_access` unit tests.
 - **Gap after our own frame.** At least `TX_GAP_MS` (100 ms) of silence follows each of our
   frames before the next one starts (`ChannelAccess::note_tx_done`). Stock never sends two
   frames back to back because each carries its own contention delay.
-- **Coordinated relay slots start at the turnaround.** Slot k of the SignalRouting ladder fires
-  at `SLOT_ORIGIN_MS` plus k half-airtimes (`channel_access::slot_delay_ms`, used by
-  `plan_broadcast_relay` and `NeighborGraph::commit_relay`). Undesignated cost-ranked unicast
-  slot 0 uses the same origin (`Router::evaluate_tx_plan`), as does a unicast that names us as
-  next hop (`plan_designated_unicast`). All SignalRouting nodes share the origin, so slot order
-  agrees at every preset. Tests: `sr_slot_schedule`, `broadcast_relay` unit tests,
-  `undesignated_unicast_slot_zero_waits_for_peer_turnaround`.
+- **The broadcast ladder starts at the turnaround; unicast slot 0 starts at stock's contention
+  floor.** Rung k of the SignalRouting broadcast ladder fires at `SLOT_ORIGIN_MS` plus k
+  half-airtimes (`channel_access::slot_delay_ms`, used by `plan_broadcast_relay` and
+  `NeighborGraph::commit_relay`). Undesignated cost-ranked unicast slot 0, and a unicast that
+  names us as next hop, instead wait `coordinated_relay::relay_floor_ms` — twice `CW_MAX` slot
+  times, the boundary below which no stock non-router ever transmits
+  (`Router::evaluate_tx_plan`, `plan_designated_unicast`). The two answer different questions and
+  had been sharing one value by accident: a unicast relay that keyed up earlier than the floor
+  would go out while a stock neighbour was still inside its own contention window, so that
+  neighbour could not have heard our copy, would not cancel its own, and the duplicate we were
+  avoiding would happen anyway. Both figures derive from quantities every SignalRouting node
+  computes identically, so the broadcast ladder's rung order agrees at every preset. Tests:
+  `sr_slot_schedule`, `broadcast_relay` unit tests,
+  `undesignated_unicast_slot_zero_waits_stocks_contention_floor`.
+- **Two floors keep rungs apart, and both are absolute.** Rung spacing is half the packet
+  airtime floored at `MIN_RUNG_SPACING_MS` (50 ms), and the tie-break range is half of that
+  floored spacing, floored again at `MIN_TIE_BREAK_RANGE_MS` (20 ms)
+  (`coordinated_relay::half_airtime_ms`, `tie_break_range_ms`). They are wall-clock quantities,
+  not preset-derived: the range derives from the *floored* half, and deriving either from the
+  slot time would cut node separation into the 5–6 ms band where colocated nodes stop hearing
+  each other in time to cancel. The invariant that the range never reaches the spacing is pinned
+  at every preset and frame length by `tie_break_range_stays_below_rung_spacing_everywhere`.
+- **Every rung carries a strictly positive tie-break.** `coordinated_relay::slot_tie_break_ms`
+  adds 1 to `tie_break_range_ms` milliseconds, deterministic per packet id and node id, applied
+  once where a relay is committed (`NeighborGraph::commit_relay`) so that a ranked rung, a
+  sole-candidate relay and an acknowledgement all get it. It is never zero and never negative:
+  zero is what let two nodes key up together — all 38 measured broadcast doubles were separated
+  only by this offset, mean 6.55 ms — and a signed offset could pull a rung in front of its own
+  slot. The full contention delay was applied here once and randomised the rung order outright,
+  which is how two colocated nodes in rungs 1 and 4 ended up 50 ms apart.
 - **Waiting for a designated SR next hop.** Before acting in its place, a candidate waits the
   turnaround plus the peer's maximum contention delay plus one airtime
   (`channel_access::peer_relay_wait_ms`, via `Router::sr_peer_relay_wait_ms`). For a stock next
@@ -134,9 +181,10 @@ airtime. Every SignalRouting node uses the same figure.
 - **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
   names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
   the destination (`plan_unicast_relay`); the best placed keys up first and the rest cancel on
-  its copy. Slot 0 waits `SLOT_ORIGIN_MS`; later slots wait for the leader's peer relay window
-  then space by half an airtime. Tests: `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
-  `undesignated_unicast_slot_zero_waits_for_peer_turnaround`.
+  its copy. Slot 0 waits `coordinated_relay::relay_floor_ms`, stock's own contention floor;
+  later slots wait for the leader's peer relay window then space by half an airtime. Tests:
+  `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
+  `undesignated_unicast_slot_zero_waits_stocks_contention_floor`.
 - **Soft coverage skips.** `UnicastCovered` for a shared downstream gateway, or for a
   better-positioned SR neighbour, applies only when that node is known to hold this copy
   (`heard_from` or has already transmitted this id). A neighbour that *could* hear the
@@ -258,21 +306,27 @@ airtime. Every SignalRouting node uses the same figure.
   (`RelayReason::Sparse`). This is a node's state for its first topology interval after boot,
   where behaving like a plain rebroadcaster is right, and it is what makes a two-node mesh work.
 - **T1 stands in for a transmission that was expected and did not happen, and for nothing
-  else.** Deferring arms it when either is true, both known at that moment:
-  **a slot was given** — `BroadcastRelayPlan::slots_given > 0`, i.e. a stock relay router or a
-  ranked SR peer is expected to relay, so if their copy never comes ours is the redundancy that
-  covers the loss; or
-  **a witness is owed** — the frame carries `want_ack`, reached us straight from its originator
-  (`hop_start == hop_limit`), and `NeighborGraph::is_elected_witness` makes us its answerer.
-  Stock's reliable router turns a heard rebroadcast of its own packet into an implicit ACK
-  and otherwise retransmits it three times, so one elected witness replaces three
-  frames from the sender. A frame that arrived relayed was already witnessed — the relay's own
-  transmission is the rebroadcast its source heard — so no witness is owed for it.
-  Neither reason means no transmission is expected and nobody is waiting to be told
-  (`SrSkipReason::AlreadyCovered`, logged as `no slot given, no witness owed`). Measured over
-  30 min on three field nodes (2026-09-08): this declines about 100 copies per node and cut T1
-  traffic roughly tenfold, while delivery between two colocated nodes was unchanged (3.2%
-  asymmetric ids with it, 2.9% without).
+  else.** Deferring arms it on one condition, known at that moment:
+  a rung was given out — `BroadcastRelayPlan::slots_given > 0`, i.e. a stock relay router, a
+  ranked SR peer, or an answerer ahead of us in the acknowledgement pass is expected to
+  transmit, so if their copy never comes ours is the redundancy that covers the loss.
+  No rung given means no transmission is expected and nobody is waiting to be told
+  (`SrSkipReason::AlreadyCovered`, logged as `no rung given, nothing expected`). A rung given
+  is logged by kind — a reserved stock router (`SrSkipReason::RouterExpected`) or a ranked peer
+  (`SrSkipReason::BetterNeighbor`) — because one is an expectation we cannot coordinate with and
+  the other is one we can, and merging them makes the reservation's effect invisible in a
+  capture. Measured over 30 min on three field nodes (2026-09-08): declining the rest costs
+  about 100 copies per node and cut T1 traffic roughly tenfold, while delivery between two
+  colocated nodes was unchanged (3.2% asymmetric ids with it, 2.9% without).
+  **The `want_ack` witness election is gone.** It armed T1 whenever a frame carrying `want_ack`
+  arrived straight from its originator and an election named us its answerer. Stock strips
+  `want_ack` from every broadcast before it reaches the air — 0 of 83,727 broadcast receptions
+  carry the flag — so the term could never fire on the wire, and the need behind it is served by
+  the acknowledgement pass below, which does not depend on the flag.
+  **The insurance copy carries no `want_ack` of its own** (`Header::clear_want_ack`, applied
+  where T1 snapshots the frame rather than in the shared relay builder). A copy that kept the
+  flag would invite the far side to start its own reply ladder over a frame we sent only as
+  redundancy.
 - **A heard copy stops the insurance even after it fired.** The frame leaves the router but can
   still be waiting behind listen-before-talk, so a copy heard in that window pulls it back out
   of the radio TX queue (`note_tx_cancel`, the same path a committed relay uses); once the radio
@@ -297,8 +351,39 @@ airtime. Every SignalRouting node uses the same figure.
   Originator T1 in `send_local` remains a separate “did anyone rebroadcast?” timer with the same
   cancel-on-rebroadcast helpers. Tests: `t1_retransmit_fires_after_defer_window`,
   `t1_stands_down_when_the_peers_copy_is_heard`, `no_expected_transmission_arms_no_insurance`,
-  `elected_witness_answers_when_no_slot_was_given`,
-  `source_witness_is_the_neighbour_the_source_can_hear`, `ranked_broadcast_slot_does_not_arm_t1`.
+  `ranked_broadcast_slot_does_not_arm_t1`.
+- **When the ladder comes out empty, somebody still answers** (`plan_acknowledgement`,
+  `RelayReason::Acknowledgement`). The ranking drops every candidate with no unique coverage,
+  because the cost it ranks on is the mean delivery cost over the unique targets and an empty
+  target set has nothing to price. A fully-covered broadcast therefore earns no transmission at
+  all — which is correct for coverage and wrong for the sender, because the only delivery
+  confirmation stock has for a broadcast is hearing somebody rebroadcast it. Suppressing every
+  copy removes the signal its retry ladder waits on, so it retransmits into silence and the
+  phone reports a failure for a message that in fact arrived everywhere.
+  So a second pass runs, with its own price, only when the first left the ladder empty and
+  nothing was reserved. **Scope**: a text broadcast that reached us straight from its originator
+  (`is_direct_packet` — hop budget and relay byte both), decided at the router where the portnum
+  and header are known. A frame that arrived relayed was rebroadcast by definition, so its
+  originator already has its confirmation.
+  **Direction**: the opposite of coverage. Coverage asks whether a relay reaches a target; an
+  acknowledgement asks whether the *originator* hears the relay, because a copy it cannot hear
+  tells it nothing. `route::acknowledgement_price_fixed` therefore demands positive,
+  one-directional evidence — the source's own list naming the candidate, or us watching the
+  source's traffic carried by it — prices it as the source would measure it, and refuses a
+  guessed link or one past `COVERAGE_ETX_CEILING_FIXED`. The symmetric test would not do: a
+  direct observation writes both edge directions from one measurement, and symmetry is the one
+  thing an acknowledgement may not assume.
+  **Candidates** are ourselves plus the neighbours we can hear that are SR-active or immediate
+  relay routers and have a price, ordered by that price in `COST_BUCKET_FIXED` buckets, then by
+  packet-id parity and node id so the work rotates across packets instead of always falling to
+  the same node. Rungs start at `SLOT_ORIGIN_MS` and space by half an airtime; a rung ahead of
+  ours counts toward `slots_given`, so T1 insures an answer that never comes.
+  **We stand down** for a neighbour that will rebroadcast regardless and will not cancel for us
+  (`Capability::will_not_cancel_for_us`, stock ROUTER and ROUTER_LATE) when it can hear the
+  transmitter: its copy is already the acknowledgement. A stock CLIENT is deliberately not such
+  a node — it floods later than our rung and cancels on hearing us, so answering first removes
+  its copy rather than adding to ours. Tests: `somebody_answers_when_the_ladder_is_empty`,
+  `the_source_hears_the_first_answerer_best`, `reservation_and_rung_are_counted_apart`.
 
 ## 4. Duplicates and hand-offs
 
@@ -314,6 +399,18 @@ airtime. Every SignalRouting node uses the same figure.
 - **Other duplicates cancel our pending copy** when the copy shows the packet is moving on
   (`Router::perhaps_cancel_dupe`); broadcast copies are pulled back only when the transmitters
   heard so far cover every neighbour we reach.
+- **Coverage decides a committed relay's cancel; our role decides everything else.** The two
+  gates answer different questions. Coverage is about the packet — the neighbours we would have
+  carried have been carried by somebody else, so our copy would add a duplicate and nothing
+  more. `NeighborGraph::role_allows_canceling_dupe` is about the node — whether a router may
+  fall silent for reasons of its own — and stock keeps ROUTER and ROUTER_LATE rebroadcasting
+  through duplicates on purpose. For a relay *we* committed to under the coverage model,
+  coverage wins: the frame may still be pullable out of the radio queue, and a covered relay
+  that goes out anyway is a duplicate we chose. Without this a node configured ROUTER or
+  ROUTER_LATE cancelled its insurance and then transmitted regardless. Traffic we never
+  committed to keeps stock's behaviour for our role unchanged. Tests:
+  `coverage_cancels_a_committed_relay_whatever_our_role`,
+  `role_still_governs_traffic_we_did_not_commit_to`.
 
 ## 5. Topology reports
 
@@ -375,7 +472,8 @@ airtime. Every SignalRouting node uses the same figure.
   which relayed frames each had happened to hear.
 - **Coverage is priced on measurements only; reachability may use a guess.** `hop_cost_fixed`
   skips `Inferred` edges and returns no price when only a guess exists, so `covers`,
-  `coverage_owner`, `witness_owner` and both slot rankings (through `delivery_hop_cost_fixed`)
+  `coverage_owner`, `acknowledgement_price_fixed` and both slot rankings (through
+  `delivery_hop_cost_fixed`)
   refuse to let a guess excuse a transmission — no price means no coverage, which means we relay.
   The route search prices its own hops straight from the edges and still travels over an inferred
   edge, which is the one thing inferring an edge is for. A candidate's coverage set is likewise
@@ -415,7 +513,8 @@ airtime. Every SignalRouting node uses the same figure.
   retracted — the node stays in the graph, so a peer that still hears it keeps it reachable and a
   unicast for it still finds that route. **Coverage goes further than our own edge**: past the
   same horizon the node is nobody's coverage target (`route::is_silent_publisher`, applied inside
-  `admits_coverage`, so the ranking, absorb and the cancel path all follow). A peer's published
+  `admits_coverage`, and in `unique_coverage_neighbor` so the cancel path follows the same rule
+  the ranking used; test `cancel_path_applies_the_silence_rule`). A peer's published
   edge to it outlives our retraction by up to a broadcast interval, so without that every node
   credits its peers with covering a node that has gone — and each of those peers, having retracted
   it under the same rule, declines the slot it was handed. Field 2026-09-08: the branch gateway

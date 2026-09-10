@@ -228,6 +228,32 @@ mod tests {
         assert!(cw_size_from_snr(12) >= cw_size_from_snr(-10));
     }
 
+    /// The SNR feeding the contention window is clamped, so the two bands stay disjoint. Stock's
+    /// mapping is not clamped upstream, and an SNR past its top extrapolates the window one step
+    /// beyond CWmax: a router's draw stretches from 15 slots to 17 and reaches into the band the
+    /// non-router roles start in. Measured on this fleet, 1,163 of 88,485 receptions carry an SNR
+    /// at or above +16 (maximum 17.75), so out-of-range input is routine, not a corner case.
+    #[test]
+    fn the_router_band_stays_below_the_non_router_floor_at_every_snr() {
+        for slot_ms in [8u32, 10, 17, 28, 48, 89] {
+            let floor = relay_floor_ms(slot_ms);
+            for snr in i8::MIN..=i8::MAX {
+                let cw = cw_size_from_snr(snr);
+                assert!(
+                    (CW_MIN..=CW_MAX).contains(&cw),
+                    "snr {snr} mapped outside [{CW_MIN}, {CW_MAX}]: {cw}"
+                );
+                // Worst case of `random(0, 2 * CWsize) * slotTime`, the exclusive top of the draw.
+                let worst_early = (2 * cw as u32 - 1) * slot_ms;
+                assert!(
+                    worst_early < floor,
+                    "snr {snr} at slot {slot_ms}ms: early band reaches {worst_early}ms, \
+                     non-router floor is {floor}ms"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tx_delay_uses_preset_slot() {
         let cfg = RadioConfig::eu868_short_slow();

@@ -268,16 +268,6 @@ pub const OWNER_COST_BUCKET_FIXED: u16 = 50;
 /// buckets, then the lowest node id. Mute and passive nodes never own: they do not relay.
 /// `me` is our own node and `me_relays` whether our role rebroadcasts: we are absent from our own
 /// capability cache, so our eligibility has to be passed in.
-/// Whose copy an originator will actually hear: among the nodes that can be shown to deliver
-/// to it (`covers`, so a publishing source must be known to hear the candidate and a silent one
-/// falls back to the candidate's own edge), the cheapest in the delivery direction, stock
-/// rebroadcasters given way, node id as the tie-break.
-///
-/// Deliberately not [`coverage_owner`]: that ranks a candidate's own edge *to* the target, which
-/// is the only evidence available for a neighbour nobody can be shown to reach, but it is the
-/// wrong direction for a witness — a copy from a node the originator cannot hear acknowledges
-/// nothing. A source that publishes nothing leaves each node with only its own evidence, so
-/// several may elect themselves; that is still fewer than every node that heard the frame.
 /// What an acknowledgement from `candidate` is worth to `source`: the cost in the direction the
 /// source would have to hear it, or `None` when it would not be heard at all.
 ///

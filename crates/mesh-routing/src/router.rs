@@ -4398,6 +4398,84 @@ mod tests {
             .is_some());
     }
 
+    /// The insurance copy must never ask to be acknowledged. A frame we heard may carry
+    /// `want_ack` — stock strips it from its own broadcasts, but nothing on the wire guarantees
+    /// every sender does — and a copy that keeps the flag can be read by a sending path as a
+    /// fresh reliable transmission, restarting the originator's retry interval. Cleared on the
+    /// T1 snapshot alone: relayed unicasts legitimately keep the flag.
+    #[test]
+    fn the_insurance_copy_asks_for_no_acknowledgement() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(0xCC00_00CC));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        const NEIGHBOR: u32 = 0xBB00_00BB;
+        const STOCK: u32 = 0xDD00_00DD;
+        const EDGE: u32 = 0xEE00_00EE;
+        {
+            let graph = router.graph_mut();
+            graph.observe_direct_neighbor(NEIGHBOR, -70, 8, 0, 0);
+            graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
+            graph.observe_direct_neighbor(EDGE, -70, 8, 0, 0);
+            graph.confirm_direct_neighbor_hears_us(NEIGHBOR);
+            graph.confirm_direct_neighbor_hears_us(STOCK);
+            graph.confirm_direct_neighbor_hears_us(EDGE);
+            graph.track_node_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
+            graph.capability_mut().track_topology(NEIGHBOR, true, 0);
+            for target in [NEIGHBOR, EDGE] {
+                graph.edges_mut().update_edge(
+                    0xCC00_00CC,
+                    STOCK,
+                    target,
+                    2.0,
+                    0,
+                    EdgeSource::Reported,
+                    true,
+                    0,
+                );
+                graph.edges_mut().set_edge_hears_us(STOCK, target, true);
+            }
+        }
+
+        // want_ack set on the frame we hear: the stock repeater takes the early slot, we defer
+        // with nothing unique left, and T1 arms on its expected transmission.
+        let header =
+            PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, true, false, 0, 0);
+        let wire = encode_wire(header, &[0x01, 0x02]);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 10,
+                    bytes: &wire,
+                },
+                1_000,
+            )
+            .unwrap();
+        assert!(
+            PacketHeader::decode(&wire[..PACKET_HEADER_LEN])
+                .unwrap()
+                .want_ack(),
+            "the frame we heard must carry the flag, or this test proves nothing"
+        );
+        let airtime = coordinated_relay::DEFAULT_SLOT_MS * 10;
+        let plan = router.evaluate_tx_plan(&result, 0.0, airtime, 1_000);
+        assert!(plan.relay.is_none(), "we defer to the repeater");
+
+        let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
+        let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
+        let ladder =
+            coordinated_relay::half_airtime_ms(airtime) * crate::graph::MAX_EDGES_PER_NODE as u32;
+        let fired = router
+            .poll_t1_retransmit(1_000 + fire_ms + ladder)
+            .expect("insurance fires");
+        let sent = PacketHeader::decode(&fired.bytes[..PACKET_HEADER_LEN]).unwrap();
+        assert!(
+            !sent.want_ack(),
+            "the insurance copy must not carry want_ack"
+        );
+    }
+
     /// A copy heard after our insurance fired must still stop it: the frame has left the router
     /// but waits behind listen-before-talk, and only the radio queue can pull it back. Field
     /// 2026-09-08: six copies went out 0.4 to 1.0 s behind another insurer's for want of this.
@@ -6359,7 +6437,7 @@ mod tests {
     }
 
     #[test]
-    fn undesignated_unicast_slot_zero_waits_for_peer_turnaround() {
+    fn undesignated_unicast_slot_zero_waits_stocks_contention_floor() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
