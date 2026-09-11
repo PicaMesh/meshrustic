@@ -319,6 +319,15 @@ pub async fn radio_task(
             });
             let report = router.run_maintenance(now_ms, slot_ms);
             if report.graph_log_due {
+                // Restate identity, role and build with each periodic dump. Emitting them only on
+                // USB connect was not enough: a logger that reattaches even twenty seconds after a
+                // reboot misses them, and they are evicted from the 16 KB ring long before it
+                // arrives. Three reflashes in a row produced captures that could not say which
+                // firmware or role they came from. One line a minute makes any capture
+                // self-describing, whenever it was started.
+                crate::usb_log::log::mesh::node_id(router.node_num());
+                crate::usb_log::log::mesh::device_role(router.device_role());
+                crate::usb_log::log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
                 crate::usb_log::log::sr::emit_topology_dump(router);
             }
             last_maintenance = Instant::now();
