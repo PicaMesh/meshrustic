@@ -314,6 +314,33 @@ pub mod mesh {
         put_u32(&mut line, &mut pos, admin_keys);
         finish_line(&mut line, pos);
     }
+
+    /// `[meshrustic] host command rejected: <reason>` — Part C's line parser refused a line.
+    /// Named here, not silently dropped: the H1 controlled-node harness (see
+    /// tmp/controlled-node-harness-plan-20260911.md in the repo) needs to know which check
+    /// failed, not just that a line went nowhere.
+    pub fn host_command_rejected(reason: &[u8]) {
+        let mut line = [0u8; 96];
+        let mut pos = line_prefix(&mut line);
+        put(&mut line, &mut pos, b"[meshrustic] host command rejected: ");
+        put(&mut line, &mut pos, reason);
+        finish_line(&mut line, pos);
+    }
+
+    /// `[meshrustic] host command dropped: queue full` — a line parsed fine but the radio task
+    /// had not yet drained the previous command. The channel is deliberately tiny (capacity 2,
+    /// never unbounded); this is the same "say so" discipline as a rejected line, not a silent
+    /// loss.
+    pub fn host_command_dropped() {
+        let mut line = [0u8; 64];
+        let mut pos = line_prefix(&mut line);
+        put(
+            &mut line,
+            &mut pos,
+            b"[meshrustic] host command dropped: queue full",
+        );
+        finish_line(&mut line, pos);
+    }
 }
 
 /// Mirror key `[Radio0]` defmt lines as plain text for USB CDC.

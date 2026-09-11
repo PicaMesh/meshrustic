@@ -1,11 +1,23 @@
-//! USB CDC logging for field debug (Phase 4).
+//! USB CDC logging for field debug (Phase 4), plus host command input (Part C of H1).
 
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::channel::Channel;
+use mesh_routing::HostCommand;
 
 pub(crate) mod log;
 mod task;
 
 pub use task::usb_task;
+
+/// A host-typed command, from the USB task to the radio task. Capacity 2, never unbounded, so
+/// a flood of input cannot grow memory in this `no_std` binary; the radio task drains it with a
+/// non-blocking receive (see `lora::radio_task`), so a full queue only drops and logs the
+/// newest command rather than stalling anything. Both tasks run on the same single executor
+/// with nothing in an interrupt handler touching this channel, so `ThreadModeRawMutex` is
+/// enough -- no need for the heavier `CriticalSectionRawMutex`.
+pub type HostCommandChannel = Channel<ThreadModeRawMutex, HostCommand, 2>;
 
 static USB_CONNECTED: AtomicBool = AtomicBool::new(false);
 

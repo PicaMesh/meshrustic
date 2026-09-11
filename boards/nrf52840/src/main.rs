@@ -65,6 +65,11 @@ static RADIO_SLOT: StaticCell<RadioSlot<lora::Sx1262Driver>> = StaticCell::new()
 // (see `Router::unconfigured`). `load_node_config` below gives it its node id and channel.
 static ROUTER: ConstStaticCell<Router> = ConstStaticCell::new(Router::unconfigured());
 static CONFIG_STORE: StaticCell<NvmcConfigStore> = StaticCell::new();
+// Part C (H1 controlled-node harness): a host-typed command from the USB task to the radio
+// task. Built the same way every other object shared between these two independently-spawned
+// tasks already is -- a `StaticCell`, initialised once here, threaded into both spawns as a
+// `'static` reference -- rather than inventing a second sharing pattern.
+static HOST_CMD_CHANNEL: StaticCell<usb_log::HostCommandChannel> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -157,8 +162,14 @@ async fn main(spawner: Spawner) {
     let own_role = router.device_role();
     usb_log::log::mesh::device_role(own_role);
 
+    let host_cmd_channel = HOST_CMD_CHANNEL.init(usb_log::HostCommandChannel::new());
     spawner
-        .spawn(usb_log::usb_task(p.USBD, config.node_num, own_role))
+        .spawn(usb_log::usb_task(
+            p.USBD,
+            config.node_num,
+            own_role,
+            host_cmd_channel,
+        ))
         .unwrap();
     let saadc_config = saadc::Config::default();
     let mut saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
@@ -180,6 +191,7 @@ async fn main(spawner: Spawner) {
             store,
             config.node_num,
             radio_wdt,
+            host_cmd_channel,
         ))
         .unwrap();
 

@@ -1,16 +1,24 @@
-//! Embassy task: USB CDC ACM device + log drain.
+//! Embassy task: USB CDC ACM device + log drain + host command input.
+//!
+//! The command read side is Part C of the H1 controlled-node experiment harness (see
+//! `tmp/controlled-node-harness-plan-20260911.md` in the MeshRustic repo): it lets an operator
+//! make this node originate a frame, which is otherwise impossible to arrange over the write-only
+//! link this task used to be. A line is parsed here and handed to the radio task over a small
+//! channel; nothing here talks to the radio directly.
 
 use crate::Irqs;
-use embassy_futures::join::join;
+use embassy_futures::join::join3;
 use embassy_nrf::peripherals;
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver;
 use embassy_time::Timer;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config};
+use mesh_routing::{CommandError, LineAccumulator, MAX_COMMAND_LINE};
 use static_cell::StaticCell;
 
 use super::log;
+use super::HostCommandChannel;
 
 static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
 static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
@@ -39,7 +47,12 @@ fn serial_number_str(node_num: u32) -> &'static str {
 }
 
 #[embassy_executor::task]
-pub async fn usb_task(usb: peripherals::USBD, node_num: u32, device_role: u32) {
+pub async fn usb_task(
+    usb: peripherals::USBD,
+    node_num: u32,
+    device_role: u32,
+    host_cmd: &'static HostCommandChannel,
+) {
     let driver = Driver::new(usb, Irqs, HardwareVbusDetect::new(Irqs));
 
     let mut config = Config::new(0x1209, 0x0001);
@@ -58,13 +71,14 @@ pub async fn usb_task(usb: peripherals::USBD, node_num: u32, device_role: u32) {
         CONTROL_BUF.init([0; 64]),
     );
 
-    let mut class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
+    let class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
+    let (mut sender, mut receiver) = class.split();
     let mut usb_dev = builder.build();
 
     let usb_run = usb_dev.run();
     let log_run = async {
         loop {
-            class.wait_connection().await;
+            sender.wait_connection().await;
             crate::usb_log::set_usb_connected(true);
             defmt::info!("USB CDC connected");
             log::push_line("[meshrustic] USB log ready");
@@ -81,7 +95,7 @@ pub async fn usb_task(usb: peripherals::USBD, node_num: u32, device_role: u32) {
                 let mut buf = [0u8; 64];
                 let n = log::read_chunk(&mut buf);
                 if n > 0 {
-                    if class.write_packet(&buf[..n]).await.is_err() {
+                    if sender.write_packet(&buf[..n]).await.is_err() {
                         crate::usb_log::set_usb_connected(false);
                         break;
                     }
@@ -93,5 +107,54 @@ pub async fn usb_task(usb: peripherals::USBD, node_num: u32, device_role: u32) {
         }
     };
 
-    join(usb_run, log_run).await;
+    // Part C: host command input. A fixed-capacity line accumulator, reset on every new
+    // connection so a line left partial by a disconnect can never be silently completed by
+    // bytes from the next session. A complete, parsed line is handed to the radio task through
+    // `host_cmd`; a rejected or dropped one is logged with its specific reason, never silent.
+    let cmd_run = async {
+        let mut acc: LineAccumulator<MAX_COMMAND_LINE> = LineAccumulator::new();
+        loop {
+            receiver.wait_connection().await;
+            acc.reset();
+            loop {
+                let mut buf = [0u8; 64];
+                let n = match receiver.read_packet(&mut buf).await {
+                    Ok(n) => n,
+                    Err(_) => break, // disconnected: outer loop waits for the next connection
+                };
+                for &b in &buf[..n] {
+                    let Some(line_result) = acc.push_byte(b) else {
+                        continue;
+                    };
+                    match line_result {
+                        // The accumulator itself only ever reports LineTooLong; a line that fit
+                        // is parsed, which is where the rest of `CommandError`'s variants come
+                        // from -- `reason_for` covers both.
+                        Err(err) => log::mesh::host_command_rejected(reason_for(err)),
+                        Ok(line) => match mesh_routing::parse_line(&line) {
+                            Ok(cmd) => {
+                                if host_cmd.try_send(cmd).is_err() {
+                                    log::mesh::host_command_dropped();
+                                }
+                            }
+                            Err(err) => log::mesh::host_command_rejected(reason_for(err)),
+                        },
+                    }
+                }
+            }
+        }
+    };
+
+    join3(usb_run, log_run, cmd_run).await;
+}
+
+/// Which check failed, for the log line -- never a silent drop.
+fn reason_for(err: CommandError) -> &'static [u8] {
+    match err {
+        CommandError::LineTooLong => b"line too long",
+        CommandError::UnknownKeyword => b"unknown keyword (expected BCAST or UNI)",
+        CommandError::MissingNodeId => b"UNI: missing node id",
+        CommandError::MalformedNodeId => b"UNI: node id is not valid hex",
+        CommandError::EmptyMessage => b"empty message text",
+    }
 }

@@ -13,6 +13,7 @@ pub mod capability;
 pub mod channel_access;
 pub mod coordinated_relay;
 pub mod graph;
+pub mod host_command;
 pub mod neighbor_graph;
 pub mod nodeinfo;
 pub mod packet_history;
@@ -66,6 +67,9 @@ pub use graph::{
     publishes_topology, verified_connectivity, DownstreamTable, EdgeSource, RoutableFilter, Route,
     RouteCache, COVERAGE_ETX_CEILING_FIXED, MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE,
     PLACEHOLDER_NODE_PREFIX, UNVERIFIED_HOP_COST_FACTOR,
+};
+pub use host_command::{
+    parse_line, CommandError, HostCommand, LineAccumulator, MAX_COMMAND_LINE, MAX_COMMAND_TEXT,
 };
 pub use neighbor_graph::{
     MaintenanceReport, NeighborEntry, NeighborGraph, TopologyMergeResult, LAST_HOP_BUDGET,

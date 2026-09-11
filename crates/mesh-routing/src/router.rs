@@ -642,6 +642,13 @@ impl Router {
         self.modem_preset
     }
 
+    /// Our own configured LoRa hop limit -- what any locally-originated frame should ask for
+    /// absent a caller-specific reason to ask for less (see `host_command`'s producer in the
+    /// board's radio task, the first caller of `send_local` outside a host test).
+    pub fn hop_limit(&self) -> u8 {
+        self.hop_limit
+    }
+
     fn cw_slot_ms(&self) -> u32 {
         slot_time_for_preset(self.modem_preset)
     }

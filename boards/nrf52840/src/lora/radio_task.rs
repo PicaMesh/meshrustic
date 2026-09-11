@@ -1,20 +1,21 @@
 //! Embassy task driving radio 0 RX/TX and AirTime ticks.
 
 use embassy_time::{Duration, Instant, Timer};
-use mesh_protocol::PacketHeader;
+use mesh_protocol::{num::TEXT_MESSAGE_APP, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_radio::{
     eu868_config_for_preset, packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868,
 };
 use mesh_routing::channel_access::ChannelAccess;
 use mesh_routing::{
-    wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, InboundPacket, Router, RxDecodeInfo,
-    SrLogEvent, MAX_SR_LOG,
+    wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, HostCommand, InboundPacket, Router,
+    RxDecodeInfo, SrLogEvent, MAX_SR_LOG,
 };
 use mesh_store::{ConfigStore, EMPTY_ADMIN_KEY};
 use static_cell::StaticCell;
 
 use super::sx1262::Sx1262Driver;
 use crate::store::NvmcConfigStore;
+use crate::usb_log::HostCommandChannel;
 
 static AIR_TIME: StaticCell<AirTime> = StaticCell::new();
 
@@ -29,6 +30,7 @@ pub async fn radio_task(
     store: &'static mut NvmcConfigStore,
     node_num: u32,
     mut watchdog: Option<embassy_nrf::wdt::WatchdogHandle>,
+    host_cmd: &'static HostCommandChannel,
 ) {
     let air = air_time();
     let profile = slot.driver.profile();
@@ -159,6 +161,32 @@ pub async fn radio_task(
 
             if let Some(admin) = router.poll_admin_tx(now_ms) {
                 enqueue_tx(admin, slot, router, node_num, b"admin");
+            }
+
+            // Part C (H1 controlled-node harness): a command typed at the USB host, one more
+            // producer in this chain, gated by the same `may_release` check as every other. A
+            // non-blocking check -- the channel is drained here, never awaited -- so an empty
+            // queue costs nothing on this pass, same as every `poll_*` above. `send_local` is
+            // called exactly as any other originated frame would be: nothing shortcuts to the
+            // radio, so an injected frame's timing is indistinguishable from any other.
+            if let Ok(cmd) = host_cmd.try_receive() {
+                let (to, text) = match cmd {
+                    HostCommand::Broadcast { text } => (NODENUM_BROADCAST, text),
+                    HostCommand::Unicast { to, text } => (to, text),
+                };
+                let airtime_ms =
+                    packet_time_ms(slot.config(), PACKET_HEADER_LEN + text.len(), true).max(1);
+                if let Some(plan) = router.send_local(
+                    to,
+                    TEXT_MESSAGE_APP,
+                    &text,
+                    false,
+                    router.hop_limit(),
+                    now_ms,
+                    airtime_ms,
+                ) {
+                    enqueue_tx(plan, slot, router, node_num, b"host-cmd");
+                }
             }
         }
 
