@@ -109,10 +109,8 @@ async fn main(spawner: Spawner) {
         .count() as u32;
 
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
-    usb_log::log::mesh::node_id(config.node_num);
-    // Which firmware this board is actually carrying. A capture without this line predates the
-    // stamp; a hash ending in `+` was built from a tree with uncommitted changes.
-    usb_log::log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
+    // The node id and build stamp are emitted by the USB task on every connection instead: a line
+    // pushed here is evicted from the log ring before any host attaches.
     usb_log::log::mesh::reset_reason(reset_reason);
     usb_log::log::push_line(if radio_wdt.is_some() {
         "[meshrustic] watchdog armed: 30 s, pet by the radio task"

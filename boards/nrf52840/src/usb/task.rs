@@ -68,6 +68,13 @@ pub async fn usb_task(usb: peripherals::USBD, node_num: u32) {
             crate::usb_log::set_usb_connected(true);
             defmt::info!("USB CDC connected");
             log::push_line("[meshrustic] USB log ready");
+            // Identity and firmware on every connection, not once at boot. Lines pushed before
+            // this task runs are written into a 16 KB ring that the node fills long before a host
+            // attaches, so a boot-time stamp is evicted and never seen — which is exactly what
+            // happened to the first attempt. Re-stating it here also answers "what is this node
+            // running?" for a capture started at any time, not only one that caught a reboot.
+            log::mesh::node_id(node_num);
+            log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
 
             loop {
                 let mut buf = [0u8; 64];
