@@ -1477,7 +1477,8 @@ impl NeighborGraph {
         known_relay: Option<u32>,
         packet_id: u32,
     ) -> Option<(u32, bool, bool)> {
-        if !self.is_active_routing_role() {
+        // A node that publishes no topology has nobody to tell, so it records nothing.
+        if !self.is_active_routing_role() && !self.can_send_topology() {
             return None;
         }
         if from == 0 || (rssi == 0 && snr == 0) {
@@ -1499,6 +1500,14 @@ impl NeighborGraph {
         if self.has_our_transmission(packet_id) {
             return None;
         }
+        // Measuring a relayer we heard is first-hand observation, not inference: the RSSI and SNR
+        // come off the relayer's own frame, exactly as they do for a frame that arrived direct. So
+        // every node records it, whatever its role. Only the node that hears a relayer can supply
+        // the transmit-direction evidence coverage needs about it ("does that router reach me?"),
+        // and a node that never records it stays permanently uncovered, so each of its neighbours
+        // holds unique coverage of it and relays. What the active-routing class gates is the
+        // inference below — who sits behind the gateway — which only a node that ranks relays uses.
+        let active_routing = self.is_active_routing_role();
         self.edges.ensure_local_node(self.my_node, now_ms);
         // What we measured is the relay's link to us, not the relay's link to the source. An
         // inferred edge/downstream gets a nominal cost per hop the packet has travelled; with the
@@ -1523,7 +1532,7 @@ impl NeighborGraph {
         // own list carries the other direction and says nothing about this one.
         let gateway_never_publishes = self.capability.status(gateway) == CapabilityStatus::Legacy
             || is_placeholder_node(gateway);
-        if gateway_never_publishes {
+        if active_routing && gateway_never_publishes {
             let result_relay_to_dest = self.edges.update_edge(
                 self.my_node,
                 gateway,
@@ -1565,7 +1574,8 @@ impl NeighborGraph {
             .edges
             .has_direct_reported_edge_to(self.my_node, gateway)
             || is_placeholder_node(gateway);
-        if can_infer_downstream
+        if active_routing
+            && can_infer_downstream
             && (single_hop || !source_sr_active)
             && !self.is_downstream_relay_for(gateway, from, now_ms)
         {
@@ -1581,7 +1591,9 @@ impl NeighborGraph {
             self.route_cache.clear();
         }
 
-        self.record_heard_transmissions(from, packet_id, Some(gateway), now_ms);
+        if active_routing {
+            self.record_heard_transmissions(from, packet_id, Some(gateway), now_ms);
+        }
         Some((gateway, is_new_gateway, hears_us))
     }
 
@@ -2720,6 +2732,96 @@ mod tests {
         assert_eq!(entries[0].node_id, RELAY);
         assert_eq!(entries[0].rssi, -70);
         assert_eq!(entries[0].snr, 12);
+    }
+
+    /// A CLIENT_MUTE never relays but does publish topology, and it is the only node that can
+    /// say whether a relayer reaches it. Before this, it recorded nothing and so stayed
+    /// permanently uncovered, which is what made every neighbour hold unique coverage of it.
+    #[test]
+    fn a_mute_node_publishes_the_relayer_it_hears() {
+        const ME: u32 = 0xAA00_00AA;
+        const RELAY: u32 = 0xBB00_00BB;
+        const REMOTE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE);
+
+        let observed = graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, Some(RELAY), 0);
+        assert_eq!(
+            observed.map(|(id, _, _, is_new, _)| (id, is_new)),
+            Some((RELAY, true))
+        );
+
+        let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
+        assert_eq!(graph.fill_neighbor_entries(&mut entries), 1);
+        assert_eq!(entries[0].node_id, RELAY);
+        assert_eq!(entries[0].rssi, -70);
+    }
+
+    #[test]
+    fn a_passive_node_publishes_the_relayer_it_hears() {
+        const ME: u32 = 0xAA00_00AA;
+        const RELAY: u32 = 0xBB00_00BB;
+        const REMOTE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(crate::nodeinfo::DEVICE_ROLE_SENSOR);
+
+        graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, Some(RELAY), 0);
+
+        let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
+        assert_eq!(graph.fill_neighbor_entries(&mut entries), 1);
+        assert_eq!(entries[0].node_id, RELAY);
+    }
+
+    /// LOST_AND_FOUND broadcasts no topology, so it has nobody to tell and records nothing.
+    #[test]
+    fn a_node_that_publishes_no_topology_records_no_relayer() {
+        const ME: u32 = 0xAA00_00AA;
+        const RELAY: u32 = 0xBB00_00BB;
+        const REMOTE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(crate::nodeinfo::DEVICE_ROLE_LOST_AND_FOUND);
+
+        let observed = graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, Some(RELAY), 0);
+        assert!(observed.is_none());
+        assert_eq!(graph.neighbor_count(), 0);
+    }
+
+    /// The measurement is first-hand; who sits behind the gateway is inference, and only a node
+    /// that ranks relays uses it. An unresolved gateway is the case where an active node does
+    /// invent that edge, so it is the one that shows the split.
+    #[test]
+    fn a_mute_node_records_the_relayer_without_inferring_a_path_behind_it() {
+        const ME: u32 = 0xAA00_00AA;
+        const REMOTE: u32 = 0xCC00_00CC;
+        let placeholder = crate::graph::placeholder_node_id(0xBB);
+
+        let mut active = NeighborGraph::new();
+        active.set_my_node(ME);
+        active.set_device_role(DEVICE_ROLE_ROUTER);
+        active.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, None, 0);
+        assert!(
+            active
+                .edges()
+                .find_node(placeholder)
+                .and_then(|n| n.find_edge(REMOTE))
+                .is_some(),
+            "an active node infers the path behind an unresolved gateway"
+        );
+
+        let mut mute = NeighborGraph::new();
+        mute.set_my_node(ME);
+        mute.set_device_role(crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE);
+        mute.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, None, 0);
+        assert!(
+            mute.edges()
+                .find_node(placeholder)
+                .and_then(|n| n.find_edge(REMOTE))
+                .is_none(),
+            "a node that never ranks relays must not invent the path behind the gateway"
+        );
     }
 
     #[test]

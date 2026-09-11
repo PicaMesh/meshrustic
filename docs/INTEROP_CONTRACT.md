@@ -556,6 +556,21 @@ is actually waiting for.
   gateway that publishes topology overwrote what it had already told us. Reachability learned from
   relayed frames lives in the downstream table, which is gated separately, on the source and the
   hop count, because no publisher supplies it.
+- **Measuring a relayer is observation, not inference, so every publisher does it.** A relayed
+  frame carries a real RSSI and SNR off the relayer's own transmission, so the `us → gateway` edge
+  is a first-hand measurement and every role that publishes topology records it, mute and passive
+  included; a role that publishes nothing records nothing, because it has nobody to tell. What the
+  active-routing class gates is the inference drawn from the same frame — the `gateway → source`
+  edge, the downstream table and the contention bookkeeping — all of which exist to rank relays.
+  Before this split a node outside the active class dropped the observation whole, so it never
+  listed the routers it heard. Coverage needs transmit-direction evidence and only the node that
+  hears a router can supply it, so such a node stayed permanently uncovered: every neighbour held
+  unique coverage of it and relayed. Field 2026-09-11, a CLIENT_MUTE heard 925 relays from a stock
+  router in one capture and published a list naming none of them, and it alone accounted for 54 of
+  64 redundant relays. Tests: `a_mute_node_publishes_the_relayer_it_hears`,
+  `a_passive_node_publishes_the_relayer_it_hears`,
+  `a_node_that_publishes_no_topology_records_no_relayer`,
+  `a_mute_node_records_the_relayer_without_inferring_a_path_behind_it`.
 - **The reverse direction of our own measurement is an assumption, not a measurement.** Observing
   a neighbour writes `us → neighbour` as `Reported` and `neighbour → us` as `Inferred`: we cannot
   measure how well it hears us. Recorded as `Reported` it outranked and permanently blocked the
