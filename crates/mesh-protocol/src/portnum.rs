@@ -103,7 +103,12 @@ mod tests {
             rate_limit_bucket(Some(num::TELEMETRY_APP)),
             RateLimitBucket::Other
         );
-        assert_eq!(rate_limit_bucket(None), RateLimitBucket::Other);
+        // A packet we could not decode gets its own bucket, not OTHER: a relay without the key
+        // cannot tell chat from telemetry, and judging it at the OTHER threshold killed a private
+        // group's chat at the first relay that lacked the key. Pinned as distinct from OTHER so
+        // collapsing the two fails here rather than in the field.
+        assert_eq!(rate_limit_bucket(None), RateLimitBucket::Unknown);
+        assert_ne!(rate_limit_bucket(None), rate_limit_bucket(Some(num::TELEMETRY_APP)));
     }
 
     #[test]
