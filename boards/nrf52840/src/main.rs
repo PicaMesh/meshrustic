@@ -110,6 +110,9 @@ async fn main(spawner: Spawner) {
 
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
     usb_log::log::mesh::node_id(config.node_num);
+    // Which firmware this board is actually carrying. A capture without this line predates the
+    // stamp; a hash ending in `+` was built from a tree with uncommitted changes.
+    usb_log::log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
     usb_log::log::mesh::reset_reason(reset_reason);
     usb_log::log::push_line(if radio_wdt.is_some() {
         "[meshrustic] watchdog armed: 30 s, pet by the radio task"
@@ -152,7 +155,9 @@ async fn main(spawner: Spawner) {
     // rather than a default the router has not adopted yet.
     usb_log::log::mesh::device_role(router.device_role());
 
-    spawner.spawn(usb_log::usb_task(p.USBD)).unwrap();
+    spawner
+        .spawn(usb_log::usb_task(p.USBD, config.node_num))
+        .unwrap();
     let saadc_config = saadc::Config::default();
     let mut saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
     // Internal 0.6 V reference with gain 1/6 -> 3.6 V full scale; keep it explicit so

@@ -17,15 +17,35 @@ static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
 static MSOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
 static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 static CDC_STATE: StaticCell<State> = StaticCell::new();
+static SERIAL_NUMBER: StaticCell<[u8; 8]> = StaticCell::new();
+
+/// The USB serial-number string, as this node's id in lowercase hex.
+///
+/// Every board used to report `0001`, so two of them attached at once were indistinguishable:
+/// udev builds `/dev/serial/by-id/` from the serial, could only create one link for the pair, and
+/// the second board appeared under no stable name at all. Logging tools then silently captured one
+/// node and missed the other. The id is already known here — it is derived from the chip's factory
+/// DEVICEID and may be overridden from flash — so it costs nothing to publish and makes the by-id
+/// link name the node.
+fn serial_number_str(node_num: u32) -> &'static str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let buf = SERIAL_NUMBER.init([0u8; 8]);
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte = HEX[((node_num >> (28 - i * 4)) & 0xF) as usize];
+    }
+    // Always ASCII hex by construction; the fallback keeps this total rather than panicking in a
+    // task that runs before anything can report the panic.
+    core::str::from_utf8(buf).unwrap_or("meshrustic")
+}
 
 #[embassy_executor::task]
-pub async fn usb_task(usb: peripherals::USBD) {
+pub async fn usb_task(usb: peripherals::USBD, node_num: u32) {
     let driver = Driver::new(usb, Irqs, HardwareVbusDetect::new(Irqs));
 
     let mut config = Config::new(0x1209, 0x0001);
     config.manufacturer = Some("PicaMesh");
     config.product = Some("meshrustic");
-    config.serial_number = Some("0001");
+    config.serial_number = Some(serial_number_str(node_num));
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
