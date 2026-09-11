@@ -111,6 +111,7 @@ impl RelayIdentityCache {
         edges: &EdgeStore,
         my_node: u32,
         now_ms: u32,
+        modem_preset: u8,
     ) -> Option<u32> {
         let bucket = self.buckets[..self.bucket_count as usize]
             .iter()
@@ -149,6 +150,7 @@ impl RelayIdentityCache {
             rssi,
             snr,
             now_ms,
+            modem_preset,
         );
 
         let result = if best_direct != 0 {
@@ -184,6 +186,7 @@ impl RelayIdentityCache {
             graph.edges(),
             graph.my_node(),
             now_ms,
+            graph.modem_preset(),
         ) {
             return resolved;
         }
@@ -233,6 +236,7 @@ impl RelayIdentityCache {
         rssi: i16,
         snr: i8,
         now_ms: u32,
+        modem_preset: u8,
     ) -> u32 {
         if direct.is_empty() {
             return 0;
@@ -241,7 +245,7 @@ impl RelayIdentityCache {
             return direct[0];
         }
         if rssi != 0 {
-            let packet_etx = calculate_etx(rssi as i32, snr as f32);
+            let packet_etx = calculate_etx(rssi as i32, snr as f32, modem_preset);
             let packet_etx_fixed = (packet_etx * 100.0).clamp(1.0, 65535.0) as u16;
             let mut best = direct[0];
             let mut best_diff = u16::MAX;
@@ -285,7 +289,15 @@ mod tests {
 
         cache.remember_relay_identity(0x1234_00CD, 0xCD, 1_000);
         assert_eq!(
-            cache.resolve_relay_identity(0xCD, -70, 8, graph.edges(), 0xAA, 2_000),
+            cache.resolve_relay_identity(
+                0xCD,
+                -70,
+                8,
+                graph.edges(),
+                0xAA,
+                2_000,
+                graph.modem_preset()
+            ),
             Some(0x1234_00CD)
         );
 
@@ -297,7 +309,8 @@ mod tests {
                 8,
                 graph.edges(),
                 0xAA,
-                RELAY_ID_CACHE_TTL_MS + 2_001
+                RELAY_ID_CACHE_TTL_MS + 2_001,
+                graph.modem_preset()
             ),
             None
         );

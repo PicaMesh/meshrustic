@@ -347,7 +347,7 @@ pub fn coverage_owner(
         };
         // Ownership decides *who* covers a neighbour nobody can be shown to reach; it must not
         // decide *whether* the neighbour is reachable at all. A link past the coverage ceiling
-        // (the "heard once" ETX 40 sentinel included) delivers nothing, so its holder owns
+        // (the curve's own floor included) delivers nothing, so its holder owns
         // nothing: the ranking would otherwise credit it with unique coverage and hand it the
         // first slot, and the packet would wait a full defer window for a relay that cannot
         // come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
@@ -780,7 +780,17 @@ mod tests {
     fn direct_neighbor_is_next_hop() {
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 0);
-        edges.update_edge_from_observation(0xAA, 0xAA, 0xBB, -70, 8, 0, EdgeSource::Reported, 1);
+        edges.update_edge_from_observation(
+            0xAA,
+            0xAA,
+            0xBB,
+            -70,
+            8,
+            0,
+            EdgeSource::Reported,
+            1,
+            mesh_radio::MODEM_DEFAULT_PRESET,
+        );
         let downstream = DownstreamTable::new();
         let route = calculate_route(&edges, &downstream, 0xAA, 0xBB, 0, None);
         assert_eq!(route.next_hop, 0xBB);

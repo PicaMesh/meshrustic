@@ -375,8 +375,9 @@ impl EdgeStore {
         now_ms: u32,
         source: EdgeSource,
         heard_on: RadioId,
+        modem_preset: u8,
     ) -> i8 {
-        let etx = calculate_etx(rssi as i32, snr as f32);
+        let etx = calculate_etx(rssi as i32, snr as f32, modem_preset);
         self.update_edge(my_node, from, to, etx, now_ms, source, true, heard_on)
     }
 

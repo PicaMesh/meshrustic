@@ -8,8 +8,8 @@ use mesh_routing::{
 
 #[test]
 fn etx_monotonic_with_signal_strength() {
-    let weak = calculate_etx(-110, 0.0);
-    let strong = calculate_etx(-60, 10.0);
+    let weak = calculate_etx(-110, 0.0, mesh_radio::MODEM_DEFAULT_PRESET);
+    let strong = calculate_etx(-60, 10.0, mesh_radio::MODEM_DEFAULT_PRESET);
     assert!(strong < weak);
 }
 
@@ -95,9 +95,10 @@ fn relay_slot_index_increases_with_more_candidates() {
 
 #[test]
 fn etx_to_signal_round_trip_is_stable() {
-    let etx = calculate_etx(-75, 8.0);
-    let (rssi, snr) = etx_to_signal(etx);
-    let again = calculate_etx(rssi as i32, snr as f32);
+    let preset = mesh_radio::MODEM_SHORT_SLOW;
+    let etx = calculate_etx(-75, 8.0, preset);
+    let (rssi, snr) = etx_to_signal(etx, preset);
+    let again = calculate_etx(rssi as i32, snr as f32, preset);
     assert!((again - etx).abs() < 5.0);
 }
 

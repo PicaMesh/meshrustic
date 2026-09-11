@@ -2456,6 +2456,7 @@ impl Router {
                 self.graph.edges(),
                 self.node_num,
                 now_ms,
+                self.modem_preset,
             )
             .or_else(|| {
                 self.graph
@@ -2643,6 +2644,7 @@ impl Router {
             self.graph.edges(),
             self.node_num,
             now_ms,
+            self.modem_preset,
         ) {
             if cached != real_node_id {
                 return false;

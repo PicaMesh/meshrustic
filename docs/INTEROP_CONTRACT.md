@@ -155,6 +155,58 @@ is actually waiting for.
 
 ## 3a. Unicast routes
 
+- **Link cost is priced from decode margin, not from absolute signal strength.** `calculate_etx`
+  takes the modem preset in force (`NeighborGraph::modem_preset`, itself a mirror of the stored LoRa
+  config) along with the observed RSSI and SNR. A LoRa frame decodes when SNR clears the
+  demodulator's minimum for the spreading factor in use — a datasheet figure that runs from about
+  -7.5 dB at the fastest preset's spreading factor to about -20 dB at the slowest — so the curve's
+  dominant term is *decode margin*, the reported SNR minus that preset's threshold: deeply negative
+  margin prices a link near the curve's floor regardless of RSSI, margin at the threshold itself
+  prices a link as marginal, and margin a few dB above it saturates the price near its best. RSSI
+  contributes only a second, much narrower term — a mild, monotonic shading for capture effect,
+  interference margin and estimate confidence at very weak absolute signal strength — never enough
+  on its own to move a link across the coverage ceiling except in a narrow band right at the
+  crossover. A reported SNR that is not finite (a corrupted reading) is priced as though it were far
+  below every preset's threshold, not passed through: the curve is total for every
+  `(modem_preset, rssi, snr)`, including non-finite and out-of-range inputs. ETX is still the
+  reciprocal of the resulting delivery probability, stored at the same fixed-point scale
+  (`ETX_MIN_FIXED`, `ETX_MAX_FIXED`) as before; only the function of `(rssi, snr, modem_preset)` that
+  produces it changed. `etx_to_signal` is the inverse used only by its own round-trip test — no
+  production path calls it — and, since an ETX alone cannot say how much of it was RSSI and how much
+  was margin, it reports a fixed representative RSSI and recovers SNR as the preset's threshold plus
+  the recovered margin.
+  `COVERAGE_ETX_CEILING_FIXED` is unchanged by this: recalibrating the curve changes which
+  `(modem_preset, rssi, snr)` triples clear it, which is the point, not the ceiling itself.
+  `OWNER_COST_BUCKET_FIXED`/`COST_BUCKET_FIXED` (§3b's cost buckets) and `broadcast_relay`'s own
+  `BIDI_ETX_CEILING`, which gates a candidate's bidirectional-priority tier, are unchanged too — the
+  new curve's own worst output still sits well below `BIDI_ETX_CEILING`, so it still excludes the
+  same worst-case links from that tier. The wire format carries raw RSSI/SNR
+  per neighbour, never ETX, so this is a local scoring change only: old and new firmware keep
+  exchanging topology correctly and disagree only on the price each puts on it, until every node in a
+  branch runs the recalibrated curve.
+- **Every healthy link now prices into one cost bucket, and that is accepted, not a defect.** Once
+  decode margin reaches the curve's saturation point, every stronger reading — more margin, more
+  RSSI, both — moves the price by only a few hundredths of an ETX, so at a fast preset every link
+  with a comfortable margin lands within a single `COST_BUCKET_FIXED`/`OWNER_COST_BUCKET_FIXED`
+  bucket regardless of how much better one is than another. Two consequences follow, and only one of
+  them is left as-is. Ranking among these links falls through to the node-id tie-break, which is the
+  intended behaviour of a bucketed comparison, not a symptom: ETX means expected transmissions, and a
+  link with 20 dB of margin and one with 10 dB both deliver on essentially the first try, so pricing
+  them alike is the curve being honest, not imprecise — the old curve's spread across that same
+  range was false precision the recalibration exists to remove. Cost is only the secondary ranking
+  key behind unique coverage, and the discrimination that actually matters operationally — healthy,
+  marginal, and hopeless — is exactly what the margin curve's shape is built to preserve; nothing
+  here is remediated, and re-spreading the curve to manufacture ranking differences among healthy
+  links would reintroduce the false precision this change removes.
+  The second consequence is assessed separately: `EdgeStore`'s `etx_change_threshold` is a relative
+  comparison, and a change confined to the saturated band moves the ratio by less than its 1.2
+  trigger, so `mark_topology_dirty` is not called and `topology_dirty_send` stays unset for it — the
+  change reaches peers only on the next periodic broadcast (`TOPOLOGY_BROADCAST_MS`, 600 s) rather
+  than being pushed out early. This is judged immaterial: a change too small to cross a cost bucket
+  can never change which candidate leads a coverage or ownership ranking, so a peer still costing the
+  edge at its last-known-healthy value for up to one broadcast interval reaches the same routing
+  decisions it would have reached with the update in hand immediately. Not remediated, for the same
+  reason the ranking consequence is not: `etx_change_threshold` stays untouched.
 - **An edge is one-directional evidence, priced at the receiver.** A node listing a neighbour
   says it hears that neighbour, at the RSSI and SNR it measured on that neighbour's signal.
   `calculate_route` therefore runs Dijkstra backwards from the destination: a settled node is
@@ -269,8 +321,8 @@ is actually waiting for.
   in `OWNER_COST_BUCKET_FIXED` buckets, with stock ROUTER/REPEATER/ROUTER_CLIENT given way first
   (they rebroadcast regardless of SR and already hold the earliest slots) and the lowest node id
   as the final tie-break. Mute and passive nodes never own: they do not relay. **Ownership stops
-  at the coverage ceiling**: a link past `COVERAGE_ETX_CEILING_FIXED` (the "heard once" ETX 40
-  sentinel included) delivers nothing, so its holder owns nothing and the neighbour is simply
+  at the coverage ceiling**: a link past `COVERAGE_ETX_CEILING_FIXED` (the curve's own floor
+  included) delivers nothing, so its holder owns nothing and the neighbour is simply
   out of reach. Ownership decides *who* carries such a neighbour, never *whether* it is
   reachable — without that bound the ranking credited unique coverage to a node that cannot
   deliver and handed it the first slot, so the packet waited a full defer window for a relay

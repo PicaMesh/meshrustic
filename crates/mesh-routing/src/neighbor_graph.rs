@@ -1120,7 +1120,7 @@ impl NeighborGraph {
             {
                 continue;
             }
-            let etx = calculate_etx(neighbor.rssi as i32, neighbor.snr as f32);
+            let etx = calculate_etx(neighbor.rssi as i32, neighbor.snr as f32, self.modem_preset);
             let relay_has_edge = self
                 .edges
                 .find_node(sender)
@@ -1355,6 +1355,7 @@ impl NeighborGraph {
             now_ms,
             EdgeSource::Reported,
             heard_on,
+            self.modem_preset,
         );
         // The reverse direction is our assumption of symmetry, not something we can measure: we
         // have no way to know how well the neighbour hears us. Recording it as `Reported` gave
@@ -1372,6 +1373,7 @@ impl NeighborGraph {
             now_ms,
             EdgeSource::Inferred,
             heard_on,
+            self.modem_preset,
         );
         self.upsert_direct_signal(node_id, rssi, snr, now_ms);
         result
@@ -1506,7 +1508,7 @@ impl NeighborGraph {
         // A downstream entry stands for a path, so it is priced per hop the packet travelled. An
         // inferred edge stands for one hop — the gateway's link to the source — so it is priced
         // as one, whatever route the packet took to reach us.
-        let nominal_hop = calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR);
+        let nominal_hop = calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR, self.modem_preset);
         let path_etx = nominal_hop * hops_used as f32;
 
         let is_new_gateway =
@@ -1547,6 +1549,7 @@ impl NeighborGraph {
             now_ms,
             EdgeSource::Mirrored,
             heard_on,
+            self.modem_preset,
         );
 
         if result_us_to_relay == EDGE_NEW || result_us_to_relay == EDGE_SIGNIFICANT_CHANGE {
@@ -2803,7 +2806,11 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        graph.observe_direct_neighbor(RELAY, -80, 10, 0, 0);
+        // -80/10 and -70/12 both clear LONG_FAST's decode threshold by a wide margin and saturate
+        // to the same delivery probability under the margin-dominant curve, so they no longer pin
+        // a variance change (the point of this test) — -90/-15 sits well below the margin curve's
+        // saturation point, so moving to -70/12 is a real change under the new curve too.
+        graph.observe_direct_neighbor(RELAY, -90, -15, 0, 0);
         let variance_before = graph
             .edges()
             .find_node(ME)
@@ -3455,8 +3462,11 @@ mod tests {
         graph.observe_packet(FAR, 7, 5, 0xBB, -16, 14, 2_000, 0, Some(RELAYER), 0x77);
         let route = graph.get_route(FAR, 2_000);
         assert_eq!(route.next_hop, RELAYER);
-        let nominal =
-            crate::graph::etx_to_fixed(calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR));
+        let nominal = crate::graph::etx_to_fixed(calculate_etx(
+            INFERRED_LINK_RSSI,
+            INFERRED_LINK_SNR,
+            graph.modem_preset(),
+        ));
         assert!(
             route.cost_fixed as u32 >= 2 * nominal as u32,
             "two inferred hops must cost at least twice the nominal link: {} < {}",
@@ -4083,7 +4093,7 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA);
         graph.observe_direct_neighbor(0xBB, -70, 8, 100, 0);
-        let expected_etx = etx_to_fixed(calculate_etx(-75, 8.0));
+        let expected_etx = etx_to_fixed(calculate_etx(-75, 8.0, graph.modem_preset()));
         let neighbor = PackedNeighbor {
             node_id: 0xCC,
             rssi: -75,
