@@ -151,10 +151,14 @@ async fn main(spawner: Spawner) {
     ));
     // After the identity is set, so the line reports the role the graph will actually rank with
     // rather than a default the router has not adopted yet.
-    usb_log::log::mesh::device_role(router.device_role());
+    // Role travels to the USB task so it can be re-stated on every connection: like the node id
+    // and the build stamp, a line pushed here is evicted from the log ring long before a host
+    // attaches, and a capture that cannot say a node's role cannot judge its relay decisions.
+    let own_role = router.device_role();
+    usb_log::log::mesh::device_role(own_role);
 
     spawner
-        .spawn(usb_log::usb_task(p.USBD, config.node_num))
+        .spawn(usb_log::usb_task(p.USBD, config.node_num, own_role))
         .unwrap();
     let saadc_config = saadc::Config::default();
     let mut saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
