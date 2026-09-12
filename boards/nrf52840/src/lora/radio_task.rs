@@ -1,5 +1,6 @@
 //! Embassy task driving radio 0 RX/TX and AirTime ticks.
 
+use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 use mesh_protocol::{num::TEXT_MESSAGE_APP, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_radio::{
@@ -31,6 +32,7 @@ pub async fn radio_task(
     node_num: u32,
     mut watchdog: Option<embassy_nrf::wdt::WatchdogHandle>,
     host_cmd: &'static HostCommandChannel,
+    mut dio1_wake: embassy_nrf::gpio::Input<'static>,
 ) {
     let air = air_time();
     let profile = slot.driver.profile();
@@ -368,7 +370,26 @@ pub async fn radio_task(
             || !slot.rx_queue.is_empty();
         let sleep_ms = if busy { LOOP_ACTIVE_MS } else { LOOP_IDLE_MS };
 
-        Timer::after_millis(sleep_ms).await;
+        // Wake on the radio's own interrupt line as well as on the tick. Every received frame
+        // carries `now_ms`, taken at the top of the next iteration, so before this the stamp was
+        // whichever tick happened to notice the frame — up to LOOP_IDLE_MS out. Waking on the edge
+        // makes it the instant the radio raised DIO1, and it is still taken before any SPI traffic,
+        // so the error no longer varies with payload length either.
+        //
+        // A rising edge, not a level: DIO1 stays high until the interrupt is cleared, so waiting on
+        // the level would return immediately and spin. Still `select`ed with the tick, which remains
+        // the backstop — a missed or spurious edge can cost latency, never the loop — and the tick
+        // alone continues to drive maintenance, transmit release and duty-cycle bookkeeping. The
+        // line is shared with the blocking transmit inside the radio crate, so a wake is not by
+        // itself evidence of a reception; what it meant is decided by the IRQ status read above.
+        match select(
+            Timer::after_millis(sleep_ms),
+            dio1_wake.wait_for_rising_edge(),
+        )
+        .await
+        {
+            Either::First(()) | Either::Second(()) => {}
+        }
     }
 }
 

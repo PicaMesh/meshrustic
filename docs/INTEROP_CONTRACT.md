@@ -119,6 +119,19 @@ is actually waiting for.
   stock does since 2.5 (`build_app_wire_frame`, the topology, nodeinfo and telemetry frame
   builders, the PKI frame builder). Receivers treat a relay byte equal to the sender's byte, or
   zero, as a direct transmission (`is_direct_packet`).
+- **Device telemetry interval is stock's field, in stock's units.** The periodic device-metrics
+  broadcast is driven by `ModuleConfig.TelemetryConfig.device_update_interval`, in **seconds**, so a
+  stock client setting it does what that client expects. **Zero means unset, not disabled** — it
+  selects the firmware default of 20 minutes, matching how stock reads an absent value; there is
+  deliberately no "off" encoding, because a node that publishes nothing about itself is
+  indistinguishable from one that has died. A configured value below an **airtime-derived floor** is
+  rejected rather than clamped: the floor is computed from a maximum-length packet's airtime against
+  half the region's duty-cycle budget, so a single telemetry stream cannot alone fill it, and it
+  moves with the preset rather than being a literal. The value is persisted in the stored config and
+  survives a reboot; older records carry zero in that field and therefore take the default, so no
+  stored config is invalidated by its introduction. Tests:
+  `default_interval_is_twenty_minutes`, `zero_means_default_not_disable`,
+  `set_interval_and_persist_reload`, `below_airtime_floor_is_rejected`.
 - **Next hop.** A relayed unicast carries the next hop from our own route or zero, never the
   byte inherited from the incoming frame (`relay_header_with_next_hop_opts`). Zero means "any
   relay may carry it", stock's `NO_NEXT_HOP_PREFERENCE`.

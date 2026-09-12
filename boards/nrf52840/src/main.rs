@@ -14,7 +14,7 @@ use cortex_m_rt::{exception, ExceptionFrame};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
+use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::rng;
 use embassy_nrf::saadc;
@@ -138,6 +138,15 @@ async fn main(spawner: Spawner) {
     let spim = spim::Spim::new(p.SPI3, Irqs, p.P1_11, p.P0_02, p.P1_15, spi_cfg);
 
     let cs = Output::new(p.P1_13, Level::High, OutputDrive::Standard);
+    // A second, read-only handle on DIO1 so the radio task can be woken by the edge instead of
+    // discovering it on its next poll. The sx126x crate keeps the first handle and busy-waits on it
+    // inside its blocking transmit, so the pin cannot simply be moved here. Both handles are inputs
+    // configured identically and neither drives the line; the only exclusive resource is the GPIOTE
+    // channel, which this handle alone allocates.
+    let dio1_wake = Input::new(
+        unsafe { embassy_nrf::Peripheral::clone_unchecked(&p.P0_10) },
+        Pull::None,
+    );
     let lora_pins = LoRaPins::power_on(p.P0_13, p.P0_09, p.P0_29, p.P0_10);
     let mut driver = create_radio(spim, cs, lora_pins, Sx1262ModuleProfile::default_board());
     driver.set_radio_config(eu868_config_for_preset(config.lora.modem_preset));
@@ -192,6 +201,7 @@ async fn main(spawner: Spawner) {
             config.node_num,
             radio_wdt,
             host_cmd_channel,
+            dio1_wake,
         ))
         .unwrap();
 
