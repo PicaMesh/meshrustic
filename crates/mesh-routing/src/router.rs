@@ -46,7 +46,7 @@ use crate::sr_log::{
     RelayRetxCancelReason, SrLog, SrLogEvent, SrSkipReason, T1CancelReason, MAX_SR_LOG,
 };
 use crate::telemetry::{
-    build_device_telemetry_wire_frame, DeviceMetricsSnapshot, DEVICE_TELEMETRY_BROADCAST_MS,
+    build_device_telemetry_wire_frame, device_telemetry_interval_ms, DeviceMetricsSnapshot,
 };
 use crate::topology::{
     build_app_wire_frame, build_topology_wire_frame, extract_packed_neighbors,
@@ -2379,7 +2379,8 @@ impl Router {
         // is deliberately not gated on having a battery reading: an unknown pack voltage
         // only drops fields 1-2 from the encoded DeviceMetrics.
         if (self.last_telemetry_ms == 0
-            || now_ms.wrapping_sub(self.last_telemetry_ms) >= DEVICE_TELEMETRY_BROADCAST_MS)
+            || now_ms.wrapping_sub(self.last_telemetry_ms)
+                >= device_telemetry_interval_ms(self.admin.device_update_interval_secs))
             && !self.pending_telemetry.active
         {
             self.schedule_telemetry_broadcast(now_ms);

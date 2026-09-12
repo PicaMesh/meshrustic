@@ -35,16 +35,38 @@ message AdminMessage {
     User get_owner_response = 4;
     ConfigType get_config_request = 5;
     Config get_config_response = 6;
-    uint32 get_module_config_request = 7;
+    ModuleConfigType get_module_config_request = 7;
     ModuleConfig get_module_config_response = 8;
     bool get_device_metadata_request = 12;
     DeviceMetadata get_device_metadata_response = 13;
     Config set_config = 34;
+    ModuleConfig set_module_config = 35;
     bool begin_edit_settings = 64;
     bool commit_edit_settings = 65;
     int32 reboot_seconds = 97;
   }
+
+  enum ModuleConfigType {
+    MQTT_CONFIG = 0;
+    SERIAL_CONFIG = 1;
+    EXTNOTIF_CONFIG = 2;
+    STOREFORWARD_CONFIG = 3;
+    RANGETEST_CONFIG = 4;
+    TELEMETRY_CONFIG = 5;
+    CANNEDMSG_CONFIG = 6;
+    AUDIO_CONFIG = 7;
+    REMOTEHARDWARE_CONFIG = 8;
+    NEIGHBORINFO_CONFIG = 9;
+  }
 }
 
-// Empty stub ModuleConfig so get_module_config always has a reply payload.
-message ModuleConfig {}
+// ModuleConfig subset: TelemetryConfig.device_update_interval (seconds).
+message ModuleConfig {
+  message TelemetryConfig {
+    uint32 device_update_interval = 1;
+  }
+
+  oneof payload_variant {
+    TelemetryConfig telemetry = 6;
+  }
+}

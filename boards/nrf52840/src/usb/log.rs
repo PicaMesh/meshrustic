@@ -488,7 +488,7 @@ pub mod radio {
         pos: &mut usize,
         parsed: &mesh_protocol::ParsedPacket,
     ) {
-        append_slice(line, pos, b", maybe: id=0x");
+        append_slice(line, pos, b" maybe: id=0x");
         *pos += push_hex_u32_8(&mut line[*pos..], parsed.id);
         append_slice(line, pos, b" fr=!");
         *pos += push_hex_u32_8(&mut line[*pos..], parsed.from);

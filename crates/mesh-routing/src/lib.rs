@@ -40,12 +40,13 @@ pub use admin::{
     ROUTING_ERROR_PKI_FAILED, ROUTING_ERROR_PKI_UNKNOWN_PUBKEY,
 };
 pub use admin_codec::{
-    decode_admin_message, decode_channel, decode_config, encode_admin_message, encode_channel,
-    encode_config, AdminMessage, AdminPayload, ConfigPayload, DeviceMetadata, WireChannel,
-    WireChannelSettings, WireDeviceConfig, WireLoRaConfig, WireSecurityConfig, ADMIN_APP,
-    CHANNEL_ROLE_DISABLED, CHANNEL_ROLE_PRIMARY, CHANNEL_ROLE_SECONDARY, CONFIG_TYPE_DEVICE,
-    CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS, REGION_EU_868,
-    SESSION_PASSKEY_LEN,
+    decode_admin_message, decode_channel, decode_config, decode_module_config,
+    encode_admin_message, encode_channel, encode_config, encode_module_config, AdminMessage,
+    AdminPayload, ConfigPayload, DeviceMetadata, ModuleConfigPayload, WireChannel,
+    WireChannelSettings, WireDeviceConfig, WireLoRaConfig, WireSecurityConfig, WireTelemetryConfig,
+    ADMIN_APP, CHANNEL_ROLE_DISABLED, CHANNEL_ROLE_PRIMARY, CHANNEL_ROLE_SECONDARY,
+    CONFIG_TYPE_DEVICE, CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY,
+    MAX_ADMIN_KEYS, MODULE_CONFIG_TYPE_TELEMETRY, REGION_EU_868, SESSION_PASSKEY_LEN,
 };
 pub use bridge::{
     evaluate_bridge_targets, should_bridge_to, BridgeDedupCache, BridgeEval, BridgeLeg,
@@ -106,8 +107,9 @@ pub use sr_log::{
 pub use sr_role::{role_is_active_routing, role_is_mute, role_is_passive};
 pub use telemetry::{
     battery_level_from_mv, build_device_telemetry_wire_frame, decode_device_metrics,
-    extract_device_metrics, interpret_battery_reading, is_plausible_battery_reading,
-    DecodedDeviceMetrics, DeviceMetricsSnapshot, DEVICE_TELEMETRY_BROADCAST_MS,
+    device_telemetry_interval_ms, extract_device_metrics, interpret_battery_reading,
+    is_plausible_battery_reading, min_device_update_interval_secs, DecodedDeviceMetrics,
+    DeviceMetricsSnapshot, DEFAULT_DEVICE_UPDATE_INTERVAL_SECS, DEVICE_TELEMETRY_BROADCAST_MS,
     MAGIC_USB_BATTERY_LEVEL, TELEMETRY_APP,
 };
 pub use topology::{

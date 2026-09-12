@@ -10,14 +10,38 @@ use crate::topology::{
 };
 
 pub const TELEMETRY_APP: u32 = 67;
-/// Periodic device telemetry broadcast interval (20 min; config later).
-pub const DEVICE_TELEMETRY_BROADCAST_MS: u32 = 1_200_000;
+/// Default `ModuleConfig.TelemetryConfig.device_update_interval` when unset / zero (seconds).
+pub const DEFAULT_DEVICE_UPDATE_INTERVAL_SECS: u32 = 1_200;
+/// Default periodic device telemetry broadcast interval (20 min).
+pub const DEVICE_TELEMETRY_BROADCAST_MS: u32 = DEFAULT_DEVICE_UPDATE_INTERVAL_SECS * 1_000;
 /// Wire value when USB-powered (no battery percent).
 pub const MAGIC_USB_BATTERY_LEVEL: u32 = 101;
 /// Plausible single-cell LiPo range and SAADC saturation threshold.
 pub const MIN_BATTERY_MV: u32 = 2500;
 pub const MAX_BATTERY_MV: u32 = 4350;
 pub const ADC_SATURATED_RAW: u32 = 3950;
+
+/// Effective broadcast interval in ms: 0 / unset → default.
+pub fn device_telemetry_interval_ms(stored_secs: u32) -> u32 {
+    let secs = if stored_secs == 0 {
+        DEFAULT_DEVICE_UPDATE_INTERVAL_SECS
+    } else {
+        stored_secs
+    };
+    secs.saturating_mul(1_000)
+}
+
+/// Shortest accepted `device_update_interval` (seconds) for `radio`.
+///
+/// Derived so a single telemetry stream cannot alone fill the polite duty-cycle
+/// budget: `ceil(airtime_ms * 100 / polite_percent / 1000)`, using max-length
+/// packet airtime (conservative).
+pub fn min_device_update_interval_secs(radio: &mesh_radio::RadioConfig) -> u32 {
+    let airtime_ms = mesh_radio::packet_time_ms(radio, 255, false).max(1);
+    let polite_pct = (u32::from(radio.region.duty_cycle_percent) * 50 / 100).max(1);
+    let interval_ms = airtime_ms.saturating_mul(100).div_ceil(polite_pct);
+    interval_ms.div_ceil(1_000).max(1)
+}
 
 /// Fields advertised in `Telemetry.device_metrics` (port 67).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -321,6 +345,30 @@ mod tests {
     fn saturated_adc_is_not_plausible() {
         assert!(!is_plausible_battery_reading(5997, 4093));
         assert!(!is_plausible_battery_reading(4200, 4000));
+    }
+
+    #[test]
+    fn device_telemetry_interval_zero_is_default() {
+        assert_eq!(
+            device_telemetry_interval_ms(0),
+            DEVICE_TELEMETRY_BROADCAST_MS
+        );
+        assert_eq!(device_telemetry_interval_ms(600), 600_000);
+    }
+
+    #[test]
+    fn min_interval_floor_is_airtime_derived() {
+        let radio = mesh_radio::eu868_config_for_preset(mesh_radio::MODEM_DEFAULT_PRESET);
+        let floor = min_device_update_interval_secs(&radio);
+        assert!(floor > 1);
+        let airtime = mesh_radio::packet_time_ms(&radio, 255, false).max(1);
+        let polite = (u32::from(radio.region.duty_cycle_percent) * 50 / 100).max(1);
+        let expected = airtime
+            .saturating_mul(100)
+            .div_ceil(polite)
+            .div_ceil(1_000)
+            .max(1);
+        assert_eq!(floor, expected);
     }
 
     #[test]

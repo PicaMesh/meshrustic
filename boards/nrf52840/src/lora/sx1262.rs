@@ -237,7 +237,7 @@ impl Sx1262Driver {
         if let Ok(header) = PacketHeader::decode(payload) {
             let parsed = header.parse();
             defmt::warn!(
-                "[Radio0] RX crc error len={} rssi={} snr={}, maybe: id=0x{:08x} fr=!{:08x} to=!{:08x}",
+                "[Radio0] RX crc error len={} rssi={} snr={} maybe: id=0x{:08x} fr=!{:08x} to=!{:08x}",
                 len,
                 rssi,
                 snr,

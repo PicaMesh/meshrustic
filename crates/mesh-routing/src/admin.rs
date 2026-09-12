@@ -5,13 +5,16 @@ use mesh_store::{NodeConfig, ADMIN_KEY_SLOTS, BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_A
 
 use crate::admin_codec::{
     decode_admin_message, encode_admin_message, AdminMessage, AdminPayload, ConfigPayload,
-    DeviceMetadata, WireChannel, WireChannelSettings, WireDeviceConfig, WireLoRaConfig,
-    WireSecurityConfig, CHANNEL_ROLE_DISABLED, CHANNEL_ROLE_PRIMARY, CONFIG_TYPE_DEVICE,
-    CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS, REGION_EU_868,
+    DeviceMetadata, ModuleConfigPayload, WireChannel, WireChannelSettings, WireDeviceConfig,
+    WireLoRaConfig, WireSecurityConfig, WireTelemetryConfig, CHANNEL_ROLE_DISABLED,
+    CHANNEL_ROLE_PRIMARY, CONFIG_TYPE_DEVICE, CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY,
+    CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS, MODULE_CONFIG_TYPE_TELEMETRY, REGION_EU_868,
     SESSION_PASSKEY_LEN,
 };
 use crate::nodeinfo::{NodeInfoIdentity, DEVICE_ROLE_ROUTER, HW_MODEL_NRF52_PROMICRO_DIY};
+use crate::telemetry::min_device_update_interval_secs;
 use mesh_crypto::DEFAULT_PSK;
+use mesh_radio::eu868_config_for_preset;
 
 /// Session passkey validity window (ms).
 pub const ADMIN_SESSION_TTL_MS: u32 = 300_000;
@@ -35,6 +38,7 @@ pub struct AdminState {
     pub editing: bool,
     pub buffered_lora: Option<WireLoRaConfig>,
     pub buffered_admin_keys: Option<[[u8; 32]; ADMIN_KEY_SLOTS]>,
+    pub buffered_device_update_interval_secs: Option<u32>,
     pub admin_public_keys: [[u8; 32]; ADMIN_KEY_SLOTS],
     pub private_key: [u8; 32],
     pub public_key: [u8; 32],
@@ -43,6 +47,8 @@ pub struct AdminState {
     pub hop_limit: u8,
     pub tx_power_dbm: u8,
     pub ok_to_mqtt: bool,
+    /// Stored `device_update_interval` seconds; 0 = firmware default.
+    pub device_update_interval_secs: u32,
     pub pending_reboot_seconds: Option<i32>,
     pub config_dirty: bool,
     /// Host/test only: replace Appendix A builtins for real PKI keypairs.
@@ -67,6 +73,7 @@ impl AdminState {
             editing: false,
             buffered_lora: None,
             buffered_admin_keys: None,
+            buffered_device_update_interval_secs: None,
             admin_public_keys: [EMPTY_ADMIN_KEY; ADMIN_KEY_SLOTS],
             private_key: [0; 32],
             public_key: [0; 32],
@@ -75,6 +82,7 @@ impl AdminState {
             hop_limit: 3,
             tx_power_dbm: 27,
             ok_to_mqtt: true,
+            device_update_interval_secs: 0,
             pending_reboot_seconds: None,
             config_dirty: false,
             #[cfg(any(test, feature = "std"))]
@@ -100,6 +108,7 @@ impl AdminState {
         self.hop_limit = cfg.lora.hop_limit;
         self.tx_power_dbm = cfg.lora.tx_power_dbm;
         self.ok_to_mqtt = cfg.lora.ok_to_mqtt;
+        self.device_update_interval_secs = cfg.device_update_interval_secs;
     }
 
     /// Deprecated name kept as alias for call sites.
@@ -117,6 +126,7 @@ impl AdminState {
         cfg.lora.ok_to_mqtt = self.ok_to_mqtt;
         cfg.private_key = self.private_key;
         cfg.public_key = self.public_key;
+        cfg.device_update_interval_secs = self.device_update_interval_secs;
     }
 
     pub fn export_admin_keys_and_lora(&self, cfg: &mut NodeConfig) {
@@ -273,10 +283,17 @@ pub fn handle_admin(
             };
             outcome.response = Some(resp);
         }
-        AdminPayload::GetModuleConfigRequest(_) => {
+        AdminPayload::GetModuleConfigRequest(config_type) => {
             let passkey = state.issue_session(now_ms);
+            let module = if config_type == MODULE_CONFIG_TYPE_TELEMETRY {
+                ModuleConfigPayload::Telemetry(WireTelemetryConfig {
+                    device_update_interval: state.device_update_interval_secs,
+                })
+            } else {
+                ModuleConfigPayload::Empty
+            };
             let resp = AdminMessage {
-                payload: AdminPayload::GetModuleConfigResponse,
+                payload: AdminPayload::GetModuleConfigResponse(module),
                 has_session_passkey: true,
                 session_passkey: passkey,
             };
@@ -319,6 +336,7 @@ pub fn handle_admin(
             state.editing = true;
             state.buffered_lora = None;
             state.buffered_admin_keys = None;
+            state.buffered_device_update_interval_secs = None;
             outcome.routing_ok = true;
         }
         AdminPayload::CommitEditSettings => {
@@ -342,6 +360,15 @@ pub fn handle_admin(
             if let Some(keys) = state.buffered_admin_keys.take() {
                 state.admin_public_keys = keys;
                 outcome.config_dirty = true;
+            }
+            if let Some(secs) = state.buffered_device_update_interval_secs.take() {
+                match apply_device_update_interval(state, secs) {
+                    Ok(()) => outcome.config_dirty = true,
+                    Err(()) => {
+                        outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
+                        return outcome;
+                    }
+                }
             }
             state.editing = false;
             outcome.apply_modem_preset = preset_changed;
@@ -390,6 +417,40 @@ pub fn handle_admin(
                     }
                 }
                 ConfigPayload::Device(_) | ConfigPayload::Sessionkey | ConfigPayload::Empty => {}
+            }
+            outcome.routing_ok = true;
+        }
+        AdminPayload::SetModuleConfig(config) => {
+            if !state.session_ok(&msg, now_ms) {
+                outcome.routing_error = Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY);
+                return outcome;
+            }
+            match config {
+                ModuleConfigPayload::Telemetry(tel) => {
+                    if state.editing {
+                        let radio = eu868_config_for_preset(state.modem_preset);
+                        if tel.device_update_interval != 0
+                            && tel.device_update_interval < min_device_update_interval_secs(&radio)
+                        {
+                            outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
+                            return outcome;
+                        }
+                        state.buffered_device_update_interval_secs =
+                            Some(tel.device_update_interval);
+                    } else {
+                        match apply_device_update_interval(state, tel.device_update_interval) {
+                            Ok(()) => {
+                                outcome.config_dirty = true;
+                                state.config_dirty = true;
+                            }
+                            Err(()) => {
+                                outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
+                                return outcome;
+                            }
+                        }
+                    }
+                }
+                ModuleConfigPayload::Empty => {}
             }
             outcome.routing_ok = true;
         }
@@ -513,6 +574,17 @@ fn apply_lora_to_state(state: &mut AdminState, lora: &WireLoRaConfig) -> Result<
     state.use_preset = true;
     state.ok_to_mqtt = lora.config_ok_to_mqtt;
     Ok(preset)
+}
+
+fn apply_device_update_interval(state: &mut AdminState, secs: u32) -> Result<(), ()> {
+    if secs != 0 {
+        let radio = eu868_config_for_preset(state.modem_preset);
+        if secs < min_device_update_interval_secs(&radio) {
+            return Err(());
+        }
+    }
+    state.device_update_interval_secs = secs;
+    Ok(())
 }
 
 /// Encode admin response payload bytes.
@@ -884,7 +956,7 @@ mod tests {
         );
         assert!(matches!(
             mout.response.unwrap().payload,
-            AdminPayload::GetModuleConfigResponse
+            AdminPayload::GetModuleConfigResponse(ModuleConfigPayload::Empty)
         ));
     }
 

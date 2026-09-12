@@ -11,6 +11,9 @@ pub const CONFIG_TYPE_LORA: u32 = 5;
 pub const CONFIG_TYPE_SECURITY: u32 = 7;
 pub const CONFIG_TYPE_SESSIONKEY: u32 = 8;
 
+/// `ModuleConfigType.TELEMETRY_CONFIG`.
+pub const MODULE_CONFIG_TYPE_TELEMETRY: u32 = 5;
+
 /// `RegionCode.EU_868`.
 pub const REGION_EU_868: u32 = 3;
 
@@ -143,6 +146,19 @@ pub enum ConfigPayload {
     Sessionkey,
 }
 
+/// `ModuleConfig.TelemetryConfig` wire fields we honor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct WireTelemetryConfig {
+    /// Seconds; 0 = unset / use firmware default.
+    pub device_update_interval: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleConfigPayload {
+    Empty,
+    Telemetry(WireTelemetryConfig),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DeviceMetadata {
     pub firmware_version: [u8; 32],
@@ -171,10 +187,11 @@ pub enum AdminPayload {
     GetConfigRequest(u32),
     GetConfigResponse(ConfigPayload),
     GetModuleConfigRequest(u32),
-    GetModuleConfigResponse,
+    GetModuleConfigResponse(ModuleConfigPayload),
     GetDeviceMetadataRequest,
     GetDeviceMetadataResponse(DeviceMetadata),
     SetConfig(ConfigPayload),
+    SetModuleConfig(ModuleConfigPayload),
     BeginEditSettings,
     CommitEditSettings,
     RebootSeconds(i32),
@@ -271,6 +288,76 @@ pub fn encode_security_config(sec: &WireSecurityConfig) -> heapless::Vec<u8, 200
         push_varint_field(&mut out, 8, 1);
     }
     out
+}
+
+pub fn encode_telemetry_config(tel: &WireTelemetryConfig) -> heapless::Vec<u8, 16> {
+    let mut out = heapless::Vec::new();
+    if tel.device_update_interval != 0 {
+        push_varint_field(&mut out, 1, tel.device_update_interval);
+    }
+    out
+}
+
+/// Encode `ModuleConfig` oneof payload bytes.
+pub fn encode_module_config(config: &ModuleConfigPayload) -> heapless::Vec<u8, 64> {
+    let mut out = heapless::Vec::new();
+    match config {
+        ModuleConfigPayload::Empty => {}
+        ModuleConfigPayload::Telemetry(tel) => {
+            let inner = encode_telemetry_config(tel);
+            push_bytes_field(&mut out, 6, &inner);
+        }
+    }
+    out
+}
+
+pub fn decode_telemetry_config(payload: &[u8]) -> Option<WireTelemetryConfig> {
+    let mut tel = WireTelemetryConfig::default();
+    let mut idx = 0usize;
+    while idx < payload.len() {
+        let (tag, mut i) = read_varint(payload, idx)?;
+        let field = tag >> 3;
+        let wire = (tag & 0x07) as u8;
+        match (field, wire) {
+            (1, 0) => {
+                let (v, ni) = read_varint(payload, i)?;
+                tel.device_update_interval = v;
+                i = ni;
+            }
+            _ => {
+                i = skip_field(payload, i, wire)?;
+            }
+        }
+        idx = i;
+    }
+    Some(tel)
+}
+
+pub fn decode_module_config(payload: &[u8]) -> Option<ModuleConfigPayload> {
+    let mut result = ModuleConfigPayload::Empty;
+    let mut idx = 0usize;
+    while idx < payload.len() {
+        let (tag, mut i) = read_varint(payload, idx)?;
+        let field = tag >> 3;
+        let wire = (tag & 0x07) as u8;
+        match (field, wire) {
+            (6, 2) => {
+                let (len, ni) = read_varint(payload, i)?;
+                let end = ni + len as usize;
+                if end > payload.len() {
+                    return None;
+                }
+                result =
+                    ModuleConfigPayload::Telemetry(decode_telemetry_config(&payload[ni..end])?);
+                i = end;
+            }
+            _ => {
+                i = skip_field(payload, i, wire)?;
+            }
+        }
+        idx = i;
+    }
+    Some(result)
 }
 
 pub fn encode_channel(ch: &WireChannel) -> heapless::Vec<u8, 96> {
@@ -620,9 +707,9 @@ pub fn encode_admin_message(msg: &AdminMessage) -> heapless::Vec<u8, 240> {
         AdminPayload::GetModuleConfigRequest(config_type) => {
             push_varint_field(&mut out, 7, *config_type);
         }
-        AdminPayload::GetModuleConfigResponse => {
-            // Empty ModuleConfig message.
-            push_bytes_field(&mut out, 8, &[]);
+        AdminPayload::GetModuleConfigResponse(config) => {
+            let inner = encode_module_config(config);
+            push_bytes_field(&mut out, 8, &inner);
         }
         AdminPayload::GetDeviceMetadataRequest => {
             push_varint_field(&mut out, 12, 1);
@@ -634,6 +721,10 @@ pub fn encode_admin_message(msg: &AdminMessage) -> heapless::Vec<u8, 240> {
         AdminPayload::SetConfig(config) => {
             let inner = encode_config(config);
             push_bytes_field(&mut out, 34, &inner);
+        }
+        AdminPayload::SetModuleConfig(config) => {
+            let inner = encode_module_config(config);
+            push_bytes_field(&mut out, 35, &inner);
         }
         AdminPayload::BeginEditSettings => {
             push_varint_field(&mut out, 64, 1);
@@ -716,8 +807,8 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
                 if end > payload.len() {
                     return None;
                 }
-                // Empty ModuleConfig body is fine.
-                msg.payload = AdminPayload::GetModuleConfigResponse;
+                msg.payload =
+                    AdminPayload::GetModuleConfigResponse(decode_module_config(&payload[ni..end])?);
                 i = end;
             }
             (12, 0) => {
@@ -745,6 +836,16 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
                     return None;
                 }
                 msg.payload = AdminPayload::SetConfig(decode_config(&payload[ni..end])?);
+                i = end;
+            }
+            (35, 2) => {
+                let (len, ni) = read_varint(payload, i)?;
+                let end = ni + len as usize;
+                if end > payload.len() {
+                    return None;
+                }
+                msg.payload =
+                    AdminPayload::SetModuleConfig(decode_module_config(&payload[ni..end])?);
                 i = end;
             }
             (64, 0) => {

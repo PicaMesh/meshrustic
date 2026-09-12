@@ -459,7 +459,7 @@ fn get_device_role_and_module_config_stub() {
     let tx = router.poll_admin_tx(4_100).unwrap();
     assert!(matches!(
         decrypt_pki_admin(&tx, &b1_priv, &node_pub).1.payload,
-        AdminPayload::GetModuleConfigResponse
+        AdminPayload::GetModuleConfigResponse(_)
     ));
 }
 
@@ -502,7 +502,7 @@ fn rapid_multi_get_queue_and_rate_limit() {
             msg.payload,
             AdminPayload::GetChannelResponse(_)
                 | AdminPayload::GetConfigResponse(_)
-                | AdminPayload::GetModuleConfigResponse
+                | AdminPayload::GetModuleConfigResponse(_)
         ));
         replies += 1;
     }

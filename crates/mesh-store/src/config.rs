@@ -91,6 +91,9 @@ pub struct NodeConfig {
     pub lora: LoRaConfig,
     /// Configurable admin public keys only (built-ins are firmware constants).
     pub admin_public_keys: [[u8; 32]; ADMIN_KEY_SLOTS],
+    /// `ModuleConfig.TelemetryConfig.device_update_interval` (seconds).
+    /// Zero means unset → firmware default (20 min).
+    pub device_update_interval_secs: u32,
 }
 
 impl NodeConfig {
@@ -102,6 +105,7 @@ impl NodeConfig {
             channel_key: default_channel_key(),
             lora: LoRaConfig::eu868_default(),
             admin_public_keys: [[0u8; 32]; ADMIN_KEY_SLOTS],
+            device_update_interval_secs: 0,
         }
     }
 

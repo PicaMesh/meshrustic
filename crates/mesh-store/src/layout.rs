@@ -23,7 +23,8 @@
 //! | 121 | 1 | frozen (v4) | ok_to_mqtt (0/1); records before v4 decode as 1 |
 //! | 122 | 2 | reserved | must encode as 0; ignore on decode (future flags) |
 //! | 124 | 96 | frozen | `admin_public_keys[3][32]` |
-//! | 220 | 32 | reserved | forward-compatible padding — encode 0; do not reinterpret |
+//! | 220 | 4 | v4+ | `device_update_interval_secs` (0 = default); was reserved zeros |
+//! | 224 | 28 | reserved | forward-compatible padding — encode 0; do not reinterpret |
 //! | 252 | 4 | frozen | CRC32 over bytes `[0..252)` |
 //!
 //! Additive settings: prefer consuming reserved bytes with a version bump only when
@@ -42,9 +43,12 @@ pub const STORE_VERSION_V3: u32 = 3;
 pub const STORE_RECORD_LEN: usize = 256;
 pub const STORE_RECORD_LEN_V1: usize = 128;
 /// Start of forward-compatible reserved tail (before CRC).
-pub const STORE_RESERVED_START: usize = 220;
+pub const STORE_RESERVED_START: usize = 224;
 pub const STORE_RESERVED_END: usize = 252;
 pub const STORE_CRC_OFFSET: usize = 252;
+/// Flash offset of `device_update_interval_secs` (u32 LE).
+#[cfg(test)]
+pub const STORE_DEVICE_UPDATE_INTERVAL_OFFSET: usize = 220;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreError {
@@ -91,7 +95,8 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
         let off = 124 + i * 32;
         out[off..off + 32].copy_from_slice(&config.admin_public_keys[i]);
     }
-    // 220..252 reserved — left zero for forward compatibility
+    out[220..224].copy_from_slice(&config.device_update_interval_secs.to_le_bytes());
+    // 224..252 reserved — left zero for forward compatibility
 
     let crc = crc32(&out[..STORE_CRC_OFFSET]);
     out[STORE_CRC_OFFSET..STORE_RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
@@ -161,6 +166,8 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
         key.copy_from_slice(&buf[off..off + 32]);
     }
 
+    let device_update_interval_secs = u32::from_le_bytes(buf[220..224].try_into().unwrap());
+
     Ok(NodeConfig {
         node_num: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
         private_key,
@@ -168,6 +175,7 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
         channel_key,
         lora,
         admin_public_keys,
+        device_update_interval_secs,
     })
 }
 
@@ -213,6 +221,7 @@ fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
         channel_key,
         lora,
         admin_public_keys: [[0u8; 32]; ADMIN_KEY_SLOTS],
+        device_update_interval_secs: 0,
     })
 }
 
@@ -356,6 +365,23 @@ mod tests {
         assert_eq!(decoded.admin_public_keys[0], [0x11; 32]);
         assert_eq!(decoded.admin_public_keys[1], [0u8; 32]);
         assert_eq!(decoded.admin_public_keys[2], [0x33; 32]);
+    }
+
+    #[test]
+    fn device_update_interval_survives_round_trip() {
+        let mut config = NodeConfig::first_boot(1, [1; 32], [2; 32]);
+        config.device_update_interval_secs = 600;
+        let mut buf = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut buf).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                buf[STORE_DEVICE_UPDATE_INTERVAL_OFFSET..STORE_DEVICE_UPDATE_INTERVAL_OFFSET + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            600
+        );
+        assert_eq!(decode(&buf).unwrap().device_update_interval_secs, 600);
     }
 
     #[test]
