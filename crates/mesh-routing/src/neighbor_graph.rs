@@ -820,6 +820,67 @@ impl NeighborGraph {
         count as u8
     }
 
+    /// How late this packet's own relay ladder can still key up: the last rung's delay.
+    ///
+    /// The insurance timer waits for the latest transmission anyone might still make, and that is
+    /// the later of two independent things — the worst stock draw, which scales with the slot time,
+    /// and our own ladder, which scales with the airtime. They cross: at a slow preset with a
+    /// full-size frame the ladder passes the stock worst case after only a handful of candidates,
+    /// because a half-airtime there is measured in seconds while a slot time is measured in tens of
+    /// milliseconds. Past that point a timer based on the stock draw alone fires while the ladder
+    /// is still running, and insurance becomes a competitor to the relay it was meant to cover.
+    ///
+    /// Reserved positions are not counted: they sit inside the router window, which the stock worst
+    /// case already spans.
+    pub fn relay_ladder_span_ms(
+        &self,
+        packet_id: u32,
+        heard_from: u32,
+        now_ms: u32,
+        half_airtime_ms: u32,
+    ) -> u32 {
+        let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
+        let n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
+        let rungs = u32::from(n.saturating_sub(1));
+        crate::channel_access::SLOT_ORIGIN_MS.saturating_add(rungs.saturating_mul(half_airtime_ms))
+    }
+
+    /// Our rung on the insurance ladder: how many insurers are ordered ahead of us.
+    ///
+    /// Derived from the ladder it insures, not from the relay slot index. Two things follow, and
+    /// both were wrong before:
+    ///
+    /// **Stock candidates do not count.** The old stagger was the relay slot index — stock count
+    /// plus our position — times a half-airtime, which priced every reserved position as a rung of
+    /// ours. Reserved positions are a slot time wide and sit inside the router window; insurance
+    /// fires after that whole window has passed, so adding a half-airtime per stock node delays
+    /// every insurer for a window that is already behind them.
+    ///
+    /// **The order is the ladder's own tie-break**, the packet-id parity the relay ranking uses, so
+    /// the insurance burden rotates across packets instead of always falling on the lowest node id.
+    /// Nodes that already transmitted are excluded, by the same candidate rule: one that has sent
+    /// is not going to insure, and counting it pushes everybody else's copy later for nothing.
+    pub fn insurance_rung_index(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> u8 {
+        let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
+        let n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
+        let prefer_high = (packet_id & 1) != 0;
+        let mut ahead = 0u8;
+        for &peer in &sr[..n as usize] {
+            if peer == self.my_node {
+                continue;
+            }
+            let ordered_first = if prefer_high {
+                peer > self.my_node
+            } else {
+                peer < self.my_node
+            };
+            if ordered_first {
+                ahead = ahead.saturating_add(1);
+            }
+        }
+        ahead
+    }
+
     pub fn relay_candidate_count(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> u8 {
         self.relay_slot_index(packet_id, heard_from, now_ms)
             .1
@@ -2735,6 +2796,121 @@ mod tests {
         graph.record_heard_transmissions(ME, 7, Some(placeholder), 0);
         assert!(!graph.has_node_transmitted(ME, 7, 0));
         assert!(!graph.has_node_transmitted(placeholder, 7, 0));
+    }
+
+    /// The insurance timer waits for whichever last transmission is later, and the two cross.
+    ///
+    /// A slot time and a half-airtime scale with different things, so on a slow preset with a
+    /// full-size frame the ladder overtakes the worst stock draw after a handful of candidates —
+    /// measured: four at LONG_SLOW, seven at LONG_FAST, fourteen at SHORT_SLOW. Before this the
+    /// timer knew only the stock draw and fired while the ladder was still running.
+    #[test]
+    fn the_insurance_wait_covers_the_ladder_when_it_outlasts_the_stock_window() {
+        const ME: u32 = 0x0A00_000A;
+        const SRC: u32 = 0x1100_0011;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_modem_preset(mesh_radio::MODEM_LONG_SLOW);
+        for i in 0..6u32 {
+            let peer = 0x2000_0000 + i;
+            graph.observe_direct_neighbor(peer, -70, 8, 0, 0);
+            graph.capability_mut().track_topology(peer, true, 0);
+        }
+        graph.observe_direct_neighbor(SRC, -70, 8, 0, 0);
+
+        // A full-size frame at LONG_SLOW: the half-airtime is seconds, the slot time milliseconds.
+        let slot = crate::coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_LONG_SLOW);
+        let half = crate::coordinated_relay::half_airtime_ms(mesh_radio::packet_time_ms(
+            &mesh_radio::eu868_config_for_preset(mesh_radio::MODEM_LONG_SLOW),
+            237,
+            true,
+        ));
+        let span = graph.relay_ladder_span_ms(0x20, SRC, 0, half);
+        let stock_worst = crate::coordinated_relay::tx_delay_ms_worst(slot);
+        assert!(
+            span > stock_worst,
+            "the ladder must outlast the stock window here: span {span} vs stock {stock_worst}"
+        );
+    }
+
+    /// With few candidates the stock window still dominates, so the wait does not grow for nothing.
+    #[test]
+    fn a_short_ladder_does_not_extend_the_insurance_wait() {
+        const ME: u32 = 0x0A00_000A;
+        const SRC: u32 = 0x1100_0011;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(SRC, -70, 8, 0, 0);
+        let slot = crate::coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW);
+        let span = graph.relay_ladder_span_ms(0x20, SRC, 0, 50);
+        assert!(span < crate::coordinated_relay::tx_delay_ms_worst(slot));
+    }
+
+    /// The insurance stagger no longer charges a half-airtime per stock rebroadcaster. A reserved
+    /// position is a slot time inside the router window, and insurance fires only once that window
+    /// has passed, so counting them delayed every insurer for a window already behind it.
+    #[test]
+    fn stock_rebroadcasters_do_not_push_the_insurance_rung() {
+        const ME: u32 = 0xBB00_00BB;
+        const SRC: u32 = 0x1100_0011;
+        const STOCK_A: u32 = 0x2200_0022;
+        const STOCK_B: u32 = 0x3300_0033;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        for peer in [SRC, STOCK_A, STOCK_B] {
+            graph.observe_direct_neighbor(peer, -70, 8, 0, 0);
+        }
+        for stock in [STOCK_A, STOCK_B] {
+            graph.track_node_role(stock, DEVICE_ROLE_ROUTER, 0);
+        }
+        // Two stock routers are reserved for, and neither is an insurer.
+        assert_eq!(graph.insurance_rung_index(0x20, SRC, 0), 0);
+    }
+
+    /// Insurers are ordered by the packet-id tie-break the relay ladder uses, so the burden
+    /// rotates across packets instead of always falling on the lowest node id.
+    #[test]
+    fn the_insurance_order_follows_the_packet_id_tie_break() {
+        // We hold the lowest node id of the three insurers, so the two parities put us at opposite
+        // ends of the ladder: first when the low id leads, last when the high id does.
+        const ME: u32 = 0x0A00_000A;
+        const SRC: u32 = 0x1100_0011;
+        const MID: u32 = 0xBB00_00BB;
+        const HIGH: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        for peer in [SRC, MID, HIGH] {
+            graph.observe_direct_neighbor(peer, -70, 8, 0, 0);
+            graph.capability_mut().track_topology(peer, true, 0);
+        }
+        assert_eq!(
+            graph.insurance_rung_index(0x20, SRC, 0),
+            0,
+            "even packet id orders the lowest id first, and that is us"
+        );
+        assert_eq!(
+            graph.insurance_rung_index(0x21, SRC, 0),
+            2,
+            "odd packet id flips it, so both peers insure ahead of us"
+        );
+    }
+
+    /// A peer that already transmitted is not going to insure, so counting it would push every
+    /// remaining insurer later for nothing.
+    #[test]
+    fn a_peer_that_already_transmitted_is_not_an_insurer() {
+        const ME: u32 = 0xBB00_00BB;
+        const SRC: u32 = 0x1100_0011;
+        const GONE: u32 = 0x0A00_000A;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        for peer in [SRC, GONE] {
+            graph.observe_direct_neighbor(peer, -70, 8, 0, 0);
+            graph.capability_mut().track_topology(peer, true, 0);
+        }
+        assert_eq!(graph.insurance_rung_index(0x20, SRC, 100), 1);
+        graph.record_node_transmission(GONE, 0x20, 100);
+        assert_eq!(graph.insurance_rung_index(0x20, SRC, 100), 0);
     }
 
     #[test]

@@ -2782,7 +2782,11 @@ impl Router {
             );
         }
         if to == NODENUM_BROADCAST && portnum != SIGNAL_ROUTING_APP {
-            self.schedule_t1_broadcast(packet_id, len, frame, airtime_ms, 0, now_ms);
+            let half = crate::coordinated_relay::half_airtime_ms(airtime_ms);
+            let span = self
+                .graph
+                .relay_ladder_span_ms(packet_id, self.node_num, now_ms, half);
+            self.schedule_t1_broadcast(packet_id, len, frame, airtime_ms, 0, span, now_ms);
         }
         Some(RelayPlan {
             len,
@@ -3885,9 +3889,12 @@ impl Router {
         // Every node that deferred arms T1, so the insurers need the slot ladder too: firing
         // together would collide precisely when the ranked relay was the frame that went missing.
         // Same deterministic order as an unranked relay slot, one half-airtime apart.
-        let (rank, _) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
-        let stagger = (rank as u32).saturating_mul(half_airtime_ms);
-        self.schedule_t1_broadcast(parsed.id, len, bytes, airtime_ms, stagger, now_ms);
+        let ahead = self.graph.insurance_rung_index(parsed.id, heard_from, now_ms);
+        let stagger = (ahead as u32).saturating_mul(half_airtime_ms);
+        let span = self
+            .graph
+            .relay_ladder_span_ms(parsed.id, heard_from, now_ms, half_airtime_ms);
+        self.schedule_t1_broadcast(parsed.id, len, bytes, airtime_ms, stagger, span, now_ms);
     }
 
     fn schedule_t1_broadcast(
@@ -3897,6 +3904,7 @@ impl Router {
         bytes: [u8; MAX_WIRE_LEN],
         airtime_ms: u32,
         stagger_ms: u32,
+        ladder_span_ms: u32,
         now_ms: u32,
     ) {
         for slot in &self.pending_retransmits {
@@ -3911,7 +3919,11 @@ impl Router {
         else {
             return;
         };
+        // Whichever of the two possible last transmissions is later: the worst stock draw, or the
+        // last rung of our own ladder. They are floors on the same instant and compose by `max`,
+        // never by addition — the ladder runs inside the stock window, it does not follow it.
         let fire_delay = tx_delay_ms_worst(self.cw_slot_ms())
+            .max(ladder_span_ms)
             .saturating_add(airtime_ms)
             .saturating_add(stagger_ms);
         self.pending_retransmits[idx] = PendingRetransmit {
