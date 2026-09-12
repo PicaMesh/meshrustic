@@ -105,90 +105,68 @@ pub async fn radio_task(
         let now_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
         let slot_ms = packet_time_ms(slot.config(), 64, true).max(1);
 
-        // Release frames to the radio only when the channel is quiet, nothing received is still
-        // waiting for the router, and no post-reception hold is running. Pending work keeps its
-        // due time inside the router and is picked up on the next pass.
-        let rx_busy = slot.rx_busy().unwrap_or(false);
-        let may_release = !rx_busy && access.may_transmit(now_ms) && slot.rx_queue.is_empty();
-        // Attribute a held frame to the gate that held it. Without this a relay that left later
-        // than its rung is only visible as a residual, with no way to tell the post-reception
-        // hold from a reception in progress or from frames still queued for the router — and the
-        // hold is the one the ladder's timing depends on. Logged once per hold, on the edge, so a
-        // long hold does not fill the log.
-        if !may_release && router.has_pending_work() {
-            if !tx_held_logged {
-                crate::usb_log::log::radio::tx_held(
-                    access.remaining_ms(now_ms),
-                    rx_busy,
-                    !slot.rx_queue.is_empty(),
-                );
-                tx_held_logged = true;
-            }
-        } else {
-            tx_held_logged = false;
+        // Due frames keep the delay they were given. RadioSlot::service decides whether the
+        // head of the queue may key up, with that frame in hand, so a hold names the frame
+        // and the reason instead of applying one boolean to the whole pass.
+        let may_tx = access.may_transmit(now_ms);
+        if let Some(relay) = router.poll_ready_relay(now_ms) {
+            enqueue_tx(relay, slot, router, node_num, b"relay");
         }
-        if may_release {
-            if let Some(relay) = router.poll_ready_relay(now_ms) {
-                enqueue_tx(relay, slot, router, node_num, b"relay");
-            }
 
-            if let Some(topo) = router.poll_topology_tx(now_ms) {
-                enqueue_tx(topo, slot, router, node_num, b"topology");
-            }
+        if let Some(topo) = router.poll_topology_tx(now_ms) {
+            enqueue_tx(topo, slot, router, node_num, b"topology");
+        }
 
-            if let Some(nodeinfo) = router.poll_nodeinfo_tx(now_ms) {
-                enqueue_tx(nodeinfo, slot, router, node_num, b"nodeinfo");
-            }
+        if let Some(nodeinfo) = router.poll_nodeinfo_tx(now_ms) {
+            enqueue_tx(nodeinfo, slot, router, node_num, b"nodeinfo");
+        }
 
-            if let Some(telemetry) = router.poll_telemetry_tx(now_ms) {
-                enqueue_tx(telemetry, slot, router, node_num, b"telemetry");
-            }
+        if let Some(telemetry) = router.poll_telemetry_tx(now_ms) {
+            enqueue_tx(telemetry, slot, router, node_num, b"telemetry");
+        }
 
-            if let Some(tr) = router.poll_traceroute_tx(now_ms) {
-                enqueue_tx(tr, slot, router, node_num, b"traceroute");
-            }
+        if let Some(tr) = router.poll_traceroute_tx(now_ms) {
+            enqueue_tx(tr, slot, router, node_num, b"traceroute");
+        }
 
-            if let Some(t1) = router.poll_t1_retransmit(now_ms) {
-                enqueue_tx(t1, slot, router, node_num, b"t1");
-            }
+        if let Some(t1) = router.poll_t1_retransmit(now_ms) {
+            enqueue_tx(t1, slot, router, node_num, b"t1");
+        }
 
-            router.set_channel_utilization(air.channel_utilization_percent());
-            if let Some(retx) = router.poll_reliable_retransmit(now_ms) {
-                enqueue_tx(retx, slot, router, node_num, b"retx");
-            }
+        router.set_channel_utilization(air.channel_utilization_percent());
+        if let Some(retx) = router.poll_reliable_retransmit(now_ms) {
+            enqueue_tx(retx, slot, router, node_num, b"retx");
+        }
 
-            if let Some(ack) = router.poll_ack_tx(now_ms) {
-                enqueue_tx(ack, slot, router, node_num, b"ack");
-            }
+        if let Some(ack) = router.poll_ack_tx(now_ms) {
+            enqueue_tx(ack, slot, router, node_num, b"ack");
+        }
 
-            if let Some(admin) = router.poll_admin_tx(now_ms) {
-                enqueue_tx(admin, slot, router, node_num, b"admin");
-            }
+        if let Some(admin) = router.poll_admin_tx(now_ms) {
+            enqueue_tx(admin, slot, router, node_num, b"admin");
+        }
 
-            // Part C (H1 controlled-node harness): a command typed at the USB host, one more
-            // producer in this chain, gated by the same `may_release` check as every other. A
-            // non-blocking check -- the channel is drained here, never awaited -- so an empty
-            // queue costs nothing on this pass, same as every `poll_*` above. `send_local` is
-            // called exactly as any other originated frame would be: nothing shortcuts to the
-            // radio, so an injected frame's timing is indistinguishable from any other.
-            if let Ok(cmd) = host_cmd.try_receive() {
-                let (to, text) = match cmd {
-                    HostCommand::Broadcast { text } => (NODENUM_BROADCAST, text),
-                    HostCommand::Unicast { to, text } => (to, text),
-                };
-                let airtime_ms =
-                    packet_time_ms(slot.config(), PACKET_HEADER_LEN + text.len(), true).max(1);
-                if let Some(plan) = router.send_local(
-                    to,
-                    TEXT_MESSAGE_APP,
-                    &text,
-                    false,
-                    router.hop_limit(),
-                    now_ms,
-                    airtime_ms,
-                ) {
-                    enqueue_tx(plan, slot, router, node_num, b"host-cmd");
-                }
+        // A command typed at the USB host, one more producer in this chain. A non-blocking
+        // check -- the channel is drained here, never awaited -- so an empty queue costs
+        // nothing on this pass, same as every `poll_*` above. `send_local` is called exactly
+        // as any other originated frame would be: nothing shortcuts to the radio.
+        if let Ok(cmd) = host_cmd.try_receive() {
+            let (to, text) = match cmd {
+                HostCommand::Broadcast { text } => (NODENUM_BROADCAST, text),
+                HostCommand::Unicast { to, text } => (to, text),
+            };
+            let airtime_ms =
+                packet_time_ms(slot.config(), PACKET_HEADER_LEN + text.len(), true).max(1);
+            if let Some(plan) = router.send_local(
+                to,
+                TEXT_MESSAGE_APP,
+                &text,
+                false,
+                router.hop_limit(),
+                now_ms,
+                airtime_ms,
+            ) {
+                enqueue_tx(plan, slot, router, node_num, b"host-cmd");
             }
         }
 
@@ -217,12 +195,10 @@ pub async fn radio_task(
             crate::usb_log::log::sr::emit(*event);
         }
 
-        match slot.service(air, may_release) {
+        match slot.service(air, may_tx) {
             Ok(mut report) => {
-                let mut received = false;
                 let mut last_rx_id = 0u32;
                 while let Some(frame) = report.rx {
-                    received = true;
                     if let Ok(h) = PacketHeader::decode(frame.payload()) {
                         last_rx_id = h.parse().id;
                     }
@@ -239,7 +215,7 @@ pub async fn radio_task(
                     }
                     report.rx = slot.rx_queue.pop().ok();
                 }
-                if received || report.tx_deferred_rx_busy || report.tx_deferred_rx_pending {
+                if report.receptions > 0 {
                     let cw_slot = mesh_routing::slot_time_for_preset(router.modem_preset());
                     let backoff = mesh_routing::coordinated_relay::tx_delay_ms_contention(
                         air.channel_utilization_percent(),
@@ -247,9 +223,23 @@ pub async fn radio_task(
                         now_ms,
                         last_rx_id,
                         node_num,
-                    )
-                    .max(cw_slot);
+                    );
                     access.note_rx((Instant::now().as_millis() & 0xFFFF_FFFF) as u32, backoff);
+                }
+                if report.tx_deferred_rx_busy || report.tx_deferred_rx_pending || report.tx_held {
+                    if !tx_held_logged {
+                        crate::usb_log::log::radio::tx_held(
+                            report.tx_id.unwrap_or(0),
+                            access.remaining_ms((Instant::now().as_millis() & 0xFFFF_FFFF) as u32),
+                            report.tx_deferred_rx_busy,
+                            report.tx_deferred_rx_pending,
+                            report.tx_held,
+                            report.held_behind_rx.unwrap_or(0),
+                        );
+                        tx_held_logged = true;
+                    }
+                } else {
+                    tx_held_logged = false;
                 }
                 if let Some(len) = report.tx_len {
                     defmt::info!(

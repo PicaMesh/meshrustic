@@ -98,6 +98,14 @@ impl<const N: usize> TxQueue<N> {
         self.len == 0
     }
 
+    pub fn front(&self) -> Option<&TxFrame> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(&self.buf[self.head])
+        }
+    }
+
     pub fn push(&mut self, frame: TxFrame) -> Result<(), QueueError> {
         if self.len == N {
             return Err(QueueError::Full);

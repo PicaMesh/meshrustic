@@ -68,8 +68,12 @@ impl ChannelAccess {
             self.hold_until_ms.wrapping_sub(now_ms) < 0x8000_0000 && self.hold_until_ms != now_ms;
     }
 
-    /// A frame was received (or a transmission was deferred because one was arriving). Hold for
-    /// the peers' turnaround or the contention backoff, whichever is longer; holds only extend.
+    /// A frame was received. Hold for the peers' turnaround or the contention backoff, whichever
+    /// is longer. A reception while a hold is already running draws a fresh backoff from now and
+    /// extends the hold if that is later; it never shortens a longer hold already running.
+    ///
+    /// The turnaround is the floor: a tiny contention draw cannot cut the hold below it, so the
+    /// caller does not need a second floor of one CAD slot.
     pub fn note_rx(&mut self, now_ms: u32, contention_backoff_ms: u32) {
         let hold = contention_backoff_ms.max(PEER_TURNAROUND_MS);
         self.extend(now_ms.wrapping_add(hold), now_ms);
@@ -119,6 +123,19 @@ mod tests {
         ca.note_tx_done(1_000 + PEER_TURNAROUND_MS + 5);
         assert!(!ca.may_transmit(1_000 + PEER_TURNAROUND_MS + 5 + TX_GAP_MS - 1));
         assert!(ca.may_transmit(1_000 + PEER_TURNAROUND_MS + 5 + TX_GAP_MS));
+    }
+
+    #[test]
+    fn a_second_reception_extends_the_hold_and_never_shortens_it() {
+        let mut ca = ChannelAccess::new();
+        ca.note_rx(1_000, 0);
+        ca.note_rx(1_100, 0);
+        assert_eq!(ca.remaining_ms(1_100), PEER_TURNAROUND_MS);
+
+        let mut ca = ChannelAccess::new();
+        ca.note_rx(1_000, PEER_TURNAROUND_MS + 300);
+        ca.note_rx(1_100, 0);
+        assert_eq!(ca.remaining_ms(1_100), PEER_TURNAROUND_MS + 200);
     }
 
     #[test]

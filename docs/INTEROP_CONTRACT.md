@@ -38,14 +38,17 @@ is actually waiting for.
   it, a one-millisecond disagreement scales into a band that no longer lines up with stock's.
   The result is pinned per preset (8, 8, 10, 12, 17, 17, 48, 28, 89, and the LONG_FAST default
   for VERY_LONG_SLOW) by `slot_time_matches_stock_at_every_preset`.
-- **No frame within the turnaround after a reception.** After any received frame, or a
-  transmission deferred because a frame was arriving, the node keys up no sooner than the
-  turnaround or the contention backoff, whichever is longer. Implemented by
-  `ChannelAccess::note_rx` and `ChannelAccess::may_transmit`; the board's radio task consults it
-  before releasing router frames and passes the same verdict to `RadioSlot::service`, so a
-  frame already queued in the radio cannot key up on its own. The contention half is stock's
-  own per-packet `getTxDelayMsec` delay; the turnaround half is the guard above. Tests:
-  `channel_access` unit tests.
+- **No frame within the turnaround after a reception.** After any received frame the node keys
+  up no sooner than the turnaround or the contention backoff, whichever is longer. Implemented
+  by `ChannelAccess::note_rx` and `ChannelAccess::may_transmit`. A busy modem or a receive
+  queue the router has not seen yet still defers the send inside `RadioSlot::service` (listen
+  before talk, and dedupe before keying up) but does not extend that hold: only a completed
+  reception, counted by the reception ordinal on `ServiceReport`, arms it. A second reception
+  while a hold is running draws a fresh backoff and extends if that is later; it never shortens
+  a longer hold. A due frame keeps the delay it was given and is released when the gate opens
+  rather than redrawn. The contention half is stock's own per-packet `getTxDelayMsec` delay;
+  the turnaround is the floor, so a CAD-slot floor on the draw is not needed. Tests:
+  `channel_access` unit tests, `transmit_gate`, `RadioSlot` service tests.
 - **Gap after our own frame.** At least `TX_GAP_MS` (100 ms) of silence follows each of our
   frames before the next one starts (`ChannelAccess::note_tx_done`). Stock never sends two
   frames back to back because each carries its own contention delay.

@@ -350,22 +350,33 @@ pub mod radio {
         put_hex2, put_hex4, put_hex8, put_i32, put_u32, MAX_LOG_LINE,
     };
 
-    /// `[Radio0] TX held: hold=214ms rx_busy=0 rx_queued=1` — which gate is keeping a due frame
-    /// off the air, and for how long.
+    /// `[Radio0] TX held: id=0x<id> behind=N hold=214ms busy=0 pending=1 gate=0` -- which frame
+    /// waited, which reception it sat behind, and which gate kept it off the air.
     ///
-    /// Three gates share one boolean at the release site and none of them was logged, so a
-    /// relay that left later than its rung could not be attributed: the post-reception hold, a
-    /// reception in progress, and frames still waiting for the router. Rate-limited by the
-    /// caller — this fires on every pass while a hold runs.
-    pub fn tx_held(hold_ms: u32, rx_busy: bool, rx_queued: bool) {
-        let mut line = [0u8; 96];
+    /// Rate-limited by the caller — this fires on the edge, once per hold, so a long wait
+    /// does not fill the log.
+    pub fn tx_held(
+        id: u32,
+        hold_ms: u32,
+        rx_busy: bool,
+        rx_pending: bool,
+        gate: bool,
+        rx_ordinal: u32,
+    ) {
+        let mut line = [0u8; 128];
         let mut pos = line_prefix(&mut line);
-        put(&mut line, &mut pos, b"[Radio0] TX held: hold=");
+        put(&mut line, &mut pos, b"[Radio0] TX held: id=0x");
+        put_hex8(&mut line, &mut pos, id);
+        put(&mut line, &mut pos, b" behind=");
+        put_u32(&mut line, &mut pos, rx_ordinal);
+        put(&mut line, &mut pos, b" hold=");
         put_u32(&mut line, &mut pos, hold_ms);
-        put(&mut line, &mut pos, b"ms rx_busy=");
+        put(&mut line, &mut pos, b"ms busy=");
         put(&mut line, &mut pos, if rx_busy { b"1" } else { b"0" });
-        put(&mut line, &mut pos, b" rx_queued=");
-        put(&mut line, &mut pos, if rx_queued { b"1" } else { b"0" });
+        put(&mut line, &mut pos, b" pending=");
+        put(&mut line, &mut pos, if rx_pending { b"1" } else { b"0" });
+        put(&mut line, &mut pos, b" gate=");
+        put(&mut line, &mut pos, if gate { b"1" } else { b"0" });
         finish_line(&mut line, pos);
     }
 
