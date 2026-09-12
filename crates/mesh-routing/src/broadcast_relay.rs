@@ -17,6 +17,9 @@ pub struct RelayCandidate {
     pub coverage_count: u8,
     pub avg_cost_fixed: u16,
     pub tier: u8,
+    /// Ranks above cost: a node configured to carry traffic is preferred over one that merely
+    /// can, when both reach the same neighbours. See [`role_rank`].
+    pub role_rank: u8,
     /// One neighbour this candidate covers that the transmitter did not reach: the reason the
     /// relay is worth its airtime, named in the log rather than left to be guessed at.
     pub coverage_for: u32,
@@ -437,6 +440,27 @@ fn push_absorbed(list: &mut [(u32, u8); RANKED_LOG], len: &mut u8, relay: u32, c
     }
 }
 
+/// Ranking weight a candidate's own role earns it, above cost and below coverage.
+///
+/// ROUTER only, and only one step. Its operator has said this node is sited and powered to carry
+/// other people's traffic, which is a statement about the node that a link cost cannot express:
+/// two candidates reaching the same neighbours at the same price are not equally good if one of
+/// them exists for the purpose. Stock already acts on that statement by giving a ROUTER the
+/// earliest window; this is the coordinated equivalent, applied to ordering rather than to timing.
+///
+/// ROUTER_LATE is excluded deliberately rather than overlooked: its whole meaning is to relay after
+/// everyone else, so promoting it would invert the role it was chosen for. The deprecated router
+/// roles are excluded for the reason given on `CapabilityCache::is_immediate_relay_router` — on a
+/// SignalRouting node a role buys nothing, because its published list already says what it reaches,
+/// and only a stock node's role is compensated for. Stock nodes do not reach this ranking at all;
+/// the reservation pre-pass removes them from the candidate set first.
+///
+/// Coverage still outranks this, so a ROUTER with nothing unique to reach takes nothing: the
+/// zero-coverage drop happens before any of it is consulted.
+fn role_rank(ctx: &BroadcastRelayContext<'_>, candidate: u32) -> u8 {
+    u8::from(ctx.capability.role(candidate) == Some(crate::nodeinfo::DEVICE_ROLE_ROUTER))
+}
+
 fn find_best_relay_candidate<F>(
     ctx: &BroadcastRelayContext<'_>,
     candidates: &NodeSet,
@@ -529,16 +553,20 @@ where
             }
         }
 
+        let rank = role_rank(ctx, candidate);
         let mut is_better = best.node_id == 0
             || tier > best.tier
             || (tier == best.tier && unique_count > best.coverage_count)
+            || (tier == best.tier && unique_count == best.coverage_count && rank > best.role_rank)
             || (tier == best.tier
                 && unique_count == best.coverage_count
+                && rank == best.role_rank
                 && avg_cost_fixed < best.avg_cost_fixed);
         if !is_better
             && best.node_id != 0
             && tier == best.tier
             && unique_count == best.coverage_count
+            && rank == best.role_rank
             && avg_cost_fixed == best.avg_cost_fixed
         {
             is_better = if prefer_high_node_id {
@@ -553,6 +581,7 @@ where
                 coverage_count: unique_count,
                 avg_cost_fixed,
                 tier,
+                role_rank: rank,
                 coverage_for: unique[0],
             };
         }
@@ -1473,6 +1502,112 @@ mod tests {
             plan.slot_delay_ms, plan.candidate_count
         );
         assert_eq!(plan.reserved_slots, 1, "and it holds a reserved position");
+    }
+
+    /// Two SR peers reach the same unique neighbour at the same tier. The one configured ROUTER is
+    /// ranked first even though its link is the dearer of the two: cost describes a link, the role
+    /// describes the node.
+    #[test]
+    fn an_sr_router_outranks_a_client_of_equal_coverage() {
+        const RT: u32 = 0xAA00_0071;
+        const CL: u32 = 0xAA00_0072;
+        const FAR: u32 = 0xAA00_00FF;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        for peer in [BB, RT, CL] {
+            edges.update_edge(ME, ME, peer, 2.0, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(ME, peer, true);
+        }
+        // The transmitter already reaches both peers, so we hold nothing unique and the contest is
+        // between them. Both hear the transmitter and both uniquely reach FAR, which we do not; the
+        // ROUTER's link to FAR is the worse of the two.
+        for peer in [RT, CL] {
+            edges.update_edge(ME, BB, peer, 1.5, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(BB, peer, true);
+        }
+        for (peer, cost) in [(RT, 3.0f32), (CL, 1.2f32)] {
+            edges.update_edge(ME, peer, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+            edges.update_edge(ME, peer, FAR, cost, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(peer, BB, true);
+            edges.set_edge_hears_us(peer, FAR, true);
+            capability.track_topology(peer, true, 0);
+        }
+        capability.track_role(RT, crate::nodeinfo::DEVICE_ROLE_ROUTER, 0);
+        capability.track_role(CL, crate::nodeinfo::DEVICE_ROLE_CLIENT, 0);
+        let c = ctx(&edges, &capability, &downstream);
+        let best = find_best_relay_candidate(
+            &c,
+            &build_candidates(&c, BB, BB),
+            &build_already_covered(&edges, &capability, BB, BB),
+            false,
+            BB,
+            0,
+            never_transmitted,
+            None,
+        );
+        assert_eq!(best.node_id, RT, "the ROUTER is preferred despite the dearer link");
+        assert_eq!(best.role_rank, 1);
+    }
+
+    /// Coverage still outranks the role. A CLIENT reaching more neighbours beats a ROUTER reaching
+    /// fewer — the role is a tie-break above cost, not a licence to relay for nobody.
+    #[test]
+    fn coverage_still_outranks_the_router_role() {
+        const RT: u32 = 0xAA00_0071;
+        const CL: u32 = 0xAA00_0072;
+        const FAR: u32 = 0xAA00_00FF;
+        const FAR2: u32 = 0xAA00_00FE;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        for peer in [BB, RT, CL] {
+            edges.update_edge(ME, ME, peer, 2.0, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(ME, peer, true);
+        }
+        for peer in [RT, CL] {
+            edges.update_edge(ME, peer, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(peer, BB, true);
+            edges.update_edge(ME, peer, FAR, 1.5, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(peer, FAR, true);
+            capability.track_topology(peer, true, 0);
+        }
+        // Only the CLIENT reaches the second far node.
+        edges.update_edge(ME, CL, FAR2, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(CL, FAR2, true);
+        capability.track_role(RT, crate::nodeinfo::DEVICE_ROLE_ROUTER, 0);
+        capability.track_role(CL, crate::nodeinfo::DEVICE_ROLE_CLIENT, 0);
+        let c = ctx(&edges, &capability, &downstream);
+        let best = find_best_relay_candidate(
+            &c,
+            &build_candidates(&c, BB, BB),
+            &build_already_covered(&edges, &capability, BB, BB),
+            false,
+            BB,
+            0,
+            never_transmitted,
+            None,
+        );
+        assert_eq!(best.node_id, CL, "two unique neighbours beat one, whatever the role");
+    }
+
+    /// ROUTER_LATE earns no promotion. Its role means "relay after everyone else", so ranking it
+    /// first would invert the behaviour its operator chose.
+    #[test]
+    fn router_late_earns_no_ranking_promotion() {
+        const RL: u32 = 0xAA00_0073;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, RL, 2.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, RL, true);
+        capability.track_topology(RL, true, 0);
+        capability.track_role(RL, crate::nodeinfo::DEVICE_ROLE_ROUTER_LATE, 0);
+        let c = ctx(&edges, &capability, &downstream);
+        assert_eq!(role_rank(&c, RL), 0);
     }
 
     #[test]
