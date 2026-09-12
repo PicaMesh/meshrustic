@@ -112,9 +112,7 @@ fn a_pending_receive_queue_defers_without_extending_the_hold() {
     let _ = report.rx;
 
     slot.rx_queue.push(rx_frame(99)).unwrap();
-    let pending = slot
-        .service(&mut air, access.may_transmit(1_040))
-        .unwrap();
+    let pending = slot.service(&mut air, access.may_transmit(1_040)).unwrap();
     assert!(pending.tx_deferred_rx_pending);
     assert_eq!(pending.receptions, 0);
     arm_hold(&mut access, pending.receptions, 1_040, 0);
@@ -218,5 +216,3 @@ fn reception_ordinal_is_in_the_report_and_advances_once_per_reception() {
     assert_eq!(b.receptions, 1);
     assert_eq!(b.held_behind_rx, Some(2));
 }
-
-

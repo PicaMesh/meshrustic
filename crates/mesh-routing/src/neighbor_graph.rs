@@ -4347,7 +4347,7 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.set_modem_preset(MODEM_SHORT_SLOW);
-        graph.set_device_role(DEVICE_ROLE_REPEATER);
+        graph.set_device_role(crate::nodeinfo::DEVICE_ROLE_REPEATER);
         graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
         graph
             .downstream_mut()
@@ -4372,7 +4372,7 @@ mod tests {
         assert_eq!(graph.topology_version(), 0);
         assert_eq!(graph.last_topology_ms(), 0);
         assert_eq!(graph.modem_preset(), MODEM_SHORT_SLOW);
-        assert_eq!(graph.device_role(), DEVICE_ROLE_REPEATER);
+        assert_eq!(graph.device_role(), crate::nodeinfo::DEVICE_ROLE_REPEATER);
         graph.observe_direct_neighbor(PEER, -70, 8, 300, 0);
         assert_eq!(graph.neighbor_count(), 1);
     }
