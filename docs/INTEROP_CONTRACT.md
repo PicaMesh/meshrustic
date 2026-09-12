@@ -572,6 +572,16 @@ is actually waiting for.
   gateway that publishes topology overwrote what it had already told us. Reachability learned from
   relayed frames lives in the downstream table, which is gated separately, on the source and the
   hop count, because no publisher supplies it.
+- **A direct RF hearing is a neighbour whether or not the payload decodes.** Identity and the
+  hop/relay header travel in the clear; a frame heard on air with RSSI/SNR, not via MQTT, and
+  classified direct (`is_direct_packet`) therefore establishes `us → sender` as `Reported` even when
+  there is no channel key for the payload (foreign channel, wrong PSK, PKI for someone else). Decode
+  failure is irrelevant to that observation: identity and channel can arrive later if the node keeps
+  speaking. The edge is refreshed only by hearing that node transmit or relay; silence for the
+  existing neighbour liveliness window (`NEIGHBOR_TTL_MS` / `NODE_TTL_SECS`) ages it out — there is
+  no separate stranger TTL. Once recorded, the node is an ordinary direct neighbour for coverage and
+  ranking. Tests: `a_direct_hearing_is_recorded_without_a_decoded_payload`,
+  `test_undecoded_direct_frame_is_recorded_as_a_neighbour`.
 - **Measuring a relayer is observation, not inference, so every publisher does it.** A relayed
   frame carries a real RSSI and SNR off the relayer's own transmission, so the `us → gateway` edge
   is a first-hand measurement and every role that publishes topology records it, mute and passive

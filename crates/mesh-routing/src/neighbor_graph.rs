@@ -2761,6 +2761,21 @@ mod tests {
         assert!(graph.has_node_transmitted(SOURCE, 42, 100));
     }
 
+    /// Header-path observation: `observe_packet` never sees a decoded payload, so a frame whose
+    /// body cannot decrypt is still a direct neighbour when the hop/relay header says so.
+    #[test]
+    fn a_direct_hearing_is_recorded_without_a_decoded_payload() {
+        const ME: u32 = 0xAA00_00AA;
+        // Same shape as a foreign-channel broadcast: hop budget unused, relay byte = sender.
+        const STRANGER: u32 = 0x46ce_027c;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        let observed = graph.observe_packet(STRANGER, 0, 0, 0x7c, -80, 5, 1_000, 0, None, 0x9c1d_4e21);
+        assert_eq!(observed.map(|o| o.0), Some(STRANGER));
+        assert!(graph.test_has_edge(ME, STRANGER));
+        assert_eq!(graph.neighbor_count(), 1);
+    }
+
     #[test]
     fn relayed_observe_records_source_and_relayer_transmission() {
         const ME: u32 = 0xAA00_00AA;
