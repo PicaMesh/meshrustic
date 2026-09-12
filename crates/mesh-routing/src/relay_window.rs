@@ -159,14 +159,18 @@ impl PositionAllocator {
         at
     }
 
-    /// The rung a ranked candidate of ours holds: on the ladder, past the transition.
+    /// The rung a ranked candidate of ours holds: inside the window while a half-airtime still
+    /// fits, otherwise on the ladder past the transition.
     ///
-    /// Reserved positions can only push this later, never earlier. Letting a ranked candidate take
-    /// a position *inside* the window is a deliberate, separate change — an SR node's position is
-    /// ours to place and is a real transmit time rather than an expectation — and it is not made
-    /// here. [`WindowLayout::place_ranked`] defines that capacity for when it is.
+    /// An SR node's position is ours to place and is a real transmit time, so it takes a rung's
+    /// separation rather than a reservation's. Letting it sit inside the window is what makes a
+    /// top-ranked SR ROUTER early at every preset; when the window is full the candidate keeps its
+    /// rank on the ladder.
     pub fn take_rung(&mut self) -> u32 {
-        let at = self.spill();
+        let at = match self.window.place_ranked() {
+            Some(at) => at,
+            None => self.spill(),
+        };
         self.next_index = self.next_index.saturating_add(1);
         at
     }
@@ -300,12 +304,23 @@ mod tests {
     }
 
     #[test]
-    fn rungs_start_at_the_transition_and_space_by_a_half_airtime() {
+    fn rungs_take_window_positions_while_a_half_airtime_fits() {
         let half = half_for(MODEM_SHORT_SLOW, 48);
         let mut a = PositionAllocator::new(slot_time_for_preset(MODEM_SHORT_SLOW), half);
-        assert_eq!(a.take_rung(), SLOT_ORIGIN_MS);
-        assert_eq!(a.take_rung(), SLOT_ORIGIN_MS + half);
-        assert_eq!(a.take_rung(), SLOT_ORIGIN_MS + 2 * half);
+        // Empty window: the first ranked position is at the window start, not the transition.
+        assert_eq!(a.take_rung(), 0);
+        assert_eq!(a.take_rung(), half);
+        assert_eq!(a.take_rung(), 2 * half);
+    }
+
+    #[test]
+    fn a_full_window_spills_ranked_positions_onto_the_ladder() {
+        // One half-airtime that fills the whole SHORT_SLOW window: the first ranked fits, the
+        // second must clear the transition.
+        let half = window_width_ms(slot_time_for_preset(MODEM_SHORT_SLOW));
+        let mut a = PositionAllocator::new(slot_time_for_preset(MODEM_SHORT_SLOW), half);
+        assert_eq!(a.take_rung(), 0);
+        assert_eq!(a.take_rung(), SLOT_ORIGIN_MS.max(half));
     }
 
     #[test]
@@ -327,8 +342,19 @@ mod tests {
                 with >= without,
                 "preset {preset} payload {payload}: {with} must not precede {without}"
             );
-            assert!(with >= SLOT_ORIGIN_MS);
         }
+    }
+
+    #[test]
+    fn reservations_and_ranked_positions_interleave_in_the_window() {
+        // Worked example from the design: SHORT_SLOW, 48 B — one reservation at 0, then ranked
+        // positions a half-airtime apart inside what remains.
+        let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
+        let half = half_for(MODEM_SHORT_SLOW, 48);
+        let mut a = PositionAllocator::new(slot, half);
+        assert_eq!(a.take_reserved(), 0);
+        assert_eq!(a.take_rung(), slot);
+        assert_eq!(a.take_rung(), slot + half);
     }
 
     #[test]

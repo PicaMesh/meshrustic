@@ -317,6 +317,17 @@ is actually waiting for.
   Pending later slots cancel when unique coverage is gone (`has_unique_coverage` /
   `perhaps_cancel_dupe`). Tests: broadcast coverage cases in `broadcast_relay` /
   `sr_slot_schedule` / `sr_coverage`.
+- **Positions are placed by rule: reservations and ranked rungs share one window.** A **stock**
+  ROUTER/REPEATER/ROUTER_CLIENT that can hear the transmitter is reserved a window position one
+  slot time wide, regardless of coverage (`is_immediate_relay_router` — SR-active and passive
+  publishers are excluded, because they are ranked). A ranked candidate — including an SR ROUTER
+  with unique coverage — takes a floored half-airtime inside the same window while room remains,
+  then spills past the transition keeping its rank (`PositionAllocator::take_rung`). An SR ROUTER
+  with nothing unique takes nothing. Role ranks above cost and below coverage (ROUTER only;
+  ROUTER_LATE earns no promotion). Tests: `an_sr_router_with_coverage_takes_a_window_position`,
+  `an_sr_router_outranks_a_client_of_equal_coverage`, `coverage_still_outranks_the_router_role`,
+  `rungs_take_window_positions_while_a_half_airtime_fits`,
+  `a_passive_publisher_is_not_reserved_for_either`.
 - **Coverage is evidence graded by whether the receiver reports** (`route::covers`), over a link
   that is not hopeless (delivery-direction cost at or below `COVERAGE_ETX_CEILING_FIXED`). A node
   that publishes topology is held to it: it must be known to hear the transmitter

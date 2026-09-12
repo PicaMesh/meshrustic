@@ -89,13 +89,6 @@ fn jitter_slots(from: u32, id: u32, node_num: u32, slot_span: u32) -> u32 {
     (from ^ id ^ node_num) % slot_span
 }
 
-/// Meshtastic ROUTER early rebroadcast: `random(0, 2 * CWsize) * slotTimeMsec`.
-pub fn tx_delay_ms_router(snr: i8, slot_ms: u32, from: u32, id: u32, node_num: u32) -> u32 {
-    let cw = cw_size_from_snr(snr) as u32;
-    let span = 2 * cw;
-    jitter_slots(from, id, node_num, span) * slot_ms
-}
-
 /// Range of the rung tie-break: a quarter of the rung spacing either side, floored.
 ///
 /// Named so the invariant it must satisfy can be stated and tested in one place: strictly below the
@@ -213,17 +206,6 @@ mod tests {
     use mesh_radio::{RadioConfig, MODEM_SHORT_SLOW};
 
     #[test]
-    fn higher_snr_yields_longer_router_delay() {
-        let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
-        let node = 0x677a_1caf;
-        let from = 0x1234_5678;
-        let id = 42;
-        let weak = tx_delay_ms_router(-5, slot, from, id, node);
-        let strong = tx_delay_ms_router(12, slot, from, id, node);
-        assert!(strong >= weak);
-    }
-
-    #[test]
     fn cw_size_increases_with_snr() {
         assert!(cw_size_from_snr(12) >= cw_size_from_snr(-10));
     }
@@ -251,21 +233,6 @@ mod tests {
                      non-router floor is {floor}ms"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn tx_delay_uses_preset_slot() {
-        let cfg = RadioConfig::eu868_short_slow();
-        let preset_slot = mesh_radio::slot_time_ms(&cfg);
-        let from = 0x1234_5678;
-        let id = 42;
-        let node = 0x677a_1caf;
-        let with_fallback = tx_delay_ms_router(8, DEFAULT_SLOT_MS, from, id, node);
-        let with_preset = tx_delay_ms_router(8, preset_slot, from, id, node);
-        assert!(tx_delay_ms_worst(preset_slot) < tx_delay_ms_worst(DEFAULT_SLOT_MS));
-        if preset_slot != DEFAULT_SLOT_MS {
-            assert!(with_preset <= with_fallback);
         }
     }
 

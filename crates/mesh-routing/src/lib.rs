@@ -60,7 +60,7 @@ pub use capability::{
 };
 pub use coordinated_relay::{
     cw_size_from_snr, half_airtime_ms, slot_time_for_preset, transmission_record_window_ms,
-    tx_delay_ms_router, tx_delay_ms_worst, DEFAULT_SLOT_MS,
+    tx_delay_ms_worst, DEFAULT_SLOT_MS,
 };
 pub use graph::{
     calculate_etx, calculate_route, can_deliver, covers, delivery_hop_cost_fixed, etx_to_fixed,

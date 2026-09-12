@@ -1,6 +1,5 @@
 //! Broadcast relay slot scheduling (phased stock → SR → downstream → coverage).
 
-use mesh_routing::channel_access::SLOT_ORIGIN_MS;
 use mesh_routing::{EdgeSource, NeighborGraph, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER};
 
 const ME: u32 = 0xCC00_00CC;
@@ -77,7 +76,7 @@ fn best_candidate_assigned_earlier_slot() {
 
     let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF, false);
     assert!(plan.should_relay);
-    assert_eq!(plan.slot_delay_ms, SLOT_ORIGIN_MS + HALF);
+    assert_eq!(plan.slot_delay_ms, HALF, "second ranked position is one half-airtime into the window");
     assert_eq!(plan.slot_index, 1);
 }
 

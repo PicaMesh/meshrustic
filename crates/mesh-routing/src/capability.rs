@@ -363,6 +363,18 @@ mod tests {
     }
 
     #[test]
+    fn a_passive_publisher_is_not_reserved_for_either() {
+        // Role compensates only for nodes that publish nothing. A passive SR node still broadcasts
+        // its neighbours, so its ROUTER role must not earn a reserved window position.
+        let mut cache = CapabilityCache::new();
+        cache.track_role(0xBB, DEVICE_ROLE_ROUTER, 0);
+        cache.track_topology(0xBB, false, 100);
+        assert_eq!(cache.status(0xBB), CapabilityStatus::Passive);
+        assert!(cache.publishes_topology(0xBB));
+        assert!(!cache.is_immediate_relay_router(0xBB));
+    }
+
+    #[test]
     fn status_at_returns_unknown_after_ttl() {
         let mut cache = CapabilityCache::new();
         cache.track_topology(0xBB, true, 0);

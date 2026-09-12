@@ -1551,6 +1551,46 @@ mod tests {
         assert_eq!(best.role_rank, 1);
     }
 
+    /// An SR ROUTER with unique coverage takes a window position (half-airtime wide), not a
+    /// reserved stock slot and not a post-transition ladder rung when the window still has room.
+    #[test]
+    fn an_sr_router_with_coverage_takes_a_window_position() {
+        const FAR: u32 = 0xAA00_00FF;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        capability.track_topology(ME, true, 0);
+        capability.track_role(ME, crate::nodeinfo::DEVICE_ROLE_ROUTER, 0);
+        // Unique coverage of FAR: the transmitter does not reach it, we do.
+        edges.update_edge(ME, ME, FAR, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, FAR, true);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            TEST_SLOT_MS,
+            never_transmitted,
+            false,
+        );
+        assert!(plan.should_relay);
+        assert_eq!(plan.reason, RelayReason::Ranked);
+        assert_eq!(plan.reserved_slots, 0, "an SR ROUTER is ranked, never reserved");
+        assert_eq!(
+            plan.slot_delay_ms, 0,
+            "empty window: the first ranked position is at the window start"
+        );
+        assert_eq!(plan.slot_index, 0);
+        // And it must not be treated as a stock immediate router for the pre-pass.
+        assert!(!capability.is_immediate_relay_router(ME));
+    }
+
     /// Coverage still outranks the role. A CLIENT reaching more neighbours beats a ROUTER reaching
     /// fewer — the role is a tie-break above cost, not a licence to relay for nobody.
     #[test]
@@ -1886,10 +1926,7 @@ mod tests {
             false,
         );
         assert!(plan.should_relay);
-        assert_eq!(
-            plan.slot_delay_ms,
-            crate::channel_access::SLOT_ORIGIN_MS + 100
-        );
+        assert_eq!(plan.slot_delay_ms, 100, "second ranked position is one half-airtime into the window");
         assert_eq!(plan.slot_index, 1);
     }
 }
