@@ -102,11 +102,15 @@ fn unhealthy_topology_defaults_to_relay() {
     let router = ROUTER.init(Router::new(ME));
     setup_stock_relay_topology(router, false);
     assert!(!router.graph_mut().topology_healthy_for_broadcast());
+    // The helper marks STOCK as publishing its own topology to make the graph unhealthy, which
+    // also means it is not a stock node at all — a publisher is ranked on its list, not
+    // compensated for by its role. So the candidate is us, which is what "defaults to relay"
+    // means: with nothing we can defer to, we carry it.
     assert_eq!(
         router
             .graph_mut()
             .find_best_relay_candidate(99, NEIGHBOR, 0),
-        STOCK
+        ME
     );
 
     let plan = evaluate_broadcast(router, NEIGHBOR, 0);

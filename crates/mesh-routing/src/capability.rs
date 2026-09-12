@@ -174,17 +174,64 @@ impl CapabilityCache {
         (clear_hears_us, clear_hears_us_count)
     }
 
-    /// Stock ROUTER / REPEATER / ROUTER_CLIENT that are not SR-active relay immediately.
+    /// A stock ROUTER that is not SR-active: it relays immediately and draws from the router
+    /// window.
+    ///
+    /// Does this node publish its own neighbour list?
+    ///
+    /// The one distinction that decides whether a role may be compensated for. Every SignalRouting
+    /// node broadcasts its direct neighbours — active and passive alike — so for those we read what
+    /// they published and their role tells us nothing extra. A stock node broadcasts nothing, so
+    /// its role is the only thing there is.
+    ///
+    /// `Unknown` counts as "publishes nothing", and that is not a gap in the reasoning: a stock
+    /// ROUTER is never marked `Legacy`, because the only paths into that state are a mute role and
+    /// our own node. Treating `Unknown` as a publisher would mean never recognising a stock router
+    /// at all.
+    ///
+    /// Excluding `Passive` is defensive rather than corrective. A SignalRouting node carrying a
+    /// router role is active by construction — the role is in the active class, and a node
+    /// advertises its active flag from that — so `Passive` alongside a router role should not
+    /// arise. It is excluded because the rule is "does it publish", and answering that by listing
+    /// the one status that happens to occur would leave the next reader to rediscover why.
+    pub fn publishes_topology(&self, node_id: u32) -> bool {
+        matches!(
+            self.status(node_id),
+            CapabilityStatus::SrActive | CapabilityStatus::Passive
+        )
+    }
+
+    /// A **stock** node, and a ROUTER.
+    ///
+    /// Role only ever compensates for what a node cannot tell us. A SignalRouting node publishes
+    /// its neighbours whether it is active or passive, so its role adds nothing its own list does
+    /// not already say, and reading a role instead of the list would substitute a guess for a
+    /// measurement. A stock node publishes nothing, so its role is all there is, and compensating
+    /// for it is the only way to place it at all. So the gate is "publishes nothing", which is
+    /// SR-active and passive excluded — not merely SR-active. A passive SignalRouting node still
+    /// broadcasts its direct neighbours, so its role must not be compensated for either.
+    ///
+    /// An unclassified node is left in: a stock ROUTER is only marked legacy once something else
+    /// establishes it, and until then it is `Unknown`, so requiring `Legacy` here would quietly
+    /// stop reserving for the very node the window exists for.
+    ///
+    /// ROUTER, REPEATER and ROUTER_CLIENT. ROUTER_CLIENT and REPEATER are deprecated as
+    /// *configuration* choices — 2.3.15 and 2.7.11 — but not withdrawn from the wire, and stock
+    /// still gives both the high-priority rebroadcast that relays even after hearing somebody
+    /// else's copy. Nodes carrying them are deployed today. Dropping them here would stop us
+    /// absorbing the coverage of a node that is going to transmit regardless, and we would add a
+    /// duplicate beside it. Deprecation governs what an operator should configure next; it does
+    /// not change what a node already on air does.
+    ///
+    /// A SignalRouting ROUTER is excluded, deliberately: it coordinates with us, so it is ranked
+    /// like any peer rather than reserved for.
     pub fn is_immediate_relay_router(&self, node_id: u32) -> bool {
-        if self.status(node_id) == CapabilityStatus::SrActive {
+        if self.publishes_topology(node_id) {
             return false;
         }
-        let Some(role) = self.role(node_id) else {
-            return false;
-        };
         matches!(
-            role,
-            DEVICE_ROLE_ROUTER | DEVICE_ROLE_REPEATER | DEVICE_ROLE_ROUTER_CLIENT
+            self.role(node_id),
+            Some(DEVICE_ROLE_ROUTER | DEVICE_ROLE_REPEATER | DEVICE_ROLE_ROUTER_CLIENT)
         )
     }
 

@@ -22,6 +22,7 @@ pub mod qos;
 pub mod rate_limit;
 pub mod relay;
 pub mod relay_identity;
+pub mod relay_window;
 pub mod reliable;
 pub mod router;
 pub mod routing_ack;

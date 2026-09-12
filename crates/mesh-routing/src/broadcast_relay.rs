@@ -641,6 +641,7 @@ pub fn plan_broadcast_relay<F>(
     broadcast_dest: u32,
     now_ms: u32,
     half_airtime_ms: u32,
+    slot_time_ms: u32,
     has_transmitted: F,
     ack_eligible: bool,
 ) -> BroadcastRelayPlan
@@ -667,10 +668,16 @@ where
     let mut candidates = build_candidates(ctx, source, heard_from);
     let initial_candidates = candidates.count;
     let mut reason = RelayReason::None;
-    // Slot k fires at SLOT_ORIGIN_MS + k * half: nobody keys up inside the peers' turnaround.
-    let mut slot_delay = crate::channel_access::SLOT_ORIGIN_MS;
+    // Positions are placed by rule, not spaced by one constant: a reservation takes a slot time
+    // inside the stock-router window, a rung of ours takes a half-airtime, and anything the window
+    // cannot hold goes past the transition keeping its rank.
+    let mut positions = crate::relay_window::PositionAllocator::new(slot_time_ms, half);
     let mut should_relay = false;
     let mut my_delay = 0u32;
+    // Assigned when a position is handed to us, never reconstructed from a delay: once a
+    // reservation is a slot time wide and a rung a half-airtime, dividing one by the other names
+    // nothing.
+    let mut my_slot_index = 0u8;
     let mut coverage_for = 0u32;
     let mut slots_given = 0u8;
     let mut reserved_slots = 0u8;
@@ -708,7 +715,7 @@ where
                 slots_given = slots_given.saturating_add(1);
                 reserved_slots = reserved_slots.saturating_add(1);
             }
-            slot_delay = slot_delay.saturating_add(half);
+            positions.take_reserved();
         }
     }
 
@@ -743,7 +750,8 @@ where
         if best.node_id == ctx.my_node {
             should_relay = true;
             reason = RelayReason::Ranked;
-            my_delay = slot_delay;
+            my_slot_index = positions.next_index();
+            my_delay = positions.take_rung();
             coverage_for = best.coverage_for;
             break;
         }
@@ -753,7 +761,7 @@ where
         let credit = absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
         push_absorbed(&mut absorbed, &mut absorbed_len, best.node_id, credit);
         slots_given = slots_given.saturating_add(1);
-        slot_delay = slot_delay.saturating_add(half);
+        positions.take_rung();
     }
 
     if !should_relay {
@@ -764,7 +772,8 @@ where
         if relay_for_source == Some(ctx.my_node) || relay_for_dest == Some(ctx.my_node) {
             should_relay = true;
             reason = RelayReason::Downstream;
-            my_delay = slot_delay;
+            my_slot_index = positions.next_index();
+            my_delay = positions.first_free_ms();
         }
     }
 
@@ -772,7 +781,8 @@ where
     if !should_relay && initial_candidates <= 1 {
         should_relay = true;
         reason = RelayReason::Sparse;
-        my_delay = slot_delay;
+        my_slot_index = positions.next_index();
+        my_delay = positions.first_free_ms();
     }
 
     // Nobody had coverage to offer, and the originator is waiting to be told its message reached
@@ -788,6 +798,9 @@ where
             should_relay = ack.should_relay;
             reason = RelayReason::Acknowledgement;
             my_delay = ack.my_delay;
+            // The acknowledgement pass builds its own ladder, ordered by how well the source hears
+            // each candidate, so our rung there is the number of answers ranked ahead of ours.
+            my_slot_index = ack.slots_given;
             slots_given = ack.slots_given;
             for i in 0..ack.ranked_len {
                 push_ranked(&mut ranked, &mut ranked_len, ack.ranked[i as usize]);
@@ -795,10 +808,7 @@ where
         }
     }
 
-    let slot_index = my_delay
-        .saturating_sub(crate::channel_access::SLOT_ORIGIN_MS)
-        .checked_div(half)
-        .map_or(0, |slots| slots.min(u8::MAX as u32) as u8);
+    let slot_index = my_slot_index;
 
     BroadcastRelayPlan {
         should_relay,
@@ -824,6 +834,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// SHORT_SLOW slot time: the window these tests lay positions into is 15 of these.
+    const TEST_SLOT_MS: u32 = 10;
+
     use super::*;
     use crate::capability::CapabilityCache;
     use crate::graph::{DownstreamTable, EdgeSource, EdgeStore};
@@ -885,7 +898,18 @@ mod tests {
         capability.track_topology(EE, true, 0);
         let ctx = ctx(&edges, &capability, &downstream);
 
-        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, never_transmitted, false);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            1,
+            BB,
+            BB,
+            u32::MAX,
+            0,
+            50,
+            TEST_SLOT_MS,
+            never_transmitted,
+            false,
+        );
         assert!(
             plan.reserved_slots > 0,
             "the stock repeater that hears the transmitter holds a reserved position"
@@ -902,7 +926,18 @@ mod tests {
 
         // The same topology with the router's copy already on the air: it keeps its place in the
         // order, so the marker still applies, but it is no longer awaited.
-        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, 0, 50, |node| node == DD, false);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            1,
+            BB,
+            BB,
+            u32::MAX,
+            0,
+            50,
+            TEST_SLOT_MS,
+            |node| node == DD,
+            false,
+        );
         assert_eq!(
             plan.reserved_slots, 0,
             "a copy already on the air is not a transmission we are waiting for"
@@ -951,15 +986,36 @@ mod tests {
         let ctx = ctx(&edges, &capability, &downstream);
 
         // Not eligible: nothing unique, nothing owed, so nobody speaks.
-        let plan =
-            plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, t0, 50, never_transmitted, false);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            1,
+            BB,
+            BB,
+            u32::MAX,
+            t0,
+            50,
+            TEST_SLOT_MS,
+            never_transmitted,
+            false,
+        );
         assert!(
             !plan.should_relay,
             "with nothing unique to carry and no acknowledgement owed, we stay quiet"
         );
 
         // Eligible: the same frame is answered, and the ladder names both answerers in order.
-        let plan = plan_broadcast_relay(&ctx, 1, BB, BB, u32::MAX, t0, 50, never_transmitted, true);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            1,
+            BB,
+            BB,
+            u32::MAX,
+            t0,
+            50,
+            TEST_SLOT_MS,
+            never_transmitted,
+            true,
+        );
         assert_eq!(plan.reason, RelayReason::Acknowledgement);
         assert_eq!(
             plan.ranked_len, 2,
@@ -999,7 +1055,18 @@ mod tests {
         let ctx = ctx(&edges, &capability, &downstream);
         // The packet id is even, so the tie-break would prefer the *lower* node id — us. Price
         // must override it, or the ordering is not the one the design claims.
-        let plan = plan_broadcast_relay(&ctx, 2, BB, BB, u32::MAX, t0, 50, never_transmitted, true);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            2,
+            BB,
+            BB,
+            u32::MAX,
+            t0,
+            50,
+            TEST_SLOT_MS,
+            never_transmitted,
+            true,
+        );
         assert_eq!(plan.reason, RelayReason::Acknowledgement);
         assert_eq!(
             plan.ranked[0], EE,
@@ -1103,6 +1170,7 @@ mod tests {
                 0xFFFF_FFFF,
                 0,
                 100,
+                TEST_SLOT_MS,
                 never_transmitted,
                 false,
             )
@@ -1179,6 +1247,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1196,7 +1265,18 @@ mod tests {
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, A, 2.0, 0, EdgeSource::Reported, true, 0);
         let ctx = ctx(&edges, &capability, &downstream);
-        let plan = plan_broadcast_relay(&ctx, 0x77, A, A, 0xFFFF_FFFF, 0, 100, |_| false, false);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            0x77,
+            A,
+            A,
+            0xFFFF_FFFF,
+            0,
+            100,
+            TEST_SLOT_MS,
+            |_| false,
+            false,
+        );
         assert!(plan.should_relay);
     }
 
@@ -1232,6 +1312,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1312,6 +1393,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1336,12 +1418,20 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
         assert!(plan.should_relay);
     }
 
+    /// A stock REPEATER neighbour relieves us, exactly as a ROUTER does.
+    ///
+    /// REPEATER is deprecated as a configuration choice (2.7.11) but not withdrawn from the wire,
+    /// and stock still gives it the high-priority rebroadcast that fires even after hearing
+    /// somebody else's copy. It is going to transmit whether or not we do, so relaying beside it
+    /// adds a duplicate rather than delivering anything. Deprecation governs what an operator
+    /// should configure next, not what a node already on air does.
     #[test]
     fn repeater_neighbor_defers_like_field() {
         let mut edges = EdgeStore::new();
@@ -1365,12 +1455,24 @@ mod tests {
             capability: &capability,
             downstream: &downstream,
         };
-        let plan = plan_broadcast_relay(&ctx, 0x99, B, B, 0xFFFF_FFFF, 0, 100, |_| false, false);
+        let plan = plan_broadcast_relay(
+            &ctx,
+            0x99,
+            B,
+            B,
+            0xFFFF_FFFF,
+            0,
+            100,
+            TEST_SLOT_MS,
+            |_| false,
+            false,
+        );
         assert!(
             !plan.should_relay,
-            "got should_relay delay={} cands={}",
+            "a stock repeater is going to transmit: got should_relay delay={} cands={}",
             plan.slot_delay_ms, plan.candidate_count
         );
+        assert_eq!(plan.reserved_slots, 1, "and it holds a reserved position");
     }
 
     #[test]
@@ -1404,6 +1506,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1462,6 +1565,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1519,6 +1623,7 @@ mod tests {
                 0xFFFF_FFFF,
                 0,
                 100,
+                TEST_SLOT_MS,
                 never_transmitted,
                 false,
             )
@@ -1549,6 +1654,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1577,6 +1683,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1597,6 +1704,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );
@@ -1638,6 +1746,7 @@ mod tests {
             0xFFFF_FFFF,
             0,
             100,
+            TEST_SLOT_MS,
             never_transmitted,
             false,
         );

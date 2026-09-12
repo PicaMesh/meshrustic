@@ -707,6 +707,7 @@ impl NeighborGraph {
             broadcast_dest,
             now_ms,
             half_airtime_ms,
+            crate::coordinated_relay::slot_time_for_preset(self.modem_preset),
             |node| self.has_node_transmitted(node, packet_id, now_ms),
             ack_eligible,
         )
@@ -1564,6 +1565,10 @@ impl NeighborGraph {
         // publish it. Invent it only when the gateway never will: a stock node, or a placeholder
         // we have not resolved yet. Keyed on the gateway, not on the source, because the source's
         // own list carries the other direction and says nothing about this one.
+        // Deliberately not `!publishes_topology`: that asks whether a role may be compensated for,
+        // and answers "yes" for an unclassified node. Inventing an edge is a stronger claim — it
+        // must be one nobody will ever publish — and an unclassified node may yet publish one that
+        // this would have overwritten. Only a node known to publish nothing, or a placeholder.
         let gateway_never_publishes = self.capability.status(gateway) == CapabilityStatus::Legacy
             || is_placeholder_node(gateway);
         if active_routing && gateway_never_publishes {
@@ -2625,7 +2630,6 @@ mod tests {
     };
     use crate::decode_packed_neighbors;
     use crate::graph::{calculate_etx, etx_to_fixed};
-    use crate::nodeinfo::DEVICE_ROLE_REPEATER;
     use crate::topology::{write_packed_header, PackedNeighbor};
     use mesh_radio::{MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
 
@@ -2738,7 +2742,7 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA);
         graph.observe_direct_neighbor(0xBB, -70, 8, 0, 0);
-        graph.track_node_role(0xBB, DEVICE_ROLE_REPEATER, 0);
+        graph.track_node_role(0xBB, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
         assert!(graph.topology_healthy_for_broadcast());
         graph.capability_mut().track_topology(0xBB, false, 0);
         assert!(!graph.topology_healthy_for_broadcast());
@@ -3668,29 +3672,42 @@ mod tests {
         assert!(graph.relay_tx_after(1, 2, 0).is_none());
     }
 
+    /// A node that publishes its own neighbour list is never given stock-router preference, even
+    /// when its role is ROUTER.
+    ///
+    /// This test previously claimed to cover "prefers a stock router" while handing the node an SR
+    /// topology broadcast — which makes it a publisher, and so not stock at all. Role only ever
+    /// compensates for what a node cannot tell us; this one told us. The genuine stock case is
+    /// covered by `stock_router_gets_first_slot` in `broadcast_relay`.
     #[test]
-    fn find_best_relay_prefers_stock_router() {
+    fn a_publishing_router_is_not_given_stock_preference() {
+        const ME: u32 = 0xCC00_00CC;
+        const SOURCE: u32 = 0xBB00_00BB;
+        const PUBLISHER: u32 = 0xDD00_00DD;
         let mut graph = NeighborGraph::new();
-        graph.set_my_node(0xCC00_00CC);
+        graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 0, 0);
-        graph.observe_direct_neighbor(0xDD00_00DD, -72, 7, 0, 0);
-        graph.track_node_role(0xDD00_00DD, DEVICE_ROLE_ROUTER, 0);
+        graph.observe_direct_neighbor(SOURCE, -70, 8, 0, 0);
+        graph.observe_direct_neighbor(PUBLISHER, -72, 7, 0, 0);
+        graph.track_node_role(PUBLISHER, DEVICE_ROLE_ROUTER, 0);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, false);
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
         let neighbor = PackedNeighbor {
-            node_id: 0xBB00_00BB,
+            node_id: SOURCE,
             rssi: -75,
             snr: 8,
             signal_routing_active: false,
             hears_us: false,
             etx_variance: 0,
         };
-        graph.merge_topology(0xDD00_00DD, &header, &[neighbor], true, 0, 0);
-        assert_eq!(
-            graph.find_best_relay_candidate(99, 0xBB00_00BB, 0),
-            0xDD00_00DD
+        // signal_routing_active = false on its own broadcast: SR-passive, not stock.
+        graph.merge_topology(PUBLISHER, &header, &[neighbor], true, 0, 0);
+        assert!(!graph.capability().is_immediate_relay_router(PUBLISHER));
+        assert_ne!(
+            graph.find_best_relay_candidate(99, SOURCE, 0),
+            PUBLISHER,
+            "a publisher is ranked on what it published, not preferred for its role"
         );
     }
 
@@ -3873,7 +3890,7 @@ mod tests {
         graph.observe_direct_neighbor(STOCK, -70, 8, 1_000, 0);
         graph
             .capability_mut()
-            .track_role(STOCK, DEVICE_ROLE_REPEATER, 1_000);
+            .track_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 1_000);
 
         graph.run_maintenance(1_001 + PUBLISHER_SILENCE_MS);
         assert!(

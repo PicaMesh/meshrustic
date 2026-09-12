@@ -5,7 +5,7 @@ use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER
 use mesh_routing::{
     coordinated_relay, write_packed_header, CapabilityStatus, InboundPacket, NeighborGraph, Router,
     TopologyMergeResult, CAPABILITY_TTL_MS, DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE,
-    DEVICE_ROLE_REPEATER, DEVICE_ROLE_TRACKER, MAX_CAPABILITY_RECORDS,
+    DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, DEVICE_ROLE_TRACKER, MAX_CAPABILITY_RECORDS,
 };
 
 #[test]
@@ -29,8 +29,17 @@ fn passive_node_tracks_relayed_topology_capability() {
     assert_eq!(graph.capability_status(0xBB), CapabilityStatus::SrActive);
 }
 
+/// A ROUTER that publishes its own neighbour list does not take the stock router's early slot.
+///
+/// The node here broadcasts topology with `signal_routing_active: false`, which makes it SR-passive,
+/// not stock — and a node that publishes is ranked on what it published rather than compensated for
+/// by role. The test was named for the opposite claim while setting up a publisher.
+///
+/// Note what this exposes: establishing that a *genuinely* stock router hears the transmitter has no
+/// reachable path today, because the inferred edge is gated on `Legacy` and nothing ever marks a
+/// ROUTER legacy. That is the stock-router coverage blindness, not a gap in this test.
 #[test]
-fn stock_router_gets_earlier_slot_than_sr_self() {
+fn a_publishing_router_does_not_take_the_stock_early_slot() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.observe_direct_neighbor(0xBB, -70, 8, 0, 0);
@@ -49,13 +58,20 @@ fn stock_router_gets_earlier_slot_than_sr_self() {
     };
     graph.merge_topology(0xBB, &header, &[remote], true, 0, 0);
 
+    // Two candidates, not one: the publisher is ranked like any peer now that its role buys it
+    // nothing. It used to be consumed by the reservation pre-pass and so never counted.
     let (idx_self_only, count_alone) = graph.relay_slot_index(99, 0, 0);
-    assert_eq!(count_alone, 1);
+    assert_eq!(count_alone, 2);
     assert_eq!(idx_self_only, 0);
 
-    let (idx_with_stock, count) = graph.relay_slot_index(99, 0xDD, 0);
-    assert_eq!(count, 2);
-    assert_eq!(idx_with_stock, 1);
+    // It is still a candidate — it published, so it can be ranked — but it holds no reserved
+    // position, so our own rung stays where it was when we ranked alone.
+    let (idx_with_publisher, _count) = graph.relay_slot_index(99, 0xDD, 0);
+    assert!(!graph.capability().is_immediate_relay_router(0xBB));
+    assert_eq!(
+        idx_with_publisher, idx_self_only,
+        "a publisher earns no reserved position, so our rung must not move behind one"
+    );
 }
 
 #[test]

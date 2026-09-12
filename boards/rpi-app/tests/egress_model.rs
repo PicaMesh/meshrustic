@@ -5,6 +5,8 @@ use mesh_routing::{
     NeighborGraph, PackedNeighbor, TopologyMergeResult, DEVICE_ROLE_ROUTER,
 };
 
+/// SHORT_SLOW slot time: the stock-router window is 15 of these.
+const SHORT_SLOW_SLOT_MS: u32 = 10;
 const ME: u32 = 0x1000_0001;
 const EGRESS: u32 = 0xA000_000A;
 const INBOUND: u32 = 0xB000_000B;
@@ -80,6 +82,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
         0xFFFF_FFFF,
         0,
         100,
+        SHORT_SLOW_SLOT_MS,
         |_| false,
         false,
     );
@@ -101,6 +104,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
         0xFFFF_FFFF,
         0,
         100,
+        SHORT_SLOW_SLOT_MS,
         |_| false,
         false,
     );

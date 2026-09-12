@@ -123,7 +123,8 @@ fn parse_hex_node_id(token: &[u8]) -> Option<u32> {
 
 fn to_fixed_text(bytes: &[u8]) -> Result<Vec<u8, MAX_COMMAND_TEXT>, CommandError> {
     let mut out = Vec::new();
-    out.extend_from_slice(bytes).map_err(|()| CommandError::LineTooLong)?;
+    out.extend_from_slice(bytes)
+        .map_err(|()| CommandError::LineTooLong)?;
     Ok(out)
 }
 
