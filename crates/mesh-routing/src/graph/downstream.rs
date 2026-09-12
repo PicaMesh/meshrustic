@@ -42,6 +42,10 @@ impl DownstreamTable {
         self.count
     }
 
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
     pub fn entry(&self, index: u16) -> Option<&DownstreamEntry> {
         if (index as usize) < self.count as usize {
             Some(&self.entries[index as usize])

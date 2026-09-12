@@ -47,6 +47,10 @@ impl RelayIdentityCache {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.bucket_count = 0;
+    }
+
     pub fn remember_relay_identity(&mut self, node_id: u32, relay_byte: u8, now_ms: u32) {
         if relay_byte == 0 || node_id == 0 {
             return;

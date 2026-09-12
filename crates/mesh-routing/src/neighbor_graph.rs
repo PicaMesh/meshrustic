@@ -360,6 +360,30 @@ impl NeighborGraph {
         self.modem_preset
     }
 
+    /// Drop every neighbour, route and commit learned on the previous air parameters.
+    ///
+    /// Identity, role and the modem preset we are about to operate on stay. Topology version
+    /// returns to 0 so the next list is a boot announcement peers will re-base on, rather than a
+    /// silent restart they would reject as stale.
+    pub fn purge_for_preset_change(&mut self) {
+        self.edges.clear();
+        self.downstream.clear();
+        let _ = self.clear_relays();
+        self.route_cache.clear();
+        self.capability.clear();
+        self.direct_signal_count = 0;
+        self.topo_version_count = 0;
+        self.last_version_resync = None;
+        self.pending_listed = [PendingListed::EMPTY; PENDING_LISTED_SLOTS];
+        self.our_tx_count = 0;
+        self.node_tx_count = 0;
+        self.merge_asymmetric_skip_count = 0;
+        self.topology_version = 0;
+        self.topology_dirty = false;
+        self.last_topology_ms = 0;
+        self.last_topology_list_ms = 0;
+    }
+
     fn node_tx_record_window_ms(&self) -> u32 {
         crate::coordinated_relay::transmission_record_window_ms(self.modem_preset)
     }
@@ -4296,5 +4320,43 @@ mod tests {
         let report = graph.run_maintenance(400_000);
         assert!(!report.topology_dirty_send);
         assert!(!report.topology_due);
+    }
+
+    #[test]
+    fn purge_for_preset_change_drops_neighbours_routes_and_resets_topology_version() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const FAR: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_modem_preset(MODEM_SHORT_SLOW);
+        graph.set_device_role(DEVICE_ROLE_REPEATER);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        graph
+            .downstream_mut()
+            .update(ME, FAR, PEER, 2.0, 100, false, 0);
+        graph.record_node_transmission(PEER, 42, 100);
+        let routed = graph.route_to(PEER, 100);
+        assert_ne!(routed.next_hop, 0);
+        graph.commit_topology_broadcast(100, false);
+        assert!(graph.neighbor_count() > 0);
+        assert!(graph.downstream().count() > 0);
+        assert!(graph.has_node_transmitted(PEER, 42, 100));
+        assert_eq!(graph.topology_version(), 1);
+
+        graph.purge_for_preset_change();
+
+        assert_eq!(graph.neighbor_count(), 0);
+        assert_eq!(graph.graph_node_count(), 0);
+        assert_eq!(graph.downstream().count(), 0);
+        assert!(!graph.has_node_transmitted(PEER, 42, 200));
+        assert_eq!(graph.route_to(PEER, 200).next_hop, 0);
+        assert_eq!(graph.route_to(FAR, 200).next_hop, 0);
+        assert_eq!(graph.topology_version(), 0);
+        assert_eq!(graph.last_topology_ms(), 0);
+        assert_eq!(graph.modem_preset(), MODEM_SHORT_SLOW);
+        assert_eq!(graph.device_role(), DEVICE_ROLE_REPEATER);
+        graph.observe_direct_neighbor(PEER, -70, 8, 300, 0);
+        assert_eq!(graph.neighbor_count(), 1);
     }
 }

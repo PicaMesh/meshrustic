@@ -241,6 +241,9 @@ pub struct Router {
     channel_key: CryptoKey,
     channel_hash: u8,
     modem_preset: u8,
+    /// Preset the radio is actually running. `set_modem_preset` updates `modem_preset` first;
+    /// `radio_reconfigured` compares the two so a no-op apply does not drop the graph.
+    operating_preset: u8,
     use_preset: bool,
     hop_limit: u8,
     next_tx_id: u32,
@@ -412,6 +415,7 @@ impl Router {
             channel_key,
             channel_hash,
             modem_preset,
+            operating_preset: modem_preset,
             use_preset,
             hop_limit,
             next_tx_id: 1,
@@ -452,6 +456,7 @@ impl Router {
             cfg.lora.use_preset,
             cfg.channel_key,
         );
+        self.operating_preset = self.modem_preset;
         self.hop_limit = cfg.lora.hop_limit;
     }
 
@@ -484,7 +489,10 @@ impl Router {
     /// nobody on the new preset saw, reliable retries and routing ACKs the requester (who
     /// stays on its preset) can no longer hear, and admin replies to that requester. Periodic
     /// topology, NodeInfo and telemetry broadcasts stay: they introduce us on the new preset.
-    pub fn radio_reconfigured(&mut self) {
+    ///
+    /// When the operating preset actually changed, the neighbour graph is dropped too — those
+    /// links cannot exist on the new air — and we re-advertise from nothing as at boot.
+    pub fn radio_reconfigured(&mut self, now_ms: u32, slot_ms: u32) {
         let mut dropped = 0usize;
         for p in &mut self.pending {
             if p.active {
@@ -521,6 +529,17 @@ impl Router {
         }
         self.pending_topology_reply_ms = 0;
         dropped += self.graph.clear_relays();
+        if self.modem_preset != self.operating_preset {
+            if self.pending_topology.active {
+                self.pending_topology.active = false;
+                dropped += 1;
+            }
+            self.graph.purge_for_preset_change();
+            self.relay_identity.clear();
+            self.last_nodeinfo_ms = 0;
+            self.operating_preset = self.modem_preset;
+            self.ensure_boot_broadcasts(now_ms, slot_ms);
+        }
         self.sr_log.push(SrLogEvent::RadioReconfigured {
             dropped: dropped.min(u8::MAX as usize) as u8,
         });
@@ -6070,7 +6089,7 @@ mod tests {
         );
         assert!(router.relay_tx_after(UNI_SOURCE, 0x802, 0).is_some());
 
-        router.radio_reconfigured();
+        router.radio_reconfigured(released_at + 20, coordinated_relay::DEFAULT_SLOT_MS);
 
         assert!(!router.has_pending_reliable(0x801));
         assert!(router.relay_tx_after(UNI_SOURCE, 0x802, 0).is_none());
@@ -6085,6 +6104,74 @@ mod tests {
             e,
             SrLogEvent::RadioReconfigured { dropped } if *dropped >= 2
         )));
+    }
+
+    fn preset_switch_router(from: u8, to: u8) -> Router {
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut router = Router::with_channel(UNI_ME, key, 0x77, from, true, 3);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_DEST, -70, 8, 100, 0);
+        router.graph_mut().downstream_mut().update(
+            UNI_ME,
+            UNI_SOURCE,
+            UNI_DEST,
+            2.0,
+            100,
+            false,
+            0,
+        );
+        router.remember_relay_identity(UNI_DEST, (UNI_DEST & 0xFF) as u8, 100);
+        let _ = router.route_to(UNI_DEST, 100);
+        router.set_modem_preset("", to, true, key);
+        router.radio_reconfigured(200, coordinated_relay::DEFAULT_SLOT_MS);
+        router
+    }
+
+    #[test]
+    fn preset_change_purges_graph_and_re_advertises_empty_boot_topology() {
+        for &(from, to) in &[
+            (mesh_radio::MODEM_LONG_FAST, mesh_radio::MODEM_SHORT_SLOW),
+            (mesh_radio::MODEM_SHORT_SLOW, mesh_radio::MODEM_LONG_FAST),
+        ] {
+            let mut router = preset_switch_router(from, to);
+            assert_eq!(
+                router.graph_mut().neighbor_count(),
+                0,
+                "from {from} to {to}"
+            );
+            assert_eq!(router.graph_mut().downstream().count(), 0);
+            assert_eq!(router.route_to(UNI_DEST, 300).next_hop, 0);
+            assert_eq!(
+                router.resolve_heard_from_node((UNI_DEST & 0xFF) as u8, UNI_SOURCE, -70, 8, 300),
+                crate::graph::placeholder_node_id((UNI_DEST & 0xFF) as u8),
+            );
+            assert_eq!(router.topology_version(), 1);
+            assert!(
+                router.poll_topology_tx(200).is_some(),
+                "empty boot list queued from {from} to {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_preset_reconfigure_does_not_purge_the_graph() {
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut router = Router::with_channel(
+            UNI_ME,
+            key,
+            0x77,
+            mesh_radio::MODEM_LONG_FAST,
+            true,
+            3,
+        );
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_DEST, -70, 8, 100, 0);
+        router.set_modem_preset("", mesh_radio::MODEM_LONG_FAST, true, key);
+        router.radio_reconfigured(200, coordinated_relay::DEFAULT_SLOT_MS);
+        assert_eq!(router.graph_mut().neighbor_count(), 1);
+        assert!(router.poll_topology_tx(200).is_none());
     }
 
     /// A copy heard after our relay left the router (it may sit in the radio queue behind

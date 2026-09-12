@@ -57,6 +57,10 @@ impl CapabilityCache {
         self.status_at(node_id, 0, 0)
     }
 
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
     pub fn status_at(&self, node_id: u32, my_node: u32, now_ms: u32) -> CapabilityStatus {
         let Some(rec) = self.find(node_id) else {
             return CapabilityStatus::Unknown;

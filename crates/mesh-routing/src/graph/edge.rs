@@ -147,6 +147,11 @@ impl EdgeStore {
         self.node_count
     }
 
+    /// Drop every node slot. Does not touch the ETX-change threshold.
+    pub fn clear(&mut self) {
+        self.node_count = 0;
+    }
+
     pub fn find_node(&self, node_id: u32) -> Option<&NodeEdges> {
         (0..self.node_count as usize)
             .find(|&i| self.nodes[i].node_id == node_id)
