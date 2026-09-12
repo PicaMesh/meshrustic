@@ -3,8 +3,8 @@
 
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_routing::{
-    coordinated_relay, relay_header_with_next_hop_opts, EdgeSource, InboundPacket, ProcessResult,
-    RelayPlan, Router, DEVICE_ROLE_ROUTER, LAST_HOP_BUDGET,
+    coordinated_relay, hops_away, relay_header_with_next_hop_opts, EdgeSource, InboundPacket,
+    ProcessResult, RelayPlan, Router, DEVICE_ROLE_ROUTER, LAST_HOP_BUDGET,
 };
 use static_cell::StaticCell;
 
@@ -51,7 +51,7 @@ fn ready_relay(router: &mut Router, result: &ProcessResult, now_ms: u32) -> Rela
 #[test]
 fn last_hop_has_one_hop_and_names_the_destination_on_any_link() {
     for etx in [2.0, 4.0] {
-        let hdr = relay_header_for(etx, 5, 3);
+        let hdr = relay_header_for(etx, 3, 5);
         assert_eq!(hdr.hop_limit(), LAST_HOP_BUDGET);
         assert_eq!(hdr.hop_start(), 4);
         assert_eq!(hdr.parse().next_hop, (DEST & 0xFF) as u8);
@@ -60,11 +60,12 @@ fn last_hop_has_one_hop_and_names_the_destination_on_any_link() {
 
 #[test]
 fn hop_start_preserves_hops_away_after_relay() {
-    let hdr = relay_header_for(2.0, 5, 3);
-    let hops_away_rx = 5u8.saturating_sub(3);
-    let hops_away_tx = hdr.hop_start().saturating_sub(hdr.hop_limit());
-    assert_eq!(hops_away_rx, 2);
-    assert_eq!(hops_away_tx, hops_away_rx.saturating_add(1));
+    for &(hop_start, hop_limit) in &[(3, 3), (5, 3), (7, 4)] {
+        let hdr = relay_header_for(2.0, hop_limit, hop_start);
+        let hops_away_rx = hops_away(hop_start, hop_limit, true).expect("well-formed");
+        let hops_away_tx = hops_away(hdr.hop_start(), hdr.hop_limit(), true).expect("consistent");
+        assert_eq!(hops_away_tx, hops_away_rx.saturating_add(1));
+    }
 }
 
 #[test]
@@ -84,7 +85,7 @@ fn router_relay_applies_limit_on_unicast() {
     let router = ROUTER.init(Router::new(ME));
     setup_router(router, 2.0);
 
-    let header = PacketHeader::from_fields(DEST, SOURCE, 99, 0x01, 5, 3, false, false, 0, 0);
+    let header = PacketHeader::from_fields(DEST, SOURCE, 99, 0x01, 3, 5, false, false, 0, 0);
     let mut hdr = [0u8; PACKET_HEADER_LEN];
     header.encode_to(&mut hdr);
     let wire = [hdr.as_slice(), &[0x01u8]].concat();
