@@ -571,6 +571,26 @@ is actually waiting for.
   `a_passive_node_publishes_the_relayer_it_hears`,
   `a_node_that_publishes_no_topology_records_no_relayer`,
   `a_mute_node_records_the_relayer_without_inferring_a_path_behind_it`.
+- **A relayed frame measures our link to its relayer, and that measurement is `Reported`.** The
+  frame is a direct RF transmission from the relayer whatever originated the payload it carries, so
+  the RSSI and SNR taken off it measure `us → relayer` exactly as a frame the relayer originated
+  would. It therefore *establishes* that link rather than only refreshing one: a stock router that
+  relays constantly and originates almost never — 5 packets in 840, field 2026-09-11 — is otherwise
+  measured hundreds of times and recorded not once, so nobody can say it reaches them and every
+  neighbour keeps unique coverage of it and relays. Publishing it costs a peer nothing: `us →
+  relayer` is our own measurement of our own link and appears in the list we broadcast, so a peer
+  recomputing our coverage from that list reaches the number we do. The `Mirrored` exclusion guards
+  the other case — an edge *between other nodes* that a third party published, where that owner is
+  the authority and republishing it would make two nodes disagree.
+- **What a relayed frame cannot supply is identity, so an unidentified relayer is never published.**
+  It names its relayer in one byte. That byte resolves only when it names exactly one node we have
+  measured; two neighbours sharing a low byte resolve to nobody, because the identity decides which
+  node a published, coverage-bearing edge is written to, and naming the wrong one has a peer credit
+  coverage that does not exist and stop relaying to us. Unresolved, the relayer stays a placeholder,
+  and a placeholder is never published — so a relayer must still be identified by other means
+  before any of this publishes anything. Tests:
+  `an_unidentified_relayer_is_measured_but_never_published`,
+  `a_relay_byte_naming_one_neighbour_resolves_to_it`, `an_ambiguous_relay_byte_resolves_to_nobody`.
 - **The reverse direction of our own measurement is an assumption, not a measurement.** Observing
   a neighbour writes `us → neighbour` as `Reported` and `neighbour → us` as `Inferred`: we cannot
   measure how well it hears us. Recorded as `Reported` it outranked and permanently blocked the

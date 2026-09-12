@@ -303,18 +303,28 @@ impl NeighborGraph {
     }
 
     /// Outgoing edge whose destination low byte matches `relay_byte` (non-placeholder preferred).
+    /// Resolve a relay byte against our own measured neighbours, and only when it is unambiguous.
+    ///
+    /// A relayed frame names its relayer in one byte, so two neighbours sharing that byte are
+    /// indistinguishable in it. The resolved identity decides which node a measured, published
+    /// edge is written to, and a peer reads that edge as evidence the named node reaches us — so
+    /// naming the wrong one would have a peer credit coverage that does not exist and stop
+    /// relaying to us. With eight neighbours a shared low byte is not a remote case. No answer is
+    /// the safe answer: the caller falls back to a placeholder, which is never published.
     pub fn match_relay_byte_on_outgoing_edges(&self, relay_byte: u8) -> Option<u32> {
         let node = self.edges.find_node(self.my_node)?;
+        let mut found: Option<u32> = None;
         for i in 0..node.edge_count as usize {
             let to = node.edges[i].to;
-            if (to & 0xFF) as u8 != relay_byte {
+            if (to & 0xFF) as u8 != relay_byte || is_placeholder_node(to) {
                 continue;
             }
-            if !is_placeholder_node(to) {
-                return Some(to);
+            match found {
+                Some(seen) if seen != to => return None,
+                _ => found = Some(to),
             }
         }
-        None
+        found
     }
 
     pub fn match_relay_placeholder_on_outgoing_edges(&self, relay_byte: u8) -> Option<u32> {
@@ -2737,6 +2747,54 @@ mod tests {
     /// A CLIENT_MUTE never relays but does publish topology, and it is the only node that can
     /// say whether a relayer reaches it. Before this, it recorded nothing and so stayed
     /// permanently uncovered, which is what made every neighbour hold unique coverage of it.
+    #[test]
+    fn a_relay_byte_naming_one_neighbour_resolves_to_it() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 0, 0);
+        assert_eq!(graph.match_relay_byte_on_outgoing_edges(0xBB), Some(PEER));
+    }
+
+    /// Two neighbours sharing a low byte are indistinguishable in a relayed frame. Guessing would
+    /// write a measured, published edge to the wrong node, and a peer reading it would credit that
+    /// node with covering us and stop relaying to us.
+    #[test]
+    fn an_ambiguous_relay_byte_resolves_to_nobody() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const TWIN: u32 = 0xCC00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 0, 0);
+        graph.observe_direct_neighbor(TWIN, -80, 4, 0, 0);
+        assert_eq!(graph.match_relay_byte_on_outgoing_edges(0xBB), None);
+    }
+
+    /// Identity, not signal, is what a relayed frame cannot supply: it names its relayer in one
+    /// byte. So a relayer we have never identified stays a placeholder and is never published,
+    /// however many of its frames we measure.
+    #[test]
+    fn an_unidentified_relayer_is_measured_but_never_published() {
+        const ME: u32 = 0xAA00_00AA;
+        const REMOTE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+
+        for i in 0..5u32 {
+            graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000 + i * 1_000, 0, None, i);
+        }
+
+        let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
+        assert_eq!(
+            graph.fill_neighbor_entries(&mut entries),
+            0,
+            "a placeholder relayer must never appear in the list we publish"
+        );
+    }
+
     #[test]
     fn a_mute_node_publishes_the_relayer_it_hears() {
         const ME: u32 = 0xAA00_00AA;
