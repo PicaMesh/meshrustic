@@ -98,28 +98,32 @@ fn bridge_stub_direct_call_returns_zero() {
     assert_eq!(plan.bridge_count, 0);
 }
 
-#[test]
-fn cross_preset_unicast_bridges_to_long_fast_segment() {
-    static ROUTER: StaticCell<Router> = StaticCell::new();
-    let router = ROUTER.init(Router::new(0x677a_1caf));
-    let dest = 0x5889_1234u32;
-    {
-        let graph = router.graph_mut();
-        graph.observe_direct_neighbor(0x979e_d146, -70, 8, 0, 0);
-        graph.observe_direct_neighbor(dest, -70, 8, 0, 1);
-    }
-
-    let header = PacketHeader::from_fields(dest, 0x979e_d146, 9, 0x77, 3, 3, false, false, 0, 0);
+fn unicast_bridge_wire(to: u32, from: u32, id: u32) -> heapless::Vec<u8, 64> {
+    let header = PacketHeader::from_fields(to, from, id, 0x77, 3, 3, false, false, 0, 0);
     let mut wire = heapless::Vec::<u8, 64>::new();
     let mut hdr = [0u8; PACKET_HEADER_LEN];
     header.encode_to(&mut hdr);
     wire.extend_from_slice(&hdr).unwrap();
     wire.extend_from_slice(&[0xAA, 0xBB, 0xCC]).unwrap();
+    wire
+}
 
+/// Same four properties in either direction: one leg, the other radio, no same-radio relay,
+/// length preserved.
+fn assert_cross_radio_unicast_bridge(rx_radio: u8, target_radio: u8) {
+    let mut router = Router::new(0x677a_1caf);
+    let dest = 0x5889_1234u32;
+    {
+        let graph = router.graph_mut();
+        graph.observe_direct_neighbor(0x979e_d146, -70, 8, 0, rx_radio);
+        graph.observe_direct_neighbor(dest, -70, 8, 0, target_radio);
+    }
+
+    let wire = unicast_bridge_wire(dest, 0x979e_d146, 9);
     let result = router
         .process_inbound(
             &InboundPacket {
-                radio_id: 0,
+                radio_id: rx_radio,
                 rssi: -70,
                 snr: 10,
                 bytes: &wire,
@@ -130,18 +134,26 @@ fn cross_preset_unicast_bridges_to_long_fast_segment() {
 
     let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 100);
 
-    assert_eq!(plan.bridge_count, 1);
-    assert_eq!(plan.bridge[0].target_radio, 1);
-    assert!(plan.relay.is_none());
+    assert_eq!(
+        plan.bridge_count, 1,
+        "rx_radio={rx_radio} target_radio={target_radio}"
+    );
+    assert_eq!(
+        plan.bridge[0].target_radio, target_radio,
+        "rx_radio={rx_radio}"
+    );
+    assert!(
+        plan.relay.is_none(),
+        "same-radio relay alongside bridge, rx_radio={rx_radio}"
+    );
     assert_eq!(plan.bridge[0].len as usize, wire.len());
 }
 
-#[test]
-fn bridge_dedup_suppresses_second_bridge_to_same_target() {
+fn assert_bridge_dedup_to_target(rx_radio: u8, target_radio: u8) {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA00_00AA);
-    graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 0, 0);
-    graph.observe_direct_neighbor(0xCC00_00CC, -70, 8, 0, 1);
+    graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 0, rx_radio);
+    graph.observe_direct_neighbor(0xCC00_00CC, -70, 8, 0, target_radio);
     let route = graph.route_to(0xCC00_00CC, 100);
     let parsed =
         PacketHeader::from_fields(0xCC00_00CC, 0xBB00_00BB, 2, 0x77, 3, 3, false, false, 0, 0)
@@ -152,7 +164,7 @@ fn bridge_dedup_suppresses_second_bridge_to_same_target() {
         delay_ms: 0,
     };
     let eval = BridgeEval {
-        rx_radio: 0,
+        rx_radio,
         parsed: &parsed,
         route,
         decoded_portnum: None,
@@ -165,33 +177,52 @@ fn bridge_dedup_suppresses_second_bridge_to_same_target() {
     let mut sr_log = mesh_routing::SrLog::new();
     let qos = ChannelQoS::new();
     let mut plan = TxPlan::default();
-    assert!(evaluate_bridge_targets(
-        &eval,
-        &relay,
-        &mut graph,
-        &mut dedup,
-        &qos,
-        &mut sr_log,
-        0xAA00_00AA,
-        10,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
-        &mut plan,
-    ));
+    assert!(
+        evaluate_bridge_targets(
+            &eval,
+            &relay,
+            &mut graph,
+            &mut dedup,
+            &qos,
+            &mut sr_log,
+            0xAA00_00AA,
+            10,
+            coordinated_relay::DEFAULT_SLOT_MS,
+            coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
+            &mut plan,
+        ),
+        "first bridge rx_radio={rx_radio} target_radio={target_radio}"
+    );
     assert_eq!(plan.bridge_count, 1);
+    assert_eq!(plan.bridge[0].target_radio, target_radio);
     plan = TxPlan::default();
-    assert!(!evaluate_bridge_targets(
-        &eval,
-        &relay,
-        &mut graph,
-        &mut dedup,
-        &qos,
-        &mut sr_log,
-        0xAA00_00AA,
-        10,
-        coordinated_relay::DEFAULT_SLOT_MS,
-        coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
-        &mut plan,
-    ));
+    assert!(
+        !evaluate_bridge_targets(
+            &eval,
+            &relay,
+            &mut graph,
+            &mut dedup,
+            &qos,
+            &mut sr_log,
+            0xAA00_00AA,
+            10,
+            coordinated_relay::DEFAULT_SLOT_MS,
+            coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW),
+            &mut plan,
+        ),
+        "repeat must be suppressed rx_radio={rx_radio} target_radio={target_radio}"
+    );
     assert_eq!(plan.bridge_count, 0);
+}
+
+#[test]
+fn cross_preset_unicast_bridges_to_long_fast_segment() {
+    assert_cross_radio_unicast_bridge(0, 1);
+    assert_cross_radio_unicast_bridge(1, 0);
+}
+
+#[test]
+fn bridge_dedup_suppresses_second_bridge_to_same_target() {
+    assert_bridge_dedup_to_target(0, 1);
+    assert_bridge_dedup_to_target(1, 0);
 }
