@@ -1581,6 +1581,22 @@ pub mod sr {
                 put_hex8(&mut line, &mut pos, node_id);
                 finish_line(&mut line, pos);
             }
+            SrLogEvent::BroadcastUnrankedThinGraph {
+                from,
+                direct_neighbors,
+            } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[SR] Relay !");
+                put_hex8(&mut line, &mut pos, from);
+                put(
+                    &mut line,
+                    &mut pos,
+                    b" unranked: topology too thin to judge, direct=",
+                );
+                put_u32(&mut line, &mut pos, direct_neighbors as u32);
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::DirectNeighborLostDirty => {
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

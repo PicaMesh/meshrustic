@@ -1660,11 +1660,21 @@ impl Router {
         );
 
         let half_airtime = half_airtime_ms(slot_ms);
-        let broadcast_plan = if parsed.to == NODENUM_BROADCAST
+        let broadcast_candidate = parsed.to == NODENUM_BROADCAST
             && self.graph.signal_routing_active()
-            && parsed.from != self.node_num
-            && self.graph.topology_healthy_for_broadcast()
-        {
+            && parsed.from != self.node_num;
+        // Too few SR-capable direct neighbours to judge coverage: the relay goes out unranked,
+        // because delivering everywhere outranks saving a packet when the graph cannot say who
+        // else is covered. Say so — otherwise the capture shows a relay with no decision behind
+        // it and nothing to distinguish it from one the ranking chose.
+        if broadcast_candidate && !self.graph.topology_healthy_for_broadcast() {
+            let direct_neighbors = self.graph.neighbor_count();
+            self.sr_log.push(SrLogEvent::BroadcastUnrankedThinGraph {
+                from: parsed.from,
+                direct_neighbors,
+            });
+        }
+        let broadcast_plan = if broadcast_candidate && self.graph.topology_healthy_for_broadcast() {
             // Eligibility for the acknowledgement pass is policy and belongs here, where the
             // portnum and the header are known; the ladder it produces is mechanism and belongs in
             // the ranking. Scoped to a text broadcast that arrived straight from its originator:

@@ -190,6 +190,14 @@ pub enum SrLogEvent {
     RelayConfirmedHearsUs {
         node_id: u32,
     },
+    /// Broadcast relayed without ever being ranked: too few SR-capable direct neighbours to judge
+    /// coverage, so delivery wins over saving the packet. Logged because the relay is otherwise
+    /// indistinguishable in a capture from one the ranking chose, and silence here has twice cost
+    /// a field diagnosis.
+    BroadcastUnrankedThinGraph {
+        from: u32,
+        direct_neighbors: u8,
+    },
     DirectNeighborLostDirty,
     NodeInfoReceived {
         from: u32,
