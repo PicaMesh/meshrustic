@@ -10,6 +10,15 @@ const ME: u32 = 0xCC00_00CC;
 const NEIGHBOR: u32 = 0xBB00_00BB;
 const STOCK: u32 = 0xDD00_00DD;
 
+/// Build a two-neighbour graph around us, healthy or not.
+///
+/// Note what "unhealthy" has to mean here, because it is not free to choose. `topology_healthy_for_
+/// broadcast` counts a direct neighbour as capable when its status is SR-active **or Unknown**, and
+/// a genuine stock node is exactly `Unknown` — nothing ever marks a stock router legacy. So a real
+/// stock relay router always makes the topology healthy, and the unhealthy case cannot contain one:
+/// it is reached by making every neighbour a publisher, which is what the `!healthy` branch does to
+/// `STOCK`. That node is then SR-passive rather than stock, despite its name, and is treated as a
+/// publisher for the rest of the test. See `a_stock_router_neighbour_always_makes_topology_healthy`.
 fn setup_stock_relay_topology(router: &mut Router, healthy: bool) {
     router.set_device_role(DEVICE_ROLE_ROUTER);
     let graph = router.graph_mut();
@@ -102,10 +111,9 @@ fn unhealthy_topology_defaults_to_relay() {
     let router = ROUTER.init(Router::new(ME));
     setup_stock_relay_topology(router, false);
     assert!(!router.graph_mut().topology_healthy_for_broadcast());
-    // The helper marks STOCK as publishing its own topology to make the graph unhealthy, which
-    // also means it is not a stock node at all — a publisher is ranked on its list, not
-    // compensated for by its role. So the candidate is us, which is what "defaults to relay"
-    // means: with nothing we can defer to, we carry it.
+    // Every neighbour here publishes, which is the only way to be unhealthy — so there is no stock
+    // node left to defer to and we carry the frame ourselves. That is what "defaults to relay"
+    // means. A real stock router could not appear in this state; it would make the graph healthy.
     assert_eq!(
         router
             .graph_mut()
@@ -116,4 +124,27 @@ fn unhealthy_topology_defaults_to_relay() {
     let plan = evaluate_broadcast(router, NEIGHBOR, 0);
     assert!(plan.relay.is_none());
     assert!(router.relay_tx_after(NEIGHBOR, 99, 0).is_some());
+}
+
+/// A real stock relay router always makes the topology healthy, so "unhealthy" and "a stock router
+/// is present" cannot hold at once.
+///
+/// Worth pinning because the opposite is easy to assume: health counts a neighbour whose capability
+/// is `Unknown`, and `Unknown` is precisely where a stock node sits — `track_role` only marks a mute
+/// role legacy, and `track_topology` is only reached from a SignalRouting broadcast, which stock
+/// never sends. Anyone trying to construct "unhealthy topology behind a stock router" is chasing a
+/// state the model does not have.
+#[test]
+fn a_stock_router_neighbour_always_makes_topology_healthy() {
+    static ROUTER: StaticCell<Router> = StaticCell::new();
+    let router = ROUTER.init(Router::new(ME));
+    setup_stock_relay_topology(router, true);
+    let graph = router.graph_mut();
+    assert_eq!(
+        graph.capability().status(STOCK),
+        mesh_routing::CapabilityStatus::Unknown,
+        "a stock node is never marked legacy or passive"
+    );
+    assert!(graph.capability().is_immediate_relay_router(STOCK));
+    assert!(graph.topology_healthy_for_broadcast());
 }
