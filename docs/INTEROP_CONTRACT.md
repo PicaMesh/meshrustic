@@ -52,19 +52,18 @@ is actually waiting for.
 - **Gap after our own frame.** At least `TX_GAP_MS` (100 ms) of silence follows each of our
   frames before the next one starts (`ChannelAccess::note_tx_done`). Stock never sends two
   frames back to back because each carries its own contention delay.
-- **The broadcast ladder starts at the turnaround; unicast slot 0 starts at stock's contention
-  floor.** Rung k of the SignalRouting broadcast ladder fires at `SLOT_ORIGIN_MS` plus k
-  half-airtimes (`channel_access::slot_delay_ms`, used by `plan_broadcast_relay` and
-  `NeighborGraph::commit_relay`). Undesignated cost-ranked unicast slot 0, and a unicast that
-  names us as next hop, instead wait `coordinated_relay::relay_floor_ms` — twice `CW_MAX` slot
-  times, the boundary below which no stock non-router ever transmits
-  (`Router::evaluate_tx_plan`, `plan_designated_unicast`). The two answer different questions and
-  had been sharing one value by accident: a unicast relay that keyed up earlier than the floor
-  would go out while a stock neighbour was still inside its own contention window, so that
-  neighbour could not have heard our copy, would not cancel its own, and the duplicate we were
-  avoiding would happen anyway. Both figures derive from quantities every SignalRouting node
-  computes identically, so the broadcast ladder's rung order agrees at every preset. Tests:
-  `sr_slot_schedule`, `broadcast_relay` unit tests,
+- **The broadcast ladder and undesignated unicast slot 0 share stock's contention
+  floor.** Rung k of the SignalRouting broadcast ladder fires at
+  `coordinated_relay::relay_floor_ms` (`2·CW_MAX·slot_time`) plus k half-airtimes
+  (`relay_window::WindowLayout::first_rung_ms`, used by `plan_broadcast_relay`,
+  `plan_acknowledgement`, and `NeighborGraph::relay_ladder_span_ms` /
+  `commit_relay`'s fallback). Undesignated cost-ranked unicast slot 0, and a unicast that
+  names us as next hop, wait the same floor
+  (`Router::evaluate_tx_plan`, `plan_designated_unicast`). Dest-ACK and peer-relay waits
+  still compose from `PEER_TURNAROUND_MS` (250 ms): that is the peer re-arm, not the ladder
+  origin. Both the floor and the half-airtime derive from quantities every SignalRouting
+  node computes identically, so the broadcast ladder's rung order agrees at every preset.
+  Tests: `sr_slot_schedule`, `broadcast_relay` unit tests, `relay_window` unit tests,
   `undesignated_unicast_slot_zero_waits_stocks_contention_floor`.
 - **Two floors keep rungs apart, and both are absolute.** Rung spacing is half the packet
   airtime floored at `MIN_RUNG_SPACING_MS` (50 ms), and the tie-break range is half of that
@@ -474,7 +473,7 @@ is actually waiting for.
   **Candidates** are ourselves plus the neighbours we can hear that are SR-active or immediate
   relay routers and have a price, ordered by that price in `COST_BUCKET_FIXED` buckets, then by
   packet-id parity and node id so the work rotates across packets instead of always falling to
-  the same node. Rungs start at `SLOT_ORIGIN_MS` and space by half an airtime; a rung ahead of
+  the same node. Rungs start at `relay_floor_ms` and space by half an airtime; a rung ahead of
   ours counts toward `slots_given`, so T1 insures an answer that never comes.
   **We stand down** for a neighbour that will rebroadcast regardless and will not cancel for us
   (`Capability::will_not_cancel_for_us`, stock ROUTER and ROUTER_LATE) when it can hear the

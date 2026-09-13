@@ -332,6 +332,7 @@ fn plan_acknowledgement(
     source: u32,
     heard_from: u32,
     half: u32,
+    slot_time_ms: u32,
 ) -> Option<AcknowledgementPlan> {
     if !ctx.my_node_relays {
         return None;
@@ -412,7 +413,7 @@ fn plan_acknowledgement(
         ranked: [0; RANKED_LOG],
         ranked_len: 0,
     };
-    let mut delay = crate::channel_access::SLOT_ORIGIN_MS;
+    let mut delay = crate::coordinated_relay::relay_floor_ms(slot_time_ms);
     for &(node, _) in entries.iter().take(count) {
         if (plan.ranked_len as usize) < RANKED_LOG {
             plan.ranked[plan.ranked_len as usize] = node;
@@ -823,7 +824,7 @@ where
     // cost it ranks on is the mean delivery cost over the unique targets and there is nothing to
     // price. So this is a second pass with its own price, run only when the ladder came out empty.
     if !should_relay && slots_given == 0 && ack_eligible {
-        if let Some(ack) = plan_acknowledgement(ctx, packet_id, source, heard_from, half) {
+        if let Some(ack) = plan_acknowledgement(ctx, packet_id, source, heard_from, half, slot_time_ms) {
             should_relay = ack.should_relay;
             reason = RelayReason::Acknowledgement;
             my_delay = ack.my_delay;
@@ -1103,7 +1104,7 @@ mod tests {
         );
         assert!(plan.should_relay, "we answer too, behind it");
         assert!(
-            plan.slot_delay_ms > crate::channel_access::SLOT_ORIGIN_MS,
+            plan.slot_delay_ms > crate::coordinated_relay::relay_floor_ms(TEST_SLOT_MS),
             "our answer waits behind its rung and cancels if that answer arrives"
         );
         assert!(

@@ -10,17 +10,18 @@
 //! The board asks [`ChannelAccess`] before releasing anything to the radio; the router derives
 //! every "how long will a peer take to answer" wait from the same constants, so the sender's
 //! restraint and the listeners' expectations agree. Slot-coordinated relays start their ladder
-//! at [`SLOT_ORIGIN_MS`] for the same reason.
+//! at stock's contention floor (`coordinated_relay::relay_floor_ms`); the turnaround below is
+//! what peer-ACK and peer-relay waits still use.
 
 /// Time a peer needs after a frame ends before it is listening again (69–172 ms measured on
-/// Meshtastic-based peers, plus margin). Also the origin of the coordinated relay slot ladder.
+/// Meshtastic-based peers, plus margin). Dest-ACK and peer-relay waits compose from this.
 pub const PEER_TURNAROUND_MS: u32 = 250;
 
 /// Minimum silence after one of our own frames before the next one starts.
 pub const TX_GAP_MS: u32 = 100;
 
-/// First coordinated relay slot fires this long after the frame it answers; slot k fires at
-/// `SLOT_ORIGIN_MS + k * half_airtime`. Every SignalRouting node uses the same origin.
+/// Historical name for the turnaround. Kept so older call sites and logs that mean "peer
+/// re-arm" stay readable; the broadcast ladder no longer uses it as its origin.
 pub const SLOT_ORIGIN_MS: u32 = PEER_TURNAROUND_MS;
 
 /// Wait before relaying a unicast whose destination heard the source directly: it needs the
@@ -41,8 +42,12 @@ pub fn peer_relay_wait_ms(airtime_ms: u32, contention_max_ms: u32) -> u32 {
 }
 
 /// Delay of coordinated relay slot `slot` (0-based) after the frame it answers.
-pub fn slot_delay_ms(slot: u32, half_airtime_ms: u32) -> u32 {
-    SLOT_ORIGIN_MS.saturating_add(slot.saturating_mul(half_airtime_ms))
+///
+/// Starts at [`crate::coordinated_relay::relay_floor_ms`] — `2·CWmax·slot_time`, the same border
+/// the stock-router window ends at — then spaces by half an airtime.
+pub fn slot_delay_ms(slot: u32, half_airtime_ms: u32, slot_time_ms: u32) -> u32 {
+    crate::coordinated_relay::relay_floor_ms(slot_time_ms)
+        .saturating_add(slot.saturating_mul(half_airtime_ms))
 }
 
 /// Gate between the router's frames and the radio. Times are `u32` milliseconds that wrap.
@@ -150,7 +155,9 @@ mod tests {
     fn peer_waits_derive_from_the_turnaround() {
         assert_eq!(dest_ack_wait_ms(80, 60), PEER_TURNAROUND_MS + 120 + 80);
         assert_eq!(peer_relay_wait_ms(80, 60), PEER_TURNAROUND_MS + 60 + 80);
-        assert_eq!(slot_delay_ms(0, 50), SLOT_ORIGIN_MS);
-        assert_eq!(slot_delay_ms(3, 50), SLOT_ORIGIN_MS + 150);
+        let slot = 10u32;
+        let floor = crate::coordinated_relay::relay_floor_ms(slot);
+        assert_eq!(slot_delay_ms(0, 50, slot), floor);
+        assert_eq!(slot_delay_ms(3, 50, slot), floor + 150);
     }
 }

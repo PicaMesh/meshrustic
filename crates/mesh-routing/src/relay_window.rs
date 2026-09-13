@@ -13,8 +13,7 @@
 //! separation — one floored half-airtime — and two of them can never collide because the ranking
 //! assigns them.
 
-use crate::channel_access::SLOT_ORIGIN_MS;
-use crate::coordinated_relay::CW_MAX;
+use crate::coordinated_relay::{relay_floor_ms, CW_MAX};
 
 /// Positions the window holds, at stock's granularity: `2·CWmax − 1`.
 pub const WINDOW_POSITIONS: u8 = 2 * CW_MAX - 1;
@@ -87,14 +86,10 @@ impl WindowLayout {
 
     /// Where the ladder's first rung goes.
     ///
-    /// Anchored to [`SLOT_ORIGIN_MS`], the literal 250 ms, and deliberately not to
-    /// [`crate::coordinated_relay::relay_floor_ms`] — even though the window laid out above *is*
-    /// the `2·CWmax − 1` slots immediately below that border, so the two are one geometry expressed
-    /// twice. Moving this origin onto the preset-derived border is a separate change with its own
-    /// ordering constraint, and doing it here would shift on-air timing at LONG_FAST and slower
-    /// (448 ms against 250) as a side effect of a change that is meant to be about *placement*.
-    /// Until then the two anchors disagree: at SHORT_SLOW the window ends at 150 ms and the first
-    /// rung sits at 250, so a reservation rarely moves it at all.
+    /// Anchored to [`relay_floor_ms`] — `2·CWmax·slot_time`, stock's own border between the router
+    /// window and the contention window every other role draws from. The window laid out above is
+    /// the `2·CWmax − 1` slots immediately below that border, so the two are one geometry: the
+    /// first rung sits on the border the window ends at.
     ///
     /// The empty case is stated separately on purpose. Folding it into the formula leaves the last
     /// position at zero and degenerates to a bare half-airtime — on a mesh with no router at all
@@ -106,9 +101,10 @@ impl WindowLayout {
     /// because at LONG_FAST and slower a half-airtime exceeds it and a rung there would land inside
     /// the preceding position's frame.
     pub fn first_rung_ms(&self) -> u32 {
+        let transition = relay_floor_ms(self.slot_time_ms);
         match self.last_placed_end_ms {
-            None => SLOT_ORIGIN_MS,
-            Some(last) => SLOT_ORIGIN_MS.max(last.saturating_add(self.half_airtime_ms)),
+            None => transition,
+            Some(last) => transition.max(last.saturating_add(self.half_airtime_ms)),
         }
     }
 }
@@ -184,7 +180,7 @@ impl PositionAllocator {
     /// Where a transmission goes when nothing was placed ahead of it.
     pub fn first_free_ms(&mut self) -> u32 {
         if self.window.is_empty() {
-            crate::channel_access::SLOT_ORIGIN_MS
+            self.window.first_rung_ms()
         } else {
             self.spill()
         }
@@ -259,12 +255,10 @@ mod tests {
     #[test]
     fn an_empty_window_puts_the_first_rung_at_the_transition() {
         // Not at a bare half-airtime: that is the degenerate case a withdrawn rule produced.
-        let w = WindowLayout::new(
-            slot_time_for_preset(MODEM_LONG_FAST),
-            half_for(MODEM_LONG_FAST, 253),
-        );
+        let slot = slot_time_for_preset(MODEM_LONG_FAST);
+        let w = WindowLayout::new(slot, half_for(MODEM_LONG_FAST, 253));
         assert!(w.is_empty());
-        assert_eq!(w.first_rung_ms(), SLOT_ORIGIN_MS);
+        assert_eq!(w.first_rung_ms(), relay_floor_ms(slot));
     }
 
     #[test]
@@ -276,14 +270,15 @@ mod tests {
             (MODEM_LONG_FAST, 253),
         ] {
             let half = half_for(preset, payload);
-            let mut w = WindowLayout::new(slot_time_for_preset(preset), half);
+            let slot = slot_time_for_preset(preset);
+            let mut w = WindowLayout::new(slot, half);
             let first = w.place_reserved().expect("room for one");
             let rung = w.first_rung_ms();
             assert!(
                 rung >= first + half,
                 "preset {preset} payload {payload}: rung {rung} must clear {first} by {half}"
             );
-            assert!(rung >= SLOT_ORIGIN_MS);
+            assert!(rung >= relay_floor_ms(slot));
         }
     }
 
@@ -317,10 +312,11 @@ mod tests {
     fn a_full_window_spills_ranked_positions_onto_the_ladder() {
         // One half-airtime that fills the whole SHORT_SLOW window: the first ranked fits, the
         // second must clear the transition.
-        let half = window_width_ms(slot_time_for_preset(MODEM_SHORT_SLOW));
-        let mut a = PositionAllocator::new(slot_time_for_preset(MODEM_SHORT_SLOW), half);
+        let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
+        let half = window_width_ms(slot);
+        let mut a = PositionAllocator::new(slot, half);
         assert_eq!(a.take_rung(), 0);
-        assert_eq!(a.take_rung(), SLOT_ORIGIN_MS.max(half));
+        assert_eq!(a.take_rung(), relay_floor_ms(slot).max(half));
     }
 
     #[test]
@@ -359,19 +355,18 @@ mod tests {
 
     #[test]
     fn nothing_placed_means_the_transition() {
-        let mut a = PositionAllocator::new(
-            slot_time_for_preset(MODEM_SHORT_SLOW),
-            half_for(MODEM_SHORT_SLOW, 48),
-        );
-        assert_eq!(a.first_free_ms(), SLOT_ORIGIN_MS);
+        let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
+        let mut a = PositionAllocator::new(slot, half_for(MODEM_SHORT_SLOW, 48));
+        assert_eq!(a.first_free_ms(), relay_floor_ms(slot));
     }
 
     #[test]
     fn a_single_reservation_at_short_slow_is_cleared_by_the_whole_transition() {
         // The invariant is "at least" one half-airtime, not "exactly": here it is far more.
+        let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
         let half = half_for(MODEM_SHORT_SLOW, 48);
-        let mut w = WindowLayout::new(slot_time_for_preset(MODEM_SHORT_SLOW), half);
+        let mut w = WindowLayout::new(slot, half);
         w.place_reserved();
-        assert_eq!(w.first_rung_ms(), SLOT_ORIGIN_MS);
+        assert_eq!(w.first_rung_ms(), relay_floor_ms(slot));
     }
 }

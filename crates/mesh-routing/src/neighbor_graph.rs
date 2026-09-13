@@ -842,7 +842,10 @@ impl NeighborGraph {
         let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
         let n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
         let rungs = u32::from(n.saturating_sub(1));
-        crate::channel_access::SLOT_ORIGIN_MS.saturating_add(rungs.saturating_mul(half_airtime_ms))
+        let transition = crate::coordinated_relay::relay_floor_ms(
+            crate::coordinated_relay::slot_time_for_preset(self.modem_preset),
+        );
+        transition.saturating_add(rungs.saturating_mul(half_airtime_ms))
     }
 
     /// Our rung on the insurance ladder: how many insurers are ordered ahead of us.
@@ -1706,7 +1709,7 @@ impl NeighborGraph {
         heard_from: u32,
         now_ms: u32,
         half_airtime_ms: u32,
-        _cw_slot_ms: u32,
+        cw_slot_ms: u32,
         node_num: u32,
         broadcast_plan: Option<&crate::broadcast_relay::BroadcastRelayPlan>,
     ) -> (u32, u8, u8) {
@@ -1720,7 +1723,7 @@ impl NeighborGraph {
             (
                 idx,
                 count,
-                crate::channel_access::slot_delay_ms(idx as u32, half),
+                crate::channel_access::slot_delay_ms(idx as u32, half, cw_slot_ms),
             )
         };
         // The slot already encodes the coordinated order. Only a small deterministic tie-break
