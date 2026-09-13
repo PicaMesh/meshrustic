@@ -361,11 +361,9 @@ impl NodeRateLimiter {
         }
 
         if now_ms.wrapping_sub(b.window_start_ms) >= window_ms {
-            if b.limited && clear > 0 {
-                if b.count < clear {
-                    b.limited = false;
-                    event = Some(RateLimitEvent::Clear { node_id, kind });
-                }
+            if b.limited && clear > 0 && b.count < clear {
+                b.limited = false;
+                event = Some(RateLimitEvent::Clear { node_id, kind });
             }
             b.count = 0;
             b.window_start_ms = now_ms;
@@ -407,11 +405,11 @@ impl NodeRateLimiter {
                     if !prox.in_graph && cand.in_graph {
                         i
                     } else if prox.in_graph == cand.in_graph {
-                        if prox.hops > cand.hops {
-                            i
-                        } else if prox.hops == cand.hops
-                            && e.oldest_window_start() < self.originators[c].oldest_window_start()
-                        {
+                        // Farthest first, oldest window breaking a tie.
+                        let farther = prox.hops > cand.hops;
+                        let same_distance_but_staler = prox.hops == cand.hops
+                            && e.oldest_window_start() < self.originators[c].oldest_window_start();
+                        if farther || same_distance_but_staler {
                             i
                         } else {
                             c
@@ -495,11 +493,11 @@ impl NodeRateLimiter {
                     if !prox.in_graph && cand.in_graph {
                         i
                     } else if prox.in_graph == cand.in_graph {
-                        if prox.hops > cand.hops {
-                            i
-                        } else if prox.hops == cand.hops
-                            && e.relay.window_start_ms < self.relays[c].relay.window_start_ms
-                        {
+                        // Farthest first, oldest window breaking a tie.
+                        let farther = prox.hops > cand.hops;
+                        let same_distance_but_staler = prox.hops == cand.hops
+                            && e.relay.window_start_ms < self.relays[c].relay.window_start_ms;
+                        if farther || same_distance_but_staler {
                             i
                         } else {
                             c

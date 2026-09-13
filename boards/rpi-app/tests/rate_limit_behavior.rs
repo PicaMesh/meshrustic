@@ -321,7 +321,10 @@ fn multi_from_one_resolved_relay_is_contained() {
             break;
         }
     }
-    assert!(limited, "RELAY should trip under multi-from flood via one last hop");
+    assert!(
+        limited,
+        "RELAY should trip under multi-from flood via one last hop"
+    );
 
     let wire = build_topology_wire(0xB000_00AA, 0x9101, channel, &key, listed);
     let mut wired = wire;
@@ -336,4 +339,3 @@ fn multi_from_one_resolved_relay_is_contained() {
     assert!(result.rate_limited);
     assert_eq!(router.graph_mut().get_downstream_relay(listed, 1_000), None);
 }
-
