@@ -112,6 +112,8 @@ impl NodeEdges {
 pub struct EdgeStore {
     nodes: [NodeEdges; super::MAX_GRAPH_NODES],
     node_count: u8,
+    /// Absolute ETX delta that registers an edge change as significant ("half a retransmission").
+    /// Per-edge EWMA variance is added so a noisy link raises its own bar.
     etx_change_threshold: f32,
 }
 
@@ -139,7 +141,8 @@ impl EdgeStore {
                 }; MAX_EDGES_PER_NODE],
             }; super::MAX_GRAPH_NODES],
             node_count: 0,
-            etx_change_threshold: 1.2,
+            // Absolute ETX delta ("half a retransmission"); per-edge variance raises the bar.
+            etx_change_threshold: 0.5,
         }
     }
 
@@ -298,11 +301,10 @@ impl EdgeStore {
             }
             let old_etx = edge.etx();
             let abs_change = (etx - old_etx).abs();
-            let rel_change = if old_etx > 0.0 {
-                abs_change / old_etx
-            } else {
-                1.0
-            };
+            // Significance uses the variance already on the edge; this observation's change is
+            // folded in afterwards so a quiet link really does report at the 0.5 floor.
+            let dynamic = self.etx_change_threshold + edge.etx_variance_f();
+            let significant = abs_change > dynamic;
             edge.set_etx(etx);
             if update_timestamp {
                 edge.last_update_ms = now_ms;
@@ -314,8 +316,9 @@ impl EdgeStore {
             if heard_on != 0 && source == EdgeSource::Reported {
                 edge.heard_on = heard_on;
             }
-            let dynamic = self.etx_change_threshold + edge.etx_variance_f();
-            if rel_change > dynamic {
+            // Absolute ETX delta vs threshold + EWMA variance (both in ETX units). Symmetric:
+            // an improvement past the bar is as significant as a degradation past it.
+            if significant {
                 EDGE_SIGNIFICANT_CHANGE
             } else {
                 EDGE_NO_CHANGE
@@ -864,5 +867,107 @@ mod tests {
         edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
         assert!(edges.is_our_direct_neighbor(0xBB, 0xAA));
         assert!(!edges.has_direct_reported_edge_to(0xAA, 0xBB));
+    }
+
+    #[test]
+    fn an_improvement_larger_than_the_bar_is_significant() {
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        assert_eq!(
+            edges.update_edge(ME, ME, PEER, 3.0, 1_000, EdgeSource::Reported, true, 0),
+            EDGE_NEW
+        );
+        // Absolute drop of 1.0 ETX clears the 0.5 floor on a quiet edge.
+        assert_eq!(
+            edges.update_edge(ME, ME, PEER, 2.0, 2_000, EdgeSource::Reported, true, 0),
+            EDGE_SIGNIFICANT_CHANGE
+        );
+    }
+
+    #[test]
+    fn a_degradation_larger_than_the_bar_is_significant() {
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        assert_eq!(
+            edges.update_edge(ME, ME, PEER, 2.0, 1_000, EdgeSource::Reported, true, 0),
+            EDGE_NEW
+        );
+        assert_eq!(
+            edges.update_edge(ME, ME, PEER, 3.0, 2_000, EdgeSource::Reported, true, 0),
+            EDGE_SIGNIFICANT_CHANGE
+        );
+    }
+
+    #[test]
+    fn a_change_just_above_half_is_significant_on_a_quiet_edge() {
+        // Pins that significance consults the variance already on the edge, not the value after
+        // folding this observation in: with post-update EWMA a 0.55 jump would fail (0.5+0.1375).
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.update_edge(ME, ME, PEER, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        assert_eq!(
+            edges.update_edge(ME, ME, PEER, 2.55, 2_000, EdgeSource::Reported, true, 0),
+            EDGE_SIGNIFICANT_CHANGE
+        );
+    }
+
+    #[test]
+    fn a_change_smaller_than_the_bar_is_not_significant_either_way() {
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.update_edge(ME, ME, PEER, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        assert_eq!(
+            edges.update_edge(ME, ME, PEER, 2.3, 2_000, EdgeSource::Reported, true, 0),
+            EDGE_NO_CHANGE
+        );
+        assert_eq!(
+            edges.update_edge(ME, ME, PEER, 2.0, 3_000, EdgeSource::Reported, true, 0),
+            EDGE_NO_CHANGE
+        );
+    }
+
+    #[test]
+    fn variance_raises_the_bar_so_a_noisy_edge_stops_reporting_small_jumps() {
+        const ME: u32 = 0xAA;
+        const QUIET: u32 = 0xBB;
+        const NOISY: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.update_edge(ME, ME, QUIET, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, NOISY, 2.0, 1_000, EdgeSource::Reported, true, 0);
+
+        // Build EWMA variance with repeated large swings on the noisy edge only.
+        let mut etx = 2.0_f32;
+        for i in 0..8u32 {
+            etx = if i % 2 == 0 { 7.0 } else { 2.0 };
+            edges.update_edge(ME, ME, NOISY, etx, 2_000 + i, EdgeSource::Reported, true, 0);
+        }
+        // Leave the noisy edge at 2.0 so the probe matches the quiet edge's starting point.
+        if etx != 2.0 {
+            edges.update_edge(ME, ME, NOISY, 2.0, 3_000, EdgeSource::Reported, true, 0);
+        }
+
+        // Same absolute jump: significant on a quiet edge, damped on the noisy one.
+        assert_eq!(
+            edges.update_edge(ME, ME, QUIET, 3.0, 4_000, EdgeSource::Reported, true, 0),
+            EDGE_SIGNIFICANT_CHANGE
+        );
+        assert_eq!(
+            edges.update_edge(ME, ME, NOISY, 3.0, 4_000, EdgeSource::Reported, true, 0),
+            EDGE_NO_CHANGE
+        );
+    }
+
+    #[test]
+    fn a_brand_new_edge_is_significant_unconditionally() {
+        const ME: u32 = 0xAA;
+        let mut edges = EdgeStore::new();
+        assert_eq!(
+            edges.update_edge(ME, ME, 0xBB, 1.0, 1_000, EdgeSource::Reported, true, 0),
+            EDGE_NEW
+        );
     }
 }

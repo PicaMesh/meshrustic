@@ -213,15 +213,16 @@ is actually waiting for.
   marginal, and hopeless — is exactly what the margin curve's shape is built to preserve; nothing
   here is remediated, and re-spreading the curve to manufacture ranking differences among healthy
   links would reintroduce the false precision this change removes.
-  The second consequence is assessed separately: `EdgeStore`'s `etx_change_threshold` is a relative
-  comparison, and a change confined to the saturated band moves the ratio by less than its 1.2
-  trigger, so `mark_topology_dirty` is not called and `topology_dirty_send` stays unset for it — the
-  change reaches peers only on the next periodic broadcast (`TOPOLOGY_BROADCAST_MS`, 600 s) rather
-  than being pushed out early. This is judged immaterial: a change too small to cross a cost bucket
-  can never change which candidate leads a coverage or ownership ranking, so a peer still costing the
-  edge at its last-known-healthy value for up to one broadcast interval reaches the same routing
-  decisions it would have reached with the update in hand immediately. Not remediated, for the same
-  reason the ranking consequence is not: `etx_change_threshold` stays untouched.
+  The second consequence is assessed separately: `EdgeStore`'s `etx_change_threshold` is an absolute
+  ETX delta (default 0.5, "half a retransmission"), and an edge update is significant when
+  `|new - old| > threshold + variance`, with variance the per-edge EWMA of absolute ETX changes —
+  all three terms in ETX units. The comparison is symmetric, so an improvement past the bar marks
+  topology dirty the same way a degradation does. Variance raises the bar on a link that swings
+  repeatedly, which is what keeps a single unstable neighbour from driving early broadcasts; a
+  stable link keeps reporting at the 0.5 floor. Field traffic under the margin curve is almost
+  entirely either no change at all or a jump well above any bar between 0.2 and 1.0, so the
+  saturated healthy band — not the threshold — is what keeps the graph quiet, and the dirty
+  broadcast floor caps how often an early send can fire.
 - **An edge is one-directional evidence, priced at the receiver.** A node listing a neighbour
   says it hears that neighbour, at the RSSI and SNR it measured on that neighbour's signal.
   `calculate_route` therefore runs Dijkstra backwards from the destination: a settled node is
