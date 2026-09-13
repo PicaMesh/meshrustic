@@ -871,6 +871,77 @@ impl Router {
             None
         };
 
+        // Rate-limit before graph/topology observe so dropped frames leave no side effects (K32).
+        let decoded_portnum = decode.portnum;
+        let rebroadcast_candidate = parsed.to != self.node_num
+            && parsed.from != self.node_num
+            && parsed.hop_limit > 0
+            && self.graph.is_rebroadcaster();
+        // Direct first-hop: last hop is the originator. Multi-hop: resolve relay_node when possible.
+        let resolved_relay = if direct {
+            (parsed.from != 0 && parsed.from != self.node_num).then_some(parsed.from)
+        } else {
+            known_relay.filter(|&id| {
+                id != 0 && !crate::graph::is_placeholder_node(id) && id != self.node_num
+            })
+        };
+        let payload_air_len = packet.bytes.len().saturating_sub(PACKET_HEADER_LEN);
+        let air_cfg = mesh_radio::eu868_config_for_preset(self.operating_preset);
+        let airtime_ms = mesh_radio::packet_time_ms(&air_cfg, payload_air_len, true).max(1);
+        let rl_pkt = crate::rate_limit::RateLimitPacket {
+            from: parsed.from,
+            to: parsed.to,
+            decoded_portnum,
+            now_ms,
+            rebroadcast_candidate,
+            resolved_relay,
+            airtime_ms,
+            channel_util_pct: self.channel_util_pct,
+        };
+        let rate_limited = {
+            let graph = &mut self.graph;
+            self.rate_limit.should_drop(&rl_pkt, |nid| {
+                crate::rate_limit::GraphProximity {
+                    in_graph: graph.rate_limit_node_in_graph(nid),
+                    hops: graph.rate_limit_graph_hops(nid, now_ms),
+                }
+            })
+        };
+        if let Some(ev) = self.rate_limit.take_event() {
+            match ev {
+                crate::rate_limit::RateLimitEvent::Trip { node_id, kind } => {
+                    self.sr_log.push(SrLogEvent::RateLimitTrip {
+                        node_id,
+                        kind: kind.as_u8(),
+                    });
+                }
+                crate::rate_limit::RateLimitEvent::Clear { node_id, kind } => {
+                    self.sr_log.push(SrLogEvent::RateLimitClear {
+                        node_id,
+                        kind: kind.as_u8(),
+                    });
+                }
+            }
+        }
+        if rate_limited {
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::RateLimited,
+            });
+            return Some(ProcessResult {
+                parsed,
+                duplicate: false,
+                rate_limited: true,
+                handle: None,
+                radio_id: packet.radio_id,
+                rssi: packet.rssi,
+                snr: packet.snr,
+                decoded_portnum,
+                decode,
+                decoded_data,
+            });
+        }
+
         if let Some((node_id, rssi, snr, is_new, hears_us)) = self.graph.observe_packet(
             parsed.from,
             parsed.hop_start,
@@ -949,35 +1020,9 @@ impl Router {
             }
         }
 
-        let decoded_portnum = decode.portnum;
         // Packets addressed to us are always processed (admin, DMs, requests); the
-        // per-source rate limiter only guards relay and graph work for other traffic.
-        if parsed.to != self.node_num
-            && self.rate_limit.should_drop(
-                parsed.from,
-                decoded_portnum,
-                parsed.hop_start,
-                parsed.hop_limit,
-                now_ms,
-            )
-        {
-            self.sr_log.push(SrLogEvent::RelaySkip {
-                from: parsed.from,
-                reason: SrSkipReason::RateLimited,
-            });
-            return Some(ProcessResult {
-                parsed,
-                duplicate: false,
-                rate_limited: true,
-                handle: None,
-                radio_id: packet.radio_id,
-                rssi: packet.rssi,
-                snr: packet.snr,
-                decoded_portnum,
-                decode,
-                decoded_data,
-            });
-        }
+        // per-source rate limiter only guards relay and graph work for other traffic
+        // (checked above, before graph observe).
 
         if let Some(data) = decoded_data.as_ref() {
             self.maybe_cancel_relay_for_foreign_ack(&parsed, data);
@@ -3043,6 +3088,11 @@ impl Router {
 
     pub fn free_pool_slots(&self) -> usize {
         self.pool.free_count()
+    }
+
+    /// Host/tests: return an inbound pool handle (process_inbound retains slots until relay/drop).
+    pub fn release_packet(&mut self, handle: crate::pool::PacketHandle) {
+        self.pool.release(handle);
     }
 
     fn process_reliable_rx(

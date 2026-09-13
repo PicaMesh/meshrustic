@@ -83,6 +83,16 @@ pub enum SrLogEvent {
         from: u32,
         reason: SrSkipReason,
     },
+    /// Inbound rate limiter tripped (kind: 0=text 1=routing 2=other 3=unknown 4=relay 5=relay-unresolved).
+    RateLimitTrip {
+        node_id: u32,
+        kind: u8,
+    },
+    /// Inbound rate limiter cleared after hysteresis.
+    RateLimitClear {
+        node_id: u32,
+        kind: u8,
+    },
     TopologySending {
         node_id: u32,
         neighbors: u8,

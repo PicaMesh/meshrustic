@@ -685,7 +685,11 @@ is actually waiting for.
 - Per source node and 90 s window: TEXT 30, ROUTING 10, OTHER 4, UNKNOWN 12; packets addressed to
   us are exempt (`NodeRateLimiter`). `ADMIN_APP` is not exempt by portnum (PKI remote admin is
   opaque to relays and lands in UNKNOWN; the destination is covered by the to-us exemption).
-  meshrustic still exempts by port today — remove to match this contract (H27).
+  Rebroadcast candidates also charge a RELAY airtime budget (8 resolved last-hop slots + 1 shared
+  unresolved; trip≈60 / clear≈15 packet-eq; hybrid AirUtil tighten; floors/ceilings). Direct
+  first-hop frames key RELAY on the originator NodeID. Rate-limit runs before graph observe so
+  dropped frames leave no topology side effects. Originator clear=0 is sticky-quiet; RELAY uses
+  fixed-window hysteresis.
 
 ## 7. Robustness
 

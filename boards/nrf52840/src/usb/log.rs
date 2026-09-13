@@ -1328,6 +1328,42 @@ pub mod sr {
                 pos += n;
                 finish_line(&mut line, pos);
             }
+            SrLogEvent::RateLimitTrip { node_id, kind } => {
+                let kind_text: &[u8] = match kind {
+                    0 => b"text",
+                    1 => b"routing",
+                    2 => b"other",
+                    3 => b"unknown",
+                    4 => b"relay",
+                    5 => b"relay-unresolved",
+                    _ => b"?",
+                };
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[RateLimit] trip ");
+                put(&mut line, &mut pos, kind_text);
+                put(&mut line, &mut pos, b" node=!");
+                put_hex8(&mut line, &mut pos, node_id);
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RateLimitClear { node_id, kind } => {
+                let kind_text: &[u8] = match kind {
+                    0 => b"text",
+                    1 => b"routing",
+                    2 => b"other",
+                    3 => b"unknown",
+                    4 => b"relay",
+                    5 => b"relay-unresolved",
+                    _ => b"?",
+                };
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[RateLimit] clear ");
+                put(&mut line, &mut pos, kind_text);
+                put(&mut line, &mut pos, b" node=!");
+                put_hex8(&mut line, &mut pos, node_id);
+                finish_line(&mut line, pos);
+            }
             SrLogEvent::TopologySending {
                 node_id,
                 neighbors,

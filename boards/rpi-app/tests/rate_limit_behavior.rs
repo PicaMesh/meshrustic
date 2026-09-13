@@ -1,5 +1,6 @@
-//! Rate limiter ordering on the RX path — dedup and neighbor observation run first;
-//! port handlers and reliable-RX side effects are skipped on drop.
+//! Rate limiter ordering on the RX path — rate-limit runs before graph/topology observe;
+//! dropped frames leave no neighbor or module side effects. Port handlers and reliable-RX
+//! side effects are skipped on drop.
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
@@ -248,3 +249,91 @@ fn dedup_still_runs_when_rate_limited() {
     assert!(dupe.duplicate);
     assert!(!dupe.rate_limited);
 }
+
+#[test]
+fn multi_from_one_resolved_relay_is_contained() {
+    // AC19: rotating originators through one resolved last hop trip RELAY; drop skips topology.
+    static ROUTER: StaticCell<Router> = StaticCell::new();
+    let our_node = 0x0101_0101;
+    let relay = 0x0A0A_0A0A;
+    let listed = 0x3333_4444;
+    let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+    let router = ROUTER.init({
+        let mut r = Router::with_modem_preset(our_node, "", MODEM_SHORT_SLOW, true, key, 3);
+        r.set_device_role(mesh_routing::DEVICE_ROLE_ROUTER);
+        r
+    });
+    let channel = router.channel_hash();
+    let relay_byte = (relay & 0xFF) as u8;
+    router.remember_relay_identity(relay, relay_byte, 0);
+    // Seed relay as a direct peer and free the pool slot.
+    {
+        let (len, frame) = build_app_wire_frame(
+            NODENUM_BROADCAST,
+            relay,
+            0x4000,
+            channel,
+            3,
+            3,
+            false,
+            &key,
+            TELEMETRY_APP,
+            &[],
+            DataEncodeOpts::default(),
+            0,
+        )
+        .expect("direct peer wire");
+        let seed = router
+            .process_inbound(&inbound(&frame[..len as usize]), 0)
+            .expect("direct peer rx");
+        if let Some(h) = seed.handle {
+            router.release_packet(h);
+        }
+    }
+
+    let mut limited = false;
+    for i in 0..80u32 {
+        let from = 0xB000_0000 + i;
+        let (len, mut frame) = build_app_wire_frame(
+            NODENUM_BROADCAST,
+            from,
+            0x7000 + i,
+            channel,
+            3,
+            5,
+            false,
+            &key,
+            TELEMETRY_APP,
+            &[],
+            DataEncodeOpts::default(),
+            0,
+        )
+        .expect("relayed telemetry");
+        frame[15] = relay_byte;
+        let result = router
+            .process_inbound(&inbound(&frame[..len as usize]), i + 1)
+            .expect("flood rx");
+        if let Some(h) = result.handle {
+            router.release_packet(h);
+        }
+        if result.rate_limited {
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited, "RELAY should trip under multi-from flood via one last hop");
+
+    let wire = build_topology_wire(0xB000_00AA, 0x9101, channel, &key, listed);
+    let mut wired = wire;
+    if wired.len() > 15 {
+        // Multi-hop topology via the same banned relay (hop_start=5, hop_limit=3).
+        wired[12] = mesh_protocol::PacketHeader::encode_flags(3, 5, false, false);
+        wired[15] = relay_byte;
+    }
+    let result = router
+        .process_inbound(&inbound(&wired), 1_000)
+        .expect("post-flood topology");
+    assert!(result.rate_limited);
+    assert_eq!(router.graph_mut().get_downstream_relay(listed, 1_000), None);
+}
+

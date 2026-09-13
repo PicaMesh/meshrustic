@@ -574,6 +574,36 @@ impl NeighborGraph {
         self.edges.find_node(node_id).is_some()
     }
 
+    /// Whether `node_id` appears in the observed graph (for rate-limit eviction).
+    /// Never uses frame hop fields; placeholders are not "in graph".
+    pub fn rate_limit_node_in_graph(&self, node_id: u32) -> bool {
+        if node_id == 0 || is_placeholder_node(node_id) {
+            return false;
+        }
+        if self.edges.find_node(node_id).is_some() {
+            return true;
+        }
+        self.is_our_direct_neighbor(node_id)
+    }
+
+    /// Graph hops away for rate-limit eviction ranking (0 = unknown / not in graph).
+    pub fn rate_limit_graph_hops(&mut self, node_id: u32, now_ms: u32) -> u8 {
+        if node_id == 0 || is_placeholder_node(node_id) || node_id == self.my_node {
+            return 0;
+        }
+        if self.is_our_direct_neighbor(node_id) {
+            return 1;
+        }
+        let route = self.get_route(node_id, now_ms);
+        if route.next_hop != 0 && route.hops > 0 {
+            return route.hops;
+        }
+        if self.rate_limit_node_in_graph(node_id) {
+            return 255;
+        }
+        0
+    }
+
     pub fn neighbor_count(&self) -> u8 {
         self.edges.count_direct_neighbors(self.my_node)
     }
