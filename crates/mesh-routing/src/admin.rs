@@ -948,6 +948,10 @@ mod tests {
     fn get_device_and_module_config_reply() {
         let mut state = AdminState::default();
         state.private_key = [0x42; 32];
+        // The reply reports the role this node is actually running, which lives in the persisted
+        // state — not the value a caller happens to pass in. Set it the way a restored config
+        // would, or the GET below can only ever see the CLIENT default.
+        state.device_role = DEVICE_ROLE_ROUTER;
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
 
         let mut get = AdminMessage::default();

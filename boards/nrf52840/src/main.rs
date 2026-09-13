@@ -173,11 +173,7 @@ async fn main(spawner: Spawner) {
 
     let host_cmd_channel = HOST_CMD_CHANNEL.init(usb_log::HostCommandChannel::new());
     spawner
-        .spawn(usb_log::usb_task(
-            p.USBD,
-            config.node_num,
-            host_cmd_channel,
-        ))
+        .spawn(usb_log::usb_task(p.USBD, config.node_num, host_cmd_channel))
         .unwrap();
     let saadc_config = saadc::Config::default();
     let mut saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
