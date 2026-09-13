@@ -49,6 +49,20 @@ pub fn device_role_name(role: u32) -> Option<&'static str> {
     })
 }
 
+/// True for a role value the wire enum defines (0..=12).
+pub fn is_known_device_role(role: u32) -> bool {
+    device_role_name(role).is_some()
+}
+
+/// Map an unknown or corrupt role byte to CLIENT so ranking never sees a nameless value.
+pub fn sanitize_device_role(role: u32) -> u32 {
+    if is_known_device_role(role) {
+        role
+    } else {
+        DEVICE_ROLE_CLIENT
+    }
+}
+
 /// Pro Micro DIY + TCXO board (`NRF52_PROMICRO_DIY` in mesh.proto).
 pub const HW_MODEL_NRF52_PROMICRO_DIY: u32 = 63;
 /// Generic private / DIY hardware model id on the wire.

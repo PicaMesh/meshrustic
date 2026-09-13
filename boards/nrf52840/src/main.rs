@@ -163,12 +163,12 @@ async fn main(spawner: Spawner) {
         config.node_num,
         config.public_key,
     ));
-    // After the identity is set, so the line reports the role the graph will actually rank with
-    // rather than a default the router has not adopted yet.
+    // Role was applied in load_node_config; set_node_identity preserves it.
     // Role travels to the USB task so it can be re-stated on every connection: like the node id
     // and the build stamp, a line pushed here is evicted from the log ring long before a host
     // attaches, and a capture that cannot say a node's role cannot judge its relay decisions.
     let own_role = router.device_role();
+    usb_log::publish_device_role(own_role);
     usb_log::log::mesh::device_role(own_role);
 
     let host_cmd_channel = HOST_CMD_CHANNEL.init(usb_log::HostCommandChannel::new());
@@ -176,7 +176,6 @@ async fn main(spawner: Spawner) {
         .spawn(usb_log::usb_task(
             p.USBD,
             config.node_num,
-            own_role,
             host_cmd_channel,
         ))
         .unwrap();

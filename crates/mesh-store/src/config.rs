@@ -94,6 +94,8 @@ pub struct NodeConfig {
     /// `ModuleConfig.TelemetryConfig.device_update_interval` (seconds).
     /// Zero means unset → firmware default (20 min).
     pub device_update_interval_secs: u32,
+    /// Configured device role (`Config.DeviceConfig.role`). Default CLIENT (0).
+    pub device_role: u8,
 }
 
 impl NodeConfig {
@@ -106,6 +108,7 @@ impl NodeConfig {
             lora: LoRaConfig::eu868_default(),
             admin_public_keys: [[0u8; 32]; ADMIN_KEY_SLOTS],
             device_update_interval_secs: 0,
+            device_role: 0,
         }
     }
 

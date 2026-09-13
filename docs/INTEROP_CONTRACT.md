@@ -328,6 +328,12 @@ is actually waiting for.
   `an_sr_router_outranks_a_client_of_equal_coverage`, `coverage_still_outranks_the_router_role`,
   `rungs_take_window_positions_while_a_half_airtime_fits`,
   `a_passive_publisher_is_not_reserved_for_either`.
+- **Our own device role is configurable and persisted.** `Config.DeviceConfig.role` is set over
+  PKI admin (`SetConfig` device), stored in the flash record (`NodeConfig.device_role`), applied to
+  the graph and the nodeinfo advert, and re-advertised on change. Get returns the live role,
+  including CLIENT (0). Unknown role values are rejected. Tests: `set_device_role_applies_and_get_returns_it`,
+  `set_router_role_survives_reload_with_firmware_boot_order`, `device_role_survives_round_trip`,
+  `unknown_device_role_is_rejected`, `corrupt_flash_role_clamps_to_client`.
 - **Coverage is evidence graded by whether the receiver reports** (`route::covers`), over a link
   that is not hopeless (delivery-direction cost at or below `COVERAGE_ETX_CEILING_FIXED`). A node
   that publishes topology is held to it: it must be known to hear the transmitter

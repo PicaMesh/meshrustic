@@ -438,9 +438,13 @@ impl Router {
     }
 
     pub fn set_node_identity(&mut self, identity: NodeInfoIdentity) {
-        self.graph.set_device_role(identity.advert.role);
+        // Role is configured separately (flash / admin). A rebuilt advert from `for_node` is
+        // always CLIENT; applying that here used to desync graph from admin.device_role and
+        // silently lose a persisted ROUTER on the next save.
+        let role = self.graph.device_role();
         self.nodeinfo_identity = identity;
-        self.admin.public_key = identity.public_key;
+        self.nodeinfo_identity.advert.role = role;
+        self.admin.public_key = self.nodeinfo_identity.public_key;
     }
 
     /// Load persisted NodeConfig into admin + channel/modem state.
@@ -450,6 +454,7 @@ impl Router {
         self.rate_limit.set_node_num(cfg.node_num);
         self.admin.apply_node_config(cfg);
         self.nodeinfo_identity = NodeInfoIdentity::for_node(cfg.node_num, cfg.public_key);
+        self.set_device_role(u32::from(cfg.device_role));
         self.set_modem_preset(
             "",
             cfg.lora.modem_preset,
@@ -736,7 +741,10 @@ impl Router {
     }
 
     pub fn set_device_role(&mut self, role: u32) {
+        let role = crate::nodeinfo::sanitize_device_role(role);
         self.graph.set_device_role(role);
+        self.nodeinfo_identity.advert.role = role;
+        self.admin.device_role = role;
     }
 
     /// One-time startup logs for SR / graph init.
@@ -1250,6 +1258,11 @@ impl Router {
         if let Some(preset) = outcome.apply_modem_preset {
             self.set_modem_preset("", preset, true, self.channel_key);
             self.pending_radio_reinit = true;
+        }
+        if let Some(role) = outcome.apply_device_role {
+            self.set_device_role(role);
+            // Peers learn the new role from nodeinfo; force the next periodic advert out soon.
+            self.last_nodeinfo_ms = 0;
         }
         if let Some(secs) = outcome.reboot_seconds {
             self.admin.pending_reboot_seconds = Some(secs);

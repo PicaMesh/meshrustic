@@ -50,7 +50,6 @@ fn serial_number_str(node_num: u32) -> &'static str {
 pub async fn usb_task(
     usb: peripherals::USBD,
     node_num: u32,
-    device_role: u32,
     host_cmd: &'static HostCommandChannel,
 ) {
     let driver = Driver::new(usb, Irqs, HardwareVbusDetect::new(Irqs));
@@ -88,7 +87,7 @@ pub async fn usb_task(
             // happened to the first attempt. Re-stating it here also answers "what is this node
             // running?" for a capture started at any time, not only one that caught a reboot.
             log::mesh::node_id(node_num);
-            log::mesh::device_role(device_role);
+            log::mesh::device_role(super::published_device_role());
             log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
 
             loop {

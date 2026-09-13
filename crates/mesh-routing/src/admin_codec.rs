@@ -63,7 +63,8 @@ pub struct WireDeviceConfig {
 impl Default for WireDeviceConfig {
     fn default() -> Self {
         Self {
-            role: crate::nodeinfo::DEVICE_ROLE_ROUTER,
+            // Protobuf default for an omitted role field is CLIENT (0), not ROUTER.
+            role: crate::nodeinfo::DEVICE_ROLE_CLIENT,
         }
     }
 }

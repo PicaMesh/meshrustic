@@ -21,7 +21,8 @@
 //! | 119 | 1 | frozen | tx_power_dbm |
 //! | 120 | 1 | frozen | use_preset (0/1) |
 //! | 121 | 1 | frozen (v4) | ok_to_mqtt (0/1); records before v4 decode as 1 |
-//! | 122 | 2 | reserved | must encode as 0; ignore on decode (future flags) |
+//! | 122 | 1 | frozen (v4+) | `device_role` (`Config.DeviceConfig.role`); older records are 0 = CLIENT |
+//! | 123 | 1 | reserved | must encode as 0; ignore on decode (future flags) |
 //! | 124 | 96 | frozen | `admin_public_keys[3][32]` |
 //! | 220 | 4 | v4+ | `device_update_interval_secs` (0 = default); was reserved zeros |
 //! | 224 | 28 | reserved | forward-compatible padding — encode 0; do not reinterpret |
@@ -89,7 +90,8 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
     out[119] = lora.tx_power_dbm;
     out[120] = if lora.use_preset { 1 } else { 0 };
     out[121] = if lora.ok_to_mqtt { 1 } else { 0 };
-    // 122..124 reserved (zeros)
+    out[122] = config.device_role;
+    // 123 reserved (zeros)
 
     for i in 0..ADMIN_KEY_SLOTS {
         let off = 124 + i * 32;
@@ -167,6 +169,8 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
     }
 
     let device_update_interval_secs = u32::from_le_bytes(buf[220..224].try_into().unwrap());
+    // Byte 122 was reserved (zero) before role persistence; those records stay CLIENT.
+    let device_role = buf[122];
 
     Ok(NodeConfig {
         node_num: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
@@ -176,6 +180,7 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
         lora,
         admin_public_keys,
         device_update_interval_secs,
+        device_role,
     })
 }
 
@@ -222,6 +227,7 @@ fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
         lora,
         admin_public_keys: [[0u8; 32]; ADMIN_KEY_SLOTS],
         device_update_interval_secs: 0,
+        device_role: 0,
     })
 }
 
@@ -382,6 +388,25 @@ mod tests {
             600
         );
         assert_eq!(decode(&buf).unwrap().device_update_interval_secs, 600);
+    }
+
+    #[test]
+    fn device_role_survives_round_trip() {
+        let mut config = NodeConfig::first_boot(1, [1; 32], [2; 32]);
+        config.device_role = 2; // ROUTER
+        let mut buf = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut buf).unwrap();
+        assert_eq!(buf[122], 2);
+        assert_eq!(decode(&buf).unwrap().device_role, 2);
+    }
+
+    #[test]
+    fn older_flash_with_zero_role_byte_stays_client() {
+        let config = NodeConfig::first_boot(1, [1; 32], [2; 32]);
+        let mut buf = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut buf).unwrap();
+        assert_eq!(buf[122], 0);
+        assert_eq!(decode(&buf).unwrap().device_role, 0);
     }
 
     #[test]

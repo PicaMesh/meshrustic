@@ -346,6 +346,7 @@ pub async fn radio_task(
                 // firmware or role they came from. One line a minute makes any capture
                 // self-describing, whenever it was started.
                 crate::usb_log::log::mesh::node_id(router.node_num());
+                crate::usb_log::publish_device_role(router.device_role());
                 crate::usb_log::log::mesh::device_role(router.device_role());
                 crate::usb_log::log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
                 crate::usb_log::log::sr::emit_topology_dump(router);
@@ -520,6 +521,7 @@ fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) {
     match store.save(&cfg) {
         Ok(()) => {
             router.clear_admin_config_dirty();
+            crate::usb_log::publish_device_role(router.device_role());
             let admin_keys = cfg
                 .admin_public_keys
                 .iter()

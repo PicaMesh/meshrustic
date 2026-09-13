@@ -1,4 +1,4 @@
-//! Remote admin handler (ADMIN_APP): ACL, session passkey, get/set LoRa + Security.
+//! Remote admin handler (ADMIN_APP): ACL, session passkey, get/set LoRa + Security + Device role.
 
 use mesh_crypto::sha256_in_place;
 use mesh_store::{NodeConfig, ADMIN_KEY_SLOTS, BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_ADMIN_KEY};
@@ -11,7 +11,10 @@ use crate::admin_codec::{
     CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS, MODULE_CONFIG_TYPE_TELEMETRY, REGION_EU_868,
     SESSION_PASSKEY_LEN,
 };
-use crate::nodeinfo::{NodeInfoIdentity, DEVICE_ROLE_ROUTER, HW_MODEL_NRF52_PROMICRO_DIY};
+use crate::nodeinfo::{
+    is_known_device_role, sanitize_device_role, NodeInfoIdentity, DEVICE_ROLE_CLIENT,
+    HW_MODEL_NRF52_PROMICRO_DIY,
+};
 use crate::telemetry::min_device_update_interval_secs;
 use mesh_crypto::DEFAULT_PSK;
 use mesh_radio::eu868_config_for_preset;
@@ -39,6 +42,7 @@ pub struct AdminState {
     pub buffered_lora: Option<WireLoRaConfig>,
     pub buffered_admin_keys: Option<[[u8; 32]; ADMIN_KEY_SLOTS]>,
     pub buffered_device_update_interval_secs: Option<u32>,
+    pub buffered_device_role: Option<u32>,
     pub admin_public_keys: [[u8; 32]; ADMIN_KEY_SLOTS],
     pub private_key: [u8; 32],
     pub public_key: [u8; 32],
@@ -49,6 +53,8 @@ pub struct AdminState {
     pub ok_to_mqtt: bool,
     /// Stored `device_update_interval` seconds; 0 = firmware default.
     pub device_update_interval_secs: u32,
+    /// Configured device role; mirrored into the graph and nodeinfo advert.
+    pub device_role: u32,
     pub pending_reboot_seconds: Option<i32>,
     pub config_dirty: bool,
     /// Host/test only: replace Appendix A builtins for real PKI keypairs.
@@ -74,6 +80,7 @@ impl AdminState {
             buffered_lora: None,
             buffered_admin_keys: None,
             buffered_device_update_interval_secs: None,
+            buffered_device_role: None,
             admin_public_keys: [EMPTY_ADMIN_KEY; ADMIN_KEY_SLOTS],
             private_key: [0; 32],
             public_key: [0; 32],
@@ -83,6 +90,7 @@ impl AdminState {
             tx_power_dbm: 27,
             ok_to_mqtt: true,
             device_update_interval_secs: 0,
+            device_role: DEVICE_ROLE_CLIENT,
             pending_reboot_seconds: None,
             config_dirty: false,
             #[cfg(any(test, feature = "std"))]
@@ -109,6 +117,7 @@ impl AdminState {
         self.tx_power_dbm = cfg.lora.tx_power_dbm;
         self.ok_to_mqtt = cfg.lora.ok_to_mqtt;
         self.device_update_interval_secs = cfg.device_update_interval_secs;
+        self.device_role = sanitize_device_role(u32::from(cfg.device_role));
     }
 
     /// Deprecated name kept as alias for call sites.
@@ -116,7 +125,7 @@ impl AdminState {
         self.import_node_config(cfg);
     }
 
-    /// Single export path: admin runtime → `NodeConfig` sections (keys + LoRa).
+    /// Single export path: admin runtime → `NodeConfig` sections (keys + LoRa + role).
     pub fn export_to_node_config(&self, cfg: &mut NodeConfig) {
         cfg.admin_public_keys = self.admin_public_keys;
         cfg.lora.apply_modem_preset(self.modem_preset);
@@ -127,6 +136,7 @@ impl AdminState {
         cfg.private_key = self.private_key;
         cfg.public_key = self.public_key;
         cfg.device_update_interval_secs = self.device_update_interval_secs;
+        cfg.device_role = sanitize_device_role(self.device_role).min(u32::from(u8::MAX)) as u8;
     }
 
     pub fn export_admin_keys_and_lora(&self, cfg: &mut NodeConfig) {
@@ -213,6 +223,8 @@ pub struct AdminOutcome {
     pub routing_ok: bool,
     /// Modem preset changed and should be applied to Router / radio.
     pub apply_modem_preset: Option<u8>,
+    /// Device role changed and should be applied to the graph and nodeinfo advert.
+    pub apply_device_role: Option<u32>,
     pub config_dirty: bool,
     pub reboot_seconds: Option<i32>,
 }
@@ -237,7 +249,7 @@ pub fn handle_admin(
     node_num: u32,
     channel_psk: &[u8],
     channel_hash: u8,
-    device_role: u32,
+    _device_role: u32,
     payload: &[u8],
     now_ms: u32,
 ) -> AdminOutcome {
@@ -303,11 +315,7 @@ pub fn handle_admin(
             let passkey = state.issue_session(now_ms);
             let config = match config_type {
                 CONFIG_TYPE_DEVICE => ConfigPayload::Device(WireDeviceConfig {
-                    role: if device_role != 0 {
-                        device_role
-                    } else {
-                        DEVICE_ROLE_ROUTER
-                    },
+                    role: state.device_role,
                 }),
                 CONFIG_TYPE_LORA => ConfigPayload::Lora(WireLoRaConfig {
                     use_preset: state.use_preset,
@@ -337,6 +345,7 @@ pub fn handle_admin(
             state.buffered_lora = None;
             state.buffered_admin_keys = None;
             state.buffered_device_update_interval_secs = None;
+            state.buffered_device_role = None;
             outcome.routing_ok = true;
         }
         AdminPayload::CommitEditSettings => {
@@ -369,6 +378,11 @@ pub fn handle_admin(
                         return outcome;
                     }
                 }
+            }
+            if let Some(role) = state.buffered_device_role.take() {
+                state.device_role = role;
+                outcome.apply_device_role = Some(role);
+                outcome.config_dirty = true;
             }
             state.editing = false;
             outcome.apply_modem_preset = preset_changed;
@@ -416,7 +430,21 @@ pub fn handle_admin(
                         state.config_dirty = true;
                     }
                 }
-                ConfigPayload::Device(_) | ConfigPayload::Sessionkey | ConfigPayload::Empty => {}
+                ConfigPayload::Device(dev) => {
+                    if !is_known_device_role(dev.role) {
+                        outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
+                        return outcome;
+                    }
+                    if state.editing {
+                        state.buffered_device_role = Some(dev.role);
+                    } else {
+                        state.device_role = dev.role;
+                        outcome.apply_device_role = Some(dev.role);
+                        outcome.config_dirty = true;
+                        state.config_dirty = true;
+                    }
+                }
+                ConfigPayload::Sessionkey | ConfigPayload::Empty => {}
             }
             outcome.routing_ok = true;
         }
@@ -631,6 +659,7 @@ fn _keep_unused() {}
 mod tests {
     use super::*;
     use crate::admin_codec::{encode_admin_message, AdminPayload, CONFIG_TYPE_SECURITY};
+    use crate::nodeinfo::DEVICE_ROLE_ROUTER;
     use mesh_store::BUILTIN_ADMIN_PUBLIC_KEYS;
 
     fn identity() -> NodeInfoIdentity {
@@ -1021,5 +1050,102 @@ mod tests {
         // admin_key-only Security set does not require reboot.
         assert!(out.reboot_seconds.is_none());
         assert!(state.pending_reboot_seconds.is_none());
+    }
+
+    #[test]
+    fn set_device_role_applies_and_get_returns_it() {
+        let mut state = AdminState::default();
+        state.private_key = [0x42; 32];
+        let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
+        let passkey = state.issue_session(4_000);
+
+        let mut set = AdminMessage::default();
+        set.payload = AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
+            role: DEVICE_ROLE_ROUTER,
+        }));
+        set.has_session_passkey = true;
+        set.session_passkey = passkey;
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&set),
+            4_100,
+        );
+        assert!(out.routing_ok);
+        assert_eq!(out.apply_device_role, Some(DEVICE_ROLE_ROUTER));
+        assert_eq!(state.device_role, DEVICE_ROLE_ROUTER);
+        assert!(out.config_dirty);
+
+        let mut get = AdminMessage::default();
+        get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE);
+        let gout = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT, // stale graph arg must not override admin state
+            &encode_admin_message(&get),
+            4_200,
+        );
+        match gout.response.unwrap().payload {
+            AdminPayload::GetConfigResponse(ConfigPayload::Device(dev)) => {
+                assert_eq!(dev.role, DEVICE_ROLE_ROUTER);
+            }
+            other => panic!("{:?}", other),
+        }
+
+        let mut set_client = AdminMessage::default();
+        set_client.payload = AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
+            role: DEVICE_ROLE_CLIENT,
+        }));
+        set_client.has_session_passkey = true;
+        set_client.session_passkey = state.issue_session(4_250);
+        let cout = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_ROUTER,
+            &encode_admin_message(&set_client),
+            4_300,
+        );
+        assert!(cout.routing_ok);
+        assert_eq!(cout.apply_device_role, Some(DEVICE_ROLE_CLIENT));
+        assert_eq!(state.device_role, DEVICE_ROLE_CLIENT);
+    }
+
+    #[test]
+    fn unknown_device_role_is_rejected() {
+        let mut state = AdminState::default();
+        state.private_key = [0x42; 32];
+        let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
+        let passkey = state.issue_session(5_000);
+        let mut set = AdminMessage::default();
+        set.payload = AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig { role: 99 }));
+        set.has_session_passkey = true;
+        set.session_passkey = passkey;
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&set),
+            5_100,
+        );
+        assert_eq!(out.routing_error, Some(ROUTING_ERROR_BAD_REQUEST));
+        assert!(out.apply_device_role.is_none());
+        assert_eq!(state.device_role, DEVICE_ROLE_CLIENT);
     }
 }
