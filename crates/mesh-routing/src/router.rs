@@ -5790,19 +5790,33 @@ mod tests {
             )
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        let relay = plan
-            .relay
-            .or_else(|| {
-                router
-                    .relay_tx_after(UNI_SOURCE, 0x705, 0)
-                    .and_then(|after| router.poll_ready_relay(after))
-            })
-            .expect("the designated hop must forward");
         assert!(
-            relay.delay_ms <= crate::channel_access::SLOT_ORIGIN_MS,
-            "designated hop owns slot 0, got {}",
-            relay.delay_ms
+            plan.relay.is_none(),
+            "slot 0 is scheduled, never released inside the evaluation"
         );
+        // Owning slot 0 is not "immediately": it waits the larger of stock's contention floor and
+        // the destination's own chance to answer, both floors on the same instant. The relay's own
+        // `delay_ms` is the residue left at poll time — zero by then — so it says nothing about
+        // when the slot was, and bounding it proved nothing.
+        let floor = coordinated_relay::relay_floor_ms(coordinated_relay::slot_time_for_preset(
+            router.modem_preset(),
+        ));
+        let scheduled_at = router
+            .relay_tx_after(UNI_SOURCE, 0x705, 0)
+            .expect("the designated hop must schedule");
+        assert!(
+            scheduled_at >= floor,
+            "designated slot 0 must wait stock's contention floor: {scheduled_at} < {floor}"
+        );
+        assert!(
+            router
+                .poll_ready_relay(scheduled_at.saturating_sub(1))
+                .is_none(),
+            "must not release before its slot"
+        );
+        let relay = router
+            .poll_ready_relay(scheduled_at)
+            .expect("the designated hop must forward");
         let hdr = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
             .unwrap()
             .parse();

@@ -683,7 +683,9 @@ is actually waiting for.
 ## 6. Inbound policing
 
 - Per source node and 90 s window: TEXT 30, ROUTING 10, OTHER 4, UNKNOWN 12; packets addressed to
-  us and ADMIN are exempt (`NodeRateLimiter`).
+  us are exempt (`NodeRateLimiter`). `ADMIN_APP` is not exempt by portnum (PKI remote admin is
+  opaque to relays and lands in UNKNOWN; the destination is covered by the to-us exemption).
+  meshrustic still exempts by port today — remove to match this contract (H27).
 
 ## 7. Robustness
 

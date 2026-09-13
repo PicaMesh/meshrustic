@@ -76,7 +76,10 @@ fn best_candidate_assigned_earlier_slot() {
 
     let plan = graph.plan_broadcast_relay(0x99, BB, BB, 0xFFFF_FFFF, 0, HALF, false);
     assert!(plan.should_relay);
-    assert_eq!(plan.slot_delay_ms, HALF, "second ranked position is one half-airtime into the window");
+    assert_eq!(
+        plan.slot_delay_ms, HALF,
+        "second ranked position is one half-airtime into the window"
+    );
     assert_eq!(plan.slot_index, 1);
 }
 
