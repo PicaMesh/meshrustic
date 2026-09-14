@@ -205,6 +205,7 @@ pub struct Router {
     pool: PacketPool,
     history: PacketHistory,
     rate_limit: NodeRateLimiter,
+    pending_young_announce: Option<crate::rate_limit::YoungAnnounce>,
     relay_identity: RelayIdentityCache,
     qos: ChannelQoS,
     graph: NeighborGraph,
@@ -339,6 +340,7 @@ impl Router {
             pool: PacketPool::new(),
             history: PacketHistory::new(),
             rate_limit: NodeRateLimiter::with_node_num(node_num),
+            pending_young_announce: None,
             relay_identity: RelayIdentityCache::new(),
             qos: ChannelQoS::new(),
             graph,
@@ -487,6 +489,18 @@ impl Router {
     /// True after a LoRa preset change — board should reinit SX1262 without sys_reset.
     pub fn take_pending_radio_reinit(&mut self) -> bool {
         core::mem::take(&mut self.pending_radio_reinit)
+    }
+
+    pub fn take_young_announce(&mut self) -> Option<crate::rate_limit::YoungAnnounce> {
+        self.pending_young_announce.take()
+    }
+
+    pub fn set_young_announce_broadcast(&mut self, enabled: bool) {
+        self.rate_limit.set_announce_broadcast(enabled);
+    }
+
+    pub fn young_announce_broadcast(&self) -> bool {
+        self.rate_limit.announce_broadcast()
     }
 
     /// The board applied a new modem preset. Everything still queued was heard on, timed for
@@ -915,6 +929,8 @@ impl Router {
                 }
             })
         };
+        self.graph
+            .set_dropped_coverage(self.rate_limit.coverage_gate(now_ms));
         if let Some(ev) = self.rate_limit.take_event() {
             match ev {
                 crate::rate_limit::RateLimitEvent::Trip { node_id, kind } => {
@@ -930,6 +946,13 @@ impl Router {
                     });
                 }
             }
+        }
+        if let Some(ann) = self.rate_limit.take_announce() {
+            self.sr_log.push(SrLogEvent::RateLimitYoungAnnounce {
+                ids: ann.ids,
+                count: ann.count,
+            });
+            self.pending_young_announce = Some(ann);
         }
         if rate_limited {
             self.sr_log.push(SrLogEvent::RelaySkip {

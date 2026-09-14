@@ -173,6 +173,7 @@ pub struct NeighborGraph {
     direct_signal_count: u8,
     merge_asymmetric_skips: [(u32, u32); 4],
     merge_asymmetric_skip_count: u8,
+    dropped_coverage: crate::rate_limit::YoungCoverageGate,
 }
 
 impl Default for NeighborGraph {
@@ -239,6 +240,7 @@ impl NeighborGraph {
             direct_signal_count: 0,
             merge_asymmetric_skips: [(0, 0); 4],
             merge_asymmetric_skip_count: 0,
+            dropped_coverage: crate::rate_limit::YoungCoverageGate::empty(),
         }
     }
 
@@ -248,6 +250,10 @@ impl NeighborGraph {
 
     pub fn my_node(&self) -> u32 {
         self.my_node
+    }
+
+    pub fn set_dropped_coverage(&mut self, gate: crate::rate_limit::YoungCoverageGate) {
+        self.dropped_coverage = gate;
     }
 
     pub fn edges(&self) -> &EdgeStore {
@@ -728,6 +734,7 @@ impl NeighborGraph {
             edges: &self.edges,
             capability: &self.capability,
             downstream: &self.downstream,
+            dropped_coverage: self.dropped_coverage,
         };
         crate::broadcast_relay::plan_broadcast_relay(
             &ctx,
@@ -2191,6 +2198,9 @@ impl NeighborGraph {
             ) {
                 continue;
             }
+            if self.dropped_coverage.blocks(neighbor) {
+                continue;
+            }
             // Ours to cover: it proved it hears us, or nobody can prove anything about it and we
             // are its owner. Otherwise it is another node's responsibility, or nobody's.
             if !edge.hears_us
@@ -3474,6 +3484,34 @@ mod tests {
             .update_edge(ME, HIGH_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
         graph.edges_mut().set_edge_hears_us(HIGH_PEER, MUTE, true);
         assert!(!graph.has_unique_coverage(&[HIGH_PEER], 0));
+    }
+
+    #[test]
+    fn a_node_whose_traffic_is_being_dropped_is_not_a_coverage_target() {
+        const ME: u32 = 0xAA00_00AA;
+        const HIGH_PEER: u32 = 0xBB00_00BB;
+        const MUTE: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        for n in [HIGH_PEER, MUTE] {
+            graph.observe_direct_neighbor(n, -70, 8, 100, 0);
+        }
+        graph.confirm_direct_neighbor_hears_us(HIGH_PEER);
+        graph.capability_mut().track_topology(HIGH_PEER, true, 100);
+        graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
+        assert!(
+            graph.has_unique_coverage(&[HIGH_PEER], 0),
+            "a mute stock neighbour only we reach is ours to carry"
+        );
+        let mut gate = crate::rate_limit::YoungCoverageGate::empty();
+        gate.active = true;
+        gate.ids[0] = MUTE;
+        gate.id_count = 1;
+        graph.set_dropped_coverage(gate);
+        assert!(
+            !graph.has_unique_coverage(&[HIGH_PEER], 0),
+            "the limiter is dropping that node's traffic: it is not a coverage target"
+        );
     }
 
     /// Ownership of a neighbour nobody can confirm goes by the measured link, with the node id

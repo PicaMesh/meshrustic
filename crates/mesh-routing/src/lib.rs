@@ -88,7 +88,8 @@ pub use packet_history::{ObserveResult, PacketHistory};
 pub use pool::{PacketGuard, PacketHandle, PacketPool, PacketSlot, POOL_SIZE};
 pub use qos::ChannelQoS;
 pub use rate_limit::{
-    GraphProximity, NodeRateLimiter, RateLimitEvent, RateLimitKind, RateLimitPacket,
+    format_young_announce, GraphProximity, NodeRateLimiter, RateLimitEvent, RateLimitKind,
+    RateLimitPacket, YoungAnnounce, YoungCoverageGate,
 };
 pub use relay::{
     copy_opaque_payload, relay_header, relay_header_with_next_hop, relay_header_with_next_hop_opts,

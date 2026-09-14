@@ -697,6 +697,29 @@ is actually waiting for.
   first-hop frames key RELAY on the originator NodeID. Rate-limit runs before graph observe so
   dropped frames leave no topology side effects. Originator clear=0 is sticky-quiet; RELAY uses
   fixed-window hysteresis.
+  Traffic from an originator first heard less than 30 minutes ago is charged to one shared YOUNG
+  bucket (trip 48 / clear 12, same 90 s window, RELAY-style hysteresis), regardless of how many
+  such originators there are. A flood of minted identities therefore buys one bucket, not a
+  thousand slots. Age is first-sighting, not NodeInfo and not decode: NodeInfo is an
+  unauthenticated broadcast, and undecodable traffic already has the UNKNOWN bucket. First-sighting
+  records are kept only while the node is young (32 slots; field max simultaneous young was 6) and
+  deleted at 30 minutes. No record with room in the table means established (fail open — a node
+  quiet for hours, and the post-boot warm-up); no record with the table full means young (fail
+  closed — overflow is the flood this control exists for). The bucket is not enforced until this
+  node has been running 30 minutes: there is no persistent node database, and a freshly booted
+  node would otherwise treat the entire mesh as young. This is identification, not authentication.
+  A patient attacker with airtime still establishes identities after thirty minutes each; what the
+  control buys is that a flood must be visible and sustained for half an hour before it can
+  achieve anything. 48 is 2× the measured 24-packet / 90 s legitimate peak of young traffic
+  (1.6% of a 24 h capture; busiest hour minted 79 identities) and far below flood volume.
+  Thirty minutes is a commitment for an attacker at almost no cost to the mesh — not a knob to
+  lower. When the young bucket is limiting, a node whose traffic is being dropped is not a
+  coverage target: a young node publishes no topology and would otherwise be treated as stock
+  and given an owner who holds a relay for a node nobody will relay for. A hop-1 diagnostic
+  with at most four fixed-width node IDs may be announced on trip (30 min refractory; suppressed
+  under RELAY-limit or high channel utilisation); local log and the host interface fire, mesh
+  broadcast stays off until a config bit exists. Our own transmissions never meet the
+  receive-path limiter and need no exemption.
 
 ## 7. Robustness
 

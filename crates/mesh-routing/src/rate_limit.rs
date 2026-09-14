@@ -3,16 +3,31 @@
 //! Originator path: up to 16 sources, each with TEXT / ROUTING / OTHER / UNKNOWN packet-count
 //! buckets. RELAY path: rebroadcast candidates charge the last hop — 8 resolved NodeID slots
 //! plus one shared bucket for unresolved `relay_node` bytes — using an airtime budget tightened
-//! by local channel utilization.
+//! by local channel utilization. Young path: one shared packet-count bucket for originators first
+//! heard less than 30 minutes ago, so a flood of minted identities buys one slot, not one each.
 //!
 //! Uniform hysteresis: trip / clear / fixed window; while limited, drop matching traffic. Originator
-//! clear=0 (quiet window); RELAY clear>0 (lift when count is below clear at window roll).
+//! clear=0 (quiet window); RELAY and YOUNG clear>0 (lift when count is below clear at window roll).
 
 use mesh_protocol::{rate_limit_bucket, RateLimitBucket};
 
 const MAX_ORIGINATORS: usize = 16;
 const MAX_RELAYS: usize = 8;
+const MAX_YOUNG: usize = 32;
 const WINDOW_MS: u32 = 90_000;
+/// First-sighting records live only while the originator is younger than this.
+const YOUNG_AGE_MS: u32 = 30 * 60 * 1000;
+/// Do not enforce the young bucket until we ourselves have been up this long.
+const WARMUP_MS: u32 = 30 * 60 * 1000;
+/// Trip well above the measured 24-packet / 90 s legitimate peak (and the 12-identity
+/// burst in the same window) and far below flood volume. 48 is 2× that peak; 12 is the
+/// RELAY-style quarter-of-trip clear, so a burst of new nodes can recover without a
+/// fully silent window. Thirty minutes is a commitment, not a tuning knob.
+const YOUNG_TRIP: u32 = 48;
+const YOUNG_CLEAR: u32 = 12;
+const ANNOUNCE_REFRACTORY_MS: u32 = 30 * 60 * 1000;
+const ANNOUNCE_CHUTIL_HIGH: f32 = 25.0;
+const ANNOUNCE_MAX_IDS: usize = 4;
 
 const THRESHOLD_TEXT: u32 = 30;
 const THRESHOLD_ROUTING: u32 = 10;
@@ -76,6 +91,80 @@ struct RelayEntry {
     relay: BucketState,
 }
 
+#[derive(Clone, Copy, Default)]
+struct YoungSighting {
+    node_id: u32,
+    first_seen_ms: u32,
+}
+
+/// Snapshot the coverage path consults: a node whose traffic the young bucket is
+/// currently dropping is not a coverage target. Ownership of a stock neighbour
+/// that nobody will relay for is a wasted slot.
+#[derive(Clone, Copy, Debug)]
+pub struct YoungCoverageGate {
+    pub active: bool,
+    pub table_full: bool,
+    pub ids: [u32; MAX_YOUNG],
+    pub id_count: u8,
+}
+
+impl YoungCoverageGate {
+    pub const fn empty() -> Self {
+        Self {
+            active: false,
+            table_full: false,
+            ids: [0; MAX_YOUNG],
+            id_count: 0,
+        }
+    }
+
+    pub fn blocks(&self, node_id: u32) -> bool {
+        if !self.active || node_id == 0 {
+            return false;
+        }
+        if self.table_full {
+            return true;
+        }
+        self.ids[..self.id_count as usize].contains(&node_id)
+    }
+}
+
+impl Default for YoungCoverageGate {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// Up to four young originator IDs, fixed-width, for the diagnostic announcement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YoungAnnounce {
+    pub ids: [u32; ANNOUNCE_MAX_IDS],
+    pub count: u8,
+}
+
+/// Fixed-width young IDs. The bytes are attacker-chosen and do not belong in free text.
+pub fn format_young_announce(ann: &YoungAnnounce, out: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut pos = 0usize;
+    let push = |out: &mut [u8], pos: &mut usize, b: u8| {
+        if *pos < out.len() {
+            out[*pos] = b;
+            *pos += 1;
+        }
+    };
+    push(out, &mut pos, b'Y');
+    for i in 0..ann.count as usize {
+        push(out, &mut pos, b' ');
+        push(out, &mut pos, b'!');
+        let id = ann.ids[i];
+        for n in 0..8 {
+            let nib = ((id >> (28 - 4 * n)) & 0xF) as usize;
+            push(out, &mut pos, HEX[nib]);
+        }
+    }
+    pos
+}
+
 /// Inputs for one inbound rate-limit decision.
 pub struct RateLimitPacket {
     pub from: u32,
@@ -106,6 +195,7 @@ pub enum RateLimitKind {
     Unknown = 3,
     Relay = 4,
     RelayUnresolved = 5,
+    Young = 6,
 }
 
 impl RateLimitKind {
@@ -130,6 +220,17 @@ pub struct NodeRateLimiter {
     relays: [RelayEntry; MAX_RELAYS],
     relay_count: u8,
     unresolved_relay: BucketState,
+    young: [YoungSighting; MAX_YOUNG],
+    young_count: u8,
+    alumni: [u32; MAX_YOUNG],
+    alumni_count: u8,
+    young_bucket: BucketState,
+    boot_ms: u32,
+    boot_known: bool,
+    announce_broadcast: bool,
+    last_announce_ms: u32,
+    announce_ever: bool,
+    pending_announce: Option<YoungAnnounce>,
     last_event: Option<RateLimitEvent>,
 }
 
@@ -192,6 +293,24 @@ impl NodeRateLimiter {
                 count: 0,
                 limited: false,
             },
+            young: [YoungSighting {
+                node_id: 0,
+                first_seen_ms: 0,
+            }; MAX_YOUNG],
+            young_count: 0,
+            alumni: [0; MAX_YOUNG],
+            alumni_count: 0,
+            young_bucket: BucketState {
+                window_start_ms: 0,
+                count: 0,
+                limited: false,
+            },
+            boot_ms: 0,
+            boot_known: false,
+            announce_broadcast: false,
+            last_announce_ms: 0,
+            announce_ever: false,
+            pending_announce: None,
             last_event: None,
         }
     }
@@ -209,6 +328,54 @@ impl NodeRateLimiter {
         self.last_event.take()
     }
 
+    pub fn take_announce(&mut self) -> Option<YoungAnnounce> {
+        self.pending_announce.take()
+    }
+
+    /// Broadcast of the young-bucket diagnostic is opt-in. Local log and the host
+    /// interface fire regardless.
+    pub fn set_announce_broadcast(&mut self, enabled: bool) {
+        self.announce_broadcast = enabled;
+    }
+
+    pub fn announce_broadcast(&self) -> bool {
+        self.announce_broadcast
+    }
+
+    /// Test/boot hook: treat `boot_ms` as the moment we came up.
+    pub fn set_boot_ms(&mut self, boot_ms: u32) {
+        self.boot_ms = boot_ms;
+        self.boot_known = true;
+    }
+
+    pub fn warmed_up(&self, now_ms: u32) -> bool {
+        self.boot_known && now_ms.wrapping_sub(self.boot_ms) >= WARMUP_MS
+    }
+
+    pub fn young_limited(&self) -> bool {
+        self.young_bucket.limited
+    }
+
+    pub fn young_table_full(&self) -> bool {
+        self.young_count as usize >= MAX_YOUNG
+    }
+
+    /// Coverage asks this, not `should_drop`: a node whose traffic is being dropped
+    /// is not a coverage target.
+    pub fn coverage_gate(&self, now_ms: u32) -> YoungCoverageGate {
+        let mut ids = [0u32; MAX_YOUNG];
+        let n = self.young_count as usize;
+        for (i, slot) in ids.iter_mut().enumerate().take(n) {
+            *slot = self.young[i].node_id;
+        }
+        YoungCoverageGate {
+            active: self.warmed_up(now_ms) && self.young_bucket.limited,
+            table_full: self.young_table_full(),
+            ids,
+            id_count: self.young_count,
+        }
+    }
+
     /// Returns `true` when the packet should be dropped for rate abuse.
     ///
     /// Packets addressed to us are never limited. `ADMIN_APP` is not exempt by portnum.
@@ -217,6 +384,7 @@ impl NodeRateLimiter {
         F: FnMut(u32) -> GraphProximity,
     {
         self.last_event = None;
+        self.pending_announce = None;
         if !self.enabled {
             return false;
         }
@@ -227,9 +395,15 @@ impl NodeRateLimiter {
             return false;
         }
 
+        self.note_boot(pkt.now_ms);
+
         let mut drop = false;
 
         let bucket_kind = rate_limit_bucket(pkt.decoded_portnum);
+        let decoded = !matches!(bucket_kind, RateLimitBucket::Unknown);
+        if decoded {
+            self.note_originator(pkt.from, pkt.now_ms);
+        }
         let (trip, kind) = match bucket_kind {
             RateLimitBucket::Text => (THRESHOLD_TEXT, RateLimitKind::Text),
             RateLimitBucket::Routing => (THRESHOLD_ROUTING, RateLimitKind::Routing),
@@ -254,6 +428,28 @@ impl NodeRateLimiter {
             );
             if let Some(ev) = ev {
                 self.last_event = Some(ev);
+            }
+            if limited {
+                drop = true;
+            }
+        }
+
+        if decoded && self.warmed_up(pkt.now_ms) && self.is_young(pkt.from, pkt.now_ms) {
+            let (limited, ev) = Self::check_and_update_bucket(
+                &mut self.young_bucket,
+                YOUNG_TRIP,
+                YOUNG_CLEAR,
+                1,
+                pkt.now_ms,
+                self.window_ms,
+                0,
+                RateLimitKind::Young,
+            );
+            if let Some(ev) = ev {
+                self.last_event = Some(ev);
+                if matches!(ev, RateLimitEvent::Trip { .. }) {
+                    self.maybe_announce(pkt.now_ms, pkt.channel_util_pct);
+                }
             }
             if limited {
                 drop = true;
@@ -314,6 +510,119 @@ impl NodeRateLimiter {
         }
 
         drop
+    }
+
+    fn note_boot(&mut self, now_ms: u32) {
+        if !self.boot_known {
+            self.boot_ms = now_ms;
+            self.boot_known = true;
+        }
+    }
+
+    fn find_young(&self, node_id: u32) -> Option<usize> {
+        self.young[..self.young_count as usize]
+            .iter()
+            .position(|e| e.node_id == node_id)
+    }
+
+    fn in_alumni(&self, node_id: u32) -> bool {
+        self.alumni[..self.alumni_count as usize].contains(&node_id)
+    }
+
+    fn add_alumni(&mut self, node_id: u32) {
+        if self.in_alumni(node_id) {
+            return;
+        }
+        if (self.alumni_count as usize) < MAX_YOUNG {
+            self.alumni[self.alumni_count as usize] = node_id;
+            self.alumni_count += 1;
+            return;
+        }
+        self.alumni.copy_within(1..MAX_YOUNG, 0);
+        self.alumni[MAX_YOUNG - 1] = node_id;
+    }
+
+    fn remove_young_at(&mut self, idx: usize) {
+        let last = self.young_count as usize - 1;
+        if idx < last {
+            self.young[idx] = self.young[last];
+        }
+        self.young[last] = YoungSighting {
+            node_id: 0,
+            first_seen_ms: 0,
+        };
+        self.young_count -= 1;
+    }
+
+    fn expire_if_old(&mut self, node_id: u32, now_ms: u32) {
+        let Some(idx) = self.find_young(node_id) else {
+            return;
+        };
+        let age = now_ms.wrapping_sub(self.young[idx].first_seen_ms);
+        if (YOUNG_AGE_MS..0x8000_0000).contains(&age) {
+            self.add_alumni(node_id);
+            self.remove_young_at(idx);
+        }
+    }
+
+    fn note_originator(&mut self, node_id: u32, now_ms: u32) {
+        self.expire_if_old(node_id, now_ms);
+        if self.find_young(node_id).is_some() || self.in_alumni(node_id) {
+            return;
+        }
+        if (self.young_count as usize) < MAX_YOUNG {
+            let i = self.young_count as usize;
+            self.young[i] = YoungSighting {
+                node_id,
+                first_seen_ms: now_ms,
+            };
+            self.young_count += 1;
+        }
+    }
+
+    /// No record + room → established (fail open). No record + full → young (fail closed).
+    fn is_young(&self, node_id: u32, now_ms: u32) -> bool {
+        if let Some(idx) = self.find_young(node_id) {
+            let age = now_ms.wrapping_sub(self.young[idx].first_seen_ms);
+            return !(YOUNG_AGE_MS..0x8000_0000).contains(&age);
+        }
+        if self.in_alumni(node_id) {
+            return false;
+        }
+        self.young_count as usize >= MAX_YOUNG
+    }
+
+    fn relay_any_limited(&self) -> bool {
+        if self.unresolved_relay.limited {
+            return true;
+        }
+        self.relays[..self.relay_count as usize]
+            .iter()
+            .any(|e| e.relay.limited)
+    }
+
+    fn maybe_announce(&mut self, now_ms: u32, channel_util_pct: f32) {
+        if self.relay_any_limited() || channel_util_pct > ANNOUNCE_CHUTIL_HIGH {
+            return;
+        }
+        if self.announce_ever {
+            let elapsed = now_ms.wrapping_sub(self.last_announce_ms);
+            if elapsed < ANNOUNCE_REFRACTORY_MS {
+                return;
+            }
+        }
+        let mut ann = YoungAnnounce {
+            ids: [0; ANNOUNCE_MAX_IDS],
+            count: 0,
+        };
+        let n = (self.young_count as usize).min(ANNOUNCE_MAX_IDS);
+        for i in 0..n {
+            ann.ids[i] = self.young[i].node_id;
+            ann.count += 1;
+        }
+        self.last_announce_ms = now_ms;
+        self.announce_ever = true;
+        self.pending_announce = Some(ann);
     }
 
     fn relay_budgets(air_ms: u32, channel_util_pct: f32) -> (u32, u32) {
@@ -682,6 +991,26 @@ mod tests {
 
         fn debug_relay_budgets(&self, air_ms: u32, chutil: f32) -> (u32, u32) {
             Self::relay_budgets(air_ms, chutil)
+        }
+
+        fn debug_tracks_young(&self, from: u32) -> bool {
+            self.find_young(from).is_some()
+        }
+
+        fn debug_young_count(&self) -> usize {
+            self.young_count as usize
+        }
+
+        fn debug_is_young(&self, from: u32, now_ms: u32) -> bool {
+            self.is_young(from, now_ms)
+        }
+
+        fn debug_young_count_value(&self) -> u32 {
+            self.young_bucket.count
+        }
+
+        fn debug_seed_young(&mut self, from: u32, first_seen_ms: u32) {
+            self.note_originator(from, first_seen_ms);
         }
     }
 
@@ -1241,5 +1570,244 @@ mod tests {
         };
         assert!(limiter.should_drop(&pkt, no_graph));
         assert_eq!(limiter.unresolved_relay.count, before);
+    }
+
+    fn warmed(limiter: &mut NodeRateLimiter) {
+        limiter.set_boot_ms(0);
+    }
+
+    #[test]
+    fn established_originator_is_never_charged_to_young() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let from = 0xAE00_0001;
+        limiter.debug_seed_young(from, 0);
+        assert!(limiter.debug_tracks_young(from));
+        assert!(
+            !drop_other(&mut limiter, from, WARMUP_MS),
+            "aged-out originator is established and must not trip young"
+        );
+        assert!(!limiter.debug_tracks_young(from), "record released at 30 min");
+        for i in 0..YOUNG_TRIP {
+            assert!(
+                !limiter.debug_is_young(from, WARMUP_MS + 1 + i),
+                "released record is established"
+            );
+            assert_eq!(
+                limiter.debug_young_count_value(),
+                0,
+                "established traffic must not charge the young bucket"
+            );
+            let _ = drop_text(&mut limiter, from, WARMUP_MS + 1 + i);
+        }
+        assert!(!limiter.young_limited());
+    }
+
+    #[test]
+    fn forged_identities_share_one_young_bucket() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let t = WARMUP_MS;
+        for i in 0..YOUNG_TRIP - 1 {
+            let from = 0xF100_0000 + i;
+            assert!(
+                !drop_text(&mut limiter, from, t + i),
+                "young identity {i} shares the bucket and must not trip yet"
+            );
+        }
+        assert!(
+            drop_text(&mut limiter, 0xF100_0000 + YOUNG_TRIP - 1, t + YOUNG_TRIP),
+            "a flood of distinct young originators trips the shared bucket"
+        );
+        assert!(limiter.young_limited());
+
+        let mut established = NodeRateLimiter::new();
+        warmed(&mut established);
+        for i in 0..YOUNG_TRIP {
+            let from = 0xE100_0000 + i;
+            established.debug_seed_young(from, 0);
+            assert!(
+                !drop_text(&mut established, from, t + i),
+                "the same volume from established originators must not trip young"
+            );
+        }
+        assert!(!established.young_limited());
+    }
+
+    #[test]
+    fn young_record_is_released_after_thirty_minutes() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let from = 0xAA00_00AA;
+        assert!(!drop_other(&mut limiter, from, WARMUP_MS));
+        assert!(limiter.debug_tracks_young(from));
+        assert_eq!(limiter.debug_young_count(), 1);
+        assert!(!drop_other(&mut limiter, from, WARMUP_MS + YOUNG_AGE_MS));
+        assert!(
+            !limiter.debug_tracks_young(from),
+            "first-sighting record is deleted once the node is no longer young"
+        );
+        assert_eq!(limiter.debug_young_count(), 0);
+    }
+
+    #[test]
+    fn no_record_fails_open_with_room_and_closed_when_full() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let now = WARMUP_MS;
+        assert!(
+            !limiter.debug_is_young(0xB100_0001, now),
+            "no record and room in the table means established"
+        );
+        for i in 0..MAX_YOUNG as u32 {
+            limiter.debug_seed_young(0xB200_0000 + i, now);
+        }
+        assert!(limiter.young_table_full());
+        assert!(
+            limiter.debug_is_young(0xB300_0001, now),
+            "no record and a full table means young"
+        );
+        assert!(!limiter.debug_tracks_young(0xB300_0001));
+    }
+
+    #[test]
+    fn young_bucket_is_not_enforced_during_warmup() {
+        let mut limiter = NodeRateLimiter::new();
+        for i in 0..YOUNG_TRIP + 4 {
+            assert!(
+                !drop_text(&mut limiter, 0xC100_0000 + i, i),
+                "warmup replaces persistence: do not drop the mesh as young after boot"
+            );
+        }
+        assert!(!limiter.young_limited());
+        assert!(!limiter.warmed_up(YOUNG_TRIP + 4));
+    }
+
+    #[test]
+    fn young_bucket_clears_below_clear_without_a_silent_window() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let t = WARMUP_MS;
+        for i in 0..YOUNG_TRIP {
+            let _ = drop_text(&mut limiter, 0xD100_0000 + i, t + i);
+        }
+        assert!(limiter.young_limited());
+        // Window roll with count still high keeps the limit and zeroes; a few charges
+        // under clear, then another roll, lifts — RELAY hysteresis, not a quiet window.
+        let busy = t + YOUNG_TRIP;
+        for i in 0..20u32 {
+            let _ = drop_text(&mut limiter, 0xD200_0000 + i, busy + i);
+        }
+        let roll = busy + 20 + WINDOW_MS;
+        assert!(drop_text(&mut limiter, 0xD300_0001, roll));
+        for i in 0..5u32 {
+            let _ = drop_text(&mut limiter, 0xD400_0000 + i, roll + 1 + i);
+        }
+        assert!(
+            !drop_text(&mut limiter, 0xD500_0001, roll + 1 + WINDOW_MS),
+            "young bucket must lift when the prior window is under the clear threshold"
+        );
+        assert!(!limiter.young_limited());
+    }
+
+    #[test]
+    fn undecodable_traffic_does_not_charge_young() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let t = WARMUP_MS;
+        for i in 0..YOUNG_TRIP {
+            assert!(
+                !drop_undecodable(&mut limiter, 0x1100_0000 + i, t + i),
+                "undecodable frames belong to UNKNOWN, not young"
+            );
+        }
+        assert!(!limiter.young_limited());
+        assert_eq!(limiter.debug_young_count(), 0);
+        assert!(!limiter.debug_tracks_young(0x1100_0000));
+    }
+
+    #[test]
+    fn young_announce_respects_refractory_and_congestion() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let t = WARMUP_MS;
+        for i in 0..YOUNG_TRIP {
+            let _ = drop_text(&mut limiter, 0xA100_0000 + i, t + i);
+        }
+        let first = limiter.take_announce();
+        assert!(first.is_some(), "first trip may announce");
+        assert!(first.unwrap().count <= 4);
+
+        for i in 0..YOUNG_TRIP {
+            let _ = drop_text(
+                &mut limiter,
+                0xA200_0000 + i,
+                t + WINDOW_MS + 10 + i,
+            );
+        }
+        assert!(
+            limiter.take_announce().is_none(),
+            "refractory is independent of how often the bucket trips"
+        );
+
+        let mut congested = NodeRateLimiter::new();
+        warmed(&mut congested);
+        for i in 0..YOUNG_TRIP {
+            let pkt = RateLimitPacket {
+                from: 0xA300_0000 + i,
+                to: 0xFFFF_FFFF,
+                decoded_portnum: Some(num::TEXT_MESSAGE_APP),
+                now_ms: t + i,
+                rebroadcast_candidate: false,
+                resolved_relay: None,
+                airtime_ms: RELAY_REF_AIRTIME_MS,
+                channel_util_pct: 40.0,
+            };
+            let _ = congested.should_drop(&pkt, no_graph);
+        }
+        assert!(congested.young_limited());
+        assert!(
+            congested.take_announce().is_none(),
+            "suppressed while channel utilisation is high"
+        );
+
+        let mut relay_busy = NodeRateLimiter::new();
+        // Young is not enforced until we have been up 30 min; RELAY still is.
+        // Trip RELAY first, then trip young after warm-up, or the young bucket
+        // would drop the flood before RELAY ever charged.
+        for i in 0..60u32 {
+            let pkt = RateLimitPacket {
+                from: 0xA400_0000 + i,
+                to: 0xFFFF_FFFF,
+                decoded_portnum: Some(num::TEXT_MESSAGE_APP),
+                now_ms: i,
+                rebroadcast_candidate: true,
+                resolved_relay: None,
+                airtime_ms: RELAY_REF_AIRTIME_MS,
+                channel_util_pct: 0.0,
+            };
+            let _ = relay_busy.should_drop(&pkt, no_graph);
+        }
+        assert!(relay_busy.unresolved_relay_limited());
+        assert!(!relay_busy.young_limited());
+        for i in 0..YOUNG_TRIP {
+            let _ = drop_text(&mut relay_busy, 0xA500_0000 + i, WARMUP_MS + i);
+        }
+        assert!(relay_busy.young_limited());
+        assert!(
+            relay_busy.take_announce().is_none(),
+            "suppressed while the RELAY bucket is limiting"
+        );
+    }
+
+    #[test]
+    fn young_announce_is_fixed_width_ids() {
+        let ann = YoungAnnounce {
+            ids: [0xAABB_CCDD, 0x0102_0304, 0, 0],
+            count: 2,
+        };
+        let mut buf = [0u8; 48];
+        let n = format_young_announce(&ann, &mut buf);
+        assert_eq!(&buf[..n], b"Y !aabbccdd !01020304");
     }
 }

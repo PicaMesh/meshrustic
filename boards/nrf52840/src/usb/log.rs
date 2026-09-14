@@ -1336,6 +1336,7 @@ pub mod sr {
                     3 => b"unknown",
                     4 => b"relay",
                     5 => b"relay-unresolved",
+                    6 => b"young",
                     _ => b"?",
                 };
                 let mut line = [0u8; 128];
@@ -1354,6 +1355,7 @@ pub mod sr {
                     3 => b"unknown",
                     4 => b"relay",
                     5 => b"relay-unresolved",
+                    6 => b"young",
                     _ => b"?",
                 };
                 let mut line = [0u8; 128];
@@ -1362,6 +1364,16 @@ pub mod sr {
                 put(&mut line, &mut pos, kind_text);
                 put(&mut line, &mut pos, b" node=!");
                 put_hex8(&mut line, &mut pos, node_id);
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RateLimitYoungAnnounce { ids, count } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[RateLimit] young ");
+                let ann = mesh_routing::YoungAnnounce { ids, count };
+                let mut body = [0u8; 48];
+                let n = mesh_routing::format_young_announce(&ann, &mut body);
+                put(&mut line, &mut pos, &body[..n]);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::TopologySending {

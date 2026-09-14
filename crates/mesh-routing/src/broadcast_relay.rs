@@ -5,6 +5,7 @@ use crate::graph::{
     coverage_owner, covers, delivery_hop_cost_fixed, is_placeholder_node, is_silent_publisher,
     DownstreamTable, EdgeSource, EdgeStore, MAX_EDGES_PER_NODE,
 };
+use crate::rate_limit::YoungCoverageGate;
 
 const BIDI_ETX_CEILING: f32 = 20.0;
 const DOWNSTREAM_TTL_MS: u32 = 7_200_000;
@@ -210,6 +211,8 @@ pub struct BroadcastRelayContext<'a> {
     pub edges: &'a EdgeStore,
     pub capability: &'a CapabilityCache,
     pub downstream: &'a DownstreamTable,
+    /// A node whose traffic the limiter is dropping is not a coverage target.
+    pub dropped_coverage: YoungCoverageGate,
 }
 
 fn get_coverage_if_relays(
@@ -293,6 +296,12 @@ fn admits_coverage(ctx: &BroadcastRelayContext<'_>, relay: u32, target: u32, now
     // to it: our own link to it is already retracted, and crediting peers with reaching it hands
     // them a slot they will decline.
     if is_silent_publisher(ctx.edges, Some(ctx.capability), target, now_ms) {
+        return false;
+    }
+    // Traffic the limiter is dropping is nobody's to carry: electing an owner for a young
+    // node while the shared young bucket is limiting holds a relay for a node nobody will
+    // relay for.
+    if ctx.dropped_coverage.blocks(target) {
         return false;
     }
     covers(ctx.edges, Some(ctx.capability), relay, target)
@@ -903,6 +912,7 @@ mod tests {
             edges,
             capability,
             downstream,
+            dropped_coverage: YoungCoverageGate::empty(),
         }
     }
 
@@ -1161,6 +1171,43 @@ mod tests {
         let c = ctx(&edges, &capability, &downstream);
         let n = get_coverage_if_relays(&c, NEAR, past, &mut buf);
         assert!(buf[..n as usize].contains(&GONE), "back on the air");
+    }
+
+    #[test]
+    fn a_dropped_young_node_is_not_a_coverage_target() {
+        // Must not collide with ME: absorb also credits the relay itself.
+        const MUTE: u32 = 0x1100_0011;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, BB, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        capability.track_topology(BB, true, 0);
+        edges.update_edge(ME, ME, MUTE, 1.5, 0, EdgeSource::Reported, false, 0);
+        capability.track_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 0);
+
+        let mut c = ctx(&edges, &capability, &downstream);
+        let mut buf = [0u32; MAX_EDGES_PER_NODE];
+        let n = get_coverage_if_relays(&c, ME, 0, &mut buf);
+        assert!(
+            buf[..n as usize].contains(&MUTE),
+            "a mute neighbour only we reach is a coverage target"
+        );
+
+        let mut gate = YoungCoverageGate::empty();
+        gate.active = true;
+        gate.ids[0] = MUTE;
+        gate.id_count = 1;
+        c.dropped_coverage = gate;
+        let n = get_coverage_if_relays(&c, ME, 0, &mut buf);
+        assert!(
+            !buf[..n as usize].contains(&MUTE),
+            "dropped traffic is nobody's to carry"
+        );
+        let mut covered = CoveredSet::new();
+        absorb_relay_coverage(&c, &mut covered, ME, 0);
+        assert!(!covered.contains(MUTE), "absorb credits the same set");
     }
 
     /// With a second candidate present — so the sole-candidate rule cannot fire — a mute stock
@@ -1484,6 +1531,7 @@ mod tests {
             edges: &edges,
             capability: &capability,
             downstream: &downstream,
+            dropped_coverage: YoungCoverageGate::empty(),
         };
         let plan = plan_broadcast_relay(
             &ctx,

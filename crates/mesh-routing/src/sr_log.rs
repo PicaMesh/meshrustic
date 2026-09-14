@@ -83,7 +83,7 @@ pub enum SrLogEvent {
         from: u32,
         reason: SrSkipReason,
     },
-    /// Inbound rate limiter tripped (kind: 0=text 1=routing 2=other 3=unknown 4=relay 5=relay-unresolved).
+    /// Inbound rate limiter tripped (kind: 0=text 1=routing 2=other 3=unknown 4=relay 5=relay-unresolved 6=young).
     RateLimitTrip {
         node_id: u32,
         kind: u8,
@@ -92,6 +92,11 @@ pub enum SrLogEvent {
     RateLimitClear {
         node_id: u32,
         kind: u8,
+    },
+    /// Young-bucket diagnostic (local log / host). Broadcast is opt-in elsewhere.
+    RateLimitYoungAnnounce {
+        ids: [u32; 4],
+        count: u8,
     },
     TopologySending {
         node_id: u32,

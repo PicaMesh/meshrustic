@@ -411,6 +411,25 @@ fn handle_rx_frame(
             result.rate_limited,
         );
 
+        if let Some(ann) = router.take_young_announce() {
+            if router.young_announce_broadcast() {
+                let mut body = [0u8; 48];
+                let n = mesh_routing::format_young_announce(&ann, &mut body);
+                let airtime_ms = packet_time_ms(slot.config(), PACKET_HEADER_LEN + n, true).max(1);
+                if let Some(plan) = router.send_local(
+                    NODENUM_BROADCAST,
+                    TEXT_MESSAGE_APP,
+                    &body[..n],
+                    false,
+                    1,
+                    now_ms,
+                    airtime_ms,
+                ) {
+                    enqueue_tx(plan, slot, router, node_num, b"young-ann");
+                }
+            }
+        }
+
         if result.rate_limited {
             defmt::warn!("[RateLimit] drop from !{:08x}", result.parsed.from);
             crate::usb_log::log::rate_limit::drop_from(result.parsed.from);

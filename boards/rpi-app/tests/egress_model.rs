@@ -73,6 +73,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
         edges: graph.edges(),
         capability: graph.capability(),
         downstream: graph.downstream(),
+        dropped_coverage: Default::default(),
     };
     let plan_without = plan_broadcast_relay(
         &ctx,
@@ -95,6 +96,7 @@ fn field_relay_plan_counts_only_hears_us_sr_candidates() {
         edges: graph.edges(),
         capability: graph.capability(),
         downstream: graph.downstream(),
+        dropped_coverage: Default::default(),
     };
     let plan_with = plan_broadcast_relay(
         &ctx,
