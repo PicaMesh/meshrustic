@@ -893,7 +893,9 @@ impl Router {
             None
         };
 
-        // Rate-limit before graph/topology observe so dropped frames leave no side effects (K32).
+        // Rate-limit before graph/topology observe, so a dropped frame drives no relay, no
+        // topology merge and no downstream learning. The one exception is our own measurement of
+        // the link the frame arrived on, re-applied below: see the `rate_limited` branch.
         let decoded_portnum = decode.portnum;
         let rebroadcast_candidate = parsed.to != self.node_num
             && parsed.from != self.node_num
@@ -919,6 +921,7 @@ impl Router {
             resolved_relay,
             airtime_ms,
             channel_util_pct: self.channel_util_pct,
+            graph_established: self.graph.neighbor_count() > 0,
         };
         let rate_limited = {
             let graph = &mut self.graph;
@@ -955,6 +958,21 @@ impl Router {
             self.pending_young_announce = Some(ann);
         }
         if rate_limited {
+            // A direct frame carrying a signal reading is our own measurement of that link, and
+            // it stays true whether or not we are dropping the payload. Discarding it would let a
+            // neighbour we are limiting age out of the graph, at which point it stops being a node
+            // we relay *behind* and becomes one we relay *for* — the limiter would manufacture the
+            // traffic it exists to suppress. The edge and its downstream invalidation are all we
+            // take: no relay planning, no topology merge, no activity or capability tracking.
+            if direct && !parsed.via_mqtt && !(packet.rssi == 0 && packet.snr == 0) {
+                self.graph.observe_direct_neighbor(
+                    parsed.from,
+                    packet.rssi,
+                    packet.snr,
+                    now_ms,
+                    packet.radio_id,
+                );
+            }
             self.sr_log.push(SrLogEvent::RelaySkip {
                 from: parsed.from,
                 reason: SrSkipReason::RateLimited,

@@ -6,8 +6,9 @@
 //! by local channel utilization. Young path: one shared packet-count bucket for originators first
 //! heard less than 30 minutes ago, so a flood of minted identities buys one slot, not one each.
 //!
-//! Uniform hysteresis: trip / clear / fixed window; while limited, drop matching traffic. Originator
-//! clear=0 (quiet window); RELAY and YOUNG clear>0 (lift when count is below clear at window roll).
+//! Uniform hysteresis: trip / clear / fixed window; while limited, drop matching traffic. Every
+//! bucket clears the same way: at the window roll, when the count for that window is below the
+//! clear threshold. Originator clear is half its trip, RELAY and YOUNG a quarter of theirs.
 
 use mesh_protocol::{rate_limit_bucket, RateLimitBucket};
 
@@ -35,7 +36,24 @@ const THRESHOLD_OTHER: u32 = 4;
 /// Undecodable traffic. Sized so a relayed remote-admin Channels screen (channel 0, LoRa
 /// config, then channels 1..7 one at a time: nine requests, nine replies) loads in one window.
 const THRESHOLD_UNKNOWN: u32 = 12;
-const ORIGINATOR_CLEAR: u32 = 0;
+/// Half the trip that limited the originator, floored at 1.
+///
+/// A clear of 0 means "sticky until a fully silent window", and every packet arriving while
+/// limited restarts that window, so an originator that keeps talking never recovers: brushing a
+/// threshold once costs it the bucket permanently. Half, not the quarter RELAY uses, because these
+/// thresholds are small — a quarter of OTHER's 4 is 1, which demands a completely silent window
+/// and reinstates the behaviour being fixed.
+const ORIGINATOR_CLEAR_RATIO_NUM: u32 = 1;
+const ORIGINATOR_CLEAR_RATIO_DEN: u32 = 2;
+
+const fn originator_clear(trip: u32) -> u32 {
+    let clear = (trip * ORIGINATOR_CLEAR_RATIO_NUM) / ORIGINATOR_CLEAR_RATIO_DEN;
+    if clear < 1 {
+        1
+    } else {
+        clear
+    }
+}
 
 const RELAY_TRIP_PACKETS: u32 = 60;
 const RELAY_CLEAR_PACKETS: u32 = 15;
@@ -177,6 +195,19 @@ pub struct RateLimitPacket {
     pub resolved_relay: Option<u32>,
     pub airtime_ms: u32,
     pub channel_util_pct: f32,
+    /// Do we hold a graph yet (at least one direct neighbour)? Gates the shared unresolved
+    /// RELAY slot only; see `charges_unresolved_relay`.
+    pub graph_established: bool,
+}
+
+/// Should this frame charge the one shared bucket for unresolved `relay_node` bytes?
+///
+/// Not until we hold a graph. Just after boot every relay byte is unresolved, so the single
+/// shared slot trips on ordinary traffic and suppresses exactly the relays a node needs in order
+/// to learn who its neighbours are — the limiter would deny itself the evidence that lifts it.
+/// One known direct neighbour is enough; resolved last hops are charged either way.
+fn charges_unresolved_relay(graph_established: bool) -> bool {
+    graph_established
 }
 
 /// Graph proximity for eviction (never frame `hop_start` / `hop_limit`).
@@ -419,7 +450,7 @@ impl NodeRateLimiter {
             let (limited, ev) = Self::check_and_update_bucket(
                 bucket,
                 trip,
-                ORIGINATOR_CLEAR,
+                originator_clear(trip),
                 1,
                 pkt.now_ms,
                 self.window_ms,
@@ -489,7 +520,7 @@ impl NodeRateLimiter {
                 if limited {
                     drop = true;
                 }
-            } else {
+            } else if charges_unresolved_relay(pkt.graph_established) {
                 let (limited, ev) = Self::check_and_update_bucket(
                     &mut self.unresolved_relay,
                     trip_ms,
@@ -645,7 +676,9 @@ impl NodeRateLimiter {
         (trip_ms, clear_ms)
     }
 
-    /// clear==0: sticky quiet window (originator). clear>0: fixed-window hysteresis (RELAY).
+    /// Fixed-window hysteresis: at the window roll, a limited bucket lifts when its count for
+    /// that window fell below `clear`. `clear == 0` is the sticky quiet window, kept only for
+    /// callers that ask for it; no production bucket does.
     fn check_and_update_bucket(
         b: &mut BucketState,
         trip: u32,
@@ -874,6 +907,7 @@ mod tests {
             resolved_relay: None,
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
+            graph_established: true,
         }
     }
 
@@ -961,6 +995,7 @@ mod tests {
                 resolved_relay: None,
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph));
         }
@@ -1012,6 +1047,137 @@ mod tests {
         fn debug_seed_young(&mut self, from: u32, first_seen_ms: u32) {
             self.note_originator(from, first_seen_ms);
         }
+
+        fn originator_limited(&self, from: u32) -> bool {
+            self.find_originator(from)
+                .map(|i| self.originators[i].other.limited)
+                .unwrap_or(false)
+        }
+    }
+
+    #[test]
+    fn originator_clear_is_half_the_trip_and_never_zero() {
+        // Half, not RELAY's quarter. OTHER's trip is 4: a quarter is 1, which would demand a
+        // completely silent window and so reinstate the sticky behaviour this ratio replaces.
+        assert_eq!(originator_clear(THRESHOLD_OTHER), 2);
+        assert_eq!(THRESHOLD_OTHER / 4, 1);
+        assert_eq!(originator_clear(THRESHOLD_TEXT), 15);
+        assert_eq!(originator_clear(THRESHOLD_ROUTING), 5);
+        assert_eq!(originator_clear(THRESHOLD_UNKNOWN), 6);
+        // A trip of 1 must still clear at 1, not at 0: a clear of 0 is the sticky window.
+        assert_eq!(originator_clear(1), 1);
+        assert!(originator_clear(THRESHOLD_OTHER) > 0);
+    }
+
+    #[test]
+    fn a_limited_originator_that_keeps_talking_still_recovers() {
+        // The defect this pins: with clear == 0 the bucket was sticky until a fully silent
+        // window, and every packet arriving while limited restarted that window — so a node
+        // that kept talking at any rate at all could never come back. One packet per window is
+        // far below OTHER's trip of 4 and must clear.
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0x1122_3344;
+        limit_other(&mut limiter, from, 0);
+        assert!(limiter.originator_limited(from));
+
+        let mut now = WINDOW_MS;
+        let mut cleared_after = None;
+        for window in 1..=4u32 {
+            let dropped = drop_other(&mut limiter, from, now);
+            if !dropped {
+                cleared_after = Some(window);
+                break;
+            }
+            now += WINDOW_MS;
+        }
+        assert!(
+            cleared_after.is_some(),
+            "a talking originator never recovered: still limited after four quiet windows"
+        );
+        assert!(!limiter.originator_limited(from));
+    }
+
+    #[test]
+    fn an_originator_still_over_the_clear_stays_limited() {
+        // The other half of the hysteresis: recovery is earned by dropping below the clear
+        // threshold, not merely by the window rolling over.
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0x5566_7788;
+        limit_other(&mut limiter, from, 0);
+        assert!(limiter.originator_limited(from));
+
+        // Three packets per window is above OTHER's clear of 2 in every window.
+        let mut now = WINDOW_MS;
+        for _ in 0..4 {
+            for i in 0..3u32 {
+                assert!(drop_other(&mut limiter, from, now + i));
+            }
+            now += WINDOW_MS;
+        }
+        assert!(limiter.originator_limited(from));
+    }
+
+    #[test]
+    fn the_shared_unresolved_relay_slot_is_not_charged_without_a_graph() {
+        // Just after boot every relay byte is unresolved, so charging the one shared slot would
+        // trip it on ordinary traffic and suppress the very relays that build the graph.
+        let mut limiter = NodeRateLimiter::new();
+        for i in 0..200u32 {
+            let pkt = RateLimitPacket {
+                from: 0x7700_0000 + i,
+                to: 0xFFFF_FFFF,
+                decoded_portnum: Some(num::TEXT_MESSAGE_APP),
+                now_ms: i,
+                rebroadcast_candidate: true,
+                resolved_relay: None,
+                airtime_ms: RELAY_REF_AIRTIME_MS,
+                channel_util_pct: 0.0,
+                graph_established: false,
+            };
+            let _ = limiter.should_drop(&pkt, no_graph);
+        }
+        assert!(!limiter.unresolved_relay_limited());
+
+        // With a graph, the same traffic charges the slot and trips it.
+        let mut limiter = NodeRateLimiter::new();
+        for i in 0..200u32 {
+            let pkt = RateLimitPacket {
+                from: 0x7700_0000 + i,
+                to: 0xFFFF_FFFF,
+                decoded_portnum: Some(num::TEXT_MESSAGE_APP),
+                now_ms: i,
+                rebroadcast_candidate: true,
+                resolved_relay: None,
+                airtime_ms: RELAY_REF_AIRTIME_MS,
+                channel_util_pct: 0.0,
+                graph_established: true,
+            };
+            let _ = limiter.should_drop(&pkt, no_graph);
+        }
+        assert!(limiter.unresolved_relay_limited());
+    }
+
+    #[test]
+    fn a_resolved_last_hop_is_charged_with_or_without_a_graph() {
+        // The gate is scoped to the shared unresolved slot: a resolved NodeID names a real
+        // relayer and is accountable from the first frame.
+        let resolved = 0x0B00_00BB;
+        let mut limiter = NodeRateLimiter::new();
+        for i in 0..200u32 {
+            let pkt = RateLimitPacket {
+                from: 0x8800_0000 + i,
+                to: 0xFFFF_FFFF,
+                decoded_portnum: Some(num::TEXT_MESSAGE_APP),
+                now_ms: i,
+                rebroadcast_candidate: true,
+                resolved_relay: Some(resolved),
+                airtime_ms: RELAY_REF_AIRTIME_MS,
+                channel_util_pct: 0.0,
+                graph_established: false,
+            };
+            let _ = limiter.should_drop(&pkt, no_graph);
+        }
+        assert!(limiter.relay_limited(resolved));
     }
 
     fn fill_slot(limiter: &mut NodeRateLimiter, from: u32, now_ms: u32) {
@@ -1109,9 +1275,18 @@ mod tests {
             drop_other(&mut limiter, from, 0),
             "4th OTHER packet should trip the limit"
         );
+        // Recovery is decided at a window roll, on the count the window just ended with. The
+        // first roll still sees the four packets that tripped the bucket, so it only resets the
+        // count; the roll after that sees the quiet window and lifts. Two rolls, not one — the
+        // price of clearing on measured traffic rather than on a bucket that any packet could
+        // hold shut indefinitely.
         assert!(
-            !drop_other(&mut limiter, from, WINDOW_MS + 1),
-            "quiet for a full window should lift the limit"
+            drop_other(&mut limiter, from, WINDOW_MS + 1),
+            "the first roll still carries the count that tripped the bucket"
+        );
+        assert!(
+            !drop_other(&mut limiter, from, 2 * WINDOW_MS + 2),
+            "a quiet window below the clear threshold should lift the limit"
         );
     }
 
@@ -1275,6 +1450,7 @@ mod tests {
                 resolved_relay: None,
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph), "relay charge {i}");
         }
@@ -1287,6 +1463,7 @@ mod tests {
             resolved_relay: None,
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
+            graph_established: true,
         };
         assert!(limiter.should_drop(&trip, no_graph));
         assert!(limiter.unresolved_relay_limited());
@@ -1306,6 +1483,7 @@ mod tests {
                 resolved_relay: Some(resolved),
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph));
         }
@@ -1318,6 +1496,7 @@ mod tests {
             resolved_relay: Some(resolved),
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
+            graph_established: true,
         };
         assert!(limiter.should_drop(&trip, no_graph));
         assert!(limiter.tracks_relay(resolved));
@@ -1333,6 +1512,7 @@ mod tests {
             resolved_relay: None,
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
+            graph_established: true,
         };
         assert!(!limiter.should_drop(&other, no_graph));
     }
@@ -1352,6 +1532,7 @@ mod tests {
                 resolved_relay: Some(neighbor),
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph), "packet {i}");
         }
@@ -1395,6 +1576,7 @@ mod tests {
                 resolved_relay: Some(resolved),
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             let _ = limiter.should_drop(&pkt, no_graph);
         }
@@ -1417,6 +1599,7 @@ mod tests {
                 resolved_relay: Some(resolved),
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             assert!(limiter.should_drop(&pkt, no_graph));
         }
@@ -1436,6 +1619,7 @@ mod tests {
                 resolved_relay: Some(resolved),
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             },
             no_graph
         ));
@@ -1452,6 +1636,7 @@ mod tests {
                     resolved_relay: Some(resolved),
                     airtime_ms: RELAY_REF_AIRTIME_MS,
                     channel_util_pct: 0.0,
+                    graph_established: true,
                 },
                 no_graph,
             );
@@ -1468,6 +1653,7 @@ mod tests {
                     resolved_relay: Some(resolved),
                     airtime_ms: RELAY_REF_AIRTIME_MS,
                     channel_util_pct: 0.0,
+                    graph_established: true,
                 },
                 no_graph
             ),
@@ -1516,6 +1702,7 @@ mod tests {
                     resolved_relay: Some(relay),
                     airtime_ms: RELAY_REF_AIRTIME_MS,
                     channel_util_pct: 0.0,
+                    graph_established: true,
                 },
                 &mut proximity
             ));
@@ -1531,6 +1718,7 @@ mod tests {
                 resolved_relay: Some(0x0A00_0080),
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             },
             &mut proximity
         ));
@@ -1552,6 +1740,7 @@ mod tests {
                 resolved_relay: None,
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             let _ = limiter.should_drop(&pkt, no_graph);
         }
@@ -1567,6 +1756,7 @@ mod tests {
             resolved_relay: None,
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
+            graph_established: true,
         };
         assert!(limiter.should_drop(&pkt, no_graph));
         assert_eq!(limiter.unresolved_relay.count, before);
@@ -1762,6 +1952,7 @@ mod tests {
                 resolved_relay: None,
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 40.0,
+                graph_established: true,
             };
             let _ = congested.should_drop(&pkt, no_graph);
         }
@@ -1785,6 +1976,7 @@ mod tests {
                 resolved_relay: None,
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
+                graph_established: true,
             };
             let _ = relay_busy.should_drop(&pkt, no_graph);
         }

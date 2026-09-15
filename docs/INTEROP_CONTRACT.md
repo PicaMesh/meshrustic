@@ -694,9 +694,20 @@ is actually waiting for.
   opaque to relays and lands in UNKNOWN; the destination is covered by the to-us exemption).
   Rebroadcast candidates also charge a RELAY airtime budget (8 resolved last-hop slots + 1 shared
   unresolved; trip≈60 / clear≈15 packet-eq; hybrid AirUtil tighten; floors/ceilings). Direct
-  first-hop frames key RELAY on the originator NodeID. Rate-limit runs before graph observe so
-  dropped frames leave no topology side effects. Originator clear=0 is sticky-quiet; RELAY uses
-  fixed-window hysteresis.
+  first-hop frames key RELAY on the originator NodeID. The shared unresolved slot is not charged
+  until we hold a graph (one direct neighbour): just after boot every relay byte is unresolved, so
+  charging it would trip on ordinary traffic and suppress exactly the relays that build the graph.
+  Rate-limit runs before graph observe, so a dropped frame drives no relay, no topology merge and
+  no downstream learning — with one exception, the edge the frame itself measures
+  (`observe_direct_neighbor`): a direct frame carrying a signal reading is our own measurement of
+  that link whether or not we drop the payload, and discarding it would let a limited neighbour age
+  out of the graph and become a node we relay *for* rather than one we relay *behind*.
+  Every bucket clears the same way, at a window roll on the count that window ended with:
+  originator clear is half its trip (floored at 1), RELAY and YOUNG a quarter of theirs. A clear of
+  0 would mean sticky-until-silent, and since every packet arriving while limited restarts that
+  window, an originator that kept talking could never recover at all. Half and not RELAY's quarter
+  because these thresholds are small — a quarter of OTHER's 4 is 1, which demands a completely
+  silent window.
   Traffic from an originator first heard less than 30 minutes ago is charged to one shared YOUNG
   bucket (trip 48 / clear 12, same 90 s window, RELAY-style hysteresis), regardless of how many
   such originators there are. A flood of minted identities therefore buys one bucket, not a
