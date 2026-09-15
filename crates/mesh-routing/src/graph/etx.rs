@@ -294,9 +294,9 @@ mod tests {
         }
     }
 
-    // Mutation-tested pins. A reviewer mutated four single constants in the fork's copy of this
-    // curve and found the existing suite (42/42) let every one through undetected. Each test below
-    // is designed, and was verified by hand, to fail under one specific mutation: apply it, run the
+    // Mutation-tested pins. A reviewer mutated four single constants in this curve and found the
+    // existing suite (42/42) let every one through undetected. Each test below is designed, and was
+    // verified by hand, to fail under one specific mutation: apply it, run the
     // suite, confirm the failure, then revert. Expected values are computed independently in
     // dB/probability arithmetic (see the accompanying comment on each), not by re-deriving them
     // from this module's own interpolation code — restating the implementation would not catch a
