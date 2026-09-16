@@ -456,7 +456,8 @@ fn push_absorbed(list: &mut [(u32, u8); RANKED_LOG], len: &mut u8, relay: u32, c
 /// other people's traffic, which is a statement about the node that a link cost cannot express:
 /// two candidates reaching the same neighbours at the same price are not equally good if one of
 /// them exists for the purpose. Stock already acts on that statement by giving a ROUTER the
-/// earliest window; this is the coordinated equivalent, applied to ordering rather than to timing.
+/// earliest window; this is the coordinated equivalent for **ordering**. Timing is gated separately
+/// by [`may_take_early_window`]: only an SR ROUTER may sit inside the early window.
 ///
 /// ROUTER_LATE is excluded deliberately rather than overlooked: its whole meaning is to relay after
 /// everyone else, so promoting it would invert the role it was chosen for. The deprecated router
@@ -468,7 +469,16 @@ fn push_absorbed(list: &mut [(u32, u8); RANKED_LOG], len: &mut u8, relay: u32, c
 /// Coverage still outranks this, so a ROUTER with nothing unique to reach takes nothing: the
 /// zero-coverage drop happens before any of it is consulted.
 fn role_rank(ctx: &BroadcastRelayContext<'_>, candidate: u32) -> u8 {
-    u8::from(ctx.capability.role(candidate) == Some(crate::nodeinfo::DEVICE_ROLE_ROUTER))
+    u8::from(may_take_early_window(ctx, candidate))
+}
+
+/// Whether this SR candidate may take a position inside the stock-router early window.
+///
+/// Only `DEVICE_ROLE_ROUTER`. CLIENT, CLIENT_BASE, ROUTER_LATE, and every other SR-active role wait
+/// past stock reservations and SR ROUTER early slots (`PositionAllocator::take_late_rung`). Stock
+/// ROUTER/REPEATER/ROUTER_CLIENT never reach this test — they are reserved in the pre-pass.
+fn may_take_early_window(ctx: &BroadcastRelayContext<'_>, candidate: u32) -> bool {
+    ctx.capability.role(candidate) == Some(crate::nodeinfo::DEVICE_ROLE_ROUTER)
 }
 
 fn find_best_relay_candidate<F>(
@@ -758,49 +768,81 @@ where
         }
     }
 
-    while !candidates.is_empty() {
-        let best = find_best_relay_candidate(
-            ctx,
-            &candidates,
-            &already_covered,
-            prefer_high,
-            source,
-            now_ms,
-            &has_transmitted,
-            if first_pick {
-                Some(&mut evaluated)
+    // Park non-ROUTER SR candidates. Early-window rungs are ROUTER-only; everyone else waits past
+    // stock reservations and SR ROUTER early slots on the late ladder.
+    let mut late_candidates = NodeSet::new();
+    {
+        let mut i = 0u8;
+        while i < candidates.count {
+            let id = candidates.ids[i as usize];
+            if may_take_early_window(ctx, id) {
+                i = i.saturating_add(1);
             } else {
-                None
-            },
-        );
-        first_pick = false;
-        if best.node_id == 0 {
+                candidates.erase(id);
+                let _ = late_candidates.insert(id);
+            }
+        }
+    }
+
+    // Phase 2a then 2b: SR ROUTER early-window rungs, then every other SR-active role late.
+    for early in [true, false] {
+        if should_relay {
             break;
         }
-        candidates.erase(best.node_id);
+        let pool = if early {
+            &mut candidates
+        } else {
+            &mut late_candidates
+        };
+        while !pool.is_empty() {
+            let best = find_best_relay_candidate(
+                ctx,
+                pool,
+                &already_covered,
+                prefer_high,
+                source,
+                now_ms,
+                &has_transmitted,
+                if first_pick {
+                    Some(&mut evaluated)
+                } else {
+                    None
+                },
+            );
+            first_pick = false;
+            if best.node_id == 0 {
+                break;
+            }
+            pool.erase(best.node_id);
 
-        if has_transmitted(best.node_id) {
+            if has_transmitted(best.node_id) {
+                let credit = absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
+                push_absorbed(&mut absorbed, &mut absorbed_len, best.node_id, credit);
+                continue;
+            }
+
+            push_ranked(&mut ranked, &mut ranked_len, best.node_id);
+            let assigned_index = positions.next_index();
+            let delay = if early {
+                positions.take_rung()
+            } else {
+                positions.take_late_rung()
+            };
+            if best.node_id == ctx.my_node {
+                should_relay = true;
+                reason = RelayReason::Ranked;
+                my_slot_index = assigned_index;
+                my_delay = delay;
+                coverage_for = best.coverage_for;
+                break;
+            }
+
+            // Earlier-ranked peer is assumed to relay — subtract their coverage so we
+            // only take a later slot when we still have unique nodes to reach.
             let credit = absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
             push_absorbed(&mut absorbed, &mut absorbed_len, best.node_id, credit);
-            continue;
+            slots_given = slots_given.saturating_add(1);
         }
-
-        push_ranked(&mut ranked, &mut ranked_len, best.node_id);
-        if best.node_id == ctx.my_node {
-            should_relay = true;
-            reason = RelayReason::Ranked;
-            my_slot_index = positions.next_index();
-            my_delay = positions.take_rung();
-            coverage_for = best.coverage_for;
-            break;
-        }
-
-        // Earlier-ranked peer is assumed to relay — subtract their coverage so we
-        // only take a later slot when we still have unique nodes to reach.
-        let credit = absorb_relay_coverage(ctx, &mut already_covered, best.node_id, now_ms);
-        push_absorbed(&mut absorbed, &mut absorbed_len, best.node_id, credit);
-        slots_given = slots_given.saturating_add(1);
-        positions.take_rung();
     }
 
     if !should_relay {
@@ -1638,6 +1680,123 @@ mod tests {
         assert_eq!(plan.slot_index, 0);
         // And it must not be treated as a stock immediate router for the pre-pass.
         assert!(!capability.is_immediate_relay_router(ME));
+    }
+
+    /// Non-ROUTER SR-active roles wait past the early window even when they have unique coverage.
+    /// The ladder border is preset-bound `relay_floor_ms`, not the 250 ms peer-turnaround artefact.
+    #[test]
+    fn a_client_with_coverage_takes_a_late_rung_past_the_transition() {
+        const FAR: u32 = 0xAA00_00FF;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        capability.track_topology(ME, true, 0);
+        capability.track_role(ME, crate::nodeinfo::DEVICE_ROLE_CLIENT, 0);
+        edges.update_edge(ME, ME, FAR, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, FAR, true);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x99,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            TEST_SLOT_MS,
+            never_transmitted,
+            false,
+        );
+        assert!(plan.should_relay);
+        assert_eq!(plan.reason, RelayReason::Ranked);
+        assert_eq!(
+            plan.slot_delay_ms,
+            crate::coordinated_relay::relay_floor_ms(TEST_SLOT_MS),
+            "CLIENT must not take an early-window position"
+        );
+    }
+
+    /// CLIENT_BASE is SR-active but not ROUTER: same late placement as CLIENT.
+    #[test]
+    fn client_base_with_coverage_takes_a_late_rung() {
+        const FAR: u32 = 0xAA00_00FE;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, BB, true);
+        capability.track_topology(ME, true, 0);
+        capability.track_role(ME, crate::nodeinfo::DEVICE_ROLE_CLIENT_BASE, 0);
+        edges.update_edge(ME, ME, FAR, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, FAR, true);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x9a,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            TEST_SLOT_MS,
+            never_transmitted,
+            false,
+        );
+        assert!(plan.should_relay);
+        assert!(
+            plan.slot_delay_ms >= crate::coordinated_relay::relay_floor_ms(TEST_SLOT_MS),
+            "CLIENT_BASE delay {} must be at or past the preset floor",
+            plan.slot_delay_ms
+        );
+    }
+
+    /// A CLIENT that outranks an SR ROUTER on coverage still waits past that ROUTER's early slot.
+    #[test]
+    fn client_outranking_router_on_coverage_still_waits_past_early_window() {
+        const RT: u32 = 0xAA00_0071;
+        const FAR: u32 = 0xAA00_00FF;
+        const FAR2: u32 = 0xAA00_00FE;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, 0);
+        for peer in [BB, RT] {
+            edges.update_edge(ME, ME, peer, 2.0, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(ME, peer, true);
+        }
+        capability.track_topology(ME, true, 0);
+        capability.track_role(ME, crate::nodeinfo::DEVICE_ROLE_CLIENT, 0);
+        capability.track_topology(RT, true, 0);
+        capability.track_role(RT, crate::nodeinfo::DEVICE_ROLE_ROUTER, 0);
+        // ROUTER reaches FAR; we reach FAR and FAR2 so coverage outranks.
+        for (who, target) in [(RT, FAR), (ME, FAR), (ME, FAR2)] {
+            edges.update_edge(ME, who, target, 1.5, 0, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(who, target, true);
+        }
+        edges.update_edge(ME, RT, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(RT, BB, true);
+        edges.update_edge(ME, ME, BB, 1.5, 0, EdgeSource::Reported, true, 0);
+        let plan = plan_broadcast_relay(
+            &ctx(&edges, &capability, &downstream),
+            0x9b,
+            BB,
+            BB,
+            0xFFFF_FFFF,
+            0,
+            100,
+            TEST_SLOT_MS,
+            never_transmitted,
+            false,
+        );
+        assert!(plan.should_relay);
+        assert_eq!(plan.slots_given, 1, "the SR ROUTER still takes an early slot ahead of us");
+        assert!(
+            plan.slot_delay_ms >= crate::coordinated_relay::relay_floor_ms(TEST_SLOT_MS),
+            "CLIENT delay {} must wait past the early window",
+            plan.slot_delay_ms
+        );
     }
 
     /// Coverage still outranks the role. A CLIENT reaching more neighbours beats a ROUTER reaching

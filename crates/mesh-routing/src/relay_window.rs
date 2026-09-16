@@ -155,18 +155,27 @@ impl PositionAllocator {
         at
     }
 
-    /// The rung a ranked candidate of ours holds: inside the window while a half-airtime still
-    /// fits, otherwise on the ladder past the transition.
+    /// Early-window rung for an **SR ROUTER** with unique coverage: inside the window while a
+    /// half-airtime still fits, otherwise on the ladder past the transition.
     ///
-    /// An SR node's position is ours to place and is a real transmit time, so it takes a rung's
-    /// separation rather than a reservation's. Letting it sit inside the window is what makes a
-    /// top-ranked SR ROUTER early at every preset; when the window is full the candidate keeps its
-    /// rank on the ladder.
+    /// Only the ROUTER role may call this. Stock relay routers are reserved separately
+    /// ([`Self::take_reserved`]); every other SR-active role uses [`Self::take_late_rung`] so it
+    /// sits past stock reservations and SR ROUTER early slots. An SR node's position is a real
+    /// transmit time, so it takes a rung's separation rather than a reservation's.
     pub fn take_rung(&mut self) -> u32 {
         let at = match self.window.place_ranked() {
             Some(at) => at,
             None => self.spill(),
         };
+        self.next_index = self.next_index.saturating_add(1);
+        at
+    }
+
+    /// Late ladder rung for non-ROUTER SR-active candidates: always past the stock/SR-ROUTER
+    /// early window ([`WindowLayout::first_rung_ms`] / spill), never a position below the
+    /// preset-bound `relay_floor_ms` border.
+    pub fn take_late_rung(&mut self) -> u32 {
+        let at = self.spill();
         self.next_index = self.next_index.saturating_add(1);
         at
     }
@@ -296,6 +305,22 @@ mod tests {
         assert_eq!(r1, slot);
         assert_eq!(r1 / half, 0);
         assert_eq!(a.next_index(), 2);
+    }
+
+    #[test]
+    fn late_rungs_never_enter_the_early_window() {
+        let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
+        let half = half_for(MODEM_SHORT_SLOW, 48);
+        let floor = relay_floor_ms(slot);
+        let mut a = PositionAllocator::new(slot, half);
+        assert_eq!(a.take_late_rung(), floor);
+        assert_eq!(a.take_late_rung(), floor + half);
+        // An SR ROUTER early slot still lands at the window start even after late rungs were
+        // handed out only if we had placed early first; late-first then early is not the
+        // production order (ROUTER phase runs before late). Still: late alone stays at/after floor.
+        let mut b = PositionAllocator::new(slot, half);
+        b.take_rung();
+        assert!(b.take_late_rung() >= floor);
     }
 
     #[test]

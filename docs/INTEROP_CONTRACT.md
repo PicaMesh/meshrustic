@@ -53,16 +53,18 @@ is actually waiting for.
   frames before the next one starts (`ChannelAccess::note_tx_done`). Stock never sends two
   frames back to back because each carries its own contention delay.
 - **The broadcast ladder and undesignated unicast slot 0 share stock's contention
-  floor.** Rung k of the SignalRouting broadcast ladder fires at
+  floor as the late-ladder border.** Rung k for non-ROUTER SR-active roles, and the first
+  free position when nobody took an early slot, fire at
   `coordinated_relay::relay_floor_ms` (`2·CW_MAX·slot_time`) plus k half-airtimes
-  (`relay_window::WindowLayout::first_rung_ms`, used by `plan_broadcast_relay`,
-  `plan_acknowledgement`, and `NeighborGraph::relay_ladder_span_ms` /
-  `commit_relay`'s fallback). Undesignated cost-ranked unicast slot 0, and a unicast that
+  (`relay_window::WindowLayout::first_rung_ms` / `take_late_rung`, used by
+  `plan_broadcast_relay`, `plan_acknowledgement`, and `NeighborGraph::relay_ladder_span_ms` /
+  `commit_relay`'s fallback). **SR ROUTER** (and stock reservations) may sit earlier, inside
+  the window below that border. Undesignated cost-ranked unicast slot 0, and a unicast that
   names us as next hop, wait the same floor
   (`Router::evaluate_tx_plan`, `plan_designated_unicast`). Dest-ACK and peer-relay waits
   still compose from `PEER_TURNAROUND_MS` (250 ms): that is the peer re-arm, not the ladder
   origin. Both the floor and the half-airtime derive from quantities every SignalRouting
-  node computes identically, so the broadcast ladder's rung order agrees at every preset.
+  node computes identically, so ladder order agrees at every preset.
   Tests: `sr_slot_schedule`, `broadcast_relay` unit tests, `relay_window` unit tests,
   `undesignated_unicast_slot_zero_waits_stocks_contention_floor`.
 - **Two floors keep rungs apart, and both are absolute.** Rung spacing is half the packet
@@ -320,13 +322,22 @@ is actually waiting for.
 - **Positions are placed by rule: reservations and ranked rungs share one window.** A **stock**
   ROUTER/REPEATER/ROUTER_CLIENT that can hear the transmitter is reserved a window position one
   slot time wide, regardless of coverage (`is_immediate_relay_router` — SR-active and passive
-  publishers are excluded, because they are ranked). A ranked candidate — including an SR ROUTER
-  with unique coverage — takes a floored half-airtime inside the same window while room remains,
-  then spills past the transition keeping its rank (`PositionAllocator::take_rung`). An SR ROUTER
-  with nothing unique takes nothing. Role ranks above cost and below coverage (ROUTER only;
-  ROUTER_LATE earns no promotion). Tests: `an_sr_router_with_coverage_takes_a_window_position`,
+  publishers are excluded, because they are ranked). Among SR-active candidates, only an **SR
+  ROUTER** with unique coverage may take a floored half-airtime inside that early window
+  (`PositionAllocator::take_rung`); when the window is full it spills past the transition keeping
+  its rank. Every other SR-active role (CLIENT, CLIENT_BASE, ROUTER_LATE, …) is placed on the late
+  ladder past stock reservations and SR ROUTER early slots
+  (`PositionAllocator::take_late_rung`), at or after the preset-bound border
+  `relay_floor_ms` (`2·CWmax·slot_time`) — not at the 250 ms peer-turnaround artefact. An SR
+  ROUTER with nothing unique takes nothing. Role also ranks above cost and below coverage
+  (ROUTER only; ROUTER_LATE earns no promotion). Tests:
+  `an_sr_router_with_coverage_takes_a_window_position`,
+  `a_client_with_coverage_takes_a_late_rung_past_the_transition`,
+  `client_base_with_coverage_takes_a_late_rung`,
+  `client_outranking_router_on_coverage_still_waits_past_early_window`,
   `an_sr_router_outranks_a_client_of_equal_coverage`, `coverage_still_outranks_the_router_role`,
   `rungs_take_window_positions_while_a_half_airtime_fits`,
+  `late_rungs_never_enter_the_early_window`,
   `a_passive_publisher_is_not_reserved_for_either`.
 - **Our own device role is configurable and persisted.** `Config.DeviceConfig.role` is set over
   PKI admin (`SetConfig` device), stored in the flash record (`NodeConfig.device_role`), applied to
