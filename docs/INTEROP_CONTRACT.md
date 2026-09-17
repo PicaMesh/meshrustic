@@ -544,14 +544,21 @@ is actually waiting for.
   `bootstrap_reply_is_dropped_when_a_list_already_went_out`.
 - **Version acceptance** (`NeighborGraph::merge_topology`): first contact accepts any version;
   then a repeat or a forward move of 1 to 127; a header-only version-0 broadcast, direct or
-  relayed, resets the tracked version, active or passive sender; after `TOPOLOGY_RESYNC_MS` without an accepted
-  report, any version is taken as the new base; and when the boot broadcast was lost, two
-  consecutive rejected reports whose versions climb by one re-base us on the second (late copies
-  of old reports never arrive an interval apart). Tests: `peer_boot_broadcast_resets_its_topology_version`,
+  relayed, resets the tracked version, active or passive sender; a received version more than
+  `TOPOLOGY_DELAYED_BEHIND_MAX` (7) behind `last` (and still in the backward half of the u8
+  circle) is a restarted counter and rebases on the first list; after `TOPOLOGY_RESYNC_MS`
+  without an accepted report, any version is taken as the new base; when the boot broadcast was
+  lost and the new counter is still near `last`, rejected versions climbing by 1..=7 re-base us
+  (a missed list is 1 then 3); and a complete, non-empty list heard from the originator whose
+  counter looks backwards rebases on that packet (a relayed copy of a near-behind list stays
+  stale so a delayed old report cannot clobber a newer one). Tests:
+  `a_far_behind_version_is_a_counter_reset`,
+  `a_near_behind_direct_list_resyncs_and_a_relayed_copy_does_not`,
+  `peer_boot_broadcast_resets_its_topology_version`,
   `passive_peer_boot_broadcast_resets_its_topology_version_too`,
   `peer_topology_resyncs_after_two_silent_intervals`,
   `relayed_boot_broadcast_resets_the_topology_version_too`,
-  `peer_restart_is_accepted_after_two_climbing_stale_reports`.
+  `peer_restart_is_accepted_after_climbing_stale_reports`.
 - **An empty list clears nothing.** The "an unlisted neighbour does not hear the sender" rule
   runs only on a complete, non-empty list: a boot broadcast is a restart notice, and a node that
   hears nobody says nothing about who hears it. Test: `empty_list_does_not_clear_hears_us`.

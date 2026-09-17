@@ -925,12 +925,11 @@ impl Router {
         };
         let rate_limited = {
             let graph = &mut self.graph;
-            self.rate_limit.should_drop(&rl_pkt, |nid| {
-                crate::rate_limit::GraphProximity {
+            self.rate_limit
+                .should_drop(&rl_pkt, |nid| crate::rate_limit::GraphProximity {
                     in_graph: graph.rate_limit_node_in_graph(nid),
                     hops: graph.rate_limit_graph_hops(nid, now_ms),
-                }
-            })
+                })
         };
         self.graph
             .set_dropped_coverage(self.rate_limit.coverage_gate(now_ms));
@@ -3993,7 +3992,9 @@ impl Router {
         // Every node that deferred arms T1, so the insurers need the slot ladder too: firing
         // together would collide precisely when the ranked relay was the frame that went missing.
         // Same deterministic order as an unranked relay slot, one half-airtime apart.
-        let ahead = self.graph.insurance_rung_index(parsed.id, heard_from, now_ms);
+        let ahead = self
+            .graph
+            .insurance_rung_index(parsed.id, heard_from, now_ms);
         let stagger = (ahead as u32).saturating_mul(half_airtime_ms);
         let span = self
             .graph
@@ -6242,15 +6243,10 @@ mod tests {
         router
             .graph_mut()
             .observe_direct_neighbor(UNI_DEST, -70, 8, 100, 0);
-        router.graph_mut().downstream_mut().update(
-            UNI_ME,
-            UNI_SOURCE,
-            UNI_DEST,
-            2.0,
-            100,
-            false,
-            0,
-        );
+        router
+            .graph_mut()
+            .downstream_mut()
+            .update(UNI_ME, UNI_SOURCE, UNI_DEST, 2.0, 100, false, 0);
         router.remember_relay_identity(UNI_DEST, (UNI_DEST & 0xFF) as u8, 100);
         let _ = router.route_to(UNI_DEST, 100);
         router.set_modem_preset("", to, true, key);
@@ -6287,14 +6283,8 @@ mod tests {
     #[test]
     fn same_preset_reconfigure_does_not_purge_the_graph() {
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
-        let mut router = Router::with_channel(
-            UNI_ME,
-            key,
-            0x77,
-            mesh_radio::MODEM_LONG_FAST,
-            true,
-            3,
-        );
+        let mut router =
+            Router::with_channel(UNI_ME, key, 0x77, mesh_radio::MODEM_LONG_FAST, true, 3);
         router
             .graph_mut()
             .observe_direct_neighbor(UNI_DEST, -70, 8, 100, 0);

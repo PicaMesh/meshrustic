@@ -29,6 +29,9 @@ pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
 /// peer whose reboot broadcast we missed, a peer that came back with a moved-on counter, and a
 /// receiver that was itself away. Twice the periodic interval.
 pub const TOPOLOGY_RESYNC_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS;
+/// Delayed copies of the previous one or two broadcasts sit a few counts behind `last`. Farther
+/// behind is a restarted counter (a flash: last=26, received=1), not an older in-flight list.
+pub const TOPOLOGY_DELAYED_BEHIND_MAX: u8 = 7;
 /// Nominal link assumed for edges inferred from relayed packets.
 pub const INFERRED_LINK_RSSI: i32 = -70;
 pub const INFERRED_LINK_SNR: f32 = 5.0;
@@ -1179,6 +1182,20 @@ impl NeighborGraph {
         diff > 0 && diff < 128
     }
 
+    fn topology_version_behind(received: u8, last: u8) -> u8 {
+        last.wrapping_sub(received)
+    }
+
+    fn topology_version_large_behind(received: u8, last: u8) -> bool {
+        let behind = Self::topology_version_behind(received, last);
+        received != last && behind > TOPOLOGY_DELAYED_BEHIND_MAX && behind < 128
+    }
+
+    fn topology_version_climbing(received: u8, stale_version: u8) -> bool {
+        let step = received.wrapping_sub(stale_version);
+        (1..=TOPOLOGY_DELAYED_BEHIND_MAX).contains(&step)
+    }
+
     /// Merge a neighbor's SR topology broadcast. `heard_on` tags the receiving radio segment.
     pub fn merge_topology(
         &mut self,
@@ -1203,30 +1220,27 @@ impl NeighborGraph {
 
         let received = header.topology_version;
         let (last, last_accept_ms) = self.topo_version_entry(sender);
-        // Three ways in: the forward window (normal), the sender's empty boot broadcast (an
-        // explicit restart: its counter starts over, so ours for it does too), or nothing accepted
-        // from it for two periodic intervals (its boot broadcast was lost, it came back with a
-        // moved-on counter, or we were away). Czar rebooted once and its reports were rejected as
-        // stale for three hours, until its whole neighbourhood had aged out of the graph.
-        // A header-only broadcast carrying version 0 is a peer's boot announcement: its version
-        // counter restarted, so forget the one we tracked. Empty lists with other versions are
-        // ordinary reports from a node without neighbours. Passive peers boot too (inno's restart
-        // was rejected as stale for twenty minutes), so the SR-active flag plays no part here,
-        // and neither does the relay byte (see below).
-        // A fourth way in: the boot broadcast was lost on the air, and the peer's restarted
-        // counter now shows as rejected versions climbing one by one. Two in a row cannot be
-        // late copies of old reports (those arrive within seconds, not a whole interval apart),
-        // so the second one re-bases us instead of waiting out two silent intervals.
-        // The boot broadcast is a statement about the sender's counter, not about the link, so a
-        // copy that reached us through a relay counts too: angl heard Czar's restart only through
-        // A and rejected Czar's reports as stale for twenty minutes.
+        // Ways in: the forward window; a header-only version-0 boot broadcast (counter restarted);
+        // a jump far behind `last` (the sender restarted and we missed the empty boot — Inno 26→1);
+        // nothing accepted for two periodic intervals; rejected versions climbing 1..=7 after a
+        // lost boot (a missed list is 1 then 3, not only exact +1); or a complete list heard from
+        // the originator whose counter looks backwards (the air is newer than what we stored).
+        // A header-only version 0 is a restart notice, active or passive, direct or relayed.
+        // Empty lists with other versions are ordinary reports from a node without neighbours.
+        // Delayed copies of the previous one or two broadcasts sit a few counts behind `last` and
+        // stay stale unless they are a complete list from the originator.
         let boot_reset = neighbors.is_empty() && received == 0;
         let silence = last_accept_ms != 0
             && now_ms.wrapping_sub(last_accept_ms) >= TOPOLOGY_RESYNC_MS
             && now_ms.wrapping_sub(last_accept_ms) < 0x8000_0000;
         let in_window = Self::topology_version_accept(received, last);
+        let counter_reset = !in_window && Self::topology_version_large_behind(received, last);
         let climb = !in_window && self.topo_version_climbs_after_stale(sender, received);
-        if !in_window && !boot_reset && !silence && !climb {
+        let direct_resync = !in_window
+            && is_direct_from_sender
+            && header.is_complete_list()
+            && !neighbors.is_empty();
+        if !in_window && !boot_reset && !counter_reset && !silence && !climb && !direct_resync {
             self.note_topo_version_stale(sender, received);
             return TopologyMergeResult::Stale { received, last };
         }
@@ -1416,12 +1430,17 @@ impl NeighborGraph {
         }
     }
 
-    /// Is `received` one past the version we last rejected from `node_id`?
+    /// Is `received` 1..=7 past the version we last rejected from `node_id`?
+    ///
+    /// Exact +1 is the usual reboot after a missed boot broadcast; a few missed lists still
+    /// rebase (v=1 then v=3). Delayed old reports sit 1–2 behind `last` and never climb from there.
     fn topo_version_climbs_after_stale(&self, node_id: u32, received: u8) -> bool {
         self.topo_versions[..self.topo_version_count as usize]
             .iter()
             .any(|e| {
-                e.node_id == node_id && e.stale_valid && received == e.stale_version.wrapping_add(1)
+                e.node_id == node_id
+                    && e.stale_valid
+                    && Self::topology_version_climbing(received, e.stale_version)
             })
     }
 
@@ -2813,7 +2832,8 @@ mod tests {
         const STRANGER: u32 = 0x46ce_027c;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
-        let observed = graph.observe_packet(STRANGER, 0, 0, 0x7c, -80, 5, 1_000, 0, None, 0x9c1d_4e21);
+        let observed =
+            graph.observe_packet(STRANGER, 0, 0, 0x7c, -80, 5, 1_000, 0, None, 0x9c1d_4e21);
         assert_eq!(observed.map(|o| o.0), Some(STRANGER));
         assert!(graph.test_has_edge(ME, STRANGER));
         assert_eq!(graph.neighbor_count(), 1);
@@ -3572,6 +3592,16 @@ mod tests {
         version: u8,
         now_ms: u32,
     ) -> TopologyMergeResult {
+        peer_report_via(graph, peer, version, now_ms, true)
+    }
+
+    fn peer_report_via(
+        graph: &mut NeighborGraph,
+        peer: u32,
+        version: u8,
+        now_ms: u32,
+        is_direct: bool,
+    ) -> TopologyMergeResult {
         let listed = PackedNeighbor {
             node_id: 0xCC00_00CC,
             rssi: -70,
@@ -3580,29 +3610,58 @@ mod tests {
             hears_us: true,
             etx_variance: 0,
         };
-        graph.merge_topology(peer, &topo_header(version), &[listed], true, now_ms, 0)
+        graph.merge_topology(peer, &topo_header(version), &[listed], is_direct, now_ms, 0)
     }
 
-    /// A version far behind the stored one is stale on its own: the forward window still holds.
+    /// A counter that jumped far behind `last` is a restart (Inno 26→1), not a delayed old list.
     #[test]
-    fn topology_version_going_backwards_is_stale() {
+    fn a_far_behind_version_is_a_counter_reset() {
         const ME: u32 = 0xAA00_00AA;
         const PEER: u32 = 0xBB00_00BB;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
         assert!(matches!(
-            peer_report(&mut graph, PEER, 98, 1_000),
+            peer_report(&mut graph, PEER, 26, 1_000),
             TopologyMergeResult::Applied { .. }
         ));
         assert!(matches!(
-            peer_report(&mut graph, PEER, 1, 2_000),
+            peer_report_via(&mut graph, PEER, 1, 2_000, false),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 1, 26)));
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 2, 3_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+    }
+
+    /// A few counts behind `last` on a relayed copy is a delayed old list. The originator's own
+    /// complete list with the same jump rebases: the air is newer than the stored counter.
+    #[test]
+    fn a_near_behind_direct_list_resyncs_and_a_relayed_copy_does_not() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 13, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(matches!(
+            peer_report_via(&mut graph, PEER, 12, 2_000, false),
             TopologyMergeResult::Stale {
-                received: 1,
-                last: 98
+                received: 12,
+                last: 13
             }
         ));
         assert!(graph.take_topology_version_resync().is_none());
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 12, 3_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 12, 13)));
     }
 
     /// The peer's empty boot broadcast restarts its counter for us too.
@@ -3635,39 +3694,37 @@ mod tests {
         ));
     }
 
-    /// 2026-09-06 19:14: A rebooted, B never processed its boot broadcast and rejected versions
-    /// 1, 2 and 3 as stale against 13. Two rejected versions climbing one by one are a restart.
+    /// The boot broadcast was lost and the new counter is still near `last`, so CounterReset
+    /// does not fire. Relayed rejects climbing by 1..=7 rebase, including a missed list.
     #[test]
-    fn peer_restart_is_accepted_after_two_climbing_stale_reports() {
+    fn peer_restart_is_accepted_after_climbing_stale_reports() {
         const ME: u32 = 0xAA00_00AA;
         const PEER: u32 = 0xBB00_00BB;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
         assert!(matches!(
-            peer_report(&mut graph, PEER, 13, 1_000),
+            peer_report(&mut graph, PEER, 8, 1_000),
             TopologyMergeResult::Applied { .. }
         ));
         assert!(matches!(
-            peer_report(&mut graph, PEER, 1, 2_000),
+            peer_report_via(&mut graph, PEER, 1, 2_000, false),
             TopologyMergeResult::Stale { .. }
         ));
-        // A repeat of the rejected version, or a jump, is not a climb.
+        assert!(
+            matches!(
+                peer_report_via(&mut graph, PEER, 1, 2_500, false),
+                TopologyMergeResult::Stale { .. }
+            ),
+            "a repeat of the rejected version is not a climb"
+        );
         assert!(matches!(
-            peer_report(&mut graph, PEER, 1, 2_500),
-            TopologyMergeResult::Stale { .. }
-        ));
-        assert!(matches!(
-            peer_report(&mut graph, PEER, 5, 3_000),
-            TopologyMergeResult::Stale { .. }
-        ));
-        assert!(matches!(
-            peer_report(&mut graph, PEER, 6, 4_000),
+            peer_report_via(&mut graph, PEER, 3, 3_000, false),
             TopologyMergeResult::Applied { .. }
         ));
-        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 6, 13)));
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 3, 8)));
         assert!(matches!(
-            peer_report(&mut graph, PEER, 7, 5_000),
+            peer_report_via(&mut graph, PEER, 4, 4_000, false),
             TopologyMergeResult::Applied { .. }
         ));
     }
@@ -3747,36 +3804,35 @@ mod tests {
         graph.set_my_node(ME);
         graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
         assert!(matches!(
-            peer_report(&mut graph, PEER, 98, 1_000),
+            peer_report(&mut graph, PEER, 8, 1_000),
             TopologyMergeResult::Applied { .. }
         ));
         assert!(matches!(
-            peer_report(&mut graph, PEER, 3, 1_000 + TOPOLOGY_RESYNC_MS - 1),
+            peer_report_via(&mut graph, PEER, 7, 1_000 + TOPOLOGY_RESYNC_MS - 1, false),
             TopologyMergeResult::Stale { .. }
         ));
         assert!(matches!(
-            peer_report(&mut graph, PEER, 3, 1_000 + TOPOLOGY_RESYNC_MS),
+            peer_report_via(&mut graph, PEER, 7, 1_000 + TOPOLOGY_RESYNC_MS, false),
             TopologyMergeResult::Applied { .. }
         ));
-        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 3, 98)));
-        // Back in the forward window from the new base.
+        assert_eq!(graph.take_topology_version_resync(), Some((PEER, 7, 8)));
         assert!(matches!(
-            peer_report(&mut graph, PEER, 4, 1_000 + TOPOLOGY_RESYNC_MS + 10),
+            peer_report(&mut graph, PEER, 8, 1_000 + TOPOLOGY_RESYNC_MS + 10),
             TopologyMergeResult::Applied { .. }
         ));
         assert!(
             matches!(
-                peer_report(&mut graph, PEER, 4, 1_000 + TOPOLOGY_RESYNC_MS + 20),
+                peer_report(&mut graph, PEER, 8, 1_000 + TOPOLOGY_RESYNC_MS + 20),
                 TopologyMergeResult::Applied { .. }
             ),
             "same version is accepted as a repeat"
         );
         assert!(
             matches!(
-                peer_report(&mut graph, PEER, 3, 1_000 + TOPOLOGY_RESYNC_MS + 30),
+                peer_report_via(&mut graph, PEER, 7, 1_000 + TOPOLOGY_RESYNC_MS + 30, false),
                 TopologyMergeResult::Stale { .. }
             ),
-            "going backwards inside the window is still stale"
+            "a relayed copy one behind the new base is still a delayed old list"
         );
     }
 

@@ -499,7 +499,9 @@ impl NodeRateLimiter {
                 self.unresolved_relay.window_start_ms = pkt.now_ms;
             }
 
-            if let Some(resolved) = pkt.resolved_relay.filter(|&id| id != 0 && id != self.node_num)
+            if let Some(resolved) = pkt
+                .resolved_relay
+                .filter(|&id| id != 0 && id != self.node_num)
             {
                 let idx = self.get_or_create_relay(resolved, pkt.now_ms, &mut proximity);
                 let node_id = self.relays[idx].node_id;
@@ -776,12 +778,7 @@ impl NodeRateLimiter {
         oldest
     }
 
-    fn get_or_create_originator<F>(
-        &mut self,
-        node_id: u32,
-        now_ms: u32,
-        proximity: &mut F,
-    ) -> usize
+    fn get_or_create_originator<F>(&mut self, node_id: u32, now_ms: u32, proximity: &mut F) -> usize
     where
         F: FnMut(u32) -> GraphProximity,
     {
@@ -1777,7 +1774,10 @@ mod tests {
             !drop_other(&mut limiter, from, WARMUP_MS),
             "aged-out originator is established and must not trip young"
         );
-        assert!(!limiter.debug_tracks_young(from), "record released at 30 min");
+        assert!(
+            !limiter.debug_tracks_young(from),
+            "record released at 30 min"
+        );
         for i in 0..YOUNG_TRIP {
             assert!(
                 !limiter.debug_is_young(from, WARMUP_MS + 1 + i),
@@ -1929,11 +1929,7 @@ mod tests {
         assert!(first.unwrap().count <= 4);
 
         for i in 0..YOUNG_TRIP {
-            let _ = drop_text(
-                &mut limiter,
-                0xA200_0000 + i,
-                t + WINDOW_MS + 10 + i,
-            );
+            let _ = drop_text(&mut limiter, 0xA200_0000 + i, t + WINDOW_MS + 10 + i);
         }
         assert!(
             limiter.take_announce().is_none(),

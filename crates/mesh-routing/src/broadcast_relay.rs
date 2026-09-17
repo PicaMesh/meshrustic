@@ -875,7 +875,9 @@ where
     // cost it ranks on is the mean delivery cost over the unique targets and there is nothing to
     // price. So this is a second pass with its own price, run only when the ladder came out empty.
     if !should_relay && slots_given == 0 && ack_eligible {
-        if let Some(ack) = plan_acknowledgement(ctx, packet_id, source, heard_from, half, slot_time_ms) {
+        if let Some(ack) =
+            plan_acknowledgement(ctx, packet_id, source, heard_from, half, slot_time_ms)
+        {
             should_relay = ack.should_relay;
             reason = RelayReason::Acknowledgement;
             my_delay = ack.my_delay;
@@ -1638,7 +1640,10 @@ mod tests {
             never_transmitted,
             None,
         );
-        assert_eq!(best.node_id, RT, "the ROUTER is preferred despite the dearer link");
+        assert_eq!(
+            best.node_id, RT,
+            "the ROUTER is preferred despite the dearer link"
+        );
         assert_eq!(best.role_rank, 1);
     }
 
@@ -1672,7 +1677,10 @@ mod tests {
         );
         assert!(plan.should_relay);
         assert_eq!(plan.reason, RelayReason::Ranked);
-        assert_eq!(plan.reserved_slots, 0, "an SR ROUTER is ranked, never reserved");
+        assert_eq!(
+            plan.reserved_slots, 0,
+            "an SR ROUTER is ranked, never reserved"
+        );
         assert_eq!(
             plan.slot_delay_ms, 0,
             "empty window: the first ranked position is at the window start"
@@ -1791,7 +1799,10 @@ mod tests {
             false,
         );
         assert!(plan.should_relay);
-        assert_eq!(plan.slots_given, 1, "the SR ROUTER still takes an early slot ahead of us");
+        assert_eq!(
+            plan.slots_given, 1,
+            "the SR ROUTER still takes an early slot ahead of us"
+        );
         assert!(
             plan.slot_delay_ms >= crate::coordinated_relay::relay_floor_ms(TEST_SLOT_MS),
             "CLIENT delay {} must wait past the early window",
@@ -1838,7 +1849,10 @@ mod tests {
             never_transmitted,
             None,
         );
-        assert_eq!(best.node_id, CL, "two unique neighbours beat one, whatever the role");
+        assert_eq!(
+            best.node_id, CL,
+            "two unique neighbours beat one, whatever the role"
+        );
     }
 
     /// ROUTER_LATE earns no promotion. Its role means "relay after everyone else", so ranking it
@@ -2134,7 +2148,10 @@ mod tests {
             false,
         );
         assert!(plan.should_relay);
-        assert_eq!(plan.slot_delay_ms, 100, "second ranked position is one half-airtime into the window");
+        assert_eq!(
+            plan.slot_delay_ms, 100,
+            "second ranked position is one half-airtime into the window"
+        );
         assert_eq!(plan.slot_index, 1);
     }
 }
