@@ -124,6 +124,20 @@ pub enum SrLogEvent {
         neighbors: u8,
         routing_version: u8,
         sr_active: bool,
+        more_chunks: bool,
+        continuation: bool,
+    },
+    /// One packed neighbour from a received topology broadcast. Mirrored edges keep ETX,
+    /// not the wire RSSI/SNR/flags, and `data=` decrypt needs a TX enqueue, so this is
+    /// the capture of the list we actually heard.
+    TopologyListedNeighbor {
+        from: u32,
+        node_id: u32,
+        rssi: i8,
+        snr: i8,
+        hears_us: bool,
+        sr_active: bool,
+        etx_variance: u8,
     },
     TopologyStale {
         from: u32,

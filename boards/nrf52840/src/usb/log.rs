@@ -1460,8 +1460,10 @@ pub mod sr {
                 neighbors,
                 routing_version,
                 sr_active,
+                more_chunks,
+                continuation,
             } => {
-                let mut line = [0u8; 160];
+                let mut line = [0u8; 192];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] RECEIVED: !";
                 put(&mut line, &mut pos, prefix);
@@ -1473,12 +1475,46 @@ pub mod sr {
                 put(&mut line, &mut pos, mid2);
                 put_u32(&mut line, &mut pos, routing_version as u32);
                 if sr_active {
-                    let tail = b", active)";
-                    put(&mut line, &mut pos, tail);
+                    put(&mut line, &mut pos, b", active");
                 } else {
-                    let tail = b", passive)";
-                    put(&mut line, &mut pos, tail);
+                    put(&mut line, &mut pos, b", passive");
                 }
+                put(&mut line, &mut pos, b", more=");
+                put_u32(&mut line, &mut pos, u32::from(more_chunks));
+                put(&mut line, &mut pos, b" cont=");
+                put_u32(&mut line, &mut pos, u32::from(continuation));
+                put(&mut line, &mut pos, b")");
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::TopologyListedNeighbor {
+                from: _,
+                node_id,
+                rssi,
+                snr,
+                hears_us,
+                sr_active,
+                etx_variance,
+            } => {
+                let mut line = [0u8; 192];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR]   -> !";
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, node_id);
+                let mid2 = b" rssi=";
+                put(&mut line, &mut pos, mid2);
+                put_i32(&mut line, &mut pos, rssi as i32);
+                let mid3 = b" snr=";
+                put(&mut line, &mut pos, mid3);
+                put_i32(&mut line, &mut pos, snr as i32);
+                let mid4 = b" hearsUs=";
+                put(&mut line, &mut pos, mid4);
+                put_u32(&mut line, &mut pos, u32::from(hears_us));
+                let mid5 = b" sr=";
+                put(&mut line, &mut pos, mid5);
+                put_u32(&mut line, &mut pos, u32::from(sr_active));
+                let mid6 = b" var=";
+                put(&mut line, &mut pos, mid6);
+                put_u32(&mut line, &mut pos, etx_variance as u32);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::TopologyDownstreamSkippedAsymmetric {

@@ -1639,6 +1639,8 @@ impl Router {
                     neighbors,
                     routing_version: header.routing_version,
                     sr_active: header.signal_routing_active,
+                    more_chunks: header.more_chunks,
+                    continuation: header.continuation,
                 });
             }
             TopologyMergeResult::Stale { received, last } => {
@@ -1649,6 +1651,17 @@ impl Router {
                 });
             }
             TopologyMergeResult::IgnoredFormat => {}
+        }
+        for n in neighbor_list.iter() {
+            self.sr_log.push(SrLogEvent::TopologyListedNeighbor {
+                from: parsed.from,
+                node_id: n.node_id,
+                rssi: n.rssi,
+                snr: n.snr,
+                hears_us: n.hears_us,
+                sr_active: n.signal_routing_active,
+                etx_variance: n.etx_variance,
+            });
         }
         if let Some((from, received, last)) = self.graph.take_topology_version_resync() {
             self.sr_log.push(SrLogEvent::TopologyVersionResync {
@@ -4267,6 +4280,101 @@ mod tests {
 
         router.run_maintenance(1_000, 20);
         assert!(router.poll_topology_tx(1_000).is_some());
+    }
+
+    #[test]
+    fn topology_ingest_logs_every_packed_neighbor_field() {
+        use crate::topology::{
+            encode_packed_neighbor_entry, PACKED_NEIGHBOR_ENTRY_SIZE,
+            PACKED_NEIGHBOR_FLAG_HEARS_US, PACKED_NEIGHBOR_FLAG_SR_ACTIVE,
+            PACKED_NEIGHBOR_HEADER_SIZE,
+        };
+        use mesh_radio::MODEM_SHORT_SLOW;
+
+        const ME: u32 = 0x046b_553a;
+        const PEER: u32 = 0x63dc_8f8c;
+        const A: u32 = 0xd33f_1eef;
+        const B: u32 = 0x979e_d146;
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut router = Router::with_channel(ME, key, 0x77, MODEM_SHORT_SLOW, true, 3);
+
+        let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE + 2 * PACKED_NEIGHBOR_ENTRY_SIZE];
+        write_packed_header(&mut packed, 5, true);
+        encode_packed_neighbor_entry(
+            &mut packed[PACKED_NEIGHBOR_HEADER_SIZE..],
+            A,
+            -81,
+            4,
+            PACKED_NEIGHBOR_FLAG_SR_ACTIVE | PACKED_NEIGHBOR_FLAG_HEARS_US,
+            3,
+        );
+        encode_packed_neighbor_entry(
+            &mut packed[PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE..],
+            B,
+            -42,
+            11,
+            0,
+            0,
+        );
+        let (len, frame) =
+            build_topology_wire_frame(PEER, 0xA1, 0x77, 3, &key, &packed, false).unwrap();
+        router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &frame[..len as usize],
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        let mut listed = heapless::Vec::<_, 4>::new();
+        for event in logs.iter() {
+            if let SrLogEvent::TopologyListedNeighbor {
+                from,
+                node_id,
+                rssi,
+                snr,
+                hears_us,
+                sr_active,
+                etx_variance,
+            } = event
+            {
+                listed
+                    .push((
+                        *from,
+                        *node_id,
+                        *rssi,
+                        *snr,
+                        *hears_us,
+                        *sr_active,
+                        *etx_variance,
+                    ))
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            listed.as_slice(),
+            &[
+                (PEER, A, -81i8, 4i8, true, true, 3u8),
+                (PEER, B, -42i8, 11i8, false, false, 0u8),
+            ]
+        );
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::TopologyReceived {
+                from: PEER,
+                neighbors: 2,
+                routing_version: SIGNAL_ROUTING_VERSION,
+                sr_active: true,
+                more_chunks: false,
+                continuation: false,
+            }
+        )));
     }
 
     /// A new neighbour marks the topology dirty; the list follows on the dirty schedule with
