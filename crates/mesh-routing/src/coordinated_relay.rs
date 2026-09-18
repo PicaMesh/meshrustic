@@ -168,9 +168,9 @@ mod tests {
     /// size — not only at the three values the older test happened to try.
     ///
     /// If it ever reaches the spacing, two adjacent rungs can swap: the earlier-ranked node
-    /// transmits second, and the coverage the ranking absorbed on its behalf is never carried. The
-    /// two floors are what make this non-obvious — the range is derived from the *floored* half, so
-    /// changing either constant alone can break it, which is why both are named and pinned here.
+    /// transmits second. The two floors are what make this non-obvious — the range is derived
+    /// from the *floored* half, so changing either constant alone can break it, which is why
+    /// both are named and pinned here.
     #[test]
     fn tie_break_range_stays_below_rung_spacing_everywhere() {
         // Every preset, and frame sizes from a bare header to the maximum payload.

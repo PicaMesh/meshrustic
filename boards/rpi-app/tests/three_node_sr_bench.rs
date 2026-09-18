@@ -74,6 +74,9 @@ fn three_node_middle_node_defers_to_stock_router() {
     c.edges_mut()
         .update_edge(0xC000_0003, D, B, 2.0, 0, EdgeSource::Reported, true, 0);
     c.edges_mut().set_edge_hears_us(D, B, true);
+    c.edges_mut()
+        .update_edge(0xC000_0003, B, D, 2.0, 0, EdgeSource::Reported, true, 0);
+    c.edges_mut().set_edge_hears_us(B, D, true);
     c.track_node_role(D, DEVICE_ROLE_REPEATER, 0);
 
     assert_eq!(c.find_best_relay_candidate(0x99, B, 0), D);

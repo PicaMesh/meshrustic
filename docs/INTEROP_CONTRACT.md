@@ -237,12 +237,14 @@ is actually waiting for.
   `route_cost_is_measured_at_the_receiver`.
 - **Delivery vs confirmed coverage.** Route search and unicast ranking treat a hop as
   deliverable via `route::can_deliver` (optimistic when the receiver does not publish topology).
-  Broadcast absorb, pre-cover, ranking coverage, and unique-coverage cancel share one admission
+  Broadcast pre-cover, ranking coverage, heard-copy absorb, and unique-coverage cancel share one admission
   rule: `route::covers` — evidence graded by whether the receiver reports (§3b), over a link at
   or below `COVERAGE_ETX_CEILING_FIXED` — or, for a neighbour nobody can be shown to reach,
   `route::coverage_owner` naming that relay. Absorb credits exactly what admission credited
-  (`admits_coverage`, test `an_owner_taking_a_slot_absorbs_the_neighbour_it_owns`): crediting only `covers` left an owned neighbour uncovered after its owner
-  took a slot, and a later phase relayed for it again. A sticky-but-hopeless `hears_us` link is
+  (`admits_coverage`, test `an_owner_taking_a_slot_absorbs_the_neighbour_it_owns`), and it runs
+  only for a copy already on the air (`has_transmitted` at ranking time, or a heard dupe). Crediting
+  only `covers` left an owned neighbour uncovered after its owner transmitted, and a later
+  rung relayed for it again. A sticky-but-hopeless `hears_us` link is
   not coverage in any of them.
   Shared helpers: `delivery_hop_cost_fixed`, `hop_cost_fixed`. Tests: `can_deliver_*`,
   `known_to_hear_ignores_stock_optimism`, `covers_requires_a_link_that_is_not_hopeless`,
@@ -314,11 +316,14 @@ is actually waiting for.
 
 ## 3b. Broadcast relay and T1
 
-- **Unique coverage owns a slot.** A broadcast relay slot is taken when we still uniquely reach
-  a neighbour that the transmitter and earlier coverers do not. Otherwise we take no ranked slot.
-  Pending later slots cancel when unique coverage is gone (`has_unique_coverage` /
-  `perhaps_cancel_dupe`). Tests: broadcast coverage cases in `broadcast_relay` /
-  `sr_slot_schedule` / `sr_coverage`.
+- **Unique coverage owns a slot.** A broadcast relay slot is taken when the candidate uniquely
+  reaches a neighbour the transmitter (and copies already heard) do not. Peers merely ranked
+  into earlier slots are not coverers: they get a later rung of their own, so the packet is
+  still carried if they never transmit. Pending later slots cancel when a heard copy leaves
+  nothing unique (`has_unique_coverage` / `perhaps_cancel_dupe`). Tests:
+  `overlapping_unique_vs_transmitter_both_take_slots`,
+  `stock_reservation_does_not_absorb_unheard_coverage`, broadcast coverage cases in
+  `broadcast_relay` / `sr_slot_schedule` / `sr_coverage`.
 - **Positions are placed by rule: reservations and ranked rungs share one window.** A **stock**
   ROUTER/REPEATER/ROUTER_CLIENT that can hear the transmitter is reserved a window position one
   slot time wide, regardless of coverage (`is_immediate_relay_router` — SR-active and passive
@@ -329,13 +334,16 @@ is actually waiting for.
   ladder past stock reservations and SR ROUTER early slots
   (`PositionAllocator::take_late_rung`), at or after the preset-bound border
   `relay_floor_ms` (`2·CWmax·slot_time`) — not at the 250 ms peer-turnaround artefact. An SR
-  ROUTER with nothing unique takes nothing. Role also ranks above cost and below coverage
-  (ROUTER only; ROUTER_LATE earns no promotion). Tests:
+  ROUTER with nothing unique takes nothing. Unique coverage does not buy a non-ROUTER an early
+  slot: a CLIENT that uniquely reaches more neighbours than an SR ROUTER still waits on the late
+  ladder. Within a window, remaining order is bidi tier, unique count, cost, then packet-id
+  parity. Tests:
   `an_sr_router_with_coverage_takes_a_window_position`,
   `a_client_with_coverage_takes_a_late_rung_past_the_transition`,
   `client_base_with_coverage_takes_a_late_rung`,
   `client_outranking_router_on_coverage_still_waits_past_early_window`,
-  `an_sr_router_outranks_a_client_of_equal_coverage`, `coverage_still_outranks_the_router_role`,
+  `an_sr_router_outranks_a_client_of_equal_coverage`,
+  `router_with_unique_beats_a_client_with_more_coverage`,
   `rungs_take_window_positions_while_a_half_airtime_fits`,
   `late_rungs_never_enter_the_early_window`,
   `a_passive_publisher_is_not_reserved_for_either`.
@@ -355,7 +363,8 @@ is actually waiting for.
   the first class's standard made every neighbour of one silent node relay every frame for it.
   `hears_us` is sticky, hence the cost half: a peer that heard the transmitter once keeps the flag
   while its link decays. The rule prices pre-coverage from the transmitter's list, each
-  candidate's coverage set, the absorbed coverage of earlier slots, and unique coverage. Tests:
+  candidate's coverage set, copies already heard, and unique coverage. Planned later slots do
+  not absorb. Tests:
   `covers_requires_a_link_that_is_not_hopeless`, `covers_a_silent_node_on_the_senders_own_edge`,
   `one_way_listed_neighbor_is_not_precovered`, `hopeless_confirmed_neighbor_is_not_precovered`,
   `poor_link_does_not_count_as_coverage`,
@@ -372,8 +381,9 @@ is actually waiting for.
   deliver and handed it the first slot, so the packet waited a full defer window for a relay
   that could not come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
   ceiling, and one node's insurance fired 65 times in 109 minutes to carry those packets
-  instead. Test: `a_hopeless_link_owns_nothing`. Applied both in the
-  slot ranking and in unique coverage, so the branch does not relay N times for the same node.
+  instead. Test: `a_hopeless_link_owns_nothing`. Applied both in the slot ranking and in
+  unique-coverage cancel. Overlapping ranked slots for the same leftover neighbour stay queued
+  until a heard copy covers it — that is how a candidate that never transmits is still backed up.
   Unique coverage additionally ignores our own non-`Reported` edges in the *ranking* only, so that
   peers computing slot order from the reported topology reach our conclusion; the dupe-cancel path
   does not need the same filter, because no production path leaves a Mirrored edge on a real

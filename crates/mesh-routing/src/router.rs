@@ -4656,24 +4656,19 @@ mod tests {
             0,
         );
         graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
-        // EDGE is reachable by us and by the stock repeater, and not by the source. The
-        // repeater takes the early slot and its coverage of EDGE is absorbed, so we defer with
-        // nothing unique left — the deferral T1 exists for exactly this: if the repeater never
-        // transmits, EDGE is still unreached when our rung comes up.
-        const EDGE: u32 = 0xEE00_00EE;
-        graph.observe_direct_neighbor(EDGE, -70, 8, 0, 0);
-        graph.confirm_direct_neighbor_hears_us(EDGE);
         graph.edges_mut().update_edge(
             0xCC00_00CC,
+            NEIGHBOR,
             STOCK,
-            EDGE,
             2.0,
             0,
             EdgeSource::Reported,
             true,
             0,
         );
-        graph.edges_mut().set_edge_hears_us(STOCK, EDGE, true);
+        graph.edges_mut().set_edge_hears_us(NEIGHBOR, STOCK, true);
+        // Transmitter already reaches STOCK. We hold nothing unique, so we defer and T1
+        // stands in if the repeater never transmits.
 
         let header =
             PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, false, false, 0, 0);
@@ -4717,34 +4712,40 @@ mod tests {
         router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
         const NEIGHBOR: u32 = 0xBB00_00BB;
         const STOCK: u32 = 0xDD00_00DD;
-        const EDGE: u32 = 0xEE00_00EE;
         {
             let graph = router.graph_mut();
             graph.observe_direct_neighbor(NEIGHBOR, -70, 8, 0, 0);
             graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
-            graph.observe_direct_neighbor(EDGE, -70, 8, 0, 0);
             graph.confirm_direct_neighbor_hears_us(NEIGHBOR);
             graph.confirm_direct_neighbor_hears_us(STOCK);
-            graph.confirm_direct_neighbor_hears_us(EDGE);
             graph.track_node_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
             graph.capability_mut().track_topology(NEIGHBOR, true, 0);
-            for target in [NEIGHBOR, EDGE] {
-                graph.edges_mut().update_edge(
-                    0xCC00_00CC,
-                    STOCK,
-                    target,
-                    2.0,
-                    0,
-                    EdgeSource::Reported,
-                    true,
-                    0,
-                );
-                graph.edges_mut().set_edge_hears_us(STOCK, target, true);
-            }
+            graph.edges_mut().update_edge(
+                0xCC00_00CC,
+                STOCK,
+                NEIGHBOR,
+                2.0,
+                0,
+                EdgeSource::Reported,
+                true,
+                0,
+            );
+            graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
+            graph.edges_mut().update_edge(
+                0xCC00_00CC,
+                NEIGHBOR,
+                STOCK,
+                2.0,
+                0,
+                EdgeSource::Reported,
+                true,
+                0,
+            );
+            graph.edges_mut().set_edge_hears_us(NEIGHBOR, STOCK, true);
         }
 
-        // want_ack set on the frame we hear: the stock repeater takes the early slot, we defer
-        // with nothing unique left, and T1 arms on its expected transmission.
+        // want_ack set on the frame we hear: the stock repeater is reserved, we have
+        // nothing unique vs the transmitter, and T1 arms on the expected transmission.
         let header =
             PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, true, false, 0, 0);
         let wire = encode_wire(header, &[0x01, 0x02]);
@@ -4793,30 +4794,36 @@ mod tests {
         router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
         const NEIGHBOR: u32 = 0xBB00_00BB;
         const STOCK: u32 = 0xDD00_00DD;
-        const EDGE: u32 = 0xEE00_00EE;
         {
             let graph = router.graph_mut();
             graph.observe_direct_neighbor(NEIGHBOR, -70, 8, 0, 0);
             graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
-            graph.observe_direct_neighbor(EDGE, -70, 8, 0, 0);
             graph.confirm_direct_neighbor_hears_us(NEIGHBOR);
             graph.confirm_direct_neighbor_hears_us(STOCK);
-            graph.confirm_direct_neighbor_hears_us(EDGE);
             graph.track_node_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
             graph.capability_mut().track_topology(NEIGHBOR, true, 0);
-            for target in [NEIGHBOR, EDGE] {
-                graph.edges_mut().update_edge(
-                    0xCC00_00CC,
-                    STOCK,
-                    target,
-                    2.0,
-                    0,
-                    EdgeSource::Reported,
-                    true,
-                    0,
-                );
-                graph.edges_mut().set_edge_hears_us(STOCK, target, true);
-            }
+            graph.edges_mut().update_edge(
+                0xCC00_00CC,
+                STOCK,
+                NEIGHBOR,
+                2.0,
+                0,
+                EdgeSource::Reported,
+                true,
+                0,
+            );
+            graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
+            graph.edges_mut().update_edge(
+                0xCC00_00CC,
+                NEIGHBOR,
+                STOCK,
+                2.0,
+                0,
+                EdgeSource::Reported,
+                true,
+                0,
+            );
+            graph.edges_mut().set_edge_hears_us(NEIGHBOR, STOCK, true);
         }
         let wire = encode_wire(
             PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, false, false, 0, 0),
@@ -4860,7 +4867,7 @@ mod tests {
                 false,
                 false,
                 0,
-                (EDGE & 0xFF) as u8,
+                (STOCK & 0xFF) as u8,
             ),
             &[0x01, 0x02],
         );
@@ -4904,30 +4911,36 @@ mod tests {
         router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
         const NEIGHBOR: u32 = 0xBB00_00BB;
         const STOCK: u32 = 0xDD00_00DD;
-        const EDGE: u32 = 0xEE00_00EE;
         {
             let graph = router.graph_mut();
             graph.observe_direct_neighbor(NEIGHBOR, -70, 8, 0, 0);
             graph.observe_direct_neighbor(STOCK, -72, 7, 0, 0);
-            graph.observe_direct_neighbor(EDGE, -70, 8, 0, 0);
             graph.confirm_direct_neighbor_hears_us(NEIGHBOR);
             graph.confirm_direct_neighbor_hears_us(STOCK);
-            graph.confirm_direct_neighbor_hears_us(EDGE);
             graph.track_node_role(STOCK, crate::nodeinfo::DEVICE_ROLE_REPEATER, 0);
             graph.capability_mut().track_topology(NEIGHBOR, true, 0);
-            for target in [NEIGHBOR, EDGE] {
-                graph.edges_mut().update_edge(
-                    0xCC00_00CC,
-                    STOCK,
-                    target,
-                    2.0,
-                    0,
-                    EdgeSource::Reported,
-                    true,
-                    0,
-                );
-                graph.edges_mut().set_edge_hears_us(STOCK, target, true);
-            }
+            graph.edges_mut().update_edge(
+                0xCC00_00CC,
+                STOCK,
+                NEIGHBOR,
+                2.0,
+                0,
+                EdgeSource::Reported,
+                true,
+                0,
+            );
+            graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
+            graph.edges_mut().update_edge(
+                0xCC00_00CC,
+                NEIGHBOR,
+                STOCK,
+                2.0,
+                0,
+                EdgeSource::Reported,
+                true,
+                0,
+            );
+            graph.edges_mut().set_edge_hears_us(NEIGHBOR, STOCK, true);
         }
         let wire = encode_wire(
             PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, false, false, 0, 0),
@@ -6507,9 +6520,8 @@ mod tests {
                 0,
             )
             .unwrap();
-        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        // PEER covers four nodes to our three (OTHER's report lists us, so it counts for us).
-        assert!(plan.relay.is_none(), "PEER covers more and takes slot 0");
+        let _plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        // PEER ranks first; we still queue a later slot for UNIQ (delayed, so TxPlan.relay is none).
         let tx_after = router
             .relay_tx_after(SRC, 0xB02, 0)
             .expect("our later slot");

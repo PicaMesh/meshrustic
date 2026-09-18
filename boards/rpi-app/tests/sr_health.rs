@@ -35,6 +35,10 @@ fn setup_stock_relay_topology(router: &mut Router, healthy: bool) {
         .edges_mut()
         .update_edge(ME, STOCK, NEIGHBOR, 2.0, 0, EdgeSource::Reported, true, 0);
     graph.edges_mut().set_edge_hears_us(STOCK, NEIGHBOR, true);
+    graph
+        .edges_mut()
+        .update_edge(ME, NEIGHBOR, STOCK, 2.0, 0, EdgeSource::Reported, true, 0);
+    graph.edges_mut().set_edge_hears_us(NEIGHBOR, STOCK, true);
 }
 
 fn evaluate_broadcast(router: &mut Router, from: u32, now_ms: u32) -> mesh_routing::TxPlan {

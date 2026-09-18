@@ -3383,10 +3383,9 @@ mod tests {
     }
 
     /// Field case of 2026-09-03 19:43: the gateway hears the phone poorly, so the phone is the
-    /// one uncovered neighbour and both nicenanos compete to relay for it. Each had just learned
-    /// the phone from its topology listing, and each modelled the other as not covering it, so
-    /// both took slot 0. With the listing applied to the peer's edge too, the costs tie and the
-    /// packet-parity tie-break picks one relayer on both nodes.
+    /// one uncovered neighbour and both nicenanos compete to relay for it. They now both take a
+    /// slot (unique vs the transmitter); packet-parity orders them, and the later cancels when
+    /// it hears the earlier copy.
     #[test]
     fn peers_that_both_cover_a_passive_neighbour_agree_on_one_relayer() {
         const A: u32 = 0xbdac_ce55;
@@ -3452,11 +3451,15 @@ mod tests {
         assert_eq!(
             &even.ranked[..1],
             &[B],
-            "even packet id: lower node id relays"
+            "even packet id: lower node id ranks first"
         );
-        assert!(!even.should_relay);
+        assert!(
+            even.should_relay,
+            "we still take a later slot for the phone until we hear B"
+        );
+        assert_eq!(even.slot_index, 1);
         let odd = graph.plan_broadcast_relay(0xcc21_2ebd, SRC, GW, 0xffff_ffff, 200, 91, false);
-        assert!(odd.should_relay, "odd packet id: higher node id relays");
+        assert!(odd.should_relay, "odd packet id: higher node id ranks first");
         assert_eq!(odd.slot_index, 0);
     }
 

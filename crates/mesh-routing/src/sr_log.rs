@@ -64,9 +64,8 @@ pub enum SrLogEvent {
         reserved_slots: u8,
         /// How many leading `ranked` entries are reservations, so the order line can mark them.
         reserved_ranked: u8,
-        /// Who absorbed coverage ahead of us and how many nodes each newly covered. Absorption is
-        /// the reason a candidate finds nothing unique; without it a suppression cannot be
-        /// attributed to the relay that caused it.
+        /// Who already transmitted this packet by ranking time, and how many nodes each newly
+        /// covered. Planned later slots do not absorb; a heard copy does.
         absorbed: [(u32, u8); crate::broadcast_relay::RANKED_LOG],
         absorbed_len: u8,
     },
