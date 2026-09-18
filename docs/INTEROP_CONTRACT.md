@@ -531,7 +531,7 @@ is actually waiting for.
 
 - **Cadence.** Periodic every `TOPOLOGY_BROADCAST_MS`; a dirty broadcast no sooner than
   `TOPOLOGY_DIRTY_MIN_MS` after the last one; a header-only version-0 broadcast at boot; direct
-  SR neighbours answer a boot broadcast once per `BOOTSTRAP_REPLY_MIN_MS`. Originated packets do
+  SR neighbours answer a boot broadcast once per `BOOTSTRAP_REPLY_MIN_MS` (120 s). Originated packets do
   not reset the timer.
 - **A bootstrap request is answered by any list, not only by its own reply.** The request is
   recorded with the time it arrived, and the queued reply is dropped if a broadcast carrying

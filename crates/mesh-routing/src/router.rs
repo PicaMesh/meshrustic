@@ -197,7 +197,7 @@ struct PendingAdmin {
 }
 
 /// Minimum spacing between topology lists sent in answer to empty bootstrap broadcasts.
-pub const BOOTSTRAP_REPLY_MIN_MS: u32 = 60_000;
+pub const BOOTSTRAP_REPLY_MIN_MS: u32 = 120_000;
 
 /// Shared static router state.
 pub struct Router {
