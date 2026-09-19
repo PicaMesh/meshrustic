@@ -265,16 +265,19 @@ is actually waiting for.
   the destination (`plan_unicast_relay`); the best placed keys up first. A heard copy cancels a
   later slot only when that transmitter can finish delivery (a priced hop to the destination, or
   being its downstream gateway) or is ranked ahead of us with a path; we keep the slot if we can
-  finish and they cannot. An
-  unresolved relay byte cancels only when we cannot finish ourselves (the designated or stock
-  hop we were waiting for). Slot 0 waits the largest floor that applies to it — stock's own
-  contention floor (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where
-  that is longer; later slots take the larger of that floor and the leader's peer relay window,
-  then space by half an airtime. There is no delay clamp that bunches late rungs. Tests:
+  finish and they cannot. An unresolved relay byte (or a placeholder identity) cancels only when
+  we cannot finish ourselves (the designated or stock hop we were waiting for). Slot 0 waits the
+  largest floor that applies to it — stock's own contention floor
+  (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where that is longer;
+  later slots take the larger of that floor and the leader's peer relay window, then space by
+  half an airtime. There is no delay clamp that bunches late rungs. Tests:
   `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
   `undesignated_unicast_slot_zero_waits_stocks_contention_floor`,
   `dupe_cancels_when_the_relayer_can_finish`,
-  `dupe_kept_when_we_can_finish_and_they_cannot`.
+  `dupe_kept_when_we_can_finish_and_they_cannot`,
+  `dupe_cancels_when_relayer_is_ranked_ahead_with_a_path`,
+  `dupe_kept_when_relayer_has_no_path`,
+  `unresolved_dupe_cancels_when_we_cannot_finish`.
 - **Soft coverage skips.** `UnicastCovered` for a shared downstream gateway, or for a
   better-positioned SR neighbour, applies only when that node is known to hold this copy
   (`heard_from` or has already transmitted this id). A neighbour that *could* hear the
