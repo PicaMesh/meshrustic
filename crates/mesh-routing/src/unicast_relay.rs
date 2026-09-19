@@ -11,7 +11,10 @@
 //!
 //! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Within a bucket, ties
 //! break by node id (packet-id parity). Before ranking, suppress only when a coverer is known to
-//! hold this copy (heard from them, or they already transmitted this id).
+//! hold this copy (heard from them, or they already transmitted this id). A heard copy cancels a
+//! later slot only when that transmitter can finish delivery, or is ranked ahead of us and has a
+//! path; we keep the slot if we can finish and they cannot. Finishing is a priced hop to the
+//! destination, or being its downstream gateway — not stock optimism without a link.
 
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
@@ -50,6 +53,18 @@ pub struct UnicastCandidate {
     pub cost: u16,
 }
 
+/// `a` is placed earlier than `b` in the unicast ranking for `packet_id`.
+fn ranked_ahead(a: UnicastCandidate, b: UnicastCandidate, packet_id: u32) -> bool {
+    let prefer_high_id = packet_id & 1 != 0;
+    a.cost < b.cost
+        || (a.cost == b.cost
+            && if prefer_high_id {
+                a.node_id > b.node_id
+            } else {
+                a.node_id < b.node_id
+            })
+}
+
 impl UnicastRelayContext<'_> {
     fn downstream_relay(&self, destination: u32, now_ms: u32) -> Option<u32> {
         self.downstream
@@ -58,6 +73,13 @@ impl UnicastRelayContext<'_> {
 
     fn reaches(&self, node: u32, destination: u32, now_ms: u32) -> bool {
         can_deliver(self.edges, Some(self.capability), node, destination)
+            || self.downstream_relay(destination, now_ms) == Some(node)
+    }
+
+    /// Last-hop delivery: a priced hop to the destination, or we are its downstream gateway.
+    /// `can_deliver` alone is not enough — it is true for every unpublished dest.
+    fn can_finish(&self, node: u32, destination: u32, now_ms: u32) -> bool {
+        delivery_hop_cost_fixed(self.edges, Some(self.capability), node, destination).is_some()
             || self.downstream_relay(destination, now_ms) == Some(node)
     }
 
@@ -182,19 +204,9 @@ pub fn plan_unicast_relay(
 
     // Ascending cost; equal costs ordered by node id, direction chosen by packet-id parity so
     // no node is favoured across packets.
-    let prefer_high_id = packet_id & 1 != 0;
-    let ahead = |a: &UnicastCandidate, b: &UnicastCandidate| {
-        a.cost < b.cost
-            || (a.cost == b.cost
-                && if prefer_high_id {
-                    a.node_id > b.node_id
-                } else {
-                    a.node_id < b.node_id
-                })
-    };
     for i in 1..count {
         let mut j = i;
-        while j > 0 && ahead(&candidates[j], &candidates[j - 1]) {
+        while j > 0 && ranked_ahead(candidates[j], candidates[j - 1], packet_id) {
             candidates.swap(j, j - 1);
             j -= 1;
         }
@@ -236,6 +248,51 @@ pub fn plan_unicast_relay(
     plan.slot_index = my_slot;
     plan.candidate_count = slot.max(1);
     Ok(plan)
+}
+
+/// Whether a heard unicast copy should pull back our pending relay.
+///
+/// Cancel when the transmitter can finish (priced hop / dest's downstream) or is ranked ahead of
+/// us with a path. Keep when we can finish and they cannot. An unresolved relay byte is treated
+/// as a designated/stock hop we were waiting for only if we cannot finish ourselves.
+pub fn unicast_dupe_cancels(
+    ctx: &UnicastRelayContext<'_>,
+    packet_id: u32,
+    destination: u32,
+    my_next_hop: u32,
+    now_ms: u32,
+    dupe_relayer: Option<u32>,
+) -> bool {
+    let me = ctx.my_node;
+    let we_finish = ctx.can_finish(me, destination, now_ms);
+    let Some(relayer) = dupe_relayer.filter(|&n| n != 0 && n != me && !is_placeholder_node(n)) else {
+        return !we_finish;
+    };
+    if ctx.can_finish(relayer, destination, now_ms) {
+        return true;
+    }
+    if we_finish {
+        return false;
+    }
+    let their_cost = ctx.candidate_cost(relayer, destination, my_next_hop, now_ms);
+    if their_cost == NO_PATH {
+        return false;
+    }
+    let mut my_cost = ctx.candidate_cost(me, destination, my_next_hop, now_ms);
+    if my_cost == NO_PATH {
+        my_cost = BEST_EFFORT_SELF_COST;
+    }
+    ranked_ahead(
+        UnicastCandidate {
+            node_id: relayer,
+            cost: their_cost,
+        },
+        UnicastCandidate {
+            node_id: me,
+            cost: my_cost,
+        },
+        packet_id,
+    )
 }
 
 #[cfg(test)]
@@ -494,5 +551,82 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err, SrSkipReason::NoRelayPath);
+    }
+
+    #[test]
+    fn dupe_cancels_when_the_relayer_can_finish() {
+        let f = field_fixture();
+        assert!(unicast_dupe_cancels(
+            &f.ctx(),
+            0x30,
+            DEST,
+            GW,
+            NOW,
+            Some(GW)
+        ));
+    }
+
+    #[test]
+    fn dupe_kept_when_we_can_finish_and_they_cannot() {
+        let mut f = field_fixture();
+        f.edges
+            .update_edge(ME, ME, DEST, 1.2, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(ME, DEST, true);
+        f.capability.track_topology(DEST, true, NOW);
+        assert!(
+            !unicast_dupe_cancels(&f.ctx(), 0x31, DEST, GW, NOW, Some(PEER)),
+            "PEER cannot finish; we can"
+        );
+        assert!(
+            !unicast_dupe_cancels(&f.ctx(), 0x31, DEST, GW, NOW, None),
+            "unresolved copy must not kill a last hop we can finish"
+        );
+    }
+
+    #[test]
+    fn dupe_cancels_when_relayer_is_ranked_ahead_with_a_path() {
+        let mut f = field_fixture();
+        f.edges
+            .update_edge(ME, PEER, GW, 1.5, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(PEER, GW, true);
+        f.capability.track_topology(PEER, true, NOW);
+        // Neither finishes (DEST is GW's downstream). Equal indirect costs: even id ranks
+        // the lower id (ME) first, so PEER is behind us and we keep.
+        assert!(!unicast_dupe_cancels(
+            &f.ctx(),
+            0x32,
+            DEST,
+            GW,
+            NOW,
+            Some(PEER)
+        ));
+        // Odd id: higher id first, PEER is ahead.
+        assert!(unicast_dupe_cancels(
+            &f.ctx(),
+            0x33,
+            DEST,
+            GW,
+            NOW,
+            Some(PEER)
+        ));
+    }
+
+    #[test]
+    fn dupe_kept_when_relayer_has_no_path() {
+        let f = field_fixture();
+        assert!(
+            !unicast_dupe_cancels(&f.ctx(), 0x35, DEST, GW, NOW, Some(PEER)),
+            "a copy from a node with no path must not kill our slot"
+        );
+    }
+
+    #[test]
+    fn unresolved_dupe_cancels_when_we_cannot_finish() {
+        let f = field_fixture();
+        assert!(unicast_dupe_cancels(&f.ctx(), 0x34, DEST, GW, NOW, None));
+        assert!(
+            unicast_dupe_cancels(&f.ctx(), 0x34, DEST, GW, NOW, Some(0xFF00_0099)),
+            "a placeholder relay byte is the designated hop we were waiting for"
+        );
     }
 }

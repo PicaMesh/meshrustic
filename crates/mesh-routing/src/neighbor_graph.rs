@@ -782,6 +782,32 @@ impl NeighborGraph {
         )
     }
 
+    /// Whether a heard unicast copy should pull back our pending relay.
+    pub fn unicast_dupe_cancels(
+        &self,
+        packet_id: u32,
+        destination: u32,
+        my_next_hop: u32,
+        now_ms: u32,
+        dupe_relayer: Option<u32>,
+    ) -> bool {
+        let ctx = crate::unicast_relay::UnicastRelayContext {
+            my_node: self.my_node,
+            edges: &self.edges,
+            capability: &self.capability,
+            downstream: &self.downstream,
+            downstream_ttl_ms: NEIGHBOR_TTL_MS,
+        };
+        crate::unicast_relay::unicast_dupe_cancels(
+            &ctx,
+            packet_id,
+            destination,
+            my_next_hop,
+            now_ms,
+            dupe_relayer,
+        )
+    }
+
     fn fill_stock_relay_candidates(
         &self,
         packet_id: u32,

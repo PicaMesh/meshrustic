@@ -2142,7 +2142,8 @@ impl Router {
         };
 
         // A unicast that already names a next hop keeps SR coordination: the designated node
-        // owns slot 0 and every other candidate shifts down one slot, cancelling on any heard copy.
+        // owns slot 0 and every other candidate shifts down one slot. A heard copy cancels that
+        // backup when the transmitter can finish or is ranked ahead; not merely because it exists.
         let designated_plan = if parsed.to != NODENUM_BROADCAST && relayer_named {
             Some(self.plan_designated_unicast(
                 &parsed,
@@ -2572,10 +2573,9 @@ impl Router {
     /// The designated node owns slot 0. If that is us we relay at once. Otherwise we keep our
     /// normal unicast rank shifted by one slot, behind a slot-0 wait sized for the designated
     /// node: one half-airtime for an SR peer (deterministic), the worst-case stock contention
-    /// window plus one airtime for a stock or unknown node. Any copy heard before our slot
-    /// cancels us (see `perhaps_cancel_dupe`). Bystanders therefore recover a failed designated
-    /// hop within a slot instead of staying silent, and duplicates are bounded by the same
-    /// cancel-on-hear rule broadcasts use.
+    /// window plus one airtime for a stock or unknown node. A heard copy cancels that backup
+    /// when the transmitter can finish or is ranked ahead (`perhaps_cancel_dupe`). Bystanders
+    /// therefore recover a failed designated hop within a slot instead of staying silent.
     fn plan_designated_unicast(
         &mut self,
         parsed: &ParsedPacket,
@@ -3851,14 +3851,22 @@ impl Router {
             }
         }
 
-        // A unicast copy heard from anyone means the packet is moving, whether the designated
-        // next hop or an earlier slot carried it: our pending copy is redundant. Broadcast
-        // coverage reasoning below does not apply to unicasts. `in_flight` covers the frame
-        // that already left the router for the radio queue (release forgets the relay here,
-        // but the board recorded our transmission when it queued the frame).
+        // Unicast: cancel only when the heard copy can finish delivery, or is ranked ahead of
+        // us with a path. Keep the slot if we can finish and they cannot — a worse-placed copy
+        // must not kill the last hop. Broadcast coverage reasoning below does not apply.
         let in_flight = self.graph.has_our_transmission(parsed.id);
         if parsed.to != NODENUM_BROADCAST && (committed || has_pending || in_flight) {
-            if self.graph.role_allows_canceling_dupe() {
+            let next_hop = self.graph.route_to(parsed.to, now_ms).next_hop;
+            let dupe_relayer = heard_relayer.filter(|&n| n != 0 && n != self.node_num);
+            if self.graph.role_allows_canceling_dupe()
+                && self.graph.unicast_dupe_cancels(
+                    parsed.id,
+                    parsed.to,
+                    next_hop,
+                    now_ms,
+                    dupe_relayer,
+                )
+            {
                 self.graph.cancel_relay(parsed.from, parsed.id);
                 let canceled_pending = self.cancel_pending(parsed.from, parsed.id);
                 self.note_tx_cancel(parsed.id);

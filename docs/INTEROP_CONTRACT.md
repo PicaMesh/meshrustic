@@ -262,13 +262,19 @@ is actually waiting for.
   `next_hop_equal_to_the_destination_names_no_relayer`.
 - **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
   names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
-  the destination (`plan_unicast_relay`); the best placed keys up first and the rest cancel on
-  its copy. Slot 0 waits the largest floor that applies to it — stock's own contention floor
-  (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where that is longer;
-  later slots take the larger of that floor and the leader's peer relay window, then space by
-  half an airtime. Tests:
+  the destination (`plan_unicast_relay`); the best placed keys up first. A heard copy cancels a
+  later slot only when that transmitter can finish delivery (a priced hop to the destination, or
+  being its downstream gateway) or is ranked ahead of us with a path; we keep the slot if we can
+  finish and they cannot. An
+  unresolved relay byte cancels only when we cannot finish ourselves (the designated or stock
+  hop we were waiting for). Slot 0 waits the largest floor that applies to it — stock's own
+  contention floor (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where
+  that is longer; later slots take the larger of that floor and the leader's peer relay window,
+  then space by half an airtime. There is no delay clamp that bunches late rungs. Tests:
   `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
-  `undesignated_unicast_slot_zero_waits_stocks_contention_floor`.
+  `undesignated_unicast_slot_zero_waits_stocks_contention_floor`,
+  `dupe_cancels_when_the_relayer_can_finish`,
+  `dupe_kept_when_we_can_finish_and_they_cannot`.
 - **Soft coverage skips.** `UnicastCovered` for a shared downstream gateway, or for a
   better-positioned SR neighbour, applies only when that node is known to hold this copy
   (`heard_from` or has already transmitted this id). A neighbour that *could* hear the
@@ -521,9 +527,10 @@ is actually waiting for.
 - **One frame per packet.** The pending relay table holds at most one frame per packet
   (`Router::store_pending` replaces), and a packet we have already transmitted is never released
   again (`Router::poll_ready_relay`).
-- **Other duplicates cancel our pending copy** when the copy shows the packet is moving on
-  (`Router::perhaps_cancel_dupe`); broadcast copies are pulled back only when the transmitters
-  heard so far cover every neighbour we reach.
+- **Other duplicates cancel our pending copy** when `Router::perhaps_cancel_dupe` says so.
+  Unicast copies use `unicast_dupe_cancels` (finish / ranked-ahead-with-a-path, above);
+  broadcast copies are pulled back only when the transmitters heard so far cover every
+  neighbour we reach.
 - **Coverage decides a committed relay's cancel; our role decides everything else.** The two
   gates answer different questions. Coverage is about the packet — the neighbours we would have
   carried have been carried by somebody else, so our copy would add a duplicate and nothing
