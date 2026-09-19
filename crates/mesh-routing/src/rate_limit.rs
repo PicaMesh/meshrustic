@@ -14,6 +14,14 @@
 //! that node on the default public channel are logged and dropped without charging the sender.
 //! WantResponse replies from other nodes would otherwise keep flooding after the originator
 //! itself is already silenced. Unicast on a non-default channel is not dest-dropped.
+//!
+//! Dest volume: default-channel POSITION / NODEINFO / TELEMETRY unicast this node would
+//! rebroadcast also charges a per-destination count (8 slots). Trip 20 / clear 5 / 90 s,
+//! RELAY-style hysteresis, but only once at least 3 distinct senders have contributed in
+//! the window — a WantResponse storm, not one node chatting. Once dest-volume limited,
+//! dest-drop applies the same way as an originator ban, including TEXT, until a window
+//! rolls under the clear. Favorites are not consulted; dest-volume is never originator-bypassed.
+//! A full table of dest-volume-limited sinks refuses a new slot rather than lifting a dest-ban.
 
 use mesh_protocol::{rate_limit_bucket, RateLimitBucket, NODENUM_BROADCAST};
 
@@ -34,6 +42,12 @@ const YOUNG_CLEAR: u32 = 12;
 const ANNOUNCE_REFRACTORY_MS: u32 = 30 * 60 * 1000;
 const ANNOUNCE_CHUTIL_HIGH: f32 = 25.0;
 const ANNOUNCE_MAX_IDS: usize = 4;
+
+const MAX_DESTS: usize = 8;
+const DEST_TRIP: u32 = 20;
+const DEST_CLEAR: u32 = 5;
+const DEST_MIN_SENDERS: u8 = 3;
+const DEST_SENDER_SLOTS: usize = 8;
 
 const THRESHOLD_TEXT: u32 = 30;
 const THRESHOLD_ROUTING: u32 = 10;
@@ -112,6 +126,14 @@ impl OriginatorEntry {
 struct RelayEntry {
     node_id: u32,
     relay: BucketState,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DestEntry {
+    node_id: u32,
+    dest: BucketState,
+    senders: [u32; DEST_SENDER_SLOTS],
+    sender_count: u8,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -239,6 +261,7 @@ pub enum RateLimitKind {
     Relay = 4,
     RelayUnresolved = 5,
     Young = 6,
+    Dest = 7,
 }
 
 impl RateLimitKind {
@@ -251,7 +274,8 @@ impl RateLimitKind {
 pub enum RateLimitEvent {
     Trip { node_id: u32, kind: RateLimitKind },
     Clear { node_id: u32, kind: RateLimitKind },
-    /// Default-channel unicast addressed to an originator that is already limited.
+    /// Default-channel unicast addressed to an originator or dest-volume sink
+    /// that is already limited.
     DestDrop { node_id: u32 },
 }
 
@@ -270,6 +294,8 @@ pub struct NodeRateLimiter {
     alumni: [u32; MAX_YOUNG],
     alumni_count: u8,
     young_bucket: BucketState,
+    dests: [DestEntry; MAX_DESTS],
+    dest_count: u8,
     boot_ms: u32,
     boot_known: bool,
     announce_broadcast: bool,
@@ -350,6 +376,17 @@ impl NodeRateLimiter {
                 count: 0,
                 limited: false,
             },
+            dests: [DestEntry {
+                node_id: 0,
+                dest: BucketState {
+                    window_start_ms: 0,
+                    count: 0,
+                    limited: false,
+                },
+                senders: [0; DEST_SENDER_SLOTS],
+                sender_count: 0,
+            }; MAX_DESTS],
+            dest_count: 0,
             boot_ms: 0,
             boot_known: false,
             announce_broadcast: false,
@@ -428,11 +465,19 @@ impl NodeRateLimiter {
             .unwrap_or(false)
     }
 
+    /// True when dest-volume has limited unicast toward `node_id`.
+    pub fn dest_volume_limited(&self, node_id: u32) -> bool {
+        self.find_dest(node_id)
+            .map(|i| self.dests[i].dest.limited)
+            .unwrap_or(false)
+    }
+
     /// Returns `true` when the packet should be dropped for rate abuse.
     ///
     /// Packets addressed to us are never limited. `ADMIN_APP` is not exempt by portnum.
-    /// Default-channel unicast *to* a limited originator is dropped without charging the
-    /// sender, so WantResponse replies do not keep flooding after the originator is silenced.
+    /// Default-channel unicast *to* a limited originator or dest-volume sink is dropped
+    /// without charging the sender, so WantResponse replies do not keep flooding after
+    /// the originator is silenced — or when we never saw the originator at all.
     pub fn should_drop<F>(&mut self, pkt: &RateLimitPacket, mut proximity: F) -> bool
     where
         F: FnMut(u32) -> GraphProximity,
@@ -448,12 +493,22 @@ impl NodeRateLimiter {
         if pkt.to == self.node_num {
             return false;
         }
-        if self.should_drop_to_limited_dest(pkt) {
-            self.last_event = Some(RateLimitEvent::DestDrop { node_id: pkt.to });
-            return true;
-        }
 
         self.note_boot(pkt.now_ms);
+
+        let dest_volume_drop = self.charge_dest_volume(pkt, &mut proximity);
+        if dest_volume_drop || self.should_drop_to_limited_dest(pkt) {
+            if !matches!(
+                self.last_event,
+                Some(RateLimitEvent::Trip {
+                    kind: RateLimitKind::Dest,
+                    ..
+                })
+            ) {
+                self.last_event = Some(RateLimitEvent::DestDrop { node_id: pkt.to });
+            }
+            return true;
+        }
 
         let mut drop = false;
 
@@ -572,14 +627,117 @@ impl NodeRateLimiter {
         drop
     }
 
-    /// Unicast on the default channel to an originator we already limited. Does not create
-    /// a slot and does not charge the sender: the flood being stopped is *replies to* the
-    /// banned node, not traffic *from* the nodes answering it.
+    /// Unicast on the default channel to an originator we already limited, or to a dest
+    /// dest-volume has limited. Does not charge the sender: the flood being stopped is
+    /// *replies to* the sink, not traffic *from* the nodes answering it.
     fn should_drop_to_limited_dest(&self, pkt: &RateLimitPacket) -> bool {
         if !pkt.on_default_channel || !is_unicast_dest(pkt.to) {
             return false;
         }
-        self.originator_limited(pkt.to)
+        self.originator_limited(pkt.to) || self.dest_volume_limited(pkt.to)
+    }
+
+    fn dest_volume_port(decoded_portnum: Option<u32>) -> bool {
+        matches!(
+            decoded_portnum,
+            Some(
+                mesh_protocol::num::POSITION_APP
+                    | mesh_protocol::num::NODEINFO_APP
+                    | mesh_protocol::num::TELEMETRY_APP
+            )
+        )
+    }
+
+    fn charges_dest_volume(pkt: &RateLimitPacket) -> bool {
+        pkt.on_default_channel
+            && is_unicast_dest(pkt.to)
+            && pkt.rebroadcast_candidate
+            && Self::dest_volume_port(pkt.decoded_portnum)
+    }
+
+    fn dest_window_will_roll(b: &BucketState, now_ms: u32, window_ms: u32) -> bool {
+        b.window_start_ms != 0 && now_ms.wrapping_sub(b.window_start_ms) >= window_ms
+    }
+
+    fn roll_dest_senders(entry: &mut DestEntry, now_ms: u32, window_ms: u32) {
+        if Self::dest_window_will_roll(&entry.dest, now_ms, window_ms) {
+            entry.senders = [0; DEST_SENDER_SLOTS];
+            entry.sender_count = 0;
+        }
+    }
+
+    fn note_dest_sender(entry: &mut DestEntry, from: u32) {
+        if from == 0 {
+            return;
+        }
+        if entry.senders[..entry.sender_count as usize].contains(&from) {
+            return;
+        }
+        if (entry.sender_count as usize) < DEST_SENDER_SLOTS {
+            entry.senders[entry.sender_count as usize] = from;
+            entry.sender_count += 1;
+        }
+    }
+
+    /// Charge dest-volume for OTHER-class unicast we would relay; roll an existing dest
+    /// window on any default-channel unicast so a dest-limit can lift without more
+    /// POSITION / NODEINFO / TELEMETRY. Returns true when dest-volume is limiting `pkt.to`.
+    fn charge_dest_volume<F>(&mut self, pkt: &RateLimitPacket, proximity: &mut F) -> bool
+    where
+        F: FnMut(u32) -> GraphProximity,
+    {
+        if !is_unicast_dest(pkt.to) || !pkt.on_default_channel {
+            return false;
+        }
+
+        if Self::charges_dest_volume(pkt) {
+            let Some(idx) = self.get_or_create_dest(pkt.to, pkt.now_ms, proximity) else {
+                return self.dest_volume_limited(pkt.to);
+            };
+            let entry = &mut self.dests[idx];
+            Self::roll_dest_senders(entry, pkt.now_ms, self.window_ms);
+            Self::note_dest_sender(entry, pkt.from);
+            let trip = if entry.dest.limited || entry.sender_count >= DEST_MIN_SENDERS {
+                DEST_TRIP
+            } else {
+                u32::MAX
+            };
+            let node_id = entry.node_id;
+            let (limited, ev) = Self::check_and_update_bucket(
+                &mut entry.dest,
+                trip,
+                DEST_CLEAR,
+                1,
+                pkt.now_ms,
+                self.window_ms,
+                node_id,
+                RateLimitKind::Dest,
+            );
+            if let Some(ev) = ev {
+                self.last_event = Some(ev);
+            }
+            return limited;
+        }
+
+        if let Some(idx) = self.find_dest(pkt.to) {
+            let entry = &mut self.dests[idx];
+            Self::roll_dest_senders(entry, pkt.now_ms, self.window_ms);
+            let node_id = entry.node_id;
+            let (_limited, ev) = Self::check_and_update_bucket(
+                &mut entry.dest,
+                DEST_TRIP,
+                DEST_CLEAR,
+                0,
+                pkt.now_ms,
+                self.window_ms,
+                node_id,
+                RateLimitKind::Dest,
+            );
+            if let Some(ev) = ev {
+                self.last_event = Some(ev);
+            }
+        }
+        self.dest_volume_limited(pkt.to)
     }
 
     fn note_boot(&mut self, now_ms: u32) {
@@ -920,6 +1078,75 @@ impl NodeRateLimiter {
         };
         idx
     }
+
+    fn find_dest(&self, node_id: u32) -> Option<usize> {
+        self.dests[..self.dest_count as usize]
+            .iter()
+            .position(|e| e.node_id == node_id)
+    }
+
+    fn find_dest_eviction_candidate<F>(&self, proximity: &mut F) -> Option<usize>
+    where
+        F: FnMut(u32) -> GraphProximity,
+    {
+        let count = self.dest_count as usize;
+        let mut candidate: Option<usize> = None;
+        for i in 0..count {
+            let e = &self.dests[i];
+            if e.dest.limited {
+                continue;
+            }
+            let prox = proximity(e.node_id);
+            candidate = Some(match candidate {
+                None => i,
+                Some(c) => {
+                    let cand = proximity(self.dests[c].node_id);
+                    if !prox.in_graph && cand.in_graph {
+                        i
+                    } else if prox.in_graph == cand.in_graph {
+                        let farther = prox.hops > cand.hops;
+                        let same_distance_but_staler = prox.hops == cand.hops
+                            && e.dest.window_start_ms < self.dests[c].dest.window_start_ms;
+                        if farther || same_distance_but_staler {
+                            i
+                        } else {
+                            c
+                        }
+                    } else {
+                        c
+                    }
+                }
+            });
+        }
+        candidate
+    }
+
+    fn get_or_create_dest<F>(&mut self, node_id: u32, now_ms: u32, proximity: &mut F) -> Option<usize>
+    where
+        F: FnMut(u32) -> GraphProximity,
+    {
+        if let Some(idx) = self.find_dest(node_id) {
+            return Some(idx);
+        }
+        let idx = if (self.dest_count as usize) < MAX_DESTS {
+            let i = self.dest_count as usize;
+            self.dest_count += 1;
+            i
+        } else {
+            self.find_dest_eviction_candidate(proximity)?
+        };
+        self.dests[idx] = DestEntry {
+            node_id,
+            dest: BucketState {
+                window_start_ms: now_ms,
+                count: 0,
+                limited: false,
+            },
+            senders: [0; DEST_SENDER_SLOTS],
+            sender_count: 0,
+        };
+        Some(idx)
+    }
 }
 
 #[cfg(test)]
@@ -947,12 +1174,23 @@ mod tests {
     }
 
     fn dest_pkt(from: u32, to: u32, on_default: bool, now_ms: u32) -> RateLimitPacket {
+        dest_reply(from, to, Some(num::NODEINFO_APP), true, on_default, now_ms)
+    }
+
+    fn dest_reply(
+        from: u32,
+        to: u32,
+        port: Option<u32>,
+        rebroadcast_candidate: bool,
+        on_default: bool,
+        now_ms: u32,
+    ) -> RateLimitPacket {
         RateLimitPacket {
             from,
             to,
-            decoded_portnum: Some(num::NODEINFO_APP),
+            decoded_portnum: port,
             now_ms,
-            rebroadcast_candidate: true,
+            rebroadcast_candidate,
             resolved_relay: None,
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
@@ -1073,6 +1311,22 @@ mod tests {
 
         fn unresolved_relay_limited(&self) -> bool {
             self.unresolved_relay.limited
+        }
+
+        fn dest_charge(&self, node_id: u32) -> u32 {
+            self.find_dest(node_id)
+                .map(|i| self.dests[i].dest.count)
+                .unwrap_or(0)
+        }
+
+        fn dest_senders(&self, node_id: u32) -> u8 {
+            self.find_dest(node_id)
+                .map(|i| self.dests[i].sender_count)
+                .unwrap_or(0)
+        }
+
+        fn tracks_dest(&self, node_id: u32) -> bool {
+            self.find_dest(node_id).is_some()
         }
 
         fn debug_relay_budgets(&self, air_ms: u32, chutil: f32) -> (u32, u32) {
@@ -2166,5 +2420,271 @@ mod tests {
             &dest_pkt(responder, banned, true, 2 * WINDOW_MS + 3),
             no_graph
         ));
+    }
+
+    fn dest_sender(i: u32) -> u32 {
+        0x1111_0001 + i
+    }
+
+    fn charge_dest_storm(
+        limiter: &mut NodeRateLimiter,
+        dest: u32,
+        n: u32,
+        start_ms: u32,
+    ) -> bool {
+        charge_dest_storm_from(limiter, dest, n, start_ms, 0)
+    }
+
+    fn charge_dest_storm_from(
+        limiter: &mut NodeRateLimiter,
+        dest: u32,
+        n: u32,
+        start_ms: u32,
+        sender_base: u32,
+    ) -> bool {
+        let mut last = false;
+        for i in 0..n {
+            last = limiter.should_drop(
+                &dest_pkt(dest_sender(sender_base + i), dest, true, start_ms + i),
+                no_graph,
+            );
+        }
+        last
+    }
+
+    #[test]
+    fn dest_volume_trips_at_20_with_sender_diversity() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7001;
+        for i in 0..19 {
+            assert!(
+                !limiter.should_drop(&dest_pkt(dest_sender(i), dest, true, i), no_graph),
+                "dest charge {i} must not trip"
+            );
+        }
+        assert!(!limiter.dest_volume_limited(dest));
+        assert!(limiter.dest_senders(dest) >= DEST_MIN_SENDERS);
+        let last_from = dest_sender(19);
+        assert!(limiter.should_drop(&dest_pkt(last_from, dest, true, 19), no_graph));
+        assert!(limiter.dest_volume_limited(dest));
+        assert_eq!(
+            limiter.take_event(),
+            Some(RateLimitEvent::Trip {
+                node_id: dest,
+                kind: RateLimitKind::Dest,
+            })
+        );
+        assert!(
+            !limiter.is_tracking_originator(last_from),
+            "dest-volume drop must not charge the responder"
+        );
+    }
+
+    #[test]
+    fn dest_volume_trips_with_exactly_three_senders() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7008;
+        let senders = [dest_sender(0), dest_sender(1), dest_sender(2)];
+        for i in 0..20 {
+            limiter.should_drop(&dest_pkt(senders[i % 3], dest, true, i as u32), no_graph);
+        }
+        assert!(limiter.dest_volume_limited(dest));
+        assert_eq!(limiter.dest_senders(dest), 3);
+    }
+
+    #[test]
+    fn dest_volume_does_not_trip_from_two_senders() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7002;
+        let senders = [dest_sender(0), dest_sender(1)];
+        for i in 0..24 {
+            limiter.should_drop(&dest_pkt(senders[i % 2], dest, true, i as u32), no_graph);
+            assert!(
+                !limiter.dest_volume_limited(dest),
+                "two senders must not dest-volume trip at {i}"
+            );
+        }
+        assert_eq!(limiter.dest_senders(dest), 2);
+        assert_eq!(limiter.dest_charge(dest), 24);
+    }
+
+    #[test]
+    fn dest_volume_does_not_charge_text_or_routing() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7003;
+        for i in 0..20 {
+            assert!(!limiter.should_drop(
+                &dest_reply(
+                    dest_sender(i),
+                    dest,
+                    Some(num::TEXT_MESSAGE_APP),
+                    true,
+                    true,
+                    i,
+                ),
+                no_graph
+            ));
+            assert!(!limiter.should_drop(
+                &dest_reply(
+                    dest_sender(100 + i),
+                    dest,
+                    Some(num::ROUTING_APP),
+                    true,
+                    true,
+                    100 + i,
+                ),
+                no_graph
+            ));
+        }
+        assert!(!limiter.tracks_dest(dest));
+        assert!(!limiter.dest_volume_limited(dest));
+    }
+
+    #[test]
+    fn dest_volume_ignores_non_rebroadcast_and_non_default() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7004;
+        for i in 0..20 {
+            assert!(!limiter.should_drop(
+                &dest_reply(
+                    dest_sender(i),
+                    dest,
+                    Some(num::NODEINFO_APP),
+                    false,
+                    true,
+                    i,
+                ),
+                no_graph
+            ));
+            assert!(!limiter.should_drop(
+                &dest_reply(
+                    dest_sender(50 + i),
+                    dest,
+                    Some(num::NODEINFO_APP),
+                    true,
+                    false,
+                    50 + i,
+                ),
+                no_graph
+            ));
+        }
+        assert!(!limiter.dest_volume_limited(dest));
+    }
+
+    #[test]
+    fn dest_volume_dest_drops_text_after_trip() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7005;
+        assert!(charge_dest_storm(&mut limiter, dest, 20, 0));
+        let text = dest_reply(
+            0xAAAA_0001,
+            dest,
+            Some(num::TEXT_MESSAGE_APP),
+            true,
+            true,
+            20,
+        );
+        assert!(limiter.should_drop(&text, no_graph));
+        assert_eq!(
+            limiter.take_event(),
+            Some(RateLimitEvent::DestDrop { node_id: dest })
+        );
+        assert!(
+            !limiter.is_tracking_originator(0xAAAA_0001),
+            "dest-drop must not charge the TEXT sender"
+        );
+    }
+
+    #[test]
+    fn dest_volume_clears_after_quiet_window() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7006;
+        assert!(charge_dest_storm(&mut limiter, dest, 20, 0));
+        assert!(limiter.dest_volume_limited(dest));
+
+        // First roll after the trip window still sees count >= clear, so dest stays limited.
+        assert!(limiter.should_drop(
+            &dest_pkt(dest_sender(40), dest, true, WINDOW_MS + 20),
+            no_graph
+        ));
+        assert!(limiter.dest_volume_limited(dest));
+
+        // Next window under the clear lifts, then this packet is a fresh dest-volume charge of 1.
+        assert!(!limiter.should_drop(
+            &dest_pkt(dest_sender(41), dest, true, 2 * WINDOW_MS + 21),
+            no_graph
+        ));
+        assert!(!limiter.dest_volume_limited(dest));
+    }
+
+    #[test]
+    fn dest_volume_stays_limited_while_the_flood_continues() {
+        let mut limiter = NodeRateLimiter::new();
+        let dest = 0x0D05_7007;
+        assert!(charge_dest_storm(&mut limiter, dest, 20, 0));
+        for i in 0..6 {
+            assert!(
+                limiter.should_drop(
+                    &dest_pkt(dest_sender(30 + i as u32), dest, true, 20 + i as u32),
+                    no_graph
+                ),
+                "flood packet {i}"
+            );
+        }
+        assert!(limiter.should_drop(
+            &dest_pkt(dest_sender(50), dest, true, WINDOW_MS + 26),
+            no_graph
+        ));
+        assert!(limiter.dest_volume_limited(dest));
+    }
+
+    #[test]
+    fn dest_volume_eviction_keeps_a_limited_dest() {
+        let mut limiter = NodeRateLimiter::new();
+        let keep = 0x0D05_00AA;
+        assert!(charge_dest_storm(&mut limiter, keep, 20, 0));
+        assert!(limiter.dest_volume_limited(keep));
+
+        for i in 0..MAX_DESTS as u32 {
+            let dest = 0x0D05_1000 + i;
+            assert!(!limiter.should_drop(&dest_pkt(dest_sender(80 + i), dest, true, 100 + i), no_graph));
+        }
+        assert!(
+            limiter.dest_volume_limited(keep),
+            "a dest-volume limited sink must not be evicted"
+        );
+        assert!(limiter.tracks_dest(keep));
+    }
+
+    #[test]
+    fn dest_volume_full_limited_table_does_not_evict() {
+        let mut limiter = NodeRateLimiter::new();
+        let mut kept = [0u32; MAX_DESTS];
+        for i in 0..MAX_DESTS as u32 {
+            let dest = 0x0D05_2000 + i;
+            kept[i as usize] = dest;
+            assert!(charge_dest_storm_from(
+                &mut limiter,
+                dest,
+                20,
+                i * 20,
+                i * 20,
+            ));
+            assert!(limiter.dest_volume_limited(dest));
+        }
+
+        let extra = 0x0D05_2FFF;
+        let _ = charge_dest_storm_from(&mut limiter, extra, 20, 200, 200);
+        assert!(
+            !limiter.dest_volume_limited(extra),
+            "a full table of dest-volume bans must not open a ninth slot"
+        );
+        assert!(!limiter.tracks_dest(extra));
+        for dest in kept {
+            assert!(
+                limiter.dest_volume_limited(dest),
+                "limited dest !{dest:08x} must survive a full table"
+            );
+        }
     }
 }

@@ -80,7 +80,8 @@ pub struct ProcessResult {
     pub parsed: ParsedPacket,
     pub duplicate: bool,
     pub rate_limited: bool,
-    /// Default-channel unicast to a limited originator (WantResponse-amplification cut).
+    /// Default-channel unicast to a limited originator or dest-volume sink
+    /// (WantResponse-amplification cut).
     pub dest_rate_limited: bool,
     pub handle: Option<PacketHandle>,
     pub radio_id: u8,
@@ -944,6 +945,9 @@ impl Router {
         if let Some(ev) = self.rate_limit.take_event() {
             match ev {
                 crate::rate_limit::RateLimitEvent::Trip { node_id, kind } => {
+                    if kind == crate::rate_limit::RateLimitKind::Dest {
+                        dest_rate_limited = true;
+                    }
                     self.sr_log.push(SrLogEvent::RateLimitTrip {
                         node_id,
                         kind: kind.as_u8(),

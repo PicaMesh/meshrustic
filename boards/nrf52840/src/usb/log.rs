@@ -1347,6 +1347,7 @@ pub mod sr {
                     4 => b"relay",
                     5 => b"relay-unresolved",
                     6 => b"young",
+                    7 => b"dest",
                     _ => b"?",
                 };
                 let mut line = [0u8; 128];
@@ -1366,6 +1367,7 @@ pub mod sr {
                     4 => b"relay",
                     5 => b"relay-unresolved",
                     6 => b"young",
+                    7 => b"dest",
                     _ => b"?",
                 };
                 let mut line = [0u8; 128];

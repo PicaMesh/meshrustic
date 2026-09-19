@@ -734,7 +734,15 @@ is actually waiting for.
   public channel are logged and dropped without charging the sender: WantResponse replies from
   other nodes would otherwise keep flooding after the originator itself is already silenced.
   Unicast on a non-default channel (private PSK) is not dest-dropped. RELAY and YOUNG limits do
-  not dest-drop; only an originator ban does.
+  not dest-drop.
+  Default-channel POSITION / NODEINFO / TELEMETRY unicast this node would rebroadcast also
+  charges a per-destination dest-volume bucket (8 slots; trip 20 / clear 5 / same 90 s window,
+  RELAY-style hysteresis). Trip requires at least 3 distinct senders in the window, so one
+  node chatting at a dest does not dest-ban the inbox. Once dest-volume limited, dest-drop
+  applies the same way as an originator ban (including TEXT) until a window rolls under the
+  clear, so a WantResponse storm is cut even when we never saw the originator. Dest-volume
+  is never favorite-bypassed. A full table of dest-volume-limited sinks refuses a new
+  slot rather than evicting a dest-ban.
   Rebroadcast candidates also charge a RELAY airtime budget (8 resolved last-hop slots + 1 shared
   unresolved; trip≈60 / clear≈15 packet-eq; hybrid AirUtil tighten; floors/ceilings). Direct
   first-hop frames key RELAY on the originator NodeID. The shared unresolved slot is not charged
