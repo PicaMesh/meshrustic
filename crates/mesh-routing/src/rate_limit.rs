@@ -9,8 +9,13 @@
 //! Uniform hysteresis: trip / clear / fixed window; while limited, drop matching traffic. Every
 //! bucket clears the same way: at the window roll, when the count for that window is below the
 //! clear threshold. Originator clear is half its trip, RELAY and YOUNG a quarter of theirs.
+//!
+//! Dest drop: while any originator bucket for a node is limited, unicast frames addressed to
+//! that node on the default public channel are logged and dropped without charging the sender.
+//! WantResponse replies from other nodes would otherwise keep flooding after the originator
+//! itself is already silenced. Unicast on a non-default channel is not dest-dropped.
 
-use mesh_protocol::{rate_limit_bucket, RateLimitBucket};
+use mesh_protocol::{rate_limit_bucket, RateLimitBucket, NODENUM_BROADCAST};
 
 const MAX_ORIGINATORS: usize = 16;
 const MAX_RELAYS: usize = 8;
@@ -198,6 +203,9 @@ pub struct RateLimitPacket {
     /// Do we hold a graph yet (at least one direct neighbour)? Gates the shared unresolved
     /// RELAY slot only; see `charges_unresolved_relay`.
     pub graph_established: bool,
+    /// Frame is on this node's default (public) channel. Dest-drop of unicast to a limited
+    /// originator applies only here; private-channel DMs are left alone.
+    pub on_default_channel: bool,
 }
 
 /// Should this frame charge the one shared bucket for unresolved `relay_node` bytes?
@@ -208,6 +216,10 @@ pub struct RateLimitPacket {
 /// One known direct neighbour is enough; resolved last hops are charged either way.
 fn charges_unresolved_relay(graph_established: bool) -> bool {
     graph_established
+}
+
+fn is_unicast_dest(to: u32) -> bool {
+    to != 0 && to != NODENUM_BROADCAST
 }
 
 /// Graph proximity for eviction (never frame `hop_start` / `hop_limit`).
@@ -239,6 +251,8 @@ impl RateLimitKind {
 pub enum RateLimitEvent {
     Trip { node_id: u32, kind: RateLimitKind },
     Clear { node_id: u32, kind: RateLimitKind },
+    /// Default-channel unicast addressed to an originator that is already limited.
+    DestDrop { node_id: u32 },
 }
 
 /// Fixed-size per-node abuse filter on the RX path.
@@ -407,9 +421,18 @@ impl NodeRateLimiter {
         }
     }
 
+    /// True when any originator bucket for `node_id` is currently limited.
+    pub fn originator_limited(&self, node_id: u32) -> bool {
+        self.find_originator(node_id)
+            .map(|i| self.originators[i].any_limited())
+            .unwrap_or(false)
+    }
+
     /// Returns `true` when the packet should be dropped for rate abuse.
     ///
     /// Packets addressed to us are never limited. `ADMIN_APP` is not exempt by portnum.
+    /// Default-channel unicast *to* a limited originator is dropped without charging the
+    /// sender, so WantResponse replies do not keep flooding after the originator is silenced.
     pub fn should_drop<F>(&mut self, pkt: &RateLimitPacket, mut proximity: F) -> bool
     where
         F: FnMut(u32) -> GraphProximity,
@@ -424,6 +447,10 @@ impl NodeRateLimiter {
         }
         if pkt.to == self.node_num {
             return false;
+        }
+        if self.should_drop_to_limited_dest(pkt) {
+            self.last_event = Some(RateLimitEvent::DestDrop { node_id: pkt.to });
+            return true;
         }
 
         self.note_boot(pkt.now_ms);
@@ -543,6 +570,16 @@ impl NodeRateLimiter {
         }
 
         drop
+    }
+
+    /// Unicast on the default channel to an originator we already limited. Does not create
+    /// a slot and does not charge the sender: the flood being stopped is *replies to* the
+    /// banned node, not traffic *from* the nodes answering it.
+    fn should_drop_to_limited_dest(&self, pkt: &RateLimitPacket) -> bool {
+        if !pkt.on_default_channel || !is_unicast_dest(pkt.to) {
+            return false;
+        }
+        self.originator_limited(pkt.to)
     }
 
     fn note_boot(&mut self, now_ms: u32) {
@@ -897,7 +934,7 @@ mod tests {
     fn originator_pkt(from: u32, port: Option<u32>, now_ms: u32) -> RateLimitPacket {
         RateLimitPacket {
             from,
-            to: 0xFFFF_FFFF,
+            to: NODENUM_BROADCAST,
             decoded_portnum: port,
             now_ms,
             rebroadcast_candidate: false,
@@ -905,6 +942,22 @@ mod tests {
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
             graph_established: true,
+            on_default_channel: true,
+        }
+    }
+
+    fn dest_pkt(from: u32, to: u32, on_default: bool, now_ms: u32) -> RateLimitPacket {
+        RateLimitPacket {
+            from,
+            to,
+            decoded_portnum: Some(num::NODEINFO_APP),
+            now_ms,
+            rebroadcast_candidate: true,
+            resolved_relay: None,
+            airtime_ms: RELAY_REF_AIRTIME_MS,
+            channel_util_pct: 0.0,
+            graph_established: true,
+            on_default_channel: on_default,
         }
     }
 
@@ -993,6 +1046,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph));
         }
@@ -1043,12 +1097,6 @@ mod tests {
 
         fn debug_seed_young(&mut self, from: u32, first_seen_ms: u32) {
             self.note_originator(from, first_seen_ms);
-        }
-
-        fn originator_limited(&self, from: u32) -> bool {
-            self.find_originator(from)
-                .map(|i| self.originators[i].other.limited)
-                .unwrap_or(false)
         }
     }
 
@@ -1130,6 +1178,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: false,
+                on_default_channel: true,
             };
             let _ = limiter.should_drop(&pkt, no_graph);
         }
@@ -1148,6 +1197,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             let _ = limiter.should_drop(&pkt, no_graph);
         }
@@ -1171,6 +1221,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: false,
+                on_default_channel: true,
             };
             let _ = limiter.should_drop(&pkt, no_graph);
         }
@@ -1448,6 +1499,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph), "relay charge {i}");
         }
@@ -1461,6 +1513,7 @@ mod tests {
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
             graph_established: true,
+            on_default_channel: true,
         };
         assert!(limiter.should_drop(&trip, no_graph));
         assert!(limiter.unresolved_relay_limited());
@@ -1481,6 +1534,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph));
         }
@@ -1494,6 +1548,7 @@ mod tests {
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
             graph_established: true,
+            on_default_channel: true,
         };
         assert!(limiter.should_drop(&trip, no_graph));
         assert!(limiter.tracks_relay(resolved));
@@ -1510,6 +1565,7 @@ mod tests {
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
             graph_established: true,
+            on_default_channel: true,
         };
         assert!(!limiter.should_drop(&other, no_graph));
     }
@@ -1530,6 +1586,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             assert!(!limiter.should_drop(&pkt, no_graph), "packet {i}");
         }
@@ -1574,6 +1631,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             let _ = limiter.should_drop(&pkt, no_graph);
         }
@@ -1597,6 +1655,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             assert!(limiter.should_drop(&pkt, no_graph));
         }
@@ -1617,6 +1676,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             },
             no_graph
         ));
@@ -1634,6 +1694,7 @@ mod tests {
                     airtime_ms: RELAY_REF_AIRTIME_MS,
                     channel_util_pct: 0.0,
                     graph_established: true,
+                    on_default_channel: true,
                 },
                 no_graph,
             );
@@ -1651,6 +1712,7 @@ mod tests {
                     airtime_ms: RELAY_REF_AIRTIME_MS,
                     channel_util_pct: 0.0,
                     graph_established: true,
+                    on_default_channel: true,
                 },
                 no_graph
             ),
@@ -1700,6 +1762,7 @@ mod tests {
                     airtime_ms: RELAY_REF_AIRTIME_MS,
                     channel_util_pct: 0.0,
                     graph_established: true,
+                    on_default_channel: true,
                 },
                 &mut proximity
             ));
@@ -1716,6 +1779,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             },
             &mut proximity
         ));
@@ -1738,6 +1802,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             let _ = limiter.should_drop(&pkt, no_graph);
         }
@@ -1754,6 +1819,7 @@ mod tests {
             airtime_ms: RELAY_REF_AIRTIME_MS,
             channel_util_pct: 0.0,
             graph_established: true,
+            on_default_channel: true,
         };
         assert!(limiter.should_drop(&pkt, no_graph));
         assert_eq!(limiter.unresolved_relay.count, before);
@@ -1949,6 +2015,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 40.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             let _ = congested.should_drop(&pkt, no_graph);
         }
@@ -1973,6 +2040,7 @@ mod tests {
                 airtime_ms: RELAY_REF_AIRTIME_MS,
                 channel_util_pct: 0.0,
                 graph_established: true,
+                on_default_channel: true,
             };
             let _ = relay_busy.should_drop(&pkt, no_graph);
         }
@@ -1997,5 +2065,106 @@ mod tests {
         let mut buf = [0u8; 48];
         let n = format_young_announce(&ann, &mut buf);
         assert_eq!(&buf[..n], b"Y !aabbccdd !01020304");
+    }
+
+    #[test]
+    fn default_channel_unicast_to_limited_originator_is_dropped() {
+        let mut limiter = NodeRateLimiter::new();
+        let banned = 0x0BAD_F00D;
+        let responder = 0x1111_2222;
+        for i in 0..THRESHOLD_OTHER {
+            assert_eq!(
+                drop_other(&mut limiter, banned, i * 100),
+                i + 1 >= THRESHOLD_OTHER,
+                "other charge {i}"
+            );
+        }
+        assert!(limiter.originator_limited(banned));
+
+        assert!(
+            limiter.should_drop(&dest_pkt(responder, banned, true, 400), no_graph),
+            "default-channel unicast to a limited originator must drop"
+        );
+        assert_eq!(
+            limiter.take_event(),
+            Some(RateLimitEvent::DestDrop { node_id: banned })
+        );
+        assert!(
+            !limiter.originator_limited(responder),
+            "dest-drop must not charge the responder"
+        );
+        assert!(!limiter.is_tracking_originator(responder));
+
+        assert!(
+            !limiter.should_drop(&dest_pkt(responder, banned, false, 401), no_graph),
+            "non-default unicast to a limited originator must pass"
+        );
+        assert!(
+            !limiter.should_drop(
+                &originator_pkt(responder, Some(num::NODEINFO_APP), 402),
+                no_graph
+            ),
+            "broadcast from a responder is not dest-dropped"
+        );
+    }
+
+    #[test]
+    fn dest_drop_does_not_apply_to_relay_only_limit() {
+        let mut limiter = NodeRateLimiter::new();
+        let last_hop = 0x0A00_0011;
+        for i in 0..59u32 {
+            let pkt = RateLimitPacket {
+                from: 0x2200_0000 + i,
+                to: NODENUM_BROADCAST,
+                decoded_portnum: Some(num::TEXT_MESSAGE_APP),
+                now_ms: i,
+                rebroadcast_candidate: true,
+                resolved_relay: Some(last_hop),
+                airtime_ms: RELAY_REF_AIRTIME_MS,
+                channel_util_pct: 0.0,
+                graph_established: true,
+                on_default_channel: true,
+            };
+            assert!(!limiter.should_drop(&pkt, no_graph), "relay charge {i}");
+        }
+        let trip = RateLimitPacket {
+            from: 0x2200_003B,
+            to: NODENUM_BROADCAST,
+            decoded_portnum: Some(num::TEXT_MESSAGE_APP),
+            now_ms: 59,
+            rebroadcast_candidate: true,
+            resolved_relay: Some(last_hop),
+            airtime_ms: RELAY_REF_AIRTIME_MS,
+            channel_util_pct: 0.0,
+            graph_established: true,
+            on_default_channel: true,
+        };
+        assert!(limiter.should_drop(&trip, no_graph));
+        assert!(limiter.relay_limited(last_hop));
+        assert!(!limiter.originator_limited(last_hop));
+        assert!(
+            !limiter.should_drop(&dest_pkt(0x1111_2222, last_hop, true, 100), no_graph),
+            "RELAY-limited last hop is not an originator ban"
+        );
+    }
+
+    #[test]
+    fn dest_drop_lifts_when_originator_clears() {
+        let mut limiter = NodeRateLimiter::new();
+        let banned = 0x0BAD_F00D;
+        let responder = 0x1111_2222;
+        for _ in 0..3 {
+            assert!(!drop_other(&mut limiter, banned, 0));
+        }
+        assert!(drop_other(&mut limiter, banned, 0));
+        assert!(limiter.should_drop(&dest_pkt(responder, banned, true, 400), no_graph));
+
+        assert!(drop_other(&mut limiter, banned, WINDOW_MS + 1));
+        assert!(!drop_other(&mut limiter, banned, 2 * WINDOW_MS + 2));
+        assert!(!limiter.originator_limited(banned));
+        assert!(!limiter.should_drop(
+            &dest_pkt(responder, banned, true, 2 * WINDOW_MS + 3),
+            no_graph
+        ));
     }
 }

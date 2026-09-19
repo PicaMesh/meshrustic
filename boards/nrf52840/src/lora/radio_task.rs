@@ -430,7 +430,14 @@ fn handle_rx_frame(
             }
         }
 
-        if result.rate_limited {
+        if result.dest_rate_limited {
+            defmt::warn!(
+                "[RateLimit] drop to !{:08x} from !{:08x}",
+                result.parsed.to,
+                result.parsed.from
+            );
+            crate::usb_log::log::rate_limit::drop_to(result.parsed.to, result.parsed.from);
+        } else if result.rate_limited {
             defmt::warn!("[RateLimit] drop from !{:08x}", result.parsed.from);
             crate::usb_log::log::rate_limit::drop_from(result.parsed.from);
         } else if result.duplicate {

@@ -835,6 +835,16 @@ pub mod rate_limit {
         put_hex8(&mut line, &mut pos, from);
         finish_line(&mut line, pos);
     }
+
+    pub fn drop_to(to: u32, from: u32) {
+        let mut line = [0u8; 80];
+        let mut pos = line_prefix(&mut line);
+        put(&mut line, &mut pos, b"[RateLimit] drop to !");
+        put_hex8(&mut line, &mut pos, to);
+        put(&mut line, &mut pos, b" from !");
+        put_hex8(&mut line, &mut pos, from);
+        finish_line(&mut line, pos);
+    }
 }
 
 pub mod qos {
@@ -1374,6 +1384,15 @@ pub mod sr {
                 let mut body = [0u8; 48];
                 let n = mesh_routing::format_young_announce(&ann, &mut body);
                 put(&mut line, &mut pos, &body[..n]);
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RateLimitDestDrop { from, to } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[RateLimit] drop to !");
+                put_hex8(&mut line, &mut pos, to);
+                put(&mut line, &mut pos, b" from !");
+                put_hex8(&mut line, &mut pos, from);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::TopologySending {

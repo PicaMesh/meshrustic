@@ -339,3 +339,71 @@ fn multi_from_one_resolved_relay_is_contained() {
     assert!(result.rate_limited);
     assert_eq!(router.graph_mut().get_downstream_relay(listed, 1_000), None);
 }
+
+#[test]
+fn default_channel_unicast_to_limited_originator_is_dropped() {
+    static ROUTER: StaticCell<Router> = StaticCell::new();
+    let our_node = 0xAABB_CCDD;
+    let attacker = 0x1111_2222;
+    let responder = 0x3333_4444;
+    let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+    let router = ROUTER.init({
+        let mut r = Router::with_modem_preset(our_node, "", MODEM_SHORT_SLOW, true, key, 3);
+        r.set_device_role(mesh_routing::DEVICE_ROLE_ROUTER);
+        r
+    });
+    let channel = router.channel_hash();
+    flood_other_bucket(router, attacker, channel, &key, 0);
+
+    let (len, frame) = build_app_wire_frame(
+        attacker,
+        responder,
+        0x9001,
+        channel,
+        3,
+        3,
+        false,
+        &key,
+        mesh_routing::NODEINFO_APP,
+        &[],
+        DataEncodeOpts::default(),
+        0,
+    )
+    .expect("default-channel reply");
+    let result = router
+        .process_inbound(&inbound(&frame[..len as usize]), 1_000)
+        .expect("dest-drop rx");
+    assert!(result.rate_limited);
+    assert!(result.dest_rate_limited);
+    if let Some(h) = result.handle {
+        router.release_packet(h);
+    }
+
+    let other_hash = channel.wrapping_add(1);
+    let (len, frame) = build_app_wire_frame(
+        attacker,
+        responder,
+        0x9002,
+        other_hash,
+        3,
+        3,
+        false,
+        &key,
+        mesh_routing::NODEINFO_APP,
+        &[],
+        DataEncodeOpts::default(),
+        0,
+    )
+    .expect("private-channel reply");
+    let result = router
+        .process_inbound(&inbound(&frame[..len as usize]), 1_001)
+        .expect("private dest rx");
+    assert!(
+        !result.dest_rate_limited,
+        "direct packets off the default channel are not dest-dropped"
+    );
+    if let Some(h) = result.handle {
+        router.release_packet(h);
+    }
+}
+

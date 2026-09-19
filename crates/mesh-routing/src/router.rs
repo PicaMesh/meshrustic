@@ -80,6 +80,8 @@ pub struct ProcessResult {
     pub parsed: ParsedPacket,
     pub duplicate: bool,
     pub rate_limited: bool,
+    /// Default-channel unicast to a limited originator (WantResponse-amplification cut).
+    pub dest_rate_limited: bool,
     pub handle: Option<PacketHandle>,
     pub radio_id: u8,
     pub rssi: i16,
@@ -808,6 +810,7 @@ impl Router {
                         parsed,
                         duplicate: true,
                         rate_limited: false,
+                        dest_rate_limited: false,
                         handle: None,
                         radio_id: packet.radio_id,
                         rssi: packet.rssi,
@@ -854,6 +857,7 @@ impl Router {
                         parsed,
                         duplicate: true,
                         rate_limited: false,
+                        dest_rate_limited: false,
                         handle: None,
                         radio_id: packet.radio_id,
                         rssi: packet.rssi,
@@ -912,6 +916,8 @@ impl Router {
         let payload_air_len = packet.bytes.len().saturating_sub(PACKET_HEADER_LEN);
         let air_cfg = mesh_radio::eu868_config_for_preset(self.operating_preset);
         let airtime_ms = mesh_radio::packet_time_ms(&air_cfg, payload_air_len, true).max(1);
+        let on_default_channel = parsed.channel == self.channel_hash
+            && psk_bytes(&self.channel_key) == DEFAULT_PSK.as_slice();
         let rl_pkt = crate::rate_limit::RateLimitPacket {
             from: parsed.from,
             to: parsed.to,
@@ -922,6 +928,7 @@ impl Router {
             airtime_ms,
             channel_util_pct: self.channel_util_pct,
             graph_established: self.graph.neighbor_count() > 0,
+            on_default_channel,
         };
         let rate_limited = {
             let graph = &mut self.graph;
@@ -933,6 +940,7 @@ impl Router {
         };
         self.graph
             .set_dropped_coverage(self.rate_limit.coverage_gate(now_ms));
+        let mut dest_rate_limited = false;
         if let Some(ev) = self.rate_limit.take_event() {
             match ev {
                 crate::rate_limit::RateLimitEvent::Trip { node_id, kind } => {
@@ -945,6 +953,13 @@ impl Router {
                     self.sr_log.push(SrLogEvent::RateLimitClear {
                         node_id,
                         kind: kind.as_u8(),
+                    });
+                }
+                crate::rate_limit::RateLimitEvent::DestDrop { node_id } => {
+                    dest_rate_limited = true;
+                    self.sr_log.push(SrLogEvent::RateLimitDestDrop {
+                        from: parsed.from,
+                        to: node_id,
                     });
                 }
             }
@@ -972,14 +987,17 @@ impl Router {
                     packet.radio_id,
                 );
             }
-            self.sr_log.push(SrLogEvent::RelaySkip {
-                from: parsed.from,
-                reason: SrSkipReason::RateLimited,
-            });
+            if !dest_rate_limited {
+                self.sr_log.push(SrLogEvent::RelaySkip {
+                    from: parsed.from,
+                    reason: SrSkipReason::RateLimited,
+                });
+            }
             return Some(ProcessResult {
                 parsed,
                 duplicate: false,
                 rate_limited: true,
+                dest_rate_limited,
                 handle: None,
                 radio_id: packet.radio_id,
                 rssi: packet.rssi,
@@ -1121,6 +1139,7 @@ impl Router {
             parsed,
             duplicate: false,
             rate_limited: false,
+            dest_rate_limited: false,
             handle: Some(handle),
             radio_id: packet.radio_id,
             rssi: packet.rssi,

@@ -720,6 +720,11 @@ is actually waiting for.
 - Per source node and 90 s window: TEXT 30, ROUTING 10, OTHER 4, UNKNOWN 12; packets addressed to
   us are exempt (`NodeRateLimiter`). `ADMIN_APP` is not exempt by portnum (PKI remote admin is
   opaque to relays and lands in UNKNOWN; the destination is covered by the to-us exemption).
+  While any originator bucket for a node is limited, unicast frames *to* that node on the default
+  public channel are logged and dropped without charging the sender: WantResponse replies from
+  other nodes would otherwise keep flooding after the originator itself is already silenced.
+  Unicast on a non-default channel (private PSK) is not dest-dropped. RELAY and YOUNG limits do
+  not dest-drop; only an originator ban does.
   Rebroadcast candidates also charge a RELAY airtime budget (8 resolved last-hop slots + 1 shared
   unresolved; trip≈60 / clear≈15 packet-eq; hybrid AirUtil tighten; floors/ceilings). Direct
   first-hop frames key RELAY on the originator NodeID. The shared unresolved slot is not charged

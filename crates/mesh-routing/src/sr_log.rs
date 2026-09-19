@@ -97,6 +97,11 @@ pub enum SrLogEvent {
         ids: [u32; 4],
         count: u8,
     },
+    /// Default-channel unicast to a limited originator.
+    RateLimitDestDrop {
+        from: u32,
+        to: u32,
+    },
     TopologySending {
         node_id: u32,
         neighbors: u8,
