@@ -724,6 +724,15 @@ is actually waiting for.
   source as downstream of that peer invents a path back through ourselves, and the two nodes then
   name each other as next hop for that destination until a unicast bounces between them. Our own
   transmissions are therefore skipped (`has_our_transmission`).
+- **A travelling neighbour heard only through a relay stops being a last hop immediately.** A
+  sender we still listed as a `Reported` direct neighbour, heard only through a resolved relayer,
+  is retracted (`retract_direct_link`) and written as downstream of that relayer. Relayed copies
+  do not refresh our measurement of the sender, so without this a node that moved behind a hop
+  kept drawing unicasts onto a dead last hop until `PUBLISHER_SILENCE_MS`. Their later topology
+  must not reinstall `sender → us` unless we hear them again — Dijkstra would treat us as that
+  last hop from a stale list. A later *direct* frame from them (`observe_direct_neighbor` +
+  `clear_for_destination`) restores the neighbour and drops every downstream row for them.
+  Tests: `a_relayed_former_neighbour_becomes_downstream`.
 
 ## 6. Inbound policing
 

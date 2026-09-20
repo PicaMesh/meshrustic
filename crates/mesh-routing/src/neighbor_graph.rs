@@ -1009,7 +1009,6 @@ impl NeighborGraph {
         None
     }
 
-    #[allow(dead_code)]
     fn remove_direct_signal(&mut self, node_id: u32) {
         let mut write = 0u8;
         for i in 0..self.direct_signal_count as usize {
@@ -1280,6 +1279,9 @@ impl NeighborGraph {
         self.edges.ensure_local_node(self.my_node, now_ms);
         self.merge_asymmetric_skip_count = 0;
 
+        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
+        // last hop to them from a stale list after they moved behind a relay.
+        let sender_is_direct = self.edges.has_direct_reported_edge_to(self.my_node, sender);
         let passive_local = !self.is_active_routing_role();
         for neighbor in neighbors {
             if neighbor.node_id == 0 || (neighbor.node_id & 0xFF00_0000) == 0xFF00_0000 {
@@ -1302,31 +1304,33 @@ impl NeighborGraph {
                 .find_node(sender)
                 .and_then(|n| n.find_edge(neighbor.node_id))
                 .is_some();
-            self.edges.update_edge(
-                self.my_node,
-                sender,
-                neighbor.node_id,
-                etx,
-                now_ms,
-                EdgeSource::Mirrored,
-                false,
-                heard_on,
-            );
-            self.edges
-                .set_edge_hears_us(sender, neighbor.node_id, neighbor.hears_us);
-            // The sender lists us as a neighbor it hears directly. That is positive
-            // evidence the sender hears us. SR-passive nodes broadcast topology but
-            // never relay, so this is their only way to earn `hears_us` (SR-mute nodes
-            // send no topology at all and are unaffected).
-            if neighbor.node_id == self.my_node {
-                self.edges.set_edge_hears_us(self.my_node, sender, true);
-            } else {
-                // The same evidence proves the sender hears every other listed node: mark the
-                // listed node's own edge to the sender (if it has reported one) as heard, so we
-                // model our peers' coverage of the sender the way they model it themselves.
-                // Without this, two nodes that both just learned a passive neighbour each saw
-                // the other as not covering it and both took slot 0 for its packets.
-                self.edges.set_edge_hears_us(neighbor.node_id, sender, true);
+            if neighbor.node_id != self.my_node || sender_is_direct {
+                self.edges.update_edge(
+                    self.my_node,
+                    sender,
+                    neighbor.node_id,
+                    etx,
+                    now_ms,
+                    EdgeSource::Mirrored,
+                    false,
+                    heard_on,
+                );
+                self.edges
+                    .set_edge_hears_us(sender, neighbor.node_id, neighbor.hears_us);
+                // The sender lists us as a neighbor it hears directly. That is positive
+                // evidence the sender hears us. SR-passive nodes broadcast topology but
+                // never relay, so this is their only way to earn `hears_us` (SR-mute nodes
+                // send no topology at all and are unaffected).
+                if neighbor.node_id == self.my_node {
+                    self.edges.set_edge_hears_us(self.my_node, sender, true);
+                } else {
+                    // The same evidence proves the sender hears every other listed node: mark the
+                    // listed node's own edge to the sender (if it has reported one) as heard, so we
+                    // model our peers' coverage of the sender the way they model it themselves.
+                    // Without this, two nodes that both just learned a passive neighbour each saw
+                    // the other as not covering it and both took slot 0 for its packets.
+                    self.edges.set_edge_hears_us(neighbor.node_id, sender, true);
+                }
             }
 
             let has_direct_connection = neighbor.node_id == self.my_node
@@ -1574,6 +1578,7 @@ impl NeighborGraph {
         let result = self.refresh_reported_direct_neighbor(node_id, rssi, snr, now_ms, heard_on);
         if result == EDGE_NEW || result == EDGE_SIGNIFICANT_CHANGE {
             self.topology_dirty = true;
+            self.route_cache.clear();
         }
         self.downstream.clear_for_destination(node_id);
         result == EDGE_NEW
@@ -1681,6 +1686,13 @@ impl NeighborGraph {
         if self.has_our_transmission(packet_id) {
             return None;
         }
+        // A former direct neighbour heard only through this relayer is retracted immediately —
+        // waiting for publisher silence left travelling unicasts aimed at a dead last hop.
+        let was_direct_neighbor = self.edges.has_direct_reported_edge_to(self.my_node, from);
+        if was_direct_neighbor && self.retract_direct_link(from) {
+            self.remove_direct_signal(from);
+            self.topology_dirty = true;
+        }
         // Measuring a relayer we heard is first-hand observation, not inference: the RSSI and SNR
         // come off the relayer's own frame, exactly as they do for a frame that arrived direct. So
         // every node records it, whatever its role. Only the node that hears a relayer can supply
@@ -1759,21 +1771,37 @@ impl NeighborGraph {
             .edges
             .has_direct_reported_edge_to(self.my_node, gateway)
             || is_placeholder_node(gateway);
-        if active_routing
-            && can_infer_downstream
-            && (single_hop || !source_sr_active)
-            && !self.is_downstream_relay_for(gateway, from, now_ms)
-        {
-            self.downstream.update(
-                self.my_node,
-                from,
-                gateway,
-                path_etx,
-                now_ms,
-                false,
-                heard_on,
-            );
-            self.route_cache.clear();
+        // Former direct neighbour heard only via this relay: always infer — they moved.
+        // Single-hop: sender went through the gateway to reach us.
+        // Multi-hop, non-SR source: stock nodes never advertise topology.
+        // Multi-hop SR-aware that was never our neighbour: skip — their own lists are better.
+        let infer_downstream = was_direct_neighbor || single_hop || !source_sr_active;
+        if active_routing && can_infer_downstream && infer_downstream {
+            if was_direct_neighbor {
+                // Write even when the relayer already published an edge to them: they still
+                // have to sit behind the hop we heard, not as our last hop.
+                self.downstream.update_exclusive(
+                    self.my_node,
+                    from,
+                    gateway,
+                    path_etx,
+                    now_ms,
+                    false,
+                    heard_on,
+                );
+                self.route_cache.clear();
+            } else if !self.is_downstream_relay_for(gateway, from, now_ms) {
+                self.downstream.update(
+                    self.my_node,
+                    from,
+                    gateway,
+                    path_etx,
+                    now_ms,
+                    false,
+                    heard_on,
+                );
+                self.route_cache.clear();
+            }
         }
 
         if active_routing {
@@ -1907,6 +1935,21 @@ impl NeighborGraph {
     pub fn transfer_downstream(&mut self, old_relay: u32, new_relay: u32, now_ms: u32) -> usize {
         self.downstream
             .transfer_downstream(old_relay, new_relay, now_ms)
+    }
+
+    /// Drop our measured link to `neighbor` and their edge back to us. Used when we hear them
+    /// only through a relayer, so Dijkstra stops treating them as a last hop. Returns true if
+    /// our edge to them existed.
+    fn retract_direct_link(&mut self, neighbor: u32) -> bool {
+        if neighbor == 0 || neighbor == self.my_node {
+            return false;
+        }
+        let removed = self.edges.remove_edge(self.my_node, neighbor);
+        self.edges.remove_edge(neighbor, self.my_node);
+        if removed {
+            self.route_cache.clear();
+        }
+        removed
     }
 
     pub fn replace_gateway_node(&mut self, old_node: u32, new_node: u32, now_ms: u32) {
@@ -2515,8 +2558,7 @@ impl NeighborGraph {
         for &node_id in &gone[..count] {
             // Only our own claim of a direct link goes. The node itself stays: a peer that still
             // hears it keeps it reachable, and a unicast for it must still find that route.
-            self.edges.remove_edge(self.my_node, node_id);
-            self.edges.remove_edge(node_id, self.my_node);
+            self.retract_direct_link(node_id);
             self.downstream.clear_for_destination(node_id);
         }
         count > 0
@@ -4117,6 +4159,69 @@ mod tests {
             graph.get_downstream_relay(0xBB00_00BB, 200),
             Some(placeholder)
         );
+    }
+
+    #[test]
+    fn a_relayed_former_neighbour_becomes_downstream() {
+        // A neighbour we used to hear, now heard only through a relay, must leave our direct set
+        // immediately and sit behind that relay — otherwise unicasts keep aiming at a dead last hop.
+        const ME: u32 = 0x0A0B_0C0D;
+        const TRAVELLER: u32 = 0x1111_1111;
+        const RELAY: u32 = 0x2222_2222;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(TRAVELLER, -70, 8, 1_000, 0);
+        graph.observe_direct_neighbor(RELAY, -70, 8, 1_000, 0);
+        graph.edges_mut().set_edge_hears_us(ME, TRAVELLER, true);
+        graph.edges_mut().set_edge_hears_us(ME, RELAY, true);
+        graph
+            .capability_mut()
+            .track_topology(TRAVELLER, true, 1_000);
+        graph.capability_mut().track_topology(RELAY, true, 1_000);
+        for (from, to) in [(RELAY, TRAVELLER), (TRAVELLER, RELAY)] {
+            graph
+                .edges_mut()
+                .update_edge(ME, from, to, 1.2, 1_000, EdgeSource::Mirrored, true, 0);
+        }
+        graph.edges_mut().set_edge_hears_us(RELAY, TRAVELLER, true);
+
+        assert_eq!(graph.get_route(TRAVELLER, 1_000).next_hop, TRAVELLER);
+
+        // Multi-hop and SR-aware: without the travelling retract this would skip downstream.
+        graph.observe_packet(TRAVELLER, 3, 1, 0x22, -70, 8, 2_000, 0, Some(RELAY), 7);
+
+        assert!(
+            !graph.is_our_direct_neighbor(TRAVELLER),
+            "a sender heard only via a relay is no longer a last hop"
+        );
+        assert!(!graph.test_has_edge(ME, TRAVELLER));
+        assert_eq!(graph.get_downstream_relay(TRAVELLER, 2_000), Some(RELAY));
+        assert_eq!(graph.get_route(TRAVELLER, 2_000).next_hop, RELAY);
+
+        // Their later list must not reinstall sender→us: Dijkstra would treat us as that last hop.
+        let lists_us = PackedNeighbor {
+            node_id: ME,
+            rssi: -72,
+            snr: 7,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(TRAVELLER, &header, &[lists_us], false, 2_100, 0);
+        assert!(
+            !graph.test_has_edge(TRAVELLER, ME),
+            "a list from a sender we no longer hear must not reinstall sender→us"
+        );
+        assert_eq!(graph.get_route(TRAVELLER, 2_100).next_hop, RELAY);
+
+        graph.observe_direct_neighbor(TRAVELLER, -70, 8, 3_000, 0);
+        graph.edges_mut().set_edge_hears_us(ME, TRAVELLER, true);
+        assert!(graph.get_downstream_relay(TRAVELLER, 3_000).is_none());
+        assert_eq!(graph.get_route(TRAVELLER, 3_000).next_hop, TRAVELLER);
     }
 
     #[test]
