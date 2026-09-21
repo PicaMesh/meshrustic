@@ -42,7 +42,11 @@ jobs:
           echo "image=${REGISTRY}/${name}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       # Same Dockerfile devs build locally — this is the whole point.
+      # The build record is a GitHub artifact (*.dockerbuild). nightly.link
+      # publishes every artifact on the workflow, so leave it off.
       - uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           file: docker/Dockerfile
