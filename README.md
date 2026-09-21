@@ -53,7 +53,7 @@ CI on `master` uploads both files as the `mr-nrf52840-nicenano` artifact. Downlo
 
 [https://nightly.link/PicaMesh/meshrustic/workflows/ci/master](https://nightly.link/PicaMesh/meshrustic/workflows/ci/master)
 
-To put a nearby nicenano into the bootloader so the DFU app can flash that zip, send a **PKI private message** (not a channel chat) from a remote-admin-authorized node that has a **direct** LoRa hop to the target, with the exact body `ENTER DFU`. The node waits two seconds (WantAck can go out), then resets into Adafruit BLE DFU. If nobody starts a transfer, the bootloader returns to the old app after about six minutes.
+To put a nearby nicenano into the bootloader so the DFU app can flash that zip, send a **PKI private message** (not a channel chat) from a remote-admin-authorized node that has a **direct** LoRa hop to the target, with the exact body `ENTER DFU`. The node replies `Entering DFU`, waits two seconds so that text can leave, then about 30 seconds for the watchdog to time out (it cannot be stopped, and that timeout reset comes back into the application). The following boot soft-resets into Adafruit BLE DFU with the watchdog off. If nobody starts a transfer, the bootloader returns to the old app after about six minutes.
 
 The Pro Micro DIY + HT-RA62 pin map in this firmware matches the MT variant on a
 nice!nano carrier board. `uf2` links at **0x26000** (Adafruit UF2 + SoftDevice S140 v6);

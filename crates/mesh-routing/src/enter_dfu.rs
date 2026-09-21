@@ -3,7 +3,10 @@
 /// Exact DM body the Meshtastic app can send (trimmed). Case-sensitive.
 pub const ENTER_DFU_TEXT: &[u8] = b"ENTER DFU";
 
-/// Seconds to wait after arming so a WantAck reply can go out before the board resets.
+/// PKI text sent back to the admin before the node leaves the application.
+pub const DFU_CONFIRM_TEXT: &[u8] = b"Entering DFU";
+
+/// Seconds to wait after arming so the confirmation can leave before the board resets.
 pub const DFU_ENTER_DELAY_SECS: i32 = 2;
 
 fn is_ascii_ws(b: u8) -> bool {

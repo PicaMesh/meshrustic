@@ -65,7 +65,9 @@ pub use coordinated_relay::{
     cw_size_from_snr, half_airtime_ms, slot_time_for_preset, transmission_record_window_ms,
     tx_delay_ms_worst, DEFAULT_SLOT_MS,
 };
-pub use enter_dfu::{payload_is_enter_dfu, DFU_ENTER_DELAY_SECS, ENTER_DFU_TEXT};
+pub use enter_dfu::{
+    payload_is_enter_dfu, DFU_CONFIRM_TEXT, DFU_ENTER_DELAY_SECS, ENTER_DFU_TEXT,
+};
 pub use graph::{
     calculate_etx, calculate_route, can_deliver, covers, delivery_hop_cost_fixed, etx_to_fixed,
     etx_to_signal, find_better_positioned_neighbor, fixed_to_etx, get_placeholder_for_relay,

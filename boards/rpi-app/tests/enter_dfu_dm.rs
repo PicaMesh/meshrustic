@@ -3,8 +3,9 @@
 use mesh_crypto::CryptoEngine;
 use mesh_protocol::{num::TEXT_MESSAGE_APP, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
-    build_app_wire_frame, payload_is_enter_dfu, DataEncodeOpts, InboundPacket, NodeInfoIdentity,
-    Router, DEVICE_ROLE_ROUTER, DFU_ENTER_DELAY_SECS, ENTER_DFU_TEXT,
+    build_app_wire_frame, decode_data_payload_full, payload_is_enter_dfu, DataEncodeOpts,
+    InboundPacket, NodeInfoIdentity, Router, DEVICE_ROLE_ROUTER, DFU_CONFIRM_TEXT,
+    DFU_ENTER_DELAY_SECS, ENTER_DFU_TEXT,
 };
 use mesh_store::{default_channel_key, generate_keypair, NodeConfig};
 
@@ -131,6 +132,24 @@ fn pki_direct_admin_dm_arms_ota_dfu() {
         router.take_pending_ota_dfu_seconds(),
         Some(DFU_ENTER_DELAY_SECS)
     );
+    let plan = router.poll_ack_tx(1_000).expect("confirmation queued");
+    let parsed = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN])
+        .unwrap()
+        .parse();
+    assert_eq!(parsed.to, peer);
+    assert_eq!(parsed.from, our);
+    assert!(!parsed.want_ack);
+    let cipher = &plan.bytes[PACKET_HEADER_LEN..plan.len as usize];
+    let mut plain = vec![0u8; cipher.len()];
+    let mut engine = CryptoEngine::new();
+    engine.set_dh_private_key(&b1_priv);
+    assert!(engine.decrypt_curve25519(our, &node_pub, parsed.id as u64, cipher, &mut plain));
+    let plain_len = cipher.len() - 12;
+    let (data, inner) = decode_data_payload_full(&plain[..plain_len]).unwrap();
+    assert_eq!(data.portnum, TEXT_MESSAGE_APP);
+    assert_eq!(data.request_id, 0xDF01);
+    assert_eq!(inner.as_slice(), DFU_CONFIRM_TEXT);
+    assert!(router.poll_ack_tx(1_000).is_none());
 }
 
 #[test]

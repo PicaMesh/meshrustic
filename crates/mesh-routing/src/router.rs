@@ -18,7 +18,7 @@ use crate::admin_codec::{AdminPayload, ADMIN_APP};
 use crate::coordinated_relay::{
     half_airtime_ms, slot_time_for_preset, tx_delay_ms_contention, tx_delay_ms_worst,
 };
-use crate::enter_dfu::{payload_is_enter_dfu, DFU_ENTER_DELAY_SECS};
+use crate::enter_dfu::{payload_is_enter_dfu, DFU_CONFIRM_TEXT, DFU_ENTER_DELAY_SECS};
 use crate::neighbor_graph::LAST_HOP_BUDGET;
 use crate::neighbor_graph::{
     MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS, TOPOLOGY_BROADCAST_MS,
@@ -1146,7 +1146,7 @@ impl Router {
                 }
             } else if data.portnum == TEXT_MESSAGE_APP && parsed.to == self.node_num {
                 if let Some(ref inner) = inner {
-                    self.maybe_arm_ota_dfu(&parsed, inner);
+                    self.maybe_arm_ota_dfu(&parsed, inner, data.has_bitfield, now_ms);
                 }
             }
         } else if parsed.to == self.node_num {
@@ -1313,7 +1313,13 @@ impl Router {
     }
 
     /// PKI private `ENTER DFU` from an authorized admin on a direct RF hop.
-    fn maybe_arm_ota_dfu(&mut self, parsed: &ParsedPacket, text: &[u8]) {
+    fn maybe_arm_ota_dfu(
+        &mut self,
+        parsed: &ParsedPacket,
+        text: &[u8],
+        hop_start_known: bool,
+        now_ms: u32,
+    ) {
         if !self.admin_reply_use_pki {
             return;
         }
@@ -1334,7 +1340,51 @@ impl Router {
         if !payload_is_enter_dfu(text) {
             return;
         }
+        if self.queue_dfu_confirm(parsed, hop_start_known, now_ms) {
+            // The text carries the request id, so it is the WantAck reply.
+            self.module_reply_suppresses_ack = true;
+        }
         self.pending_ota_dfu_seconds = Some(DFU_ENTER_DELAY_SECS);
+    }
+
+    /// PKI text back to the admin: "Entering DFU".
+    fn queue_dfu_confirm(
+        &mut self,
+        parsed: &ParsedPacket,
+        hop_start_known: bool,
+        now_ms: u32,
+    ) -> bool {
+        let Some(remote_pk) = self.admin_reply_remote_pk else {
+            return false;
+        };
+        let (hop, next_hop) = self.response_header(parsed, hop_start_known);
+        let id = self.alloc_tx_id(now_ms);
+        let opts = DataEncodeOpts {
+            want_response: false,
+            request_id: parsed.id,
+            bitfield: self.ours(),
+            ..Default::default()
+        };
+        let Some((len, bytes)) = self.build_pki_app_frame(
+            parsed.from,
+            id,
+            hop,
+            TEXT_MESSAGE_APP,
+            DFU_CONFIRM_TEXT,
+            opts,
+            &remote_pk,
+            false,
+            next_hop,
+        ) else {
+            return false;
+        };
+        self.pending_ack = PendingAck {
+            active: true,
+            next_tx_ms: now_ms,
+            len,
+            bytes,
+        };
+        true
     }
 
     fn process_admin_rx(

@@ -86,6 +86,9 @@ pub async fn radio_task(
     let mut sr_log_buf: heapless::Vec<SrLogEvent, MAX_SR_LOG> = heapless::Vec::new();
     let mut reboot_deadline: Option<Instant> = None;
     let mut ota_dfu_deadline: Option<Instant> = None;
+    // Log line is queued before USB can send it. Keep petting across this window
+    // so the host sees the entry, then park for the watchdog.
+    let mut ota_park_at: Option<Instant> = None;
     // LoRa preset: persist + soft-reinit after completion reply TX (never sys_reset).
     let mut radio_reinit_pending = false;
     // The only decision point for keying up: post-reception turnaround, post-TX gap and the
@@ -188,10 +191,19 @@ pub async fn radio_task(
             ota_dfu_deadline = Some(Instant::now() + secs_to_delay(secs));
         }
         if let Some(deadline) = ota_dfu_deadline {
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline && ota_park_at.is_none() {
                 defmt::info!("[meshrustic] enter Adafruit BLE OTA DFU");
                 crate::usb_log::log::mesh::enter_ota_dfu();
-                enter_ota_dfu(watchdog.is_some());
+                ota_park_at = Some(Instant::now() + Duration::from_millis(400));
+            }
+        }
+        if let Some(park_at) = ota_park_at {
+            if Instant::now() >= park_at {
+                if watchdog.is_some() {
+                    crate::dfu::park_for_watchdog_reset();
+                } else {
+                    crate::dfu::reset_into_ota_now();
+                }
             }
         }
         if let Some(deadline) = reboot_deadline {
@@ -602,21 +614,8 @@ fn apply_modem_preset_soft(slot: &mut RadioSlot<Sx1262Driver>, preset: u8) {
 
 /// Soft-reset without entering Adafruit UF2 / CDC upload mode.
 fn soft_reset_skip_uf2() -> ! {
-    write_dfu_gpregret(DFU_MAGIC_SKIP);
+    crate::dfu::write_gpregret(crate::dfu::DFU_MAGIC_SKIP);
     cortex_m::peripheral::SCB::sys_reset()
-}
-
-/// Adafruit_nRF52_Bootloader: DFU_MAGIC_SKIP / DFU_MAGIC_OTA_RESET in GPREGRET.
-const NRF_POWER_GPREGRET: *mut u32 = 0x4000_051C as *mut u32;
-const DFU_DBL_RESET_MEM: *mut u32 = 0x2000_7F7C as *mut u32;
-const DFU_MAGIC_SKIP: u32 = 0x6d;
-const DFU_MAGIC_OTA_RESET: u32 = 0xA8;
-
-fn write_dfu_gpregret(magic: u32) {
-    unsafe {
-        core::ptr::write_volatile(NRF_POWER_GPREGRET, magic);
-        core::ptr::write_volatile(DFU_DBL_RESET_MEM, 0);
-    }
 }
 
 fn secs_to_delay(secs: i32) -> Duration {
@@ -626,17 +625,4 @@ fn secs_to_delay(secs: i32) -> Duration {
         (secs as u64).saturating_mul(1000)
     };
     Duration::from_millis(delay_ms)
-}
-
-/// Enter Adafruit BLE OTA DFU. A running nRF WDT cannot be stopped; a software
-/// reset would leave it armed and kick the bootloader after 30s. A WDT timeout
-/// reset disables the watchdog and GPREGRET survives, so we stop petting.
-fn enter_ota_dfu(wdt_armed: bool) -> ! {
-    write_dfu_gpregret(DFU_MAGIC_OTA_RESET);
-    if wdt_armed {
-        loop {
-            cortex_m::asm::wfi();
-        }
-    }
-    cortex_m::peripheral::SCB::sys_reset()
 }
