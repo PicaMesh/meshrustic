@@ -7,6 +7,7 @@ pub const ADMIN_APP: u32 = 6;
 
 /// `ConfigType` values used by `get_config_request`.
 pub const CONFIG_TYPE_DEVICE: u32 = 0;
+pub const CONFIG_TYPE_POSITION: u32 = 1;
 pub const CONFIG_TYPE_LORA: u32 = 5;
 pub const CONFIG_TYPE_SECURITY: u32 = 7;
 pub const CONFIG_TYPE_SESSIONKEY: u32 = 8;
@@ -138,10 +139,28 @@ impl Default for WireChannel {
     }
 }
 
+/// `Config.PositionConfig` fields this node honors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct WirePositionConfig {
+    /// Seconds; 0 = role default (1 h, or 12 h for ROUTER / ROUTER_LATE).
+    pub position_broadcast_secs: u32,
+    pub fixed_position: bool,
+}
+
+/// Lat/lon from `AdminMessage.set_fixed_position`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct WireFixedPosition {
+    pub latitude_i: i32,
+    pub longitude_i: i32,
+    pub has_latitude_i: bool,
+    pub has_longitude_i: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigPayload {
     Empty,
     Device(WireDeviceConfig),
+    Position(WirePositionConfig),
     Lora(WireLoRaConfig),
     Security(WireSecurityConfig),
     Sessionkey,
@@ -193,6 +212,8 @@ pub enum AdminPayload {
     GetDeviceMetadataResponse(DeviceMetadata),
     SetConfig(ConfigPayload),
     SetModuleConfig(ModuleConfigPayload),
+    SetFixedPosition(WireFixedPosition),
+    RemoveFixedPosition,
     BeginEditSettings,
     CommitEditSettings,
     RebootSeconds(i32),
@@ -224,6 +245,10 @@ pub fn encode_config(config: &ConfigPayload) -> heapless::Vec<u8, 240> {
             let inner = encode_device_config(dev);
             push_bytes_field(&mut out, 1, &inner);
         }
+        ConfigPayload::Position(pos) => {
+            let inner = encode_position_config(pos);
+            push_bytes_field(&mut out, 2, &inner);
+        }
         ConfigPayload::Lora(lora) => {
             let inner = encode_lora_config(lora);
             push_bytes_field(&mut out, 6, &inner);
@@ -236,6 +261,85 @@ pub fn encode_config(config: &ConfigPayload) -> heapless::Vec<u8, 240> {
             // Empty SessionkeyConfig message on field 9.
             push_bytes_field(&mut out, 9, &[]);
         }
+    }
+    out
+}
+
+pub fn encode_position_config(pos: &WirePositionConfig) -> heapless::Vec<u8, 16> {
+    let mut out = heapless::Vec::new();
+    if pos.position_broadcast_secs != 0 {
+        push_varint_field(&mut out, 1, pos.position_broadcast_secs);
+    }
+    if pos.fixed_position {
+        push_varint_field(&mut out, 3, 1);
+    }
+    out
+}
+
+pub fn decode_position_config(payload: &[u8]) -> Option<WirePositionConfig> {
+    let mut pos = WirePositionConfig::default();
+    let mut idx = 0usize;
+    while idx < payload.len() {
+        let (tag, mut i) = read_varint(payload, idx)?;
+        let field = tag >> 3;
+        let wire = (tag & 0x07) as u8;
+        match (field, wire) {
+            (1, 0) => {
+                let (v, ni) = read_varint(payload, i)?;
+                pos.position_broadcast_secs = v;
+                i = ni;
+            }
+            (3, 0) => {
+                let (v, ni) = read_varint(payload, i)?;
+                pos.fixed_position = v != 0;
+                i = ni;
+            }
+            _ => {
+                // Smart broadcast, GPS, position flags, and GPIO are not stored.
+                i = skip_field(payload, i, wire)?;
+            }
+        }
+        idx = i;
+    }
+    Some(pos)
+}
+
+fn decode_fixed_position_admin(payload: &[u8]) -> Option<WireFixedPosition> {
+    let mut pos = WireFixedPosition::default();
+    let mut idx = 0usize;
+    while idx < payload.len() {
+        let (tag, mut i) = read_varint(payload, idx)?;
+        let field = tag >> 3;
+        let wire = (tag & 0x07) as u8;
+        match (field, wire) {
+            (1, 5) if i + 4 <= payload.len() => {
+                pos.latitude_i = i32::from_le_bytes(payload[i..i + 4].try_into().ok()?);
+                pos.has_latitude_i = true;
+                i += 4;
+            }
+            (2, 5) if i + 4 <= payload.len() => {
+                pos.longitude_i = i32::from_le_bytes(payload[i..i + 4].try_into().ok()?);
+                pos.has_longitude_i = true;
+                i += 4;
+            }
+            _ => {
+                i = skip_field(payload, i, wire)?;
+            }
+        }
+        idx = i;
+    }
+    Some(pos)
+}
+
+fn encode_fixed_position_admin(pos: &WireFixedPosition) -> heapless::Vec<u8, 16> {
+    let mut out = heapless::Vec::new();
+    if pos.has_latitude_i {
+        push_tag(&mut out, 1, 5);
+        let _ = out.extend_from_slice(&pos.latitude_i.to_le_bytes());
+    }
+    if pos.has_longitude_i {
+        push_tag(&mut out, 2, 5);
+        let _ = out.extend_from_slice(&pos.longitude_i.to_le_bytes());
     }
     out
 }
@@ -410,6 +514,15 @@ pub fn decode_config(payload: &[u8]) -> Option<ConfigPayload> {
                     return None;
                 }
                 result = ConfigPayload::Device(decode_device_config(&payload[ni..end])?);
+                i = end;
+            }
+            (2, 2) => {
+                let (len, ni) = read_varint(payload, i)?;
+                let end = ni + len as usize;
+                if end > payload.len() {
+                    return None;
+                }
+                result = ConfigPayload::Position(decode_position_config(&payload[ni..end])?);
                 i = end;
             }
             (6, 2) => {
@@ -727,6 +840,13 @@ pub fn encode_admin_message(msg: &AdminMessage) -> heapless::Vec<u8, 240> {
             let inner = encode_module_config(config);
             push_bytes_field(&mut out, 35, &inner);
         }
+        AdminPayload::SetFixedPosition(pos) => {
+            let inner = encode_fixed_position_admin(pos);
+            push_bytes_field(&mut out, 41, &inner);
+        }
+        AdminPayload::RemoveFixedPosition => {
+            push_varint_field(&mut out, 42, 1);
+        }
         AdminPayload::BeginEditSettings => {
             push_varint_field(&mut out, 64, 1);
         }
@@ -848,6 +968,23 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
                 msg.payload =
                     AdminPayload::SetModuleConfig(decode_module_config(&payload[ni..end])?);
                 i = end;
+            }
+            (41, 2) => {
+                let (len, ni) = read_varint(payload, i)?;
+                let end = ni + len as usize;
+                if end > payload.len() {
+                    return None;
+                }
+                msg.payload =
+                    AdminPayload::SetFixedPosition(decode_fixed_position_admin(&payload[ni..end])?);
+                i = end;
+            }
+            (42, 0) => {
+                let (v, ni) = read_varint(payload, i)?;
+                if v != 0 {
+                    msg.payload = AdminPayload::RemoveFixedPosition;
+                }
+                i = ni;
             }
             (64, 0) => {
                 let (v, ni) = read_varint(payload, i)?;
@@ -1215,5 +1352,38 @@ mod tests {
     fn sessionkey_empty_config_encodes_field_9() {
         let bytes = encode_config(&ConfigPayload::Sessionkey);
         assert_eq!(bytes.as_slice(), &[0x4a, 0x00]); // field 9, length 0
+    }
+
+    #[test]
+    fn position_config_keeps_cadence_and_fixed_flag_only() {
+        // field 1 = 7200s, field 2 smart=true, field 3 fixed=true, field 13 gps_mode=ENABLED
+        let raw = [0x08, 0xA0, 0x38, 0x10, 0x01, 0x18, 0x01, 0x68, 0x01];
+        let pos = decode_position_config(&raw).unwrap();
+        assert_eq!(pos.position_broadcast_secs, 7200);
+        assert!(pos.fixed_position);
+        let encoded = encode_position_config(&pos);
+        let again = decode_position_config(&encoded).unwrap();
+        assert_eq!(again, pos);
+        assert!(!encoded.as_slice().windows(2).any(|w| w == [0x10, 0x01]));
+    }
+
+    #[test]
+    fn set_fixed_position_round_trips_lat_lon() {
+        let mut msg = AdminMessage::default();
+        msg.payload = AdminPayload::SetFixedPosition(WireFixedPosition {
+            latitude_i: 52_520_000,
+            longitude_i: 13_405_000,
+            has_latitude_i: true,
+            has_longitude_i: true,
+        });
+        let bytes = encode_admin_message(&msg);
+        match decode_admin_message(&bytes).unwrap().payload {
+            AdminPayload::SetFixedPosition(pos) => {
+                assert_eq!(pos.latitude_i, 52_520_000);
+                assert_eq!(pos.longitude_i, 13_405_000);
+                assert!(pos.has_latitude_i && pos.has_longitude_i);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

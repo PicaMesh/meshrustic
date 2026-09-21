@@ -19,6 +19,7 @@ pub mod neighbor_graph;
 pub mod nodeinfo;
 pub mod packet_history;
 pub mod pool;
+pub mod position;
 pub mod qos;
 pub mod rate_limit;
 pub mod relay;
@@ -45,10 +46,11 @@ pub use admin_codec::{
     decode_admin_message, decode_channel, decode_config, decode_module_config,
     encode_admin_message, encode_channel, encode_config, encode_module_config, AdminMessage,
     AdminPayload, ConfigPayload, DeviceMetadata, ModuleConfigPayload, WireChannel,
-    WireChannelSettings, WireDeviceConfig, WireLoRaConfig, WireSecurityConfig, WireTelemetryConfig,
-    ADMIN_APP, CHANNEL_ROLE_DISABLED, CHANNEL_ROLE_PRIMARY, CHANNEL_ROLE_SECONDARY,
-    CONFIG_TYPE_DEVICE, CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY,
-    MAX_ADMIN_KEYS, MODULE_CONFIG_TYPE_TELEMETRY, REGION_EU_868, SESSION_PASSKEY_LEN,
+    WireChannelSettings, WireDeviceConfig, WireFixedPosition, WireLoRaConfig, WirePositionConfig,
+    WireSecurityConfig, WireTelemetryConfig, ADMIN_APP, CHANNEL_ROLE_DISABLED,
+    CHANNEL_ROLE_PRIMARY, CHANNEL_ROLE_SECONDARY, CONFIG_TYPE_DEVICE, CONFIG_TYPE_LORA,
+    CONFIG_TYPE_POSITION, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS,
+    MODULE_CONFIG_TYPE_TELEMETRY, REGION_EU_868, SESSION_PASSKEY_LEN,
 };
 pub use bridge::{
     evaluate_bridge_targets, should_bridge_to, BridgeDedupCache, BridgeEval, BridgeLeg,
@@ -88,6 +90,12 @@ pub use nodeinfo::{
 };
 pub use packet_history::{ObserveResult, PacketHistory};
 pub use pool::{PacketGuard, PacketHandle, PacketPool, PacketSlot, POOL_SIZE};
+pub use position::{
+    build_fixed_position_wire_frame, coerce_position_broadcast_secs, decode_fixed_position,
+    encode_fixed_position, position_broadcast_interval_ms, position_interval_floor_secs,
+    DecodedFixedPosition, LOC_MANUAL, POSITION_APP, POSITION_BROADCAST_SECS_CLIENT,
+    POSITION_BROADCAST_SECS_MAX, POSITION_BROADCAST_SECS_ROUTER, POSITION_PRECISION_BITS,
+};
 pub use qos::ChannelQoS;
 pub use rate_limit::{
     format_young_announce, GraphProximity, NodeRateLimiter, RateLimitEvent, RateLimitKind,

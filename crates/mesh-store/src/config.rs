@@ -96,6 +96,15 @@ pub struct NodeConfig {
     pub device_update_interval_secs: u32,
     /// Configured device role (`Config.DeviceConfig.role`). Default CLIENT (0).
     pub device_role: u8,
+    /// `Config.PositionConfig.position_broadcast_secs`. Zero means the role default.
+    pub position_broadcast_secs: u32,
+    /// `Config.PositionConfig.fixed_position`.
+    pub fixed_position: bool,
+    /// `Position.latitude_i` / `longitude_i` (degrees * 1e7).
+    pub latitude_i: i32,
+    pub longitude_i: i32,
+    /// False until `set_fixed_position` stores a coordinate pair.
+    pub has_fixed_coords: bool,
 }
 
 impl NodeConfig {
@@ -109,6 +118,11 @@ impl NodeConfig {
             admin_public_keys: [[0u8; 32]; ADMIN_KEY_SLOTS],
             device_update_interval_secs: 0,
             device_role: 0,
+            position_broadcast_secs: 0,
+            fixed_position: false,
+            latitude_i: 0,
+            longitude_i: 0,
+            has_fixed_coords: false,
         }
     }
 

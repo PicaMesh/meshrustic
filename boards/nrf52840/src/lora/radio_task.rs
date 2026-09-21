@@ -126,6 +126,10 @@ pub async fn radio_task(
             enqueue_tx(telemetry, slot, router, node_num, b"telemetry");
         }
 
+        if let Some(position) = router.poll_position_tx(now_ms) {
+            enqueue_tx(position, slot, router, node_num, b"position");
+        }
+
         if let Some(tr) = router.poll_traceroute_tx(now_ms) {
             enqueue_tx(tr, slot, router, node_num, b"traceroute");
         }

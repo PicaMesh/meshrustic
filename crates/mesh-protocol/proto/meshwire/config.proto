@@ -67,6 +67,13 @@ message Config {
     RegionCode region = 7;
   }
 
+  // Fixed position only. Smart broadcast, GPS, and position flags are ignored on set
+  // and omitted on get. `position_broadcast_secs` 0 means the role default.
+  message PositionConfig {
+    uint32 position_broadcast_secs = 1;
+    bool fixed_position = 3;
+  }
+
   message SecurityConfig {
     bytes public_key = 1;
     bytes private_key = 2;
@@ -79,6 +86,7 @@ message Config {
 
   oneof payload_variant {
     DeviceConfig device = 1;
+    PositionConfig position = 2;
     LoRaConfig lora = 6;
     SecurityConfig security = 8;
     SessionkeyConfig sessionkey = 9;

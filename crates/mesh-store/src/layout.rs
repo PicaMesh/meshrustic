@@ -25,7 +25,12 @@
 //! | 123 | 1 | reserved | must encode as 0; ignore on decode (future flags) |
 //! | 124 | 96 | frozen | `admin_public_keys[3][32]` |
 //! | 220 | 4 | v4+ | `device_update_interval_secs` (0 = default); was reserved zeros |
-//! | 224 | 28 | reserved | forward-compatible padding — encode 0; do not reinterpret |
+//! | 224 | 4 | v4+ | `position_broadcast_secs` (0 = role default) |
+//! | 228 | 1 | v4+ | `fixed_position` (0/1) |
+//! | 229 | 1 | v4+ | `has_fixed_coords` (0/1) |
+//! | 230 | 4 | v4+ | `latitude_i` (i32 LE, degrees * 1e7) |
+//! | 234 | 4 | v4+ | `longitude_i` (i32 LE, degrees * 1e7) |
+//! | 238 | 14 | reserved | forward-compatible padding — encode 0; do not reinterpret |
 //! | 252 | 4 | frozen | CRC32 over bytes `[0..252)` |
 //!
 //! Additive settings: prefer consuming reserved bytes with a version bump only when
@@ -44,7 +49,7 @@ pub const STORE_VERSION_V3: u32 = 3;
 pub const STORE_RECORD_LEN: usize = 256;
 pub const STORE_RECORD_LEN_V1: usize = 128;
 /// Start of forward-compatible reserved tail (before CRC).
-pub const STORE_RESERVED_START: usize = 224;
+pub const STORE_RESERVED_START: usize = 238;
 pub const STORE_RESERVED_END: usize = 252;
 pub const STORE_CRC_OFFSET: usize = 252;
 /// Flash offset of `device_update_interval_secs` (u32 LE).
@@ -98,7 +103,12 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
         out[off..off + 32].copy_from_slice(&config.admin_public_keys[i]);
     }
     out[220..224].copy_from_slice(&config.device_update_interval_secs.to_le_bytes());
-    // 224..252 reserved — left zero for forward compatibility
+    out[224..228].copy_from_slice(&config.position_broadcast_secs.to_le_bytes());
+    out[228] = u8::from(config.fixed_position);
+    out[229] = u8::from(config.has_fixed_coords);
+    out[230..234].copy_from_slice(&config.latitude_i.to_le_bytes());
+    out[234..238].copy_from_slice(&config.longitude_i.to_le_bytes());
+    // 238..252 reserved — left zero for forward compatibility
 
     let crc = crc32(&out[..STORE_CRC_OFFSET]);
     out[STORE_CRC_OFFSET..STORE_RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
@@ -169,6 +179,11 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
     }
 
     let device_update_interval_secs = u32::from_le_bytes(buf[220..224].try_into().unwrap());
+    let position_broadcast_secs = u32::from_le_bytes(buf[224..228].try_into().unwrap());
+    let fixed_position = buf[228] != 0;
+    let has_fixed_coords = buf[229] != 0;
+    let latitude_i = i32::from_le_bytes(buf[230..234].try_into().unwrap());
+    let longitude_i = i32::from_le_bytes(buf[234..238].try_into().unwrap());
     // Byte 122 was reserved (zero) before role persistence; those records stay CLIENT.
     let device_role = buf[122];
 
@@ -181,6 +196,11 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
         admin_public_keys,
         device_update_interval_secs,
         device_role,
+        position_broadcast_secs,
+        fixed_position,
+        latitude_i,
+        longitude_i,
+        has_fixed_coords,
     })
 }
 
@@ -228,6 +248,11 @@ fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
         admin_public_keys: [[0u8; 32]; ADMIN_KEY_SLOTS],
         device_update_interval_secs: 0,
         device_role: 0,
+        position_broadcast_secs: 0,
+        fixed_position: false,
+        latitude_i: 0,
+        longitude_i: 0,
+        has_fixed_coords: false,
     })
 }
 
@@ -511,5 +536,26 @@ mod tests {
                 assert_eq!(decoded.admin_public_keys[i], [0u8; 32]);
             }
         }
+    }
+
+    #[test]
+    fn fixed_position_survives_round_trip() {
+        let mut config = NodeConfig::first_boot(1, [1; 32], [2; 32]);
+        config.position_broadcast_secs = 7_200;
+        config.fixed_position = true;
+        config.has_fixed_coords = true;
+        config.latitude_i = -33_000_001;
+        config.longitude_i = 151_000_002;
+        let mut buf = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut buf).unwrap();
+        let decoded = decode(&buf).unwrap();
+        assert_eq!(decoded.position_broadcast_secs, 7_200);
+        assert!(decoded.fixed_position);
+        assert!(decoded.has_fixed_coords);
+        assert_eq!(decoded.latitude_i, -33_000_001);
+        assert_eq!(decoded.longitude_i, 151_000_002);
+        assert!(buf[STORE_RESERVED_START..STORE_RESERVED_END]
+            .iter()
+            .all(|&b| b == 0));
     }
 }

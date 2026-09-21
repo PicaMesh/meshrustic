@@ -20,6 +20,21 @@ message SignalNeighbor {
   bool hears_us = 6;
 }
 
+// Fixed-position subset of the mesh Position message.
+message Position {
+  enum LocSource {
+    LOC_UNSET = 0;
+    LOC_MANUAL = 1;
+    LOC_INTERNAL = 2;
+    LOC_EXTERNAL = 3;
+  }
+
+  sfixed32 latitude_i = 1;
+  sfixed32 longitude_i = 2;
+  LocSource location_source = 5;
+  uint32 precision_bits = 23;
+}
+
 message User {
   string id = 1;
   string long_name = 2;

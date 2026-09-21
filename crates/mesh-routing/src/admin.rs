@@ -6,15 +6,16 @@ use mesh_store::{NodeConfig, ADMIN_KEY_SLOTS, BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_A
 use crate::admin_codec::{
     decode_admin_message, encode_admin_message, AdminMessage, AdminPayload, ConfigPayload,
     DeviceMetadata, ModuleConfigPayload, WireChannel, WireChannelSettings, WireDeviceConfig,
-    WireLoRaConfig, WireSecurityConfig, WireTelemetryConfig, CHANNEL_ROLE_DISABLED,
-    CHANNEL_ROLE_PRIMARY, CONFIG_TYPE_DEVICE, CONFIG_TYPE_LORA, CONFIG_TYPE_SECURITY,
-    CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS, MODULE_CONFIG_TYPE_TELEMETRY, REGION_EU_868,
-    SESSION_PASSKEY_LEN,
+    WireLoRaConfig, WirePositionConfig, WireSecurityConfig, WireTelemetryConfig,
+    CHANNEL_ROLE_DISABLED, CHANNEL_ROLE_PRIMARY, CONFIG_TYPE_DEVICE, CONFIG_TYPE_LORA,
+    CONFIG_TYPE_POSITION, CONFIG_TYPE_SECURITY, CONFIG_TYPE_SESSIONKEY, MAX_ADMIN_KEYS,
+    MODULE_CONFIG_TYPE_TELEMETRY, REGION_EU_868, SESSION_PASSKEY_LEN,
 };
 use crate::nodeinfo::{
     is_known_device_role, sanitize_device_role, NodeInfoIdentity, DEVICE_ROLE_CLIENT,
     HW_MODEL_NRF52_PROMICRO_DIY,
 };
+use crate::position::coerce_position_broadcast_secs;
 use crate::telemetry::min_device_update_interval_secs;
 use mesh_crypto::DEFAULT_PSK;
 use mesh_radio::eu868_config_for_preset;
@@ -43,6 +44,7 @@ pub struct AdminState {
     pub buffered_admin_keys: Option<[[u8; 32]; ADMIN_KEY_SLOTS]>,
     pub buffered_device_update_interval_secs: Option<u32>,
     pub buffered_device_role: Option<u32>,
+    pub buffered_position: Option<WirePositionConfig>,
     pub admin_public_keys: [[u8; 32]; ADMIN_KEY_SLOTS],
     pub private_key: [u8; 32],
     pub public_key: [u8; 32],
@@ -55,6 +57,13 @@ pub struct AdminState {
     pub device_update_interval_secs: u32,
     /// Configured device role; mirrored into the graph and nodeinfo advert.
     pub device_role: u32,
+    /// Stored `position_broadcast_secs`. Zero means the role default.
+    pub position_broadcast_secs: u32,
+    /// `Config.PositionConfig.fixed_position`. Broadcasts require this and coordinates.
+    pub fixed_position: bool,
+    pub latitude_i: i32,
+    pub longitude_i: i32,
+    pub has_fixed_coords: bool,
     pub pending_reboot_seconds: Option<i32>,
     pub config_dirty: bool,
     /// Host/test only: replace Appendix A builtins for real PKI keypairs.
@@ -81,6 +90,7 @@ impl AdminState {
             buffered_admin_keys: None,
             buffered_device_update_interval_secs: None,
             buffered_device_role: None,
+            buffered_position: None,
             admin_public_keys: [EMPTY_ADMIN_KEY; ADMIN_KEY_SLOTS],
             private_key: [0; 32],
             public_key: [0; 32],
@@ -91,6 +101,11 @@ impl AdminState {
             ok_to_mqtt: true,
             device_update_interval_secs: 0,
             device_role: DEVICE_ROLE_CLIENT,
+            position_broadcast_secs: 0,
+            fixed_position: false,
+            latitude_i: 0,
+            longitude_i: 0,
+            has_fixed_coords: false,
             pending_reboot_seconds: None,
             config_dirty: false,
             #[cfg(any(test, feature = "std"))]
@@ -118,6 +133,11 @@ impl AdminState {
         self.ok_to_mqtt = cfg.lora.ok_to_mqtt;
         self.device_update_interval_secs = cfg.device_update_interval_secs;
         self.device_role = sanitize_device_role(u32::from(cfg.device_role));
+        self.position_broadcast_secs = cfg.position_broadcast_secs;
+        self.fixed_position = cfg.fixed_position;
+        self.latitude_i = cfg.latitude_i;
+        self.longitude_i = cfg.longitude_i;
+        self.has_fixed_coords = cfg.has_fixed_coords;
     }
 
     /// Deprecated name kept as alias for call sites.
@@ -137,6 +157,29 @@ impl AdminState {
         cfg.public_key = self.public_key;
         cfg.device_update_interval_secs = self.device_update_interval_secs;
         cfg.device_role = sanitize_device_role(self.device_role).min(u32::from(u8::MAX)) as u8;
+        cfg.position_broadcast_secs = self.position_broadcast_secs;
+        cfg.fixed_position = self.fixed_position;
+        cfg.latitude_i = self.latitude_i;
+        cfg.longitude_i = self.longitude_i;
+        cfg.has_fixed_coords = self.has_fixed_coords;
+    }
+
+    /// True only when fixed position is enabled and a non-zero lat/lon pair is stored.
+    /// Either missing means no broadcast: the flag alone, or coordinates alone, is not enough.
+    pub fn broadcasts_fixed_position(&self) -> bool {
+        self.fixed_position
+            && self.has_fixed_coords
+            && !(self.latitude_i == 0 && self.longitude_i == 0)
+    }
+
+    /// Raise a stored interval after a role change. Returns whether the stored value moved.
+    pub fn coerce_position_interval(&mut self) -> bool {
+        let next = coerce_position_broadcast_secs(self.position_broadcast_secs, self.device_role);
+        if next == self.position_broadcast_secs {
+            return false;
+        }
+        self.position_broadcast_secs = next;
+        true
     }
 
     pub fn export_admin_keys_and_lora(&self, cfg: &mut NodeConfig) {
@@ -227,6 +270,8 @@ pub struct AdminOutcome {
     pub apply_device_role: Option<u32>,
     pub config_dirty: bool,
     pub reboot_seconds: Option<i32>,
+    /// `set_fixed_position` landed: send one broadcast now, then follow the cadence.
+    pub broadcast_position: bool,
 }
 
 /// True for admin GET-style ops that may be safely re-run on WantAck dupe retries.
@@ -317,6 +362,10 @@ pub fn handle_admin(
                 CONFIG_TYPE_DEVICE => ConfigPayload::Device(WireDeviceConfig {
                     role: state.device_role,
                 }),
+                CONFIG_TYPE_POSITION => ConfigPayload::Position(WirePositionConfig {
+                    position_broadcast_secs: state.position_broadcast_secs,
+                    fixed_position: state.fixed_position,
+                }),
                 CONFIG_TYPE_LORA => ConfigPayload::Lora(WireLoRaConfig {
                     use_preset: state.use_preset,
                     modem_preset: state.modem_preset as u32,
@@ -346,6 +395,7 @@ pub fn handle_admin(
             state.buffered_admin_keys = None;
             state.buffered_device_update_interval_secs = None;
             state.buffered_device_role = None;
+            state.buffered_position = None;
             outcome.routing_ok = true;
         }
         AdminPayload::CommitEditSettings => {
@@ -382,6 +432,10 @@ pub fn handle_admin(
             if let Some(role) = state.buffered_device_role.take() {
                 state.device_role = role;
                 outcome.apply_device_role = Some(role);
+                outcome.config_dirty = true;
+            }
+            if let Some(pos) = state.buffered_position.take() {
+                apply_position_config(state, &pos);
                 outcome.config_dirty = true;
             }
             state.editing = false;
@@ -426,6 +480,15 @@ pub fn handle_admin(
                         state.buffered_admin_keys = Some(keys);
                     } else {
                         state.admin_public_keys = keys;
+                        outcome.config_dirty = true;
+                        state.config_dirty = true;
+                    }
+                }
+                ConfigPayload::Position(pos) => {
+                    if state.editing {
+                        state.buffered_position = Some(pos);
+                    } else {
+                        apply_position_config(state, &pos);
                         outcome.config_dirty = true;
                         state.config_dirty = true;
                     }
@@ -480,6 +543,43 @@ pub fn handle_admin(
                 }
                 ModuleConfigPayload::Empty => {}
             }
+            outcome.routing_ok = true;
+        }
+        AdminPayload::SetFixedPosition(pos) => {
+            if !state.session_ok(&msg, now_ms) {
+                outcome.routing_error = Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY);
+                return outcome;
+            }
+            if !pos.has_latitude_i || !pos.has_longitude_i {
+                outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
+                return outcome;
+            }
+            // Stock treats 0,0 as "no position" and skips the send. Reject it so the
+            // set does not look successful while nothing is ever broadcast.
+            if pos.latitude_i == 0 && pos.longitude_i == 0 {
+                outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
+                return outcome;
+            }
+            state.latitude_i = pos.latitude_i;
+            state.longitude_i = pos.longitude_i;
+            state.has_fixed_coords = true;
+            state.fixed_position = true;
+            outcome.config_dirty = true;
+            state.config_dirty = true;
+            outcome.broadcast_position = true;
+            outcome.routing_ok = true;
+        }
+        AdminPayload::RemoveFixedPosition => {
+            if !state.session_ok(&msg, now_ms) {
+                outcome.routing_error = Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY);
+                return outcome;
+            }
+            state.fixed_position = false;
+            state.has_fixed_coords = false;
+            state.latitude_i = 0;
+            state.longitude_i = 0;
+            outcome.config_dirty = true;
+            state.config_dirty = true;
             outcome.routing_ok = true;
         }
         AdminPayload::RebootSeconds(secs) => {
@@ -602,6 +702,12 @@ fn apply_lora_to_state(state: &mut AdminState, lora: &WireLoRaConfig) -> Result<
     state.use_preset = true;
     state.ok_to_mqtt = lora.config_ok_to_mqtt;
     Ok(preset)
+}
+
+fn apply_position_config(state: &mut AdminState, pos: &WirePositionConfig) {
+    state.position_broadcast_secs =
+        coerce_position_broadcast_secs(pos.position_broadcast_secs, state.device_role);
+    state.fixed_position = pos.fixed_position;
 }
 
 fn apply_device_update_interval(state: &mut AdminState, secs: u32) -> Result<(), ()> {
@@ -1151,5 +1257,110 @@ mod tests {
         assert_eq!(out.routing_error, Some(ROUTING_ERROR_BAD_REQUEST));
         assert!(out.apply_device_role.is_none());
         assert_eq!(state.device_role, DEVICE_ROLE_CLIENT);
+    }
+
+    #[test]
+    fn position_interval_is_floored_and_fixed_coords_round_trip() {
+        use crate::admin_codec::{WireFixedPosition, CONFIG_TYPE_POSITION};
+        use crate::position::POSITION_BROADCAST_SECS_CLIENT;
+
+        let mut state = AdminState::default();
+        state.private_key = [0x42; 32];
+        let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
+        let passkey = state.issue_session(6_000);
+
+        let mut set = AdminMessage::default();
+        set.payload = AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
+            position_broadcast_secs: 60,
+            fixed_position: true,
+        }));
+        set.has_session_passkey = true;
+        set.session_passkey = passkey;
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&set),
+            6_100,
+        );
+        assert!(out.routing_ok);
+        assert!(!out.broadcast_position);
+        assert_eq!(
+            state.position_broadcast_secs,
+            POSITION_BROADCAST_SECS_CLIENT
+        );
+        assert!(state.fixed_position);
+        assert!(!state.broadcasts_fixed_position());
+
+        let passkey = state.issue_session(6_200);
+        let mut fix = AdminMessage::default();
+        fix.payload = AdminPayload::SetFixedPosition(WireFixedPosition {
+            latitude_i: 1,
+            longitude_i: 0,
+            has_latitude_i: false,
+            has_longitude_i: true,
+        });
+        fix.has_session_passkey = true;
+        fix.session_passkey = passkey;
+        let missing = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&fix),
+            6_300,
+        );
+        assert_eq!(missing.routing_error, Some(ROUTING_ERROR_BAD_REQUEST));
+
+        let passkey = state.issue_session(6_400);
+        fix.payload = AdminPayload::SetFixedPosition(WireFixedPosition {
+            latitude_i: 52_000_000,
+            longitude_i: 13_000_000,
+            has_latitude_i: true,
+            has_longitude_i: true,
+        });
+        fix.session_passkey = passkey;
+        let placed = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&fix),
+            6_500,
+        );
+        assert!(placed.routing_ok);
+        assert!(placed.broadcast_position);
+        assert!(state.broadcasts_fixed_position());
+
+        let mut get = AdminMessage::default();
+        get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_POSITION);
+        let got = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&get),
+            6_600,
+        );
+        match got.response.unwrap().payload {
+            AdminPayload::GetConfigResponse(ConfigPayload::Position(pos)) => {
+                assert_eq!(pos.position_broadcast_secs, POSITION_BROADCAST_SECS_CLIENT);
+                assert!(pos.fixed_position);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

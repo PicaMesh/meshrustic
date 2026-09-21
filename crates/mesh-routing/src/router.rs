@@ -31,6 +31,7 @@ use crate::nodeinfo::{
 };
 use crate::packet_history::{ObserveResult, PacketHistory};
 use crate::pool::{PacketHandle, PacketPool, PacketSlot, MAX_PACKET_PAYLOAD};
+use crate::position::{build_fixed_position_wire_frame, position_broadcast_interval_ms};
 use crate::qos::ChannelQoS;
 use crate::rate_limit::NodeRateLimiter;
 use crate::relay::{copy_opaque_payload, relay_header_with_next_hop_opts, wire_may_relay};
@@ -222,6 +223,7 @@ pub struct Router {
     pending_topology_reply_ms: u32,
     pending_nodeinfo: PendingNodeInfo,
     pending_telemetry: PendingTelemetry,
+    pending_position: PendingTelemetry,
     pending_traceroute: PendingTraceroute,
     pending_retransmits: [PendingRetransmit; MAX_PENDING_RETRANSMITS],
     pending_reliable: [PendingReliable; MAX_PENDING_RELIABLE],
@@ -243,6 +245,7 @@ pub struct Router {
     last_nodeinfo_reply_to: u32,
     last_nodeinfo_reply_ms: u32,
     last_telemetry_ms: u32,
+    last_position_ms: u32,
     device_metrics: DeviceMetricsSnapshot,
     channel_key: CryptoKey,
     channel_hash: u8,
@@ -382,6 +385,12 @@ impl Router {
                 len: 0,
                 bytes: [0; MAX_WIRE_LEN],
             },
+            pending_position: PendingTelemetry {
+                active: false,
+                next_tx_ms: 0,
+                len: 0,
+                bytes: [0; MAX_WIRE_LEN],
+            },
             pending_traceroute: PendingTraceroute {
                 active: false,
                 next_tx_ms: 0,
@@ -420,6 +429,7 @@ impl Router {
             last_nodeinfo_reply_to: 0,
             last_nodeinfo_reply_ms: 0,
             last_telemetry_ms: 0,
+            last_position_ms: 0,
             device_metrics: DeviceMetricsSnapshot::EMPTY,
             channel_key,
             channel_hash,
@@ -772,6 +782,9 @@ impl Router {
         self.graph.set_device_role(role);
         self.nodeinfo_identity.advert.role = role;
         self.admin.device_role = role;
+        if self.admin.coerce_position_interval() {
+            self.admin.config_dirty = true;
+        }
     }
 
     /// One-time startup logs for SR / graph init.
@@ -1365,6 +1378,11 @@ impl Router {
             self.set_device_role(role);
             // Peers learn the new role from nodeinfo; force the next periodic advert out soon.
             self.last_nodeinfo_ms = 0;
+        }
+        if !self.admin.broadcasts_fixed_position() {
+            self.pending_position.active = false;
+        } else if outcome.broadcast_position {
+            self.schedule_position_broadcast(now_ms);
         }
         if let Some(secs) = outcome.reboot_seconds {
             self.admin.pending_reboot_seconds = Some(secs);
@@ -2578,6 +2596,19 @@ impl Router {
         {
             self.schedule_telemetry_broadcast(now_ms);
         }
+        if !self.admin.broadcasts_fixed_position() {
+            // Disabled or no coordinates: drop anything already queued.
+            self.pending_position.active = false;
+        } else if (self.last_position_ms == 0
+            || now_ms.wrapping_sub(self.last_position_ms)
+                >= position_broadcast_interval_ms(
+                    self.admin.position_broadcast_secs,
+                    self.admin.device_role,
+                ))
+            && !self.pending_position.active
+        {
+            self.schedule_position_broadcast(now_ms);
+        }
         report
     }
 
@@ -2894,6 +2925,7 @@ impl Router {
             || self.pending_topology.active
             || self.pending_nodeinfo.active
             || self.pending_telemetry.active
+            || self.pending_position.active
             || self.pending_traceroute.active
             || self.pending_ack.active
             || self.pending_admin.iter().any(|p| p.active)
@@ -3143,6 +3175,28 @@ impl Router {
         Some(RelayPlan {
             len: self.pending_nodeinfo.len,
             bytes: self.pending_nodeinfo.bytes,
+            delay_ms: 0,
+        })
+    }
+
+    pub fn poll_position_tx(&mut self, now_ms: u32) -> Option<RelayPlan> {
+        if !self.admin.broadcasts_fixed_position() {
+            self.pending_position.active = false;
+            return None;
+        }
+        if !self.pending_position.active {
+            return None;
+        }
+        if now_ms.wrapping_sub(self.pending_position.next_tx_ms) >= 0x8000_0000 {
+            return None;
+        }
+        if now_ms < self.pending_position.next_tx_ms {
+            return None;
+        }
+        self.pending_position.active = false;
+        Some(RelayPlan {
+            len: self.pending_position.len,
+            bytes: self.pending_position.bytes,
             delay_ms: 0,
         })
     }
@@ -3489,6 +3543,30 @@ impl Router {
         };
         self.queue_telemetry_tx(now_ms, len, frame);
         self.last_telemetry_ms = now_ms;
+    }
+
+    fn schedule_position_broadcast(&mut self, now_ms: u32) {
+        if !self.admin.broadcasts_fixed_position() {
+            return;
+        }
+        let packet_id = self.alloc_tx_id(now_ms);
+        let Some((len, frame)) = build_fixed_position_wire_frame(
+            self.node_num,
+            packet_id,
+            self.channel_hash,
+            self.hop_limit,
+            &self.channel_key,
+            self.admin.latitude_i,
+            self.admin.longitude_i,
+            self.ok_to_mqtt(),
+        ) else {
+            return;
+        };
+        self.pending_position.active = true;
+        self.pending_position.next_tx_ms = now_ms;
+        self.pending_position.len = len;
+        self.pending_position.bytes = frame;
+        self.last_position_ms = now_ms;
     }
 
     fn queue_telemetry_tx(&mut self, now_ms: u32, len: u8, frame: [u8; MAX_WIRE_LEN]) {

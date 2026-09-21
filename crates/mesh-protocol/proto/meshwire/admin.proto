@@ -41,6 +41,10 @@ message AdminMessage {
     DeviceMetadata get_device_metadata_response = 13;
     Config set_config = 34;
     ModuleConfig set_module_config = 35;
+    // Store lat/lon and set position.fixed_position. This node does not answer
+    // position requests; it only broadcasts on position_broadcast_secs.
+    Position set_fixed_position = 41;
+    bool remove_fixed_position = 42;
     bool begin_edit_settings = 64;
     bool commit_edit_settings = 65;
     int32 reboot_seconds = 97;
