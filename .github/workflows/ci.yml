@@ -36,7 +36,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: tag
-        run: echo "image=${REGISTRY}/${IMAGE_NAME}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+        run: |
+          name=$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${name}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       # Same Dockerfile devs build locally — this is the whole point.
       - uses: docker/build-push-action@v6
@@ -46,7 +49,7 @@ jobs:
           push: true
           tags: |
             ${{ steps.tag.outputs.image }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.name }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
