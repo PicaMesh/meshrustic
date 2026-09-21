@@ -6,7 +6,7 @@ pub const ENTER_DFU_TEXT: &[u8] = b"ENTER DFU";
 /// PKI text sent back to the admin before the node leaves the application.
 pub const DFU_CONFIRM_TEXT: &[u8] = b"Entering DFU";
 
-/// Seconds to wait after arming so the confirmation can leave before the board resets.
+/// Seconds to wait after arming so the ACK and the confirmation can leave.
 pub const DFU_ENTER_DELAY_SECS: i32 = 2;
 
 fn is_ascii_ws(b: u8) -> bool {

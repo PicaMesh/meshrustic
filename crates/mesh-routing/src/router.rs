@@ -230,6 +230,8 @@ pub struct Router {
     /// Latest channel utilization reported by the radio task (drives retransmit backoff).
     channel_util_pct: f32,
     pending_ack: PendingAck,
+    /// PKI "Entering DFU" text. Kept off `pending_ack` so the WantAck routing ACK still goes out.
+    pending_dfu_confirm: PendingAck,
     pending_admin: [PendingAdmin; MAX_PENDING_ADMIN],
     pending_admin_count: u8,
     /// Packet ids whose relay we cancelled after it may already have been handed to the radio;
@@ -409,6 +411,12 @@ impl Router {
             pending_reliable: [PendingReliable::inactive(); MAX_PENDING_RELIABLE],
             channel_util_pct: 0.0,
             pending_ack: PendingAck {
+                active: false,
+                next_tx_ms: 0,
+                len: 0,
+                bytes: [0; MAX_WIRE_LEN],
+            },
+            pending_dfu_confirm: PendingAck {
                 active: false,
                 next_tx_ms: 0,
                 len: 0,
@@ -1340,10 +1348,9 @@ impl Router {
         if !payload_is_enter_dfu(text) {
             return;
         }
-        if self.queue_dfu_confirm(parsed, hop_start_known, now_ms) {
-            // The text carries the request id, so it is the WantAck reply.
-            self.module_reply_suppresses_ack = true;
-        }
+        // The app marks the DM delivered only on a routing ACK. The text is a
+        // separate chat reply and must not occupy the ACK slot.
+        let _ = self.queue_dfu_confirm(parsed, hop_start_known, now_ms);
         self.pending_ota_dfu_seconds = Some(DFU_ENTER_DELAY_SECS);
     }
 
@@ -1378,7 +1385,7 @@ impl Router {
         ) else {
             return false;
         };
-        self.pending_ack = PendingAck {
+        self.pending_dfu_confirm = PendingAck {
             active: true,
             next_tx_ms: now_ms,
             len,
@@ -2978,6 +2985,7 @@ impl Router {
             || self.pending_position.active
             || self.pending_traceroute.active
             || self.pending_ack.active
+            || self.pending_dfu_confirm.active
             || self.pending_admin.iter().any(|p| p.active)
             || self
                 .pending_retransmits
@@ -3162,6 +3170,24 @@ impl Router {
         Some(RelayPlan {
             len: self.pending_ack.len,
             bytes: self.pending_ack.bytes,
+            delay_ms: 0,
+        })
+    }
+
+    pub fn poll_dfu_confirm_tx(&mut self, now_ms: u32) -> Option<RelayPlan> {
+        if !self.pending_dfu_confirm.active {
+            return None;
+        }
+        if now_ms.wrapping_sub(self.pending_dfu_confirm.next_tx_ms) >= 0x8000_0000 {
+            return None;
+        }
+        if now_ms < self.pending_dfu_confirm.next_tx_ms {
+            return None;
+        }
+        self.pending_dfu_confirm.active = false;
+        Some(RelayPlan {
+            len: self.pending_dfu_confirm.len,
+            bytes: self.pending_dfu_confirm.bytes,
             delay_ms: 0,
         })
     }

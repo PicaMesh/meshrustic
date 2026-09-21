@@ -150,6 +150,10 @@ pub async fn radio_task(
             enqueue_tx(ack, slot, router, node_num, b"ack");
         }
 
+        if let Some(confirm) = router.poll_dfu_confirm_tx(now_ms) {
+            enqueue_tx(confirm, slot, router, node_num, b"dfu");
+        }
+
         if let Some(admin) = router.poll_admin_tx(now_ms) {
             enqueue_tx(admin, slot, router, node_num, b"admin");
         }

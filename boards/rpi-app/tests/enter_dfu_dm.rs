@@ -1,13 +1,35 @@
 //! PKI private `ENTER DFU` arms Adafruit BLE OTA DFU; channel/relayed/unauthorized do not.
 
 use mesh_crypto::CryptoEngine;
-use mesh_protocol::{num::TEXT_MESSAGE_APP, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
+use mesh_protocol::{
+    num::{ROUTING_APP, TEXT_MESSAGE_APP},
+    PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN,
+};
 use mesh_routing::{
     build_app_wire_frame, decode_data_payload_full, payload_is_enter_dfu, DataEncodeOpts,
     InboundPacket, NodeInfoIdentity, Router, DEVICE_ROLE_ROUTER, DFU_CONFIRM_TEXT,
     DFU_ENTER_DELAY_SECS, ENTER_DFU_TEXT,
 };
 use mesh_store::{default_channel_key, generate_keypair, NodeConfig};
+
+fn decrypt_pki(
+    frame: &[u8],
+    from: u32,
+    from_pub: &[u8; 32],
+    to_priv: &[u8; 32],
+) -> (mesh_protocol::ParsedPacket, mesh_routing::DecodedData, heapless::Vec<u8, 240>) {
+    let parsed = PacketHeader::decode(&frame[..PACKET_HEADER_LEN])
+        .unwrap()
+        .parse();
+    let cipher = &frame[PACKET_HEADER_LEN..];
+    let mut plain = vec![0u8; cipher.len()];
+    let mut engine = CryptoEngine::new();
+    engine.set_dh_private_key(to_priv);
+    assert!(engine.decrypt_curve25519(from, from_pub, parsed.id as u64, cipher, &mut plain));
+    let plain_len = cipher.len() - 12;
+    let (data, inner) = decode_data_payload_full(&plain[..plain_len]).unwrap();
+    (parsed, data, inner)
+}
 
 fn inbound(router: &mut Router, frame: &[u8], now: u32) {
     router
@@ -48,6 +70,7 @@ fn build_pki_text(
     hop_limit: u8,
     hop_start: u8,
     relay_node: u8,
+    want_ack: bool,
 ) -> Vec<u8> {
     let plaintext = mesh_routing::encode_data_payload(TEXT_MESSAGE_APP, text);
     let mut engine = CryptoEngine::new();
@@ -62,7 +85,7 @@ fn build_pki_text(
         &mut cipher,
     ));
     let header = PacketHeader::from_fields(
-        to, from, packet_id, 0, hop_limit, hop_start, false, false, 0, relay_node,
+        to, from, packet_id, 0, hop_limit, hop_start, want_ack, false, 0, relay_node,
     );
     let mut out = vec![0u8; PACKET_HEADER_LEN + cipher.len()];
     header.encode_to((&mut out[..PACKET_HEADER_LEN]).try_into().unwrap());
@@ -126,30 +149,33 @@ fn pki_direct_admin_dm_arms_ota_dfu() {
         3,
         3,
         0,
+        true,
     );
     inbound(&mut router, &frame, 1_000);
     assert_eq!(
         router.take_pending_ota_dfu_seconds(),
         Some(DFU_ENTER_DELAY_SECS)
     );
-    let plan = router.poll_ack_tx(1_000).expect("confirmation queued");
-    let parsed = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN])
-        .unwrap()
-        .parse();
-    assert_eq!(parsed.to, peer);
-    assert_eq!(parsed.from, our);
-    assert!(!parsed.want_ack);
-    let cipher = &plan.bytes[PACKET_HEADER_LEN..plan.len as usize];
-    let mut plain = vec![0u8; cipher.len()];
-    let mut engine = CryptoEngine::new();
-    engine.set_dh_private_key(&b1_priv);
-    assert!(engine.decrypt_curve25519(our, &node_pub, parsed.id as u64, cipher, &mut plain));
-    let plain_len = cipher.len() - 12;
-    let (data, inner) = decode_data_payload_full(&plain[..plain_len]).unwrap();
-    assert_eq!(data.portnum, TEXT_MESSAGE_APP);
-    assert_eq!(data.request_id, 0xDF01);
-    assert_eq!(inner.as_slice(), DFU_CONFIRM_TEXT);
+
+    let ack = router.poll_ack_tx(1_000).expect("routing ACK queued");
+    let (ack_hdr, ack_data, _) = decrypt_pki(&ack.bytes[..ack.len as usize], our, &node_pub, &b1_priv);
+    assert_eq!(ack_hdr.to, peer);
+    assert_eq!(ack_data.portnum, ROUTING_APP);
+    assert_eq!(ack_data.request_id, 0xDF01);
     assert!(router.poll_ack_tx(1_000).is_none());
+
+    let confirm = router
+        .poll_dfu_confirm_tx(1_000)
+        .expect("confirmation queued");
+    let (confirm_hdr, confirm_data, confirm_body) =
+        decrypt_pki(&confirm.bytes[..confirm.len as usize], our, &node_pub, &b1_priv);
+    assert_eq!(confirm_hdr.to, peer);
+    assert_eq!(confirm_hdr.from, our);
+    assert!(!confirm_hdr.want_ack);
+    assert_eq!(confirm_data.portnum, TEXT_MESSAGE_APP);
+    assert_eq!(confirm_data.request_id, 0xDF01);
+    assert_eq!(confirm_body.as_slice(), DFU_CONFIRM_TEXT);
+    assert!(router.poll_dfu_confirm_tx(1_000).is_none());
 }
 
 #[test]
@@ -194,6 +220,7 @@ fn relayed_pki_dm_is_ignored() {
         2,
         3,
         0x99,
+        false,
     );
     inbound(&mut router, &frame, 1_000);
     assert!(router.take_pending_ota_dfu_seconds().is_none());
@@ -208,7 +235,7 @@ fn wrong_text_is_ignored() {
     let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x53; 16]), 53);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
 
-    let frame = build_pki_text(our, peer, 0xDF04, &b1_priv, &node_pub, b"hello", 3, 3, 0);
+    let frame = build_pki_text(our, peer, 0xDF04, &b1_priv, &node_pub, b"hello", 3, 3, 0, false);
     inbound(&mut router, &frame, 1_000);
     assert!(router.take_pending_ota_dfu_seconds().is_none());
 }
@@ -257,6 +284,7 @@ fn non_admin_pki_peer_is_ignored() {
         3,
         3,
         0,
+        false,
     );
     inbound(&mut router, &frame, 1_100);
     assert!(router.take_pending_ota_dfu_seconds().is_none());
