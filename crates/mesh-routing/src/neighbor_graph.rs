@@ -1069,12 +1069,18 @@ impl NeighborGraph {
             let Some(signal) = self.lookup_direct_signal(edge.to) else {
                 continue;
             };
+            // Per-entry SR-active is that neighbour's capability (fork:
+            // getCapabilityStatus). The packed header already carries ours;
+            // copying it here advertised stock neighbours as SR-active.
             out[written] = NeighborEntry {
                 node_id: edge.to,
                 rssi: signal.rssi,
                 snr: signal.snr,
                 last_seen_ms: edge.last_update_ms,
-                signal_routing_active: self.signal_routing_active,
+                signal_routing_active: matches!(
+                    self.capability_status(edge.to),
+                    CapabilityStatus::SrActive
+                ),
                 hears_us: edge.hears_us,
             };
             written += 1;
@@ -4726,6 +4732,52 @@ mod tests {
         assert_eq!(neighbors[0].node_id, 0x1234_5678);
         assert_eq!(neighbors[0].rssi, -80);
         assert_eq!(neighbors[0].snr, 10);
+    }
+
+    /// The packed per-neighbour SR bit is that neighbour's capability, not ours.
+    /// Header SR-active stays ours. A stock or passive listed node must go out
+    /// as SR-inactive even when we are SR-active.
+    #[test]
+    fn packed_neighbor_sr_flag_is_the_neighbours_capability() {
+        const ME: u32 = 0xAA00_00AA;
+        const SR_PEER: u32 = 0xBB00_00BB;
+        const STOCK: u32 = 0xCC00_00CC;
+        const PASSIVE: u32 = 0xDD00_00DD;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(SR_PEER, -70, 8, 100, 0);
+        graph.observe_direct_neighbor(STOCK, -72, 7, 100, 0);
+        graph.observe_direct_neighbor(PASSIVE, -74, 6, 100, 0);
+        graph.capability_mut().track_topology(SR_PEER, true, 100);
+        graph.capability_mut().track_topology(PASSIVE, false, 100);
+
+        let mut packed = [0u8; 128];
+        let len = graph
+            .build_topology_chunk(0, 1, &mut packed)
+            .expect("chunk");
+        let (hdr, neighbors) = decode_packed_neighbors(&packed[..len], len).unwrap();
+        assert!(
+            hdr.signal_routing_active,
+            "header SR-active is still our own bit"
+        );
+        assert_eq!(neighbors.len(), 3);
+        let flag = |id: u32| {
+            neighbors
+                .iter()
+                .find(|n| n.node_id == id)
+                .map(|n| n.signal_routing_active)
+                .expect("listed")
+        };
+        assert!(flag(SR_PEER), "an SR publisher we heard is packed SR-active");
+        assert!(
+            !flag(STOCK),
+            "a neighbour that never published topology is not SR-active"
+        );
+        assert!(
+            !flag(PASSIVE),
+            "an SR-passive publisher is packed SR-inactive"
+        );
     }
 
     #[test]
