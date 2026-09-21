@@ -90,6 +90,9 @@ jobs:
       - name: Pull dev image
         run: docker pull "$DEV_IMAGE"
 
+      # Host-owned before compose bind-mounts them; Docker would otherwise
+      # create .ci-cache as root and TMPDIR would be unwritable.
+      - run: mkdir -p .ci-cache/tmp .ci-cache/cargo-registry .ci-cache/cargo-git
       - run: chmod +x ./just
       - run: ./just build ${{ matrix.board }}
       - run: ./just clippy ${{ matrix.board }}

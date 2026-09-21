@@ -25,9 +25,19 @@ export HOST_GID="$(id -g)"
 
 COMPOSE=(docker compose)
 
+# CI bind-mounts .ci-cache/* into the container. If those host paths do not
+# exist, Docker creates them as root, then TMPDIR=/workspace/.ci-cache/tmp is
+# unwritable and prost/flip-link fail with a confusing NotFound.
+ensure_cache_dirs() {
+    mkdir -p "$ROOT/.ci-cache/tmp" \
+             "$ROOT/.ci-cache/cargo-registry" \
+             "$ROOT/.ci-cache/cargo-git"
+}
+
 run_dev() {
     # docker compose run does not accept docker run's combined -it shorthand.
     # Compose allocates a TTY automatically when stdin is a terminal.
+    ensure_cache_dirs
     "${COMPOSE[@]}" run --rm dev "$@"
 }
 
@@ -36,6 +46,7 @@ run_dev_interactive() {
     if [ -t 0 ]; then
         flags+=(-i)
     fi
+    ensure_cache_dirs
     "${COMPOSE[@]}" run --rm "${flags[@]}" dev "$@"
 }
 

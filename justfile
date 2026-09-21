@@ -15,7 +15,7 @@
 # Source the Xtensa env (needed only for esp32-s3) if present, then run a command.
 _in_board cmd board:
     bash -lc '\
-        mkdir -p /workspace/.ci-cache/tmp; \
+        mkdir -p /workspace/.ci-cache/tmp || exit 1; \
         [ -f /opt/export-esp.sh ] && source /opt/export-esp.sh; \
         cd boards/{{board}} && {{cmd}}'
 
