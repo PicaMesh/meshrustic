@@ -11,8 +11,8 @@ PROFILE=release
 FEATURES=nicenano
 OUT="${REPO_ROOT}/target/${TARGET}/${PROFILE}"
 ELF="${OUT}/nrf52840"
-BIN="${OUT}/nrf52840-nicenano.bin"
-UF2="${OUT}/nrf52840-nicenano.uf2"
+BIN="${OUT}/mr-nrf52840-nicenano.bin"
+UF2="${OUT}/mr-nrf52840-nicenano.uf2"
 UF2CONV="${BOARD_DIR}/scripts/uf2/uf2conv.py"
 
 # Adafruit nRF52840 UF2 family; app base with SoftDevice S140 v6.x.

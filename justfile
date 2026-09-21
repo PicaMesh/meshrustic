@@ -6,6 +6,7 @@
 #   ./just clippy <board>     cargo clippy (warnings as errors) for boards/<board>
 #   ./just flash  <board>     build + flash/run on real hardware (Linux/WSL2 + USB)
 #   ./just uf2    <board>     build + UF2 for nice!nano (Adafruit bootloader @ 0x26000)
+#   ./just ota    <board>     build + UF2 + BLE OTA zip for nice!nano
 #   ./just shell              interactive shell in the dev container (host wrapper)
 #   ./just deploy-rpi <host>  build + rsync + restart the RPi app over SSH
 #
@@ -40,6 +41,10 @@ flash board:
 # UF2 drag-and-drop image for nice!nano (double-tap reset → copy to NICENANO drive).
 uf2 board:
     just _in_board "bash scripts/make-uf2.sh" {{board}}
+
+# UF2 plus Adafruit BLE OTA zip (nRF DFU app) for nice!nano.
+ota board:
+    just _in_board "bash scripts/make-ota.sh" {{board}}
 
 # RAM/flash sections, largest statics and largest stack frames of the release build.
 size board:

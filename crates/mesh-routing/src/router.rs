@@ -2,7 +2,8 @@
 
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{
-    is_direct_packet, PacketHeader, ParsedPacket, NODENUM_BROADCAST, PACKET_HEADER_LEN,
+    is_direct_packet, num::TEXT_MESSAGE_APP, PacketHeader, ParsedPacket, NODENUM_BROADCAST,
+    PACKET_HEADER_LEN,
 };
 use mesh_radio::{
     eu868_config_for_preset, packet_time_ms, primary_channel_hash, MODEM_DEFAULT_PRESET,
@@ -17,6 +18,7 @@ use crate::admin_codec::{AdminPayload, ADMIN_APP};
 use crate::coordinated_relay::{
     half_airtime_ms, slot_time_for_preset, tx_delay_ms_contention, tx_delay_ms_worst,
 };
+use crate::enter_dfu::{payload_is_enter_dfu, DFU_ENTER_DELAY_SECS};
 use crate::neighbor_graph::LAST_HOP_BUDGET;
 use crate::neighbor_graph::{
     MaintenanceReport, NeighborGraph, TopologyMergeResult, NEIGHBOR_TTL_MS, TOPOLOGY_BROADCAST_MS,
@@ -267,6 +269,8 @@ pub struct Router {
     pending_radio_reinit: bool,
     /// Packet id of a duplicate that named us as next hop and is being forwarded as a hand-off.
     designated_repeat_id: Option<u32>,
+    /// Arm Adafruit BLE OTA DFU after this many seconds (PKI `ENTER DFU` DM).
+    pending_ota_dfu_seconds: Option<i32>,
 }
 
 impl Router {
@@ -433,6 +437,7 @@ impl Router {
             module_reply_suppresses_ack: false,
             pending_radio_reinit: false,
             designated_repeat_id: None,
+            pending_ota_dfu_seconds: None,
         }
     }
 
@@ -487,6 +492,11 @@ impl Router {
 
     pub fn take_pending_reboot_seconds(&mut self) -> Option<i32> {
         self.admin.pending_reboot_seconds.take()
+    }
+
+    /// Seconds until the board should reset into Adafruit BLE OTA DFU.
+    pub fn take_pending_ota_dfu_seconds(&mut self) -> Option<i32> {
+        self.pending_ota_dfu_seconds.take()
     }
 
     /// True after a LoRa preset change — board should reinit SX1262 without sys_reset.
@@ -1121,6 +1131,10 @@ impl Router {
                 if let Some(ref inner) = inner {
                     self.process_admin_rx(&parsed, inner, data.has_bitfield, now_ms);
                 }
+            } else if data.portnum == TEXT_MESSAGE_APP && parsed.to == self.node_num {
+                if let Some(ref inner) = inner {
+                    self.maybe_arm_ota_dfu(&parsed, inner);
+                }
             }
         } else if parsed.to == self.node_num {
             if let Some(err) = self.pending_pki_error.take() {
@@ -1283,6 +1297,31 @@ impl Router {
             None,
             None,
         )
+    }
+
+    /// PKI private `ENTER DFU` from an authorized admin on a direct RF hop.
+    fn maybe_arm_ota_dfu(&mut self, parsed: &ParsedPacket, text: &[u8]) {
+        if !self.admin_reply_use_pki {
+            return;
+        }
+        let Some(pk) = self.admin_reply_remote_pk else {
+            return;
+        };
+        if !self.admin.is_authorized(&pk) {
+            return;
+        }
+        if !is_direct_packet(
+            parsed.from,
+            parsed.hop_start,
+            parsed.hop_limit,
+            parsed.relay_node,
+        ) {
+            return;
+        }
+        if !payload_is_enter_dfu(text) {
+            return;
+        }
+        self.pending_ota_dfu_seconds = Some(DFU_ENTER_DELAY_SECS);
     }
 
     fn process_admin_rx(

@@ -406,4 +406,3 @@ fn default_channel_unicast_to_limited_originator_is_dropped() {
         router.release_packet(h);
     }
 }
-

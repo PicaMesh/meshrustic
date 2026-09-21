@@ -306,6 +306,17 @@ pub mod mesh {
         finish_line(&mut line, pos);
     }
 
+    pub fn enter_ota_dfu() {
+        let mut line = [0u8; 64];
+        let mut pos = line_prefix(&mut line);
+        put(
+            &mut line,
+            &mut pos,
+            b"[meshrustic] enter Adafruit BLE OTA DFU",
+        );
+        finish_line(&mut line, pos);
+    }
+
     pub fn config_saved(admin_keys: u32) {
         let mut line = [0u8; 64];
         let mut pos = line_prefix(&mut line);

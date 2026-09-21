@@ -58,6 +58,7 @@ All other recipes run just inside the container, e.g.:
   ./just build nrf52840
   ./just test rpi-app
   ./just uf2 nrf52840
+  ./just ota nrf52840
   ./just flash nrf52840        # Linux/WSL2 + USB only
 
 Only Docker (+ Compose v2) must be installed on the host.

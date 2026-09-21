@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
+  workflow_dispatch:
 
 # Explicitly excludes docker-compose.override.yml (USB/privileged) — CI
 # runners have no attached hardware, and `devices: /dev/bus/usb` would
@@ -16,6 +17,7 @@ env:
 permissions:
   contents: read
   packages: write
+  actions: write
 
 jobs:
   build-image:
@@ -91,3 +93,13 @@ jobs:
       - run: ./just fmt-check ${{ matrix.board }}
       - if: matrix.run_tests
         run: ./just test ${{ matrix.board }}
+      - if: matrix.board == 'nrf52840'
+        run: ./just ota nrf52840
+      - if: matrix.board == 'nrf52840'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mr-nrf52840-nicenano
+          path: |
+            target/thumbv7em-none-eabihf/release/mr-nrf52840-nicenano.uf2
+            target/thumbv7em-none-eabihf/release/mr-nrf52840-nicenano-ota.zip
+          if-no-files-found: error

@@ -35,9 +35,25 @@ UF2 for **nice!nano** (Adafruit bootloader, double-tap reset → copy to `NICENA
 
 Output:
 
-`target/thumbv7em-none-eabihf/release/nrf52840-nicenano.uf2`
+`target/thumbv7em-none-eabihf/release/mr-nrf52840-nicenano.uf2`
 
 Works on macOS — no USB passthrough needed; copy the `.uf2` in Finder like any USB drive.
+
+BLE OTA zip (nRF DFU app) for the same nicenano image:
+
+```bash
+./just ota nrf52840
+```
+
+Output:
+
+`target/thumbv7em-none-eabihf/release/mr-nrf52840-nicenano-ota.zip`
+
+CI on `master` uploads both files as the `mr-nrf52840-nicenano` artifact. Download without GitHub login:
+
+[https://nightly.link/PicaMesh/meshrustic/workflows/ci/master](https://nightly.link/PicaMesh/meshrustic/workflows/ci/master)
+
+To put a nearby nicenano into the bootloader so the DFU app can flash that zip, send a **PKI private message** (not a channel chat) from a remote-admin-authorized node that has a **direct** LoRa hop to the target, with the exact body `ENTER DFU`. The node waits two seconds (WantAck can go out), then resets into Adafruit BLE DFU. If nobody starts a transfer, the bootloader returns to the old app after about six minutes.
 
 The Pro Micro DIY + HT-RA62 pin map in this firmware matches the MT variant on a
 nice!nano carrier board. `uf2` links at **0x26000** (Adafruit UF2 + SoftDevice S140 v6);
@@ -76,6 +92,7 @@ Run from the repo root (always prefix with `./`):
 ./just fmt-check <board>     # cargo fmt --check (same as CI)
 ./just flash  <board>        # build + flash via probe-rs/espflash (Linux/WSL2 + USB)
 ./just uf2    nrf52840       # build + UF2 for nice!nano (drag-and-drop)
+./just ota    nrf52840       # UF2 + BLE OTA zip for the nRF DFU app
 ./just shell                 # interactive shell in the dev container
 ./just deploy-rpi <user@host> # build aarch64 binary, rsync + restart on a Pi
 ./just help                  # quick usage summary

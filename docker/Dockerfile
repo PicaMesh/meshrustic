@@ -19,7 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler \
         gcc-aarch64-linux-gnu \
         libc6-dev-arm64-cross \
-        usbutils picocom gdb-multiarch rsync openssh-client python3 \
+        usbutils picocom gdb-multiarch rsync openssh-client python3 python3-pip \
+    && pip3 install --break-system-packages --no-cache-dir adafruit-nrfutil \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Rust (stable) covers nRF52840, RP2040, ESP32-C3/C6, RPi -----------
