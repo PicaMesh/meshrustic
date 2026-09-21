@@ -17,7 +17,11 @@ fn decrypt_pki(
     from: u32,
     from_pub: &[u8; 32],
     to_priv: &[u8; 32],
-) -> (mesh_protocol::ParsedPacket, mesh_routing::DecodedData, heapless::Vec<u8, 240>) {
+) -> (
+    mesh_protocol::ParsedPacket,
+    mesh_routing::DecodedData,
+    heapless::Vec<u8, 240>,
+) {
     let parsed = PacketHeader::decode(&frame[..PACKET_HEADER_LEN])
         .unwrap()
         .parse();
@@ -158,7 +162,8 @@ fn pki_direct_admin_dm_arms_ota_dfu() {
     );
 
     let ack = router.poll_ack_tx(1_000).expect("routing ACK queued");
-    let (ack_hdr, ack_data, _) = decrypt_pki(&ack.bytes[..ack.len as usize], our, &node_pub, &b1_priv);
+    let (ack_hdr, ack_data, _) =
+        decrypt_pki(&ack.bytes[..ack.len as usize], our, &node_pub, &b1_priv);
     assert_eq!(ack_hdr.to, peer);
     assert_eq!(ack_data.portnum, ROUTING_APP);
     assert_eq!(ack_data.request_id, 0xDF01);
@@ -167,8 +172,12 @@ fn pki_direct_admin_dm_arms_ota_dfu() {
     let confirm = router
         .poll_dfu_confirm_tx(1_000)
         .expect("confirmation queued");
-    let (confirm_hdr, confirm_data, confirm_body) =
-        decrypt_pki(&confirm.bytes[..confirm.len as usize], our, &node_pub, &b1_priv);
+    let (confirm_hdr, confirm_data, confirm_body) = decrypt_pki(
+        &confirm.bytes[..confirm.len as usize],
+        our,
+        &node_pub,
+        &b1_priv,
+    );
     assert_eq!(confirm_hdr.to, peer);
     assert_eq!(confirm_hdr.from, our);
     assert!(!confirm_hdr.want_ack);
@@ -235,7 +244,9 @@ fn wrong_text_is_ignored() {
     let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x53; 16]), 53);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
 
-    let frame = build_pki_text(our, peer, 0xDF04, &b1_priv, &node_pub, b"hello", 3, 3, 0, false);
+    let frame = build_pki_text(
+        our, peer, 0xDF04, &b1_priv, &node_pub, b"hello", 3, 3, 0, false,
+    );
     inbound(&mut router, &frame, 1_000);
     assert!(router.take_pending_ota_dfu_seconds().is_none());
 }
