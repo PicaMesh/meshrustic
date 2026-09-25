@@ -4365,6 +4365,27 @@ mod tests {
         out
     }
 
+    fn decrypt_topology_chunk(
+        frame: &[u8],
+        channel_hash: u8,
+    ) -> (u32, crate::topology::PackedHeader, usize) {
+        let parsed = PacketHeader::decode(frame).unwrap().parse();
+        let mut cipher = frame[PACKET_HEADER_LEN..].to_vec();
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let (_port, payload) = crate::topology::try_decrypt_data(
+            &key,
+            parsed.from,
+            parsed.id,
+            channel_hash,
+            parsed.channel,
+            &mut cipher,
+        )
+        .expect("topology chunk decrypts");
+        let (hdr, neighbors) =
+            crate::topology::extract_packed_neighbors(&payload).expect("packed neighbors");
+        (parsed.id, hdr, neighbors.len())
+    }
+
     #[test]
     fn peer_relay_wait_includes_processing_allowance() {
         let router = Router::new(0x1100_0011);
@@ -4442,6 +4463,118 @@ mod tests {
         );
         assert!(router.poll_topology_tx(10_000 + 2 * airtime).is_some());
         assert!(router.poll_topology_tx(10_000 + 2 * airtime + 1).is_none());
+    }
+
+    #[test]
+    fn two_topology_chunks_reassemble_on_the_receiver() {
+        const SENDER: u32 = 0x1100_0011;
+        const RECEIVER: u32 = 0x2200_0022;
+        const UNLISTED: u32 = 0xDD00_00DD;
+        let mut sender = Router::new(SENDER);
+        for i in 0..30u32 {
+            sender
+                .graph_mut()
+                .observe_direct_neighbor(0x2000_0000 + i, -60, 8, 1_000, 0);
+        }
+        assert!(sender.schedule_topology_broadcast(10_000, 16, false));
+        let first = sender.poll_topology_tx(10_000).unwrap();
+        let cfg = eu868_config_for_preset(sender.modem_preset());
+        let airtime = packet_time_ms(&cfg, first.len as usize, false);
+        let second = sender
+            .poll_topology_tx(10_000 + 2 * airtime)
+            .expect("second chunk");
+        let hash = sender.channel_hash();
+        let (id0, h0, n0) = decrypt_topology_chunk(&first.bytes[..first.len as usize], hash);
+        let (id1, h1, n1) = decrypt_topology_chunk(&second.bytes[..second.len as usize], hash);
+        assert_ne!(id0, id1);
+        assert_eq!(h0.topology_version, h1.topology_version);
+        assert!(h0.more_chunks && !h0.continuation);
+        assert!(!h1.more_chunks && h1.continuation);
+        assert_eq!(n0, 28);
+        assert_eq!(n1, 2);
+
+        let mut receiver = Router::new(RECEIVER);
+        receiver.graph_mut().edges_mut().ensure_local_node(SENDER, 1_000);
+        receiver
+            .graph_mut()
+            .edges_mut()
+            .ensure_local_node(UNLISTED, 1_000);
+        receiver.graph_mut().edges_mut().update_edge(
+            RECEIVER,
+            SENDER,
+            UNLISTED,
+            2.0,
+            1_000,
+            EdgeSource::Mirrored,
+            true,
+            0,
+        );
+        receiver.graph_mut().edges_mut().update_edge(
+            RECEIVER,
+            UNLISTED,
+            SENDER,
+            2.0,
+            1_000,
+            EdgeSource::Reported,
+            true,
+            0,
+        );
+        receiver
+            .graph_mut()
+            .edges_mut()
+            .set_edge_hears_us(UNLISTED, SENDER, true);
+
+        let feed = |router: &mut Router, frame: &RelayPlan, now_ms: u32| {
+            router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -70,
+                        snr: 8,
+                        bytes: &frame.bytes[..frame.len as usize],
+                    },
+                    now_ms,
+                )
+                .unwrap();
+        };
+        feed(&mut receiver, &first, 20_000);
+        assert!(
+            receiver
+                .graph_mut()
+                .edges()
+                .find_node(SENDER)
+                .unwrap()
+                .find_edge(UNLISTED)
+                .is_some(),
+            "a dropped neighbour stays until the last chunk"
+        );
+        assert!(receiver
+            .graph_mut()
+            .edges()
+            .find_node(UNLISTED)
+            .unwrap()
+            .find_edge(SENDER)
+            .unwrap()
+            .hears_us);
+        feed(&mut receiver, &second, 20_000 + 2 * airtime);
+        let (dropped, count) = {
+            let from_sender = receiver.graph_mut().edges().find_node(SENDER).unwrap();
+            (
+                from_sender.find_edge(UNLISTED).is_none(),
+                from_sender.edge_count,
+            )
+        };
+        assert!(dropped, "the last chunk drops a neighbour the list no longer names");
+        assert_eq!(count, 30, "both chunks' neighbours are in the sender's list");
+        let hears = receiver
+            .graph_mut()
+            .edges()
+            .find_node(UNLISTED)
+            .unwrap()
+            .find_edge(SENDER)
+            .unwrap()
+            .hears_us;
+        assert!(!hears, "unlisted after the whole list is in hand");
     }
 
     #[test]

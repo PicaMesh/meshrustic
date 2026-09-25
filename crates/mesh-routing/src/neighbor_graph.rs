@@ -1447,9 +1447,15 @@ impl NeighborGraph {
         let now_ms = now_ms.max(1);
         for i in 0..self.topo_version_count as usize {
             if self.topo_versions[i].node_id == node_id {
+                // A repeat is the next chunk of this version, or a delayed copy still in the air.
+                // Clearing the stale note here disarms restart-climb: a rejected v=1, then this
+                // version's second chunk, then v=2 with nothing left to climb from.
+                let same_version = self.topo_versions[i].version == version;
                 self.topo_versions[i].version = version;
                 self.topo_versions[i].last_accept_ms = now_ms;
-                self.topo_versions[i].stale_valid = false;
+                if !same_version {
+                    self.topo_versions[i].stale_valid = false;
+                }
                 return;
             }
         }
@@ -3804,6 +3810,48 @@ mod tests {
             peer_report_via(&mut graph, PEER, 4, 4_000, false),
             TopologyMergeResult::Applied { .. }
         ));
+    }
+
+    /// A later chunk of the version we already hold must not wipe a rejected reboot. The fork
+    /// keeps the stale note on a same-version accept for this reason: the second chunk of v=8
+    /// lands between v=1 (rejected) and v=2 (the climb).
+    #[test]
+    fn a_continuation_chunk_keeps_the_restart_climb_armed() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        assert!(matches!(
+            peer_report(&mut graph, PEER, 8, 1_000),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(matches!(
+            peer_report_via(&mut graph, PEER, 1, 2_000, false),
+            TopologyMergeResult::Stale { .. }
+        ));
+        let mut packed = [0u8; 16];
+        write_packed_header_chunk(&mut packed, 8, true, false, true);
+        let header = decode_packed_neighbors(&packed, 8).unwrap().0;
+        let listed = PackedNeighbor {
+            node_id: 0xCC00_00CC,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        assert!(matches!(
+            graph.merge_topology(PEER, &header, &[listed], true, 2_500, 0),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert!(
+            matches!(
+                peer_report_via(&mut graph, PEER, 2, 3_000, false),
+                TopologyMergeResult::Applied { .. }
+            ),
+            "v=2 climbs from the rejected v=1; the continuation must not have cleared it"
+        );
     }
 
     /// 2026-09-06 19:16: Dura's boot broadcast cleared B's `hears_us` for it. An empty list

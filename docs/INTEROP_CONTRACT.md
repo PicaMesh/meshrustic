@@ -586,10 +586,14 @@ is actually waiting for.
   version, spaced twice the chunk airtime (`Router::poll_topology_tx`), flagged in the header
   (`PACKED_HEADER_FLAG_MORE_CHUNKS`, `PACKED_HEADER_FLAG_CONTINUATION`). The "an unlisted
   neighbour does not hear the sender" rule runs only once the whole list is in hand, gathered per
-  sender (`PendingListed`); a continuation without its first chunk changes nothing. Older
-  receivers ignore the flags. Tests:
+  sender (`PendingListed`); a continuation without its first chunk changes nothing. Accepting
+  that continuation (same version as the one already held) does not clear the stale-version
+  note, so a reboot's climb stays armed across the rest of the previous list. Older receivers
+  ignore the flags. Tests:
   `chunked_topology_clears_unlisted_hears_us_only_after_last_chunk`,
-  `large_neighbourhood_splits_into_flagged_chunks`.
+  `large_neighbourhood_splits_into_flagged_chunks`,
+  `a_continuation_chunk_keeps_the_restart_climb_armed`,
+  `two_topology_chunks_reassemble_on_the_receiver`.
 - **Three ways a neighbour proves it hears us, one definition.** Its topology list names us; we
   watch it carry a frame of ours; or a frame of its own reaches us **direct** and names our byte
   as its next hop. The third is new: a next hop is learned from traffic received, so a peer could
