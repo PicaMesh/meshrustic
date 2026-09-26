@@ -2259,6 +2259,24 @@ impl Router {
             _ => None,
         };
 
+        // A named backup transmits only when it will stamp a hop that is not the designated
+        // one and not the node it heard the packet from. Naming that hop again, or clearing
+        // the byte, is the same path: stock nodes flood from the wrong side, and the
+        // originator treats the rebroadcast as an implicit ack. A last hop the destination
+        // hears is delivery, so that copy still goes.
+        if relayer_named && !we_are_designated_hop && !self.graph.caps_last_hop(parsed.to) {
+            let stamp_byte = (next_hop & 0xFF) as u8;
+            let names_designated = next_hop != 0 && stamp_byte == parsed.next_hop;
+            if next_hop == 0 || names_designated {
+                self.pool.release(handle);
+                self.sr_log.push(SrLogEvent::RelaySkip {
+                    from: parsed.from,
+                    reason: SrSkipReason::NoRelayPath,
+                });
+                return plan;
+            }
+        }
+
         // A unicast that already names a next hop keeps SR coordination: the designated node
         // owns slot 0 and every other candidate shifts down one slot. A heard copy cancels that
         // backup when the transmitter can finish or is ranked ahead; not merely because it exists.
@@ -6607,6 +6625,33 @@ mod tests {
         assert_eq!(hdr.relay_node, 0xCC);
     }
 
+    /// A later slot is an alternative path. A backup that would clear next_hop, or stamp the
+    /// hop the packet already names, stands down: that copy implicit-acks the originator and
+    /// floods from the wrong side of the mesh.
+    #[test]
+    fn named_backup_without_another_hop_does_not_relay() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // Our only route to DEST is RELAYER (0xBB), and the packet already names that hop.
+        let wire = unicast_wire(3, 3, 0xBB, 0xDD, 0x507);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled, "restamping the designated hop is not a backup");
+        assert_eq!(reason, Some(SrSkipReason::NoRelayPath));
+
+        static ROUTER2: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER2.init(Router::new(UNI_ME));
+        // DEST is known, but nothing confirms a hop that hears us, so the copy would leave
+        // with next_hop cleared.
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_DEST, -90, 0, 0, 0);
+        let wire = unicast_wire(3, 3, 0x99, 0xDD, 0x508);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled, "a backup with nothing to stamp must stay silent");
+        assert_eq!(reason, Some(SrSkipReason::NoRelayPath));
+    }
+
     /// The relayer we heard the packet from is the first hop of a verified path, but cannot
     /// finish it alone: handing the packet back is not a dupe, so we stay in the ranking with
     /// next_hop cleared. (A guessed route pointing back is the different, contained case.)
@@ -7336,12 +7381,19 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // RELAYER (byte 0xBB) is a known SR-active direct neighbour and the designated next hop.
+        // Our route still stamps RELAYER (0xBB). The designated hop is a different SR peer, so
+        // the backup is a real alternative and the slot-0 wait is the one we measure.
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_PEER, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_PEER);
         router
             .graph_mut()
             .capability_mut()
-            .track_topology(UNI_RELAYER, true, 0);
-        let wire = unicast_wire(3, 3, 0xBB, 0xDD, 0x505);
+            .track_topology(UNI_PEER, true, 0);
+        let wire = unicast_wire(3, 3, (UNI_PEER & 0xFF) as u8, 0xDD, 0x505);
         let result = router
             .process_inbound(
                 &InboundPacket {
