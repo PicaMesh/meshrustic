@@ -7,7 +7,7 @@ use embassy_time::Instant;
 const RING_SIZE: usize = 16384;
 
 /// Max single USB log line: timestamp + RX metadata + full 255-byte hex payload.
-const MAX_LOG_LINE: usize = 640;
+pub const MAX_LOG_LINE: usize = 640;
 
 struct LogRing {
     buf: [u8; RING_SIZE],
@@ -28,8 +28,27 @@ impl LogRing {
         self.head.wrapping_sub(self.tail)
     }
 
+    /// Discard the oldest unread line, including its newline. A full ring used to drop
+    /// single bytes, which removed the middle of a line the host had already started and
+    /// glued the next line onto what remained.
+    fn drop_oldest_line(&mut self) {
+        let available = self.len();
+        let mut dropped = 0usize;
+        while dropped < available {
+            let b = self.buf[self.tail.wrapping_add(dropped) % RING_SIZE];
+            dropped += 1;
+            if b == b'\n' {
+                break;
+            }
+        }
+        self.tail = self.tail.wrapping_add(dropped);
+    }
+
     fn push(&mut self, data: &[u8]) {
         for &byte in data {
+            if self.len() >= RING_SIZE {
+                self.drop_oldest_line();
+            }
             if self.len() >= RING_SIZE {
                 self.tail = self.tail.wrapping_add(1);
             }
@@ -38,17 +57,30 @@ impl LogRing {
         }
     }
 
-    fn read_chunk(&mut self, out: &mut [u8]) -> usize {
+    /// Copy one complete line, including its newline. Returns 0 when the oldest
+    /// unread bytes are not yet a finished line. A line that cannot fit in `out`
+    /// is discarded so it cannot stall the drain.
+    fn read_line(&mut self, out: &mut [u8]) -> usize {
         let available = self.len();
-        if available == 0 {
+        if available == 0 || out.is_empty() {
             return 0;
         }
-        let n = available.min(out.len());
-        for (i, slot) in out.iter_mut().take(n).enumerate() {
-            *slot = self.buf[(self.tail + i) % RING_SIZE];
+        let scan = available.min(out.len());
+        for i in 0..scan {
+            if self.buf[self.tail.wrapping_add(i) % RING_SIZE] != b'\n' {
+                continue;
+            }
+            let take = i + 1;
+            for (j, slot) in out.iter_mut().enumerate().take(take) {
+                *slot = self.buf[self.tail.wrapping_add(j) % RING_SIZE];
+            }
+            self.tail = self.tail.wrapping_add(take);
+            return take;
         }
-        self.tail = self.tail.wrapping_add(n);
-        n
+        if available > out.len() {
+            self.drop_oldest_line();
+        }
+        0
     }
 }
 
@@ -155,8 +187,8 @@ pub fn push_line(content: &str) {
     finish_line(&mut line, pos);
 }
 
-pub fn read_chunk(out: &mut [u8]) -> usize {
-    critical_section::with(|cs| LOG_RING.borrow(cs).borrow_mut().read_chunk(out))
+pub fn read_line(out: &mut [u8]) -> usize {
+    critical_section::with(|cs| LOG_RING.borrow(cs).borrow_mut().read_line(out))
 }
 
 fn push_u32(out: &mut [u8], mut n: u32) -> usize {

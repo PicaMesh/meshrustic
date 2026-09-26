@@ -91,10 +91,23 @@ pub async fn usb_task(
             log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
 
             loop {
-                let mut buf = [0u8; 64];
-                let n = log::read_chunk(&mut buf);
+                // One complete line, then USB packets of it. Taking the line out of the
+                // ring before the await means a full ring drops some other whole line,
+                // not the middle of this one.
+                let mut buf = [0u8; log::MAX_LOG_LINE];
+                let n = log::read_line(&mut buf);
                 if n > 0 {
-                    if sender.write_packet(&buf[..n]).await.is_err() {
+                    let mut off = 0;
+                    let mut failed = false;
+                    while off < n {
+                        let end = (off + 64).min(n);
+                        if sender.write_packet(&buf[off..end]).await.is_err() {
+                            failed = true;
+                            break;
+                        }
+                        off = end;
+                    }
+                    if failed {
                         crate::usb_log::set_usb_connected(false);
                         break;
                     }
