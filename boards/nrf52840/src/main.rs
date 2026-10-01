@@ -74,9 +74,9 @@ static HOST_CMD_CHANNEL: StaticCell<usb_log::HostCommandChannel> = StaticCell::n
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // Before the watchdog is armed: a prior ENTER DFU parked until the watchdog
-    // reset, which stops it. This soft-reset is the one the bootloader stays in.
-    dfu::finish_ota_if_watchdog_reset();
+    // The bootloader returns here after a DFU inactivity timeout. Drop a leftover
+    // OTA request so this boot, and a later soft reset, stay in the application.
+    dfu::clear_stale_ota_request();
     let mut hw_config = embassy_nrf::config::Config::default();
     // The nRF52840 USBD needs HFCLK from the external 32 MHz crystal: full-speed USB
     // tolerates 0.25 % clock error and the internal RC is only good to ~1.5 %, so on the

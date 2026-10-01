@@ -201,21 +201,14 @@ is actually waiting for.
   per neighbour, never ETX, so this is a local scoring change only: old and new firmware keep
   exchanging topology correctly and disagree only on the price each puts on it, until every node in a
   branch runs the recalibrated curve.
-- **Every healthy link now prices into one cost bucket, and that is accepted, not a defect.** Once
-  decode margin reaches the curve's saturation point, every stronger reading — more margin, more
-  RSSI, both — moves the price by only a few hundredths of an ETX, so at a fast preset every link
-  with a comfortable margin lands within a single `COST_BUCKET_FIXED`/`OWNER_COST_BUCKET_FIXED`
-  bucket regardless of how much better one is than another. Two consequences follow, and only one of
-  them is left as-is. Ranking among these links falls through to the node-id tie-break, which is the
-  intended behaviour of a bucketed comparison, not a symptom: ETX means expected transmissions, and a
-  link with 20 dB of margin and one with 10 dB both deliver on essentially the first try, so pricing
-  them alike is the curve being honest, not imprecise — the old curve's spread across that same
-  range was false precision the recalibration exists to remove. Cost is only the secondary ranking
-  key behind unique coverage, and the discrimination that actually matters operationally — healthy,
-  marginal, and hopeless — is exactly what the margin curve's shape is built to preserve; nothing
-  here is remediated, and re-spreading the curve to manufacture ranking differences among healthy
-  links would reintroduce the false precision this change removes.
-  The second consequence is assessed separately: `EdgeStore`'s `etx_change_threshold` is an absolute
+- **The cost stays flat only once the margin reaches +17 dB.** Below that the price is already
+  climbing, and it climbs faster as the margin falls toward the demodulator floor. On ShortSlow
+  (+17 dB is SNR +7, +12 dB is SNR +2) that puts Czar's hearing of FCM6 (SNR 7) and angl's (SNR 2)
+  in different half-ETX ranking buckets, and the same for FCM6 hearing them at SNR -5 versus -6.
+  Past +17 dB a stronger reading still does not get cheaper: those links deliver on the first try,
+  and ranking among them falls through to the node-id tie-break. The curve below 0 dB of margin is
+  unchanged, so the ETX 7 coverage ceiling stays on the demodulator threshold.
+  `EdgeStore`'s `etx_change_threshold` is an absolute
   ETX delta (default 0.5, "half a retransmission"), and an edge update is significant when
   `|new - old| > threshold + variance`, with variance the per-edge EWMA of absolute ETX changes —
   all three terms in ETX units. The comparison is symmetric, so an improvement past the bar marks

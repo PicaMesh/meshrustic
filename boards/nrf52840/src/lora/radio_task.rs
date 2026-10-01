@@ -87,7 +87,8 @@ pub async fn radio_task(
     let mut reboot_deadline: Option<Instant> = None;
     let mut ota_dfu_deadline: Option<Instant> = None;
     // Log line is queued before USB can send it. Keep petting across this window
-    // so the host sees the entry, then park for the watchdog.
+    // so the host sees the entry, then park. The park arms the bootloader's BLE
+    // OTA register; the watchdog timeout is the reset that enters it.
     let mut ota_park_at: Option<Instant> = None;
     // LoRa preset: persist + soft-reinit after completion reply TX (never sys_reset).
     let mut radio_reinit_pending = false;

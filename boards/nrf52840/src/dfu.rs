@@ -1,13 +1,20 @@
 //! Adafruit nRF52 bootloader entry.
 //!
-//! `GPREGRET = 0xA8` on a software reset is what the bootloader treats as BLE OTA.
-//! A running watchdog cannot be stopped, and it keeps counting through that software
-//! reset, so the bootloader would be reset again before a phone can connect. Waiting
-//! for the watchdog to time out does stop it, but that reset comes back into this
-//! application (seen on Mesh Lab: the app was running again one watchdog period
-//! later, with no DFU session). The request is stored in `.uninit` RAM, which
-//! survives that reset. The following boot, before the watchdog is armed, performs
-//! the software reset the bootloader actually stays in.
+//! `GPREGRET = 0xA8` is what the bootloader treats as BLE OTA, on any reset that
+//! leaves the register intact. A running watchdog cannot be stopped, and it keeps
+//! counting through a software reset, so that reset would kick the bootloader back
+//! out before a phone can connect. A watchdog timeout does stop it. The register
+//! is armed first and the core waits for that timeout; the timeout itself is the
+//! bootloader entry.
+//!
+//! Do not stash the request in application RAM. The nicenano bootloader uses the
+//! same RAM as this image and puts its stack at the top, which is where `.uninit`
+//! lands. A flag there is gone by the time the application runs again.
+//!
+//! Entry goes through `dfu_init`, which arms the bootloader's inactivity timer
+//! (six minutes, restarted by each transfer packet). When that timer fires and
+//! nobody is connected, the bootloader starts this application. Nothing in this
+//! image may request DFU again on that boot.
 
 use cortex_m::peripheral::SCB;
 
@@ -17,19 +24,23 @@ pub const DFU_MAGIC_SKIP: u32 = 0x6d;
 pub const DFU_MAGIC_OTA_RESET: u32 = 0xA8;
 
 const NRF_POWER_GPREGRET: *mut u32 = 0x4000_051C as *mut u32;
-const NRF_POWER_RESETREAS: *mut u32 = 0x4000_0400 as *mut u32;
 /// Bootloader double-reset word. Cleared so a later pin reset is not a second tap.
 const DFU_DBL_RESET_MEM: *mut u32 = 0x2000_7F7C as *mut u32;
-/// `POWER.RESETREAS` bit 1, watchdog.
-const RESETREAS_DOG: u32 = 1 << 1;
-const OTA_STICKY_MAGIC: u32 = 0x0DF0_07A1;
+/// `WDT.INTENCLR`. Embassy enables the TIMEOUT interrupt and nothing handles it.
+const NRF_WDT_INTENCLR: *mut u32 = 0x4001_0308 as *mut u32;
+const WDT_INTEN_TIMEOUT: u32 = 1;
 
-#[used]
-#[link_section = ".uninit"]
-static mut OTA_STICKY: u32 = 0;
-
-fn sticky_ptr() -> *mut u32 {
-    core::ptr::addr_of_mut!(OTA_STICKY)
+/// Drop a BLE-OTA request if this image is running.
+///
+/// The bootloader clears `GPREGRET` on the way into DFU, then starts the
+/// application again after the inactivity timeout. A value left behind would
+/// turn the next soft reset into another DFU session.
+pub fn clear_stale_ota_request() {
+    unsafe {
+        if core::ptr::read_volatile(NRF_POWER_GPREGRET) == DFU_MAGIC_OTA_RESET {
+            core::ptr::write_volatile(NRF_POWER_GPREGRET, 0);
+        }
+    }
 }
 
 pub fn write_gpregret(magic: u32) {
@@ -39,49 +50,18 @@ pub fn write_gpregret(magic: u32) {
     }
 }
 
-fn arm_sticky() {
+/// Drop the TIMEOUT interrupt so the expiry is a watchdog reset, not an
+/// unhandled IRQ into the default handler. The counter keeps running.
+fn silence_watchdog_irq() {
     unsafe {
-        core::ptr::write_volatile(sticky_ptr(), OTA_STICKY_MAGIC);
+        core::ptr::write_volatile(NRF_WDT_INTENCLR, WDT_INTEN_TIMEOUT);
     }
 }
 
-fn take_sticky() -> bool {
-    unsafe {
-        let value = core::ptr::read_volatile(sticky_ptr());
-        core::ptr::write_volatile(sticky_ptr(), 0);
-        value == OTA_STICKY_MAGIC
-    }
-}
-
-fn resetreas() -> u32 {
-    unsafe { core::ptr::read_volatile(NRF_POWER_RESETREAS) }
-}
-
-fn clear_resetreas(value: u32) {
-    unsafe {
-        core::ptr::write_volatile(NRF_POWER_RESETREAS, value);
-    }
-}
-
-/// First instruction of `main`, before the watchdog starts.
-///
-/// A watchdog timeout leaves this flag set and `RESETREAS.DOG` set, and leaves
-/// the watchdog stopped. Soft-reset into OTA from there.
-pub fn finish_ota_if_watchdog_reset() {
-    let pending = take_sticky();
-    let reason = resetreas();
-    if !pending || reason & RESETREAS_DOG == 0 {
-        return;
-    }
-    clear_resetreas(reason);
-    write_gpregret(DFU_MAGIC_OTA_RESET);
-    SCB::sys_reset();
-}
-
-/// Park until the watchdog resets the chip. `finish_ota_if_watchdog_reset`
-/// completes the bootloader entry on the next boot.
+/// Arm BLE OTA, then wait until the watchdog resets the chip into the bootloader.
 pub fn park_for_watchdog_reset() -> ! {
-    arm_sticky();
+    write_gpregret(DFU_MAGIC_OTA_RESET);
+    silence_watchdog_irq();
     loop {
         cortex_m::asm::wfi();
     }
@@ -89,7 +69,6 @@ pub fn park_for_watchdog_reset() -> ! {
 
 /// Software reset into BLE OTA. Only safe when the watchdog is not running.
 pub fn reset_into_ota_now() -> ! {
-    let _ = take_sticky();
     write_gpregret(DFU_MAGIC_OTA_RESET);
     SCB::sys_reset();
 }

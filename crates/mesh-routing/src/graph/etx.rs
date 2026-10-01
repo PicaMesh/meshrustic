@@ -34,11 +34,14 @@ fn preset_snr_threshold_db(modem_preset: u8) -> f32 {
 }
 
 /// Decode-margin breakpoints (dB above the preset's demodulator threshold) and the delivery
-/// probability at each: steep across a narrow band around zero margin, because a LoRa demodulator
-/// is close to a step function at its threshold, not a gradual slope over tens of dB the way path
-/// loss is over distance. Flat below the first point and above the last.
-const MARGIN_BREAK_DB: [f32; 6] = [-10.0, -5.0, -2.0, 0.0, 3.0, 8.0];
-const MARGIN_PROB: [f32; 6] = [0.025, 0.05, 0.10, 0.15, 0.50, 0.95];
+/// probability at each. Flat below the first point and above the last. The last point is +17 dB,
+/// not +8: on ShortSlow that is SNR +7, and a link still climbing at SNR +2 (margin +12, probability
+/// 0.62) then costs half an ETX more. The rise is already underway at +6 dB, so a 1 dB gap down
+/// near the floor (SNR −5 versus −6) lands in different ranking buckets too. Below zero margin the
+/// curve is unchanged, and that is what keeps the ETX 7 coverage ceiling on the demodulator threshold.
+const MARGIN_BREAK_DB: [f32; 7] = [-10.0, -5.0, -2.0, 0.0, 6.0, 12.0, 17.0];
+const MARGIN_PROB: [f32; 7] = [0.025, 0.05, 0.10, 0.15, 0.50, 0.62, 0.95];
+const MARGIN_LAST: usize = MARGIN_BREAK_DB.len() - 1;
 
 /// RSSI quality factor breakpoints (dBm) and the multiplier at each: a mild, monotonic secondary
 /// term — capture effect, interference margin, estimate confidence — never large enough to be a
@@ -60,8 +63,8 @@ const NON_FINITE_SNR_FALLBACK_DB: f32 = -100.0;
 fn margin_delivery_probability(margin_db: f32) -> f32 {
     if margin_db <= MARGIN_BREAK_DB[0] {
         MARGIN_PROB[0]
-    } else if margin_db >= MARGIN_BREAK_DB[5] {
-        MARGIN_PROB[5]
+    } else if margin_db >= MARGIN_BREAK_DB[MARGIN_LAST] {
+        MARGIN_PROB[MARGIN_LAST]
     } else {
         let seg = MARGIN_BREAK_DB
             .iter()
@@ -121,12 +124,12 @@ pub fn fixed_to_etx(fixed: EtxFixed) -> f32 {
 /// the fixed-point extremes: recovered margin always lands inside `MARGIN_BREAK_DB`'s own domain.
 /// No production caller depends on this function's output.
 pub fn etx_to_signal(etx: f32, modem_preset: u8) -> (i8, i8) {
-    let target_prob = (1.0 / etx.max(1.0)).clamp(MARGIN_PROB[0], MARGIN_PROB[5]);
+    let target_prob = (1.0 / etx.max(1.0)).clamp(MARGIN_PROB[0], MARGIN_PROB[MARGIN_LAST]);
 
     let margin = if target_prob <= MARGIN_PROB[0] {
         MARGIN_BREAK_DB[0]
-    } else if target_prob >= MARGIN_PROB[5] {
-        MARGIN_BREAK_DB[5]
+    } else if target_prob >= MARGIN_PROB[MARGIN_LAST] {
+        MARGIN_BREAK_DB[MARGIN_LAST]
     } else {
         let seg = MARGIN_PROB
             .iter()
@@ -229,13 +232,13 @@ mod tests {
 
     #[test]
     fn margin_saturates_at_the_top_regardless_of_preset() {
-        // +8 dB of margin or more is the saturation point; going further must not lower the ETX
+        // +17 dB of margin or more is the saturation point; going further must not lower the ETX
         // any more, at a fast preset (SF7, threshold -7.5) or a slow one (SF12, threshold -20).
-        let at_cap = calculate_etx(-60, -7.5 + 8.0, MODEM_SHORT_FAST);
+        let at_cap = calculate_etx(-60, -7.5 + 17.0, MODEM_SHORT_FAST);
         let past_cap = calculate_etx(-60, 20.0, MODEM_SHORT_FAST);
         assert_eq!(at_cap, past_cap);
 
-        let at_cap_slow = calculate_etx(-60, -20.0 + 8.0, MODEM_LONG_SLOW);
+        let at_cap_slow = calculate_etx(-60, -20.0 + 17.0, MODEM_LONG_SLOW);
         let past_cap_slow = calculate_etx(-60, 20.0, MODEM_LONG_SLOW);
         assert_eq!(at_cap_slow, past_cap_slow);
     }
@@ -345,17 +348,40 @@ mod tests {
 
     #[test]
     fn weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint() {
-        // Margin pinned at the saturation point (SNR -2.0 at SHORT_SLOW is margin +8.0, so
-        // delivery probability is flat at MARGIN_PROB[5] = 0.95) isolates the RSSI term. At RSSI
+        // Margin pinned at the saturation point (SNR +7.0 at SHORT_SLOW is margin +17.0, so
+        // delivery probability is flat at 0.95) isolates the RSSI term. At RSSI
         // -110 dBm, strictly between RSSI_FACTOR_BREAK_DBM's -120 and -60:
         // t = (-110 - (-120)) / 60 = 1/6, rssiFactor = 0.90 + (1/6)*0.10 = 0.91667,
         // prob = 0.95 * 0.91667 = 0.87083, ETX = 1/0.87083 = 1.14833. Moving
         // RSSI_FACTOR_BREAK_DBM[0] from -120 to -100 puts -110 at-or-below the new breakpoint, so
         // the RSSI factor collapses to the flat 0.90 and ETX becomes 1.16959 instead.
-        let etx = calculate_etx(-110, -2.0, MODEM_SHORT_SLOW);
+        let etx = calculate_etx(-110, 7.0, MODEM_SHORT_SLOW);
         assert!(
             (etx - 1.14833).abs() < 0.0005,
             "saturated-margin, mid-range-RSSI ETX drifted off its pinned value: got {etx}"
+        );
+    }
+
+    fn ranking_bucket(etx: f32) -> u16 {
+        (etx * 100.0) as u16 / 50
+    }
+
+    /// Field 2026-10-01, ShortSlow. Czar hears FCM6 at RSSI -95 / SNR 7 and angl at -106 / 2.
+    /// FCM6 hears Czar at -88 / -5 and angl at -95 / -6. Unicast slots compare half-ETX buckets,
+    /// so each pair has to land in different buckets or the weaker hop can transmit first.
+    #[test]
+    fn a_weaker_link_toward_the_same_node_takes_a_later_bucket() {
+        let czar_hears = calculate_etx(-95, 7.0, MODEM_SHORT_SLOW);
+        let angl_hears = calculate_etx(-106, 2.0, MODEM_SHORT_SLOW);
+        assert!(
+            ranking_bucket(angl_hears) > ranking_bucket(czar_hears),
+            "Czar {czar_hears} angl {angl_hears}"
+        );
+        let fcm6_hears_czar = calculate_etx(-88, -5.0, MODEM_SHORT_SLOW);
+        let fcm6_hears_angl = calculate_etx(-95, -6.0, MODEM_SHORT_SLOW);
+        assert!(
+            ranking_bucket(fcm6_hears_angl) > ranking_bucket(fcm6_hears_czar),
+            "FCM6 hears Czar {fcm6_hears_czar} angl {fcm6_hears_angl}"
         );
     }
 }
