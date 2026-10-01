@@ -223,12 +223,14 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
     let mut events = heapless::Vec::<SrLogEvent, { mesh_routing::MAX_SR_LOG }>::new();
     log.take(&mut events);
 
+    // The overheard relay is not a downstream row: the placeholder has not heard us, and the
+    // originator has not listed it. The one row is the neighbour the sender listed with hears_us.
     assert!(events.iter().any(|event| matches!(
         event,
         SrLogEvent::NetworkTopologyHeader {
             direct_neighbors: 0,
             graph_nodes,
-            downstream_routes: 2,
+            downstream_routes: 1,
         } if *graph_nodes >= 1
     )));
 }

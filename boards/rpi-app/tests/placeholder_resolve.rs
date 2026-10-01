@@ -152,7 +152,9 @@ fn relayed_packet_uses_known_direct_neighbor_as_gateway() {
 
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(!graph.has_graph_node(placeholder));
-    assert_eq!(graph.get_downstream_relay(SOURCE, 300), Some(REAL_RELAY));
+    // The real node is the gateway, but the source has not listed it and it has not heard us,
+    // so the frame is not a downstream path.
+    assert_eq!(graph.get_downstream_relay(SOURCE, 300), None);
 }
 
 #[test]
@@ -172,18 +174,12 @@ fn relayed_then_direct_packet_resolves_placeholder() {
     router.process_inbound(&relayed, 100).expect("relayed rx");
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(router.graph_mut().has_graph_node(placeholder));
-    assert_eq!(
-        router.graph_mut().get_downstream_relay(SOURCE, 200),
-        Some(placeholder)
-    );
+    assert_eq!(router.graph_mut().get_downstream_relay(SOURCE, 200), None);
 
     let direct = direct_inbound(REAL_RELAY, 51, &mut wire);
     router.process_inbound(&direct, 300).expect("direct rx");
     assert!(!router.graph_mut().has_graph_node(placeholder));
-    assert_eq!(
-        router.graph_mut().get_downstream_relay(SOURCE, 400),
-        Some(REAL_RELAY)
-    );
+    assert_eq!(router.graph_mut().get_downstream_relay(SOURCE, 400), None);
 }
 
 #[test]
@@ -207,10 +203,7 @@ fn direct_then_relayed_packet_avoids_stale_placeholder() {
 
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(!router.graph_mut().has_graph_node(placeholder));
-    assert_eq!(
-        router.graph_mut().get_downstream_relay(SOURCE, 300),
-        Some(REAL_RELAY)
-    );
+    assert_eq!(router.graph_mut().get_downstream_relay(SOURCE, 300), None);
 }
 
 #[test]
