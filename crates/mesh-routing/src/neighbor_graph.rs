@@ -1779,11 +1779,23 @@ impl NeighborGraph {
         // than before the edge update, where the flag was logged but never stored.
         let hears_us = self.maybe_confirm_hears_us_from_relay(gateway, from, packet_id);
 
-        let can_infer_downstream = self
+        // Hearing the originator *via* a relay is the other direction from delivering *to* them.
+        // Keep the row only when we can send to the relay (it hears us) and the originator lists
+        // that relay (the arrival hop is one they have published). A placeholder or a relay we
+        // merely overheard does not earn a path.
+        let relay_hears_us = self
             .edges
-            .has_direct_reported_edge_to(self.my_node, gateway)
-            || is_placeholder_node(gateway);
-        // Former direct neighbour heard only via this relay: always infer — they moved.
+            .find_node(self.my_node)
+            .and_then(|n| n.find_edge(gateway))
+            .is_some_and(|e| e.hears_us);
+        let destination_lists_relay = self
+            .edges
+            .find_node(from)
+            .and_then(|n| n.find_edge(gateway))
+            .is_some();
+        let can_infer_downstream = relay_hears_us && destination_lists_relay;
+        // Former direct neighbour heard only via this relay: still only when the two facts above
+        // hold — they moved, and the path has to be one we can use.
         // Single-hop: sender went through the gateway to reach us.
         // Multi-hop, non-SR source: stock nodes never advertise topology.
         // Multi-hop SR-aware that was never our neighbour: skip — their own lists are better.
@@ -4089,6 +4101,30 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.observe_direct_neighbor(RELAYER, -16, 14, 1_000, 0);
+        graph.edges_mut().set_edge_hears_us(ME, RELAYER, true);
+        graph.capability_mut().track_topology(RELAYER, true, 1_000);
+        // FAR has to be reachable before its list can be stored. The relay's own edge says the
+        // relay hears FAR; FAR's edge is the arrival list the downstream row requires.
+        graph.edges_mut().update_edge(
+            ME,
+            RELAYER,
+            FAR,
+            1.5,
+            1_000,
+            EdgeSource::Mirrored,
+            true,
+            0,
+        );
+        graph.edges_mut().update_edge(
+            ME,
+            FAR,
+            RELAYER,
+            1.5,
+            1_000,
+            EdgeSource::Mirrored,
+            true,
+            0,
+        );
         // FAR's packet arrives via RELAYER after two hops, at bench strength (-16 dBm).
         graph.observe_packet(FAR, 7, 5, 0xBB, -16, 14, 2_000, 0, Some(RELAYER), 0x77);
         let route = graph.get_route(FAR, 2_000);
@@ -4201,18 +4237,35 @@ mod tests {
 
     #[test]
     fn relayed_packet_creates_downstream_entry() {
+        const ME: u32 = 0xAA00_00AA;
+        const FROM: u32 = 0xBB00_00BB;
         let mut graph = NeighborGraph::new();
-        graph.set_my_node(0xAA00_00AA);
+        graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
+        graph.observe_packet(FROM, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
 
         let placeholder = placeholder_node_id(0xCD);
-        assert!(graph.test_has_edge(0xAA00_00AA, placeholder));
-        assert!(graph.test_has_edge(placeholder, 0xBB00_00BB));
+        assert!(graph.test_has_edge(ME, placeholder));
+        assert!(graph.test_has_edge(placeholder, FROM));
         assert_eq!(
-            graph.get_downstream_relay(0xBB00_00BB, 200),
-            Some(placeholder)
+            graph.get_downstream_relay(FROM, 200),
+            None,
+            "an overheard relay is not a path until it hears us and the originator lists it"
         );
+
+        graph.edges_mut().set_edge_hears_us(ME, placeholder, true);
+        graph.edges_mut().update_edge(
+            ME,
+            FROM,
+            placeholder,
+            1.5,
+            100,
+            EdgeSource::Mirrored,
+            true,
+            0,
+        );
+        graph.observe_packet(FROM, 3, 2, 0xCD, -70, 8, 150, 0, None, 1);
+        assert_eq!(graph.get_downstream_relay(FROM, 200), Some(placeholder));
     }
 
     #[test]
@@ -4433,7 +4486,10 @@ mod tests {
         for t in (1..20).map(|i| i * 1_000) {
             graph.observe_packet(0xCC00_00CC, 3, 2, 0xCD, -70, 8, t, 0, None, 0);
         }
-        assert!(graph.get_downstream_relay(0xCC00_00CC, 20_000).is_some());
+        assert!(
+            graph.get_downstream_relay(0xCC00_00CC, 20_000).is_none(),
+            "the placeholder neither hears us nor is listed by the originator"
+        );
 
         let report = graph.run_maintenance(350_000);
         assert!(!report.topology_dirty_send);
@@ -4451,11 +4507,26 @@ mod tests {
 
         let placeholder = placeholder_node_id(0xCD);
         assert!(!graph.has_graph_node(placeholder));
-        // What a relayed frame teaches is reachability, and that lives in the downstream table.
         // The edge `relay -> source` belongs to the relay to publish, so it is not invented here
-        // for a gateway that may yet publish one.
-        assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 200), Some(relay));
+        // for a gateway that may yet publish one. Downstream needs the relay to hear us and the
+        // originator to list it; a single overheard frame has neither.
+        assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 200), None);
         assert!(!graph.test_has_edge(relay, 0xBB00_00BB));
+
+        graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 150, 0);
+        graph.edges_mut().set_edge_hears_us(0xAA00_00AA, relay, true);
+        graph.edges_mut().update_edge(
+            0xAA00_00AA,
+            0xBB00_00BB,
+            relay,
+            1.5,
+            150,
+            EdgeSource::Mirrored,
+            true,
+            0,
+        );
+        graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 200, 0, Some(relay), 1);
+        assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 300), Some(relay));
     }
 
     #[test]
@@ -4483,10 +4554,7 @@ mod tests {
         // Relayed frame must not resolve even when the real relay is already known.
         graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 200, 0, Some(relay), 0);
         assert!(graph.has_graph_node(placeholder));
-        assert_eq!(
-            graph.get_downstream_relay(0xBB00_00BB, 300),
-            Some(placeholder)
-        );
+        assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 300), None);
     }
 
     #[test]

@@ -221,9 +221,15 @@ is actually waiting for.
 - **An edge is one-directional evidence, priced at the receiver.** A node listing a neighbour
   says it hears that neighbour, at the RSSI and SNR it measured on that neighbour's signal.
   `calculate_route` therefore runs Dijkstra backwards from the destination: a settled node is
-  reached by the nodes it lists (at the cost it measured), by the nodes whose edge to it carries
-  `hears_us`, and, if it publishes no topology (`route::publishes_topology`), by anyone who hears
-  it. An edge is never used against its direction and every hop costs what its receiver measured.
+  reached by the nodes it lists (at the cost it measured) and, if it publishes no topology
+  (`route::publishes_topology`), by anyone who hears it. `hears_us` on a sender's edge says the
+  receiver once heard that sender; it is not the receiver's price. Into a publisher that has not
+  listed the sender, that reverse measurement is only the inbound-gateway fallback, at
+  `UNVERIFIED_HOP_COST_FACTOR`. Unicast ranking of the hop into the destination uses the same
+  split (`delivery_direction_cost_fixed`). Coverage keeps the raw measurement
+  (`hop_cost_fixed`): a confirmed neighbour whose ETX is under the ceiling is still coverage.
+  An edge is never used against its direction, and a confirmed hop costs what its receiver
+  measured.
   Intermediate hops must be routable; the destination need not. The route carries `hops`, logged
   as `Route to !X via !Y cost=C hops=H`. `find_better_positioned_neighbor` applies the same
   evidence rule through `route::can_deliver`. Tests: `one_way_edge_is_not_a_route`,
@@ -243,8 +249,9 @@ is actually waiting for.
   `known_to_hear_ignores_stock_optimism`, `covers_requires_a_link_that_is_not_hopeless`,
   `one_way_list_to_publishing_dest_is_not_a_direct_path`.
 - **Inbound-gateway fallback.** When no confirmed path exists (and the downstream table has
-  none either), the search runs again allowing hops into a topology-publishing node that never
-  confirmed the sender, at `UNVERIFIED_HOP_COST_FACTOR` times their cost, so the node that hears
+  none either), the search runs again allowing hops into a topology-publishing node that has not
+  published a measurement of the sender, at `UNVERIFIED_HOP_COST_FACTOR` times the sender's
+  reverse cost, so the node that hears
   the far side still carries the frame out; a one-way edge is usually a marginal link or a
   truncated list. The route is marked unverified (`Route::verified`, logged as `unverified`),
   a confirmed path of any length wins over it, and passive nodes are never chosen as the
@@ -714,16 +721,19 @@ is actually waiting for.
   `a_publisher_heard_on_any_frame_stays_our_neighbour`.
 - **Edge capacity.** Forty edges per node and forty graph nodes; a full edge list replaces its
   worst edge (ETX plus age) when a better one arrives (`EdgeStore::update_edge`).
-- **Inferred paths.** Edges and downstream entries learned from relayed packets are priced at a
-  nominal link per hop travelled (`INFERRED_LINK_RSSI`, `INFERRED_LINK_SNR` in
-  `observe_relayed_packet`), never at the measured strength of the relay's link to us. A copy of a
-  packet **we** transmitted teaches nothing: the peer relaying it got it from us, so recording the
-  source as downstream of that peer invents a path back through ourselves, and the two nodes then
-  name each other as next hop for that destination until a unicast bounces between them. Our own
-  transmissions are therefore skipped (`has_our_transmission`).
+- **Inferred paths.** Edges learned from relayed packets are priced at a nominal link per hop
+  travelled (`INFERRED_LINK_RSSI`, `INFERRED_LINK_SNR` in `observe_relayed_packet`), never at the
+  measured strength of the relay's link to us. A downstream row is kept only when that relay hears
+  us and the originator lists the relay: hearing the originator via the relay is the other
+  direction, and a path we cannot send to is not a path. A copy of a packet **we** transmitted
+  teaches nothing: the peer relaying it got it from us, so recording the source as downstream of
+  that peer invents a path back through ourselves, and the two nodes then name each other as next
+  hop for that destination until a unicast bounces between them. Our own transmissions are
+  therefore skipped (`has_our_transmission`).
 - **A travelling neighbour heard only through a relay stops being a last hop immediately.** A
   sender we still listed as a `Reported` direct neighbour, heard only through a resolved relayer,
-  is retracted (`retract_direct_link`) and written as downstream of that relayer. Relayed copies
+  is retracted (`retract_direct_link`). They are written as downstream of that relayer only when
+  the relayer hears us and they list it. Relayed copies
   do not refresh our measurement of the sender, so without this a node that moved behind a hop
   kept drawing unicasts onto a dead last hop until `PUBLISHER_SILENCE_MS`. Their later topology
   must not reinstall `sender → us` unless we hear them again — Dijkstra would treat us as that

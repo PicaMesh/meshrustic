@@ -6700,6 +6700,18 @@ mod tests {
         router
             .graph_mut()
             .merge_topology(UNI_PEER, &header, &[to_dest, gw], true, 0, 0);
+        // DEST's own measurement of PEER. hears_us on PEER's edge is PEER's SNR of DEST, which
+        // does not price the hop into DEST.
+        router.graph_mut().edges_mut().update_edge(
+            UNI_ME,
+            UNI_DEST,
+            UNI_PEER,
+            1.2,
+            0,
+            crate::graph::EdgeSource::Mirrored,
+            true,
+            0,
+        );
 
         let wire = unicast_wire(2, 3, 0, 0xBB, 0x506);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);

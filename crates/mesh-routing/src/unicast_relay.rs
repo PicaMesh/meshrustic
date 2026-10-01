@@ -19,7 +19,8 @@
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{
-    can_deliver, delivery_hop_cost_fixed, is_placeholder_node, DownstreamTable, EdgeStore,
+    can_deliver, delivery_hop_cost_fixed, hop_cost_fixed, is_placeholder_node, DownstreamTable,
+    EdgeStore,
     MAX_EDGES_PER_NODE,
 };
 use crate::sr_log::SrSkipReason;
@@ -98,10 +99,13 @@ impl UnicastRelayContext<'_> {
             && my_next_hop != node
             && my_next_hop != self.my_node
         {
-            if let Some(cost) =
-                delivery_hop_cost_fixed(self.edges, Some(self.capability), node, my_next_hop)
-            {
-                return bucket(cost.min(INDIRECT_TIER - 1)) | INDIRECT_TIER;
+            // Raw price: this hop is into the shared relay, and two neighbours a few hundredths
+            // apart must stay in one bucket. The penalty for a reverse-only arrival applies to
+            // the hop into the destination, above.
+            if can_deliver(self.edges, Some(self.capability), node, my_next_hop) {
+                if let Some(cost) = hop_cost_fixed(self.edges, node, my_next_hop) {
+                    return bucket(cost.min(INDIRECT_TIER - 1)) | INDIRECT_TIER;
+                }
             }
         }
         NO_PATH
