@@ -42,7 +42,8 @@ use crate::reliable::{
 };
 use crate::routing_ack::{
     build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
-    hops_away, retransmission_delay_ms, ROUTING_APP, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
+    hops_away, retransmission_delay_ms, NUM_RELIABLE_RETX, ROUTING_APP, ROUTING_ERROR_NONE,
+    ROUTING_ERROR_NO_CHANNEL,
 };
 use crate::rx_decode::{summarize_decrypted, RxDecodeInfo};
 use crate::sr_log::{
@@ -130,6 +131,7 @@ struct PendingRelay {
     tx_after_ms: u32,
     len: u8,
     bytes: [u8; MAX_WIRE_LEN],
+    unicast_flags: crate::unicast_relay::UnicastSlotFlags,
 }
 
 #[derive(Clone, Copy)]
@@ -364,6 +366,7 @@ impl Router {
                 tx_after_ms: 0,
                 len: 0,
                 bytes: [0; MAX_WIRE_LEN],
+                unicast_flags: crate::unicast_relay::UnicastSlotFlags::EMPTY,
             }; MAX_PENDING_RELAYS],
             pending_topology: PendingTopology {
                 active: false,
@@ -1607,6 +1610,8 @@ impl Router {
                     bytes,
                     delay,
                     now_ms,
+                    NUM_RELIABLE_RETX,
+                    false,
                 );
             }
         }
@@ -2239,21 +2244,13 @@ impl Router {
                 return plan;
             }
             Some(Ok(mut ranked)) if !relayer_named => {
-                // Slot 0 starts where stock's own contention window starts. Its own name and its
-                // own derivation: the broadcast ladder's origin answers a different question, and
-                // this one had been sharing that constant's value by accident.
-                //
-                // From the CAD slot time, which is what stock's boundary is expressed in. Note the
-                // `slot_ms` in scope here is a packet airtime despite its name — the board passes
-                // `packet_time_ms(..., 64, ...)` — so using it would give a floor ten times too
-                // large.
-                ranked.slot_delay_ms = if ranked.slot_index == 0 {
-                    crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).max(dest_ack_floor)
-                } else {
-                    self.sr_peer_relay_wait_ms(slot_ms)
-                        .max(dest_ack_floor)
-                        .saturating_add((ranked.slot_index as u32 - 1).saturating_mul(half_airtime))
-                };
+                ranked.slot_delay_ms = self.unicast_slot_delay_ms(
+                    &ranked,
+                    dest_ack_floor,
+                    half_airtime,
+                    slot_ms,
+                    next_hop,
+                );
                 Some(ranked)
             }
             _ => None,
@@ -2332,19 +2329,37 @@ impl Router {
             }
         }
 
-        let last_hop = parsed.to != NODENUM_BROADCAST && self.graph.caps_last_hop(parsed.to);
-        let relay_hdr =
-            match relay_header_with_next_hop_opts(&parsed, self.node_num, next_hop, last_hop) {
-                Some(h) => h,
-                None => {
-                    self.pool.release(handle);
-                    self.sr_log.push(SrLogEvent::RelaySkip {
-                        from: parsed.from,
-                        reason: SrSkipReason::WireGate,
-                    });
-                    return plan;
-                }
-            };
+        let priced_last_hop = parsed.to != NODENUM_BROADCAST
+            && crate::graph::delivery_hop_cost_fixed(
+                self.graph.edges(),
+                Some(self.graph.capability()),
+                self.node_num,
+                parsed.to,
+            )
+            .is_some();
+        let stamp_hop = if unicast_plan.as_ref().is_some_and(|p| p.nonfinal_flood) {
+            0
+        } else if priced_last_hop {
+            parsed.to
+        } else {
+            next_hop
+        };
+        let relay_hdr = match relay_header_with_next_hop_opts(
+            &parsed,
+            self.node_num,
+            stamp_hop,
+            priced_last_hop && stamp_hop != 0,
+        ) {
+            Some(h) => h,
+            None => {
+                self.pool.release(handle);
+                self.sr_log.push(SrLogEvent::RelaySkip {
+                    from: parsed.from,
+                    reason: SrSkipReason::WireGate,
+                });
+                return plan;
+            }
+        };
 
         // 2. A unicast leaving us with hop_limit 0 can only still be delivered by a node that
         // is the destination itself; without a direct link to the target it is dead airtime.
@@ -2542,8 +2557,16 @@ impl Router {
             delay_ms,
         });
 
+        let unicast_flags = crate::unicast_relay::UnicastSlotFlags {
+            last_hop_backup: unicast_plan.as_ref().is_some_and(|p| p.last_hop_backup),
+            nonfinal_flood: unicast_plan.as_ref().is_some_and(|p| p.nonfinal_flood),
+            nominated_next_hop: next_hop,
+        };
+        self.graph
+            .set_unicast_commit_flags(parsed.from, parsed.id, unicast_flags);
+
         if delay_ms == 0 {
-            self.arm_relayed_unicast_retx(len, bytes, now_ms);
+            self.arm_relayed_unicast_followup(len, bytes, now_ms, unicast_flags);
             let relay = RelayPlan {
                 len,
                 bytes,
@@ -2573,11 +2596,12 @@ impl Router {
             tx_after_ms,
             len,
             bytes,
+            unicast_flags,
         ) {
             return plan;
         }
 
-        self.arm_relayed_unicast_retx(len, bytes, now_ms);
+        self.arm_relayed_unicast_followup(len, bytes, now_ms, unicast_flags);
         let relay = RelayPlan {
             len,
             bytes,
@@ -2629,7 +2653,12 @@ impl Router {
         // (`note_tx_done`): a copy heard while the frame waits in the radio queue still runs
         // the coverage check and can pull the frame back. Release used to forget the relay here,
         // which let the frame go out regardless of what arrived in the meantime.
-        self.arm_relayed_unicast_retx(pending.len, pending.bytes, now_ms);
+        self.arm_relayed_unicast_followup(
+            pending.len,
+            pending.bytes,
+            now_ms,
+            pending.unicast_flags,
+        );
         Some(RelayPlan {
             len: pending.len,
             bytes: pending.bytes,
@@ -2880,6 +2909,9 @@ impl Router {
             reserved_ranked: 0,
             absorbed: [(0, 0); crate::broadcast_relay::RANKED_LOG],
             absorbed_len: 0,
+            last_hop_backup: false,
+            nonfinal_flood: false,
+            has_nonfinal_flood_slot: false,
         }
     }
 
@@ -2894,6 +2926,30 @@ impl Router {
                 self.cw_slot_ms(),
             ),
         )
+    }
+
+    /// Unsolicited dest ACK is only useful when the last transmitter is SR.
+    fn delivering_relayer_is_sr(
+        &self,
+        parsed: &ParsedPacket,
+        hop_start_known: bool,
+        now_ms: u32,
+    ) -> bool {
+        let node = if hops_away(parsed.hop_start, parsed.hop_limit, hop_start_known) == Some(0) {
+            parsed.from
+        } else if parsed.relay_node == 0 {
+            return false;
+        } else {
+            self.graph
+                .match_relay_byte_on_outgoing_edges(parsed.relay_node)
+                .unwrap_or(0)
+        };
+        if node == 0 {
+            return false;
+        }
+        self.graph
+            .capability_status_at(node, now_ms)
+            .is_signal_routing()
     }
 
     /// Hop budget for a reply we originate. A reply to a
@@ -3060,6 +3116,8 @@ impl Router {
                 frame,
                 delay,
                 now_ms,
+                NUM_RELIABLE_RETX,
+                false,
             );
         }
         if to == NODENUM_BROADCAST && portnum != SIGNAL_ROUTING_APP {
@@ -3135,20 +3193,59 @@ impl Router {
         })
     }
 
-    /// Arm retries for a unicast we are about to forward on behalf of someone else, when the
-    /// origin asked for reliability and we stamped a designated next hop. Retries stop as soon
-    /// as any copy of the packet is heard or the destination answers; the last one goes out with
-    /// `next_hop` cleared so the flood takes over. Fire-and-forget unicasts are never retried,
-    /// which bounds the airtime a rogue origin can extract from relayers.
-    fn arm_relayed_unicast_retx(&mut self, len: u8, bytes: [u8; MAX_WIRE_LEN], now_ms: u32) {
+    /// Named forwards: one flood insurance even when ranking assigned a later flood slot
+    /// (that neighbour may never have overheard this copy). Last-hop `want_ack` toward a
+    /// non-SR dest keeps retries until dest answers, including hop_limit 0. Flood slots and
+    /// last-hop backups do not arm a follow-up.
+    fn arm_relayed_unicast_followup(
+        &mut self,
+        len: u8,
+        bytes: [u8; MAX_WIRE_LEN],
+        now_ms: u32,
+        flags: crate::unicast_relay::UnicastSlotFlags,
+    ) {
         let Ok(hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) else {
             return;
         };
         let p = hdr.parse();
-        if p.to == NODENUM_BROADCAST || p.from == self.node_num || !p.want_ack || p.next_hop == 0 {
+        if p.to == NODENUM_BROADCAST || p.from == self.node_num {
             return;
         }
-        let delay = self.reliable_retx_delay_ms(len, p.from, p.id);
+        let dest_sr = self.graph.capability_status(p.to).is_signal_routing();
+        let last_hop = crate::graph::delivery_hop_cost_fixed(
+            self.graph.edges(),
+            Some(self.graph.capability()),
+            self.node_num,
+            p.to,
+        )
+        .is_some();
+        if p.hop_limit == 0 && !last_hop {
+            return;
+        }
+        let delay;
+        let num_retx;
+        let flood_on_last;
+        if last_hop {
+            if !p.want_ack || dest_sr || flags.last_hop_backup {
+                return;
+            }
+            delay = self.reliable_retx_delay_ms(len, p.from, p.id);
+            num_retx = NUM_RELIABLE_RETX;
+            flood_on_last = false;
+        } else if flags.nonfinal_flood || p.next_hop == 0 {
+            return;
+        } else {
+            let cfg = eu868_config_for_preset(self.modem_preset);
+            let airtime = packet_time_ms(&cfg, len as usize, false).max(1);
+            let nominated = if flags.nominated_next_hop != 0 {
+                flags.nominated_next_hop
+            } else {
+                p.next_hop as u32
+            };
+            delay = self.next_hop_carry_wait_ms(nominated, airtime);
+            num_retx = 1;
+            flood_on_last = true;
+        }
         if schedule_reliable(
             &mut self.pending_reliable,
             p.from,
@@ -3159,12 +3256,73 @@ impl Router {
             bytes,
             delay,
             now_ms,
+            num_retx,
+            flood_on_last,
         ) {
             self.sr_log.push(SrLogEvent::RelayRetxArmed {
                 id: p.id,
                 next_hop: p.next_hop,
             });
         }
+    }
+
+    fn next_hop_carry_wait_ms(&self, next_hop: u32, airtime_ms: u32) -> u32 {
+        if next_hop != 0
+            && self
+                .graph
+                .capability_status(next_hop)
+                .is_signal_routing()
+        {
+            crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).saturating_add(airtime_ms)
+        } else {
+            tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
+        }
+    }
+
+    fn unicast_named_slot_delay_ms(
+        &self,
+        slot: u8,
+        dest_ack_floor: u32,
+        half_airtime: u32,
+        airtime_ms: u32,
+    ) -> u32 {
+        if slot == 0 {
+            crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).max(dest_ack_floor)
+        } else {
+            self.sr_peer_relay_wait_ms(airtime_ms)
+                .max(dest_ack_floor)
+                .saturating_add((slot as u32 - 1).saturating_mul(half_airtime))
+        }
+    }
+
+    fn unicast_slot_delay_ms(
+        &self,
+        ranked: &crate::broadcast_relay::BroadcastRelayPlan,
+        dest_ack_floor: u32,
+        half_airtime: u32,
+        airtime_ms: u32,
+        nominated_next_hop: u32,
+    ) -> u32 {
+        if ranked.last_hop_backup {
+            let early =
+                crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).max(dest_ack_floor);
+            return early
+                .saturating_add(airtime_ms)
+                .saturating_add(self.dest_ack_wait_ms(airtime_ms));
+        }
+        if ranked.nonfinal_flood {
+            let named_slot = ranked.slot_index.saturating_sub(1);
+            return self
+                .unicast_named_slot_delay_ms(named_slot, dest_ack_floor, half_airtime, airtime_ms)
+                .saturating_add(airtime_ms)
+                .saturating_add(self.next_hop_carry_wait_ms(nominated_next_hop, airtime_ms));
+        }
+        self.unicast_named_slot_delay_ms(
+            ranked.slot_index,
+            dest_ack_floor,
+            half_airtime,
+            airtime_ms,
+        )
     }
 
     fn cancel_relayed_retx(&mut self, from: u32, id: u32, reason: RelayRetxCancelReason) {
@@ -3394,18 +3552,22 @@ impl Router {
             }
             if parsed.from != self.node_num
                 && parsed.from != 0
-                && parsed.want_ack
                 && !self.module_reply_suppresses_ack
             {
-                if data.request_id == 0 && data.reply_id == 0 {
-                    self.schedule_ack(parsed, data.has_bitfield, parsed.channel, now_ms);
-                } else if hops_away(parsed.hop_start, parsed.hop_limit, data.has_bitfield)
-                    == Some(0)
-                    || parsed.next_hop != 0
-                {
-                    // Stock: a response is acknowledged only when it reached us with zero hops
-                    // or through a designated next hop, and then with a hop-0 ACK; a relayed
-                    // response was already implicitly acknowledged by the relay.
+                if parsed.want_ack {
+                    if data.request_id == 0 && data.reply_id == 0 {
+                        self.schedule_ack(parsed, data.has_bitfield, parsed.channel, now_ms);
+                    } else if hops_away(parsed.hop_start, parsed.hop_limit, data.has_bitfield)
+                        == Some(0)
+                        || parsed.next_hop != 0
+                    {
+                        // Stock: a response is acknowledged only when it reached us with zero hops
+                        // or through a designated next hop, and then with a hop-0 ACK; a relayed
+                        // response was already implicitly acknowledged by the relay.
+                        self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
+                    }
+                } else if self.delivering_relayer_is_sr(parsed, data.has_bitfield, now_ms) {
+                    // Hop-0 ACK so the last SR hop hears delivery. Stock last hops are not waiting.
                     self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
                 }
             }
@@ -3429,8 +3591,7 @@ impl Router {
         self.schedule_ack_with_hop(parsed, channel_hash, hop, next_hop, now_ms);
     }
 
-    /// Original-sender WantAck retry (dupe, hopsAway==0): cheap hop_limit=0 re-ACK only.
-    /// Must not re-run admin/modules — those already ran on first delivery.
+    /// Hop-limit 0 re-ACK. Must not re-run admin/modules — those already ran on first delivery.
     fn schedule_dupe_want_ack(&mut self, parsed: &ParsedPacket, channel_hash: u8, now_ms: u32) {
         self.schedule_ack_with_hop(parsed, channel_hash, 0, 0, now_ms);
     }
@@ -3830,6 +3991,7 @@ impl Router {
         tx_after_ms: u32,
         len: u8,
         bytes: [u8; MAX_WIRE_LEN],
+        unicast_flags: crate::unicast_relay::UnicastSlotFlags,
     ) -> bool {
         // One pending frame per packet: a re-plan (hand-off, better slot) replaces the earlier
         // frame instead of queueing a second copy of the same packet behind it.
@@ -3846,6 +4008,7 @@ impl Router {
                 tx_after_ms,
                 len,
                 bytes,
+                unicast_flags,
             };
             return true;
         }
@@ -3866,6 +4029,7 @@ impl Router {
             now_ms.wrapping_add(plan.delay_ms),
             plan.len,
             plan.bytes,
+            crate::unicast_relay::UnicastSlotFlags::default(),
         )
     }
 
@@ -4003,9 +4167,17 @@ impl Router {
         }
 
         // Dupe path never re-enters rate_limit / admin / modules (history short-circuit).
-        // Original-sender WantAck retry: re-send idempotent admin GET replies, else hop_limit=0 re-ACK.
-        if Self::is_repeated_reliable_tx(parsed, decoded_data) {
-            if parsed.to == self.node_num && parsed.want_ack {
+        // A want_ack retry from the original sender is re-acknowledged at hop limit 0, as
+        // before. A unicast that did not ask for an ack is re-acknowledged the same way so a
+        // missed hop-0 ACK still stops the last relay. Idempotent admin reads still answer
+        // with the module reply instead of a second ACK.
+        if parsed.to == self.node_num
+            && parsed.from != self.node_num
+            && !decoded_data.is_some_and(|d| d.portnum == ROUTING_APP)
+            && !self.module_reply_suppresses_ack
+        {
+            let repeated = Self::is_repeated_reliable_tx(parsed, decoded_data);
+            if repeated && parsed.want_ack {
                 if let (Some(data), Some(payload)) = (decoded_data, inner) {
                     if data.portnum == ADMIN_APP {
                         if let Some(msg) = crate::admin_codec::decode_admin_message(payload) {
@@ -4017,7 +4189,18 @@ impl Router {
                     }
                 }
                 self.schedule_dupe_want_ack(parsed, parsed.channel, now_ms);
+            } else if !parsed.want_ack
+                && repeated
+                && self.delivering_relayer_is_sr(
+                    parsed,
+                    decoded_data.is_some_and(|d| d.has_bitfield),
+                    now_ms,
+                )
+            {
+                self.schedule_dupe_want_ack(parsed, parsed.channel, now_ms);
             }
+        }
+        if Self::is_repeated_reliable_tx(parsed, decoded_data) {
             return;
         }
 
@@ -4073,6 +4256,12 @@ impl Router {
         if parsed.to != NODENUM_BROADCAST && (committed || has_pending || in_flight) {
             let next_hop = self.graph.route_to(parsed.to, now_ms).next_hop;
             let dupe_relayer = heard_relayer.filter(|&n| n != 0 && n != self.node_num);
+            let flags = self
+                .pending
+                .iter()
+                .find(|p| p.active && p.from == parsed.from && p.id == parsed.id)
+                .map(|p| p.unicast_flags)
+                .unwrap_or_else(|| self.graph.unicast_commit_flags(parsed.from, parsed.id));
             if self.graph.role_allows_canceling_dupe()
                 && self.graph.unicast_dupe_cancels(
                     parsed.id,
@@ -4080,6 +4269,8 @@ impl Router {
                     next_hop,
                     now_ms,
                     dupe_relayer,
+                    flags,
+                    parsed.next_hop,
                 )
             {
                 self.graph.cancel_relay(parsed.from, parsed.id);
@@ -6130,7 +6321,7 @@ mod tests {
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x601, true);
         let (sent, armed_at) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB, "route to DEST goes via RELAYER");
-        assert!(router.has_pending_reliable(0x601), "retries armed");
+        assert!(router.has_pending_reliable(0x601), "flood insurance armed");
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
         assert!(logs.iter().any(|e| matches!(
@@ -6141,53 +6332,131 @@ mod tests {
             }
         )));
 
-        let step = router.reliable_retx_delay_ms(sent_len(&wire), UNI_SOURCE, 0x601);
-        let mut t = armed_at;
-        assert!(router.poll_reliable_retransmit(t + step - 1).is_none());
-        // Retries 1 and 2 keep the designated next hop.
-        for _ in 0..2 {
-            t += step;
-            let retx = router.poll_reliable_retransmit(t + 1).expect("retry due");
-            let hdr = PacketHeader::decode(&retx.bytes[..PACKET_HEADER_LEN])
-                .unwrap()
-                .parse();
-            assert_eq!(hdr.next_hop, 0xBB);
-        }
-        // Retry 3 is the fallback: next hop cleared, then nothing more.
-        t += step;
-        let last = router
-            .poll_reliable_retransmit(t + 1)
-            .expect("final retry due");
-        let hdr = PacketHeader::decode(&last.bytes[..PACKET_HEADER_LEN])
+        let flood = router
+            .poll_reliable_retransmit(armed_at.saturating_add(60_000))
+            .expect("flood insurance due");
+        let hdr = PacketHeader::decode(&flood.bytes[..PACKET_HEADER_LEN])
             .unwrap()
             .parse();
-        assert_eq!(hdr.next_hop, 0, "last retry must be released to flooding");
-        router.drain_sr_logs(&mut logs);
-        assert!(logs.iter().any(|e| matches!(
-            e,
-            SrLogEvent::RelayRetxFired {
-                id: 0x601,
-                fallback: true
-            }
-        )));
-        t += step;
-        assert!(router.poll_reliable_retransmit(t + 1).is_none());
+        assert_eq!(hdr.next_hop, 0, "named hop silent: release to flooding");
+        assert!(router
+            .poll_reliable_retransmit(armed_at.saturating_add(120_000))
+            .is_none());
         assert!(!router.has_pending_reliable(0x601));
     }
 
-    fn sent_len(wire: &[u8]) -> u8 {
-        wire.len() as u8
-    }
-
     #[test]
-    fn forwarded_unicast_without_want_ack_is_not_retried() {
+    fn forwarded_unicast_without_want_ack_is_retried_then_flooded() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x602, false);
+        let (sent, armed_at) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.next_hop, 0xBB);
+        assert!(router.has_pending_reliable(0x602));
+        let flood = router
+            .poll_reliable_retransmit(armed_at.saturating_add(60_000))
+            .expect("flood insurance due");
+        let hdr = PacketHeader::decode(&flood.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert_eq!(hdr.next_hop, 0);
+    }
+
+    #[test]
+    fn named_forward_still_arms_flood_insurance_when_ranking_has_a_later_flood_slot() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_PEER, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_PEER, true, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_PEER);
+        router.graph_mut().edges_mut().update_edge(
+            UNI_ME,
+            UNI_PEER,
+            UNI_RELAYER,
+            1.5,
+            0,
+            EdgeSource::Reported,
+            true,
+            0,
+        );
+        router
+            .graph_mut()
+            .edges_mut()
+            .set_edge_hears_us(UNI_PEER, UNI_RELAYER, true);
+        // Odd id: we rank ahead of PEER among indirects, so PEER is the flood slot.
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x611, false);
         let (sent, _) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB);
-        assert!(!router.has_pending_reliable(0x602));
+        assert!(
+            router.has_pending_reliable(0x611),
+            "named hop still insures even if ranking assigned someone else a flood slot"
+        );
+    }
+
+    #[test]
+    fn unicast_to_us_is_acked_and_a_request_keeps_its_hop_budget() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_SOURCE, true, 0);
+        for (want_ack, id, hop_limit, hop_start) in
+            [(false, 0x901u32, 3u8, 3u8), (true, 0x902u32, 2, 3)]
+        {
+            // Requested ACK: one hop already used, so the reply has a budget to travel back.
+            // Unsolicited dest ACK: hops-away 0 so the originator is the delivering relayer.
+            let (len, frame) = build_app_wire_frame(
+                UNI_ME,
+                UNI_SOURCE,
+                id,
+                router.channel_hash(),
+                hop_limit,
+                hop_start,
+                want_ack,
+                &key,
+                mesh_protocol::portnum::num::TEXT_MESSAGE_APP,
+                b"hi",
+                DataEncodeOpts {
+                    bitfield: router.ours(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .expect("frame");
+            let _ = router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -70,
+                        snr: 8,
+                        bytes: &frame[..len as usize],
+                    },
+                    id,
+                )
+                .unwrap();
+            let ack = router.poll_ack_tx(id).expect("ack");
+            let hdr = PacketHeader::decode(&ack.bytes[..PACKET_HEADER_LEN])
+                .unwrap()
+                .parse();
+            if want_ack {
+                assert!(hdr.hop_limit > 0, "a requested ack keeps its hop budget");
+            } else {
+                assert_eq!(hdr.hop_limit, 0, "an unrequested ack stays local");
+            }
+            assert_eq!(hdr.to, UNI_SOURCE);
+            assert_eq!(hdr.from, UNI_ME);
+        }
     }
 
     #[test]
@@ -7467,14 +7736,36 @@ mod tests {
         setup_unicast_graph(router);
         router
             .graph_mut()
-            .observe_direct_neighbor(UNI_DEST, -75, 6, 0, 0);
-        let wire = unicast_wire(1, 1, 0, 0xDD, 0x504);
+            .observe_direct_neighbor(UNI_DEST, -40, 12, 0, 0);
+        // Same half-ETX bucket as RELAYER's link: odd id picks the higher node id, which is us.
+        let wire = unicast_wire(1, 1, 0, 0xDD, 0x505);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(
             scheduled,
             "hop_limit 0 is fine when the next hop is the destination"
         );
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn last_hop_want_ack_retries_when_the_remaining_budget_is_one() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_DEST, -40, 12, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_DEST);
+        let wire = unicast_wire_ack(1, 1, 0, 0xDD, 0x507, true);
+        let (sent, _) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.hop_limit, 0);
+        assert_eq!(sent.next_hop, (UNI_DEST & 0xFF) as u8);
+        assert!(
+            router.has_pending_reliable(0x507),
+            "a hop-0 last hop toward a non-SR dest still retries until dest ACKs"
+        );
     }
 
     #[test]

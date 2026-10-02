@@ -1368,6 +1368,7 @@ pub mod sr {
                     SrSkipReason::ReplyRetracesLink => b"reply retraces link",
                     SrSkipReason::UnverifiedBacktrack => b"guessed route runs back",
                     SrSkipReason::AlreadyCovered => b"no rung given, nothing expected",
+                    SrSkipReason::LastHopReserved => b"last hop reserved",
                 };
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);

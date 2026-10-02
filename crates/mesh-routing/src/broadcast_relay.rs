@@ -72,6 +72,12 @@ pub struct BroadcastRelayPlan {
     /// A neighbour our relay reaches that the transmitter did not (0 when the relay was taken
     /// for another reason: sole candidate or downstream).
     pub coverage_for: u32,
+    /// Last hop: we are the dest-ACK-timed backup, not the early slot.
+    pub last_hop_backup: bool,
+    /// Non-final last ranked slot: this copy goes out with `next_hop` cleared.
+    pub nonfinal_flood: bool,
+    /// Ranking assigned a later flood slot, so named forwards do not arm their own insurance.
+    pub has_nonfinal_flood_slot: bool,
 }
 
 /// Ranking inputs collected during the first pick, for the log.
@@ -911,6 +917,9 @@ where
         reserved_ranked,
         absorbed,
         absorbed_len,
+        last_hop_backup: false,
+        nonfinal_flood: false,
+        has_nonfinal_flood_slot: false,
     }
 }
 

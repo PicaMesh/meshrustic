@@ -75,6 +75,7 @@ struct RelayCommit {
     original_heard_from: u32,
     heard_transmitters: [u32; MAX_HEARD_TRANSMITTERS],
     heard_transmitter_count: u8,
+    unicast_flags: crate::unicast_relay::UnicastSlotFlags,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -203,6 +204,7 @@ impl NeighborGraph {
                 original_heard_from: 0,
                 heard_transmitters: [0; MAX_HEARD_TRANSMITTERS],
                 heard_transmitter_count: 0,
+                unicast_flags: crate::unicast_relay::UnicastSlotFlags::EMPTY,
             }; MAX_RELAY_STATES],
             topo_versions: [TopologyVersionEntry {
                 node_id: 0,
@@ -790,6 +792,8 @@ impl NeighborGraph {
         my_next_hop: u32,
         now_ms: u32,
         dupe_relayer: Option<u32>,
+        flags: crate::unicast_relay::UnicastSlotFlags,
+        dupe_next_hop: u8,
     ) -> bool {
         let ctx = crate::unicast_relay::UnicastRelayContext {
             my_node: self.my_node,
@@ -798,13 +802,15 @@ impl NeighborGraph {
             downstream: &self.downstream,
             downstream_ttl_ms: NEIGHBOR_TTL_MS,
         };
-        crate::unicast_relay::unicast_dupe_cancels(
+        crate::unicast_relay::unicast_dupe_cancels_for(
             &ctx,
             packet_id,
             destination,
             my_next_hop,
             now_ms,
             dupe_relayer,
+            flags,
+            dupe_next_hop,
         )
     }
 
@@ -1887,6 +1893,7 @@ impl NeighborGraph {
                 original_heard_from: heard_from,
                 heard_transmitters: [0; MAX_HEARD_TRANSMITTERS],
                 heard_transmitter_count: 0,
+                unicast_flags: crate::unicast_relay::UnicastSlotFlags::default(),
             };
             return (tx_after_ms, slot_index, candidates);
         }
@@ -2476,6 +2483,31 @@ impl NeighborGraph {
         self.relay_states
             .iter()
             .any(|s| s.active && s.from == from && s.id == packet_id)
+    }
+
+    pub fn set_unicast_commit_flags(
+        &mut self,
+        from: u32,
+        packet_id: u32,
+        flags: crate::unicast_relay::UnicastSlotFlags,
+    ) {
+        for slot in &mut self.relay_states {
+            if slot.active && slot.from == from && slot.id == packet_id {
+                slot.unicast_flags = flags;
+            }
+        }
+    }
+
+    pub fn unicast_commit_flags(
+        &self,
+        from: u32,
+        packet_id: u32,
+    ) -> crate::unicast_relay::UnicastSlotFlags {
+        self.relay_states
+            .iter()
+            .find(|s| s.active && s.from == from && s.id == packet_id)
+            .map(|s| s.unicast_flags)
+            .unwrap_or_default()
     }
 
     pub fn is_committed_relay_for_id(&self, packet_id: u32) -> bool {

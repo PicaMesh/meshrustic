@@ -15,6 +15,11 @@
 //! later slot only when that transmitter can finish delivery, or is ranked ahead of us and has a
 //! path; we keep the slot if we can finish and they cannot. Finishing is a priced hop to the
 //! destination, or being its downstream gateway — not stock optimism without a link.
+//!
+//! Last hop (a priced hop to the destination): at most two such links if dest is SR, otherwise
+//! one. The second waits for dest's ACK. Indirect candidates still take later slots. Non-final
+//! hops: the last ranked non-direct slot floods (`next_hop` cleared) after the named next hop
+//! has had its chance, so stock neighbours may pick up.
 
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
@@ -52,6 +57,22 @@ pub struct UnicastRelayContext<'a> {
 pub struct UnicastCandidate {
     pub node_id: u32,
     pub cost: u16,
+}
+
+/// How a committed unicast slot should treat a heard copy and whether it floods.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnicastSlotFlags {
+    pub last_hop_backup: bool,
+    pub nonfinal_flood: bool,
+    pub nominated_next_hop: u32,
+}
+
+impl UnicastSlotFlags {
+    pub const EMPTY: Self = Self {
+        last_hop_backup: false,
+        nonfinal_flood: false,
+        nominated_next_hop: 0,
+    };
 }
 
 /// `a` is placed earlier than `b` in the unicast ranking for `packet_id`.
@@ -139,6 +160,11 @@ impl UnicastRelayContext<'_> {
 ///
 /// `my_next_hop` is what our route picker answered for `destination` (0 = no route, our own
 /// id = "relay it ourselves"). Returns the plan with our slot, or the reason we stay silent.
+///
+/// A priced hop to the destination is a last hop: at most two such links if dest is SR, else
+/// one. The extra directs return [`SrSkipReason::LastHopReserved`]. Indirect candidates still
+/// get slots. When two or more non-direct candidates remain, the last of them is the flood
+/// slot (`BroadcastRelayPlan::nonfinal_flood`).
 pub fn plan_unicast_relay(
     ctx: &UnicastRelayContext<'_>,
     packet_id: u32,
@@ -216,6 +242,33 @@ pub fn plan_unicast_relay(
         }
     }
 
+    // Last hop: at most two priced links if dest is SR (early + dest-ACK backup), otherwise
+    // one. Indirect candidates stay so the packet can still reach that link.
+    let dest_sr = ctx.capability.status(destination).is_signal_routing();
+    let i_am_direct = candidates[..count]
+        .iter()
+        .any(|c| c.node_id == me && c.cost < DOWNSTREAM_TIER_COST);
+    if count > 0 && candidates[0].cost < DOWNSTREAM_TIER_COST {
+        let max_directs = if dest_sr { 2usize } else { 1 };
+        let mut kept = 0usize;
+        let mut kept_directs = 0usize;
+        for i in 0..count {
+            let direct = candidates[i].cost < DOWNSTREAM_TIER_COST;
+            if direct {
+                if kept_directs >= max_directs {
+                    continue;
+                }
+                kept_directs += 1;
+            }
+            candidates[kept] = candidates[i];
+            kept += 1;
+        }
+        count = kept;
+        if i_am_direct && !candidates[..count].iter().any(|c| c.node_id == me) {
+            return Err(SrSkipReason::LastHopReserved);
+        }
+    }
+
     let mut plan = BroadcastRelayPlan {
         reason: RelayReason::UnicastCost,
         ..Default::default()
@@ -232,9 +285,17 @@ pub fn plan_unicast_relay(
     }
     let mut slot = 0u8;
     let mut my_slot = None;
+    let mut my_direct = false;
+    let mut last_non_direct_slot = None;
+    let mut non_direct_slots = 0u8;
     for candidate in &candidates[..count] {
         if has_transmitted(candidate.node_id) {
             continue;
+        }
+        let direct = candidate.cost < DOWNSTREAM_TIER_COST;
+        if !direct {
+            last_non_direct_slot = Some(slot);
+            non_direct_slots = non_direct_slots.saturating_add(1);
         }
         if (plan.ranked_len as usize) < RANKED_LOG {
             plan.ranked[plan.ranked_len as usize] = candidate.node_id;
@@ -242,6 +303,7 @@ pub fn plan_unicast_relay(
         }
         if candidate.node_id == me {
             my_slot = Some(slot);
+            my_direct = direct;
         }
         slot = slot.saturating_add(1);
     }
@@ -251,14 +313,13 @@ pub fn plan_unicast_relay(
     plan.should_relay = true;
     plan.slot_index = my_slot;
     plan.candidate_count = slot.max(1);
+    plan.last_hop_backup = my_direct && dest_sr && my_slot == 1;
+    plan.has_nonfinal_flood_slot = non_direct_slots >= 2;
+    plan.nonfinal_flood =
+        !my_direct && non_direct_slots >= 2 && last_non_direct_slot == Some(my_slot);
     Ok(plan)
 }
 
-/// Whether a heard unicast copy should pull back our pending relay.
-///
-/// Cancel when the transmitter can finish (priced hop / dest's downstream) or is ranked ahead of
-/// us with a path. Keep when we can finish and they cannot. An unresolved relay byte is treated
-/// as a designated/stock hop we were waiting for only if we cannot finish ourselves.
 pub fn unicast_dupe_cancels(
     ctx: &UnicastRelayContext<'_>,
     packet_id: u32,
@@ -267,11 +328,63 @@ pub fn unicast_dupe_cancels(
     now_ms: u32,
     dupe_relayer: Option<u32>,
 ) -> bool {
+    unicast_dupe_cancels_for(
+        ctx,
+        packet_id,
+        destination,
+        my_next_hop,
+        now_ms,
+        dupe_relayer,
+        UnicastSlotFlags::default(),
+        0,
+    )
+}
+
+/// Whether a heard unicast copy should pull back our pending relay.
+///
+/// Cancel when the transmitter can finish (priced hop / dest's downstream) or is ranked ahead of
+/// us with a path. Keep when we can finish and they cannot. An unresolved relay byte is treated
+/// as a designated/stock hop we were waiting for only if we cannot finish ourselves.
+///
+/// Last-hop backup: only dest's own copy (or dest ACK, handled elsewhere) cancels. A flood slot
+/// stays for a same-hop named SR copy that cannot finish, and cancels when the nominated hop,
+/// dest, a finisher, or another flood copy is heard.
+pub fn unicast_dupe_cancels_for(
+    ctx: &UnicastRelayContext<'_>,
+    packet_id: u32,
+    destination: u32,
+    my_next_hop: u32,
+    now_ms: u32,
+    dupe_relayer: Option<u32>,
+    flags: UnicastSlotFlags,
+    dupe_next_hop: u8,
+) -> bool {
     let me = ctx.my_node;
     let we_finish = ctx.can_finish(me, destination, now_ms);
     let Some(relayer) = dupe_relayer.filter(|&n| n != 0 && n != me && !is_placeholder_node(n)) else {
         return !we_finish;
     };
+    if flags.last_hop_backup {
+        return relayer == destination;
+    }
+    if flags.nonfinal_flood {
+        if relayer == destination {
+            return true;
+        }
+        if ctx.can_finish(relayer, destination, now_ms) {
+            return true;
+        }
+        let nominated = flags.nominated_next_hop;
+        if nominated != 0
+            && (relayer == nominated || (nominated & 0xFF) as u8 == (relayer & 0xFF) as u8)
+        {
+            return true;
+        }
+        if dupe_next_hop == 0 {
+            return true;
+        }
+        return false;
+    }
     if ctx.can_finish(relayer, destination, now_ms) {
         return true;
     }
@@ -442,6 +555,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(&even.ranked[..3], &[GW, ME, PEER]);
+        assert!(even.has_nonfinal_flood_slot);
+        assert!(
+            !even.nonfinal_flood,
+            "a named slot still arms its own flood insurance"
+        );
         // Odd id: higher node id first.
         let odd = plan_unicast_relay(&f.ctx(), 0xcfd2_d4db, PHONE, PHONE, DEST, GW, NOW, |_| {
             false
@@ -469,12 +587,128 @@ mod tests {
         f.edges
             .update_edge(ME, ME, DEST, 2.0, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(ME, DEST, true);
+        // DEST is not SR: only the cheapest direct gets a slot.
         let even =
             plan_unicast_relay(&f.ctx(), 0x10, PHONE, PHONE, DEST, DEST, NOW, |_| false).unwrap();
+        assert_eq!(even.ranked[0], ME, "even id: low node id first");
+        assert!(
+            !even.ranked[..even.ranked_len as usize].contains(&PEER),
+            "the other direct link does not get a slot"
+        );
+        let odd =
+            plan_unicast_relay(&f.ctx(), 0x11, PHONE, PHONE, DEST, DEST, NOW, |_| false)
+                .unwrap_err();
+        assert_eq!(odd, SrSkipReason::LastHopReserved);
+    }
+
+    #[test]
+    fn sr_dest_gives_two_last_hop_slots() {
+        let mut f = field_fixture();
+        f.capability.track_topology(DEST, true, NOW);
+        f.edges
+            .update_edge(ME, PEER, DEST, 2.0, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(PEER, DEST, true);
+        f.edges
+            .update_edge(ME, ME, DEST, 2.0, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(ME, DEST, true);
+        let even =
+            plan_unicast_relay(&f.ctx(), 0x10, PHONE, PHONE, DEST, DEST, NOW, |_| false).unwrap();
+        assert_eq!(even.ranked[0], ME);
+        assert!(
+            even.ranked[..even.ranked_len as usize].contains(&PEER),
+            "next-best last hop still gets a dest-ACK slot"
+        );
+        assert!(!even.last_hop_backup);
         let odd =
             plan_unicast_relay(&f.ctx(), 0x11, PHONE, PHONE, DEST, DEST, NOW, |_| false).unwrap();
-        assert_eq!(even.ranked[0], ME, "even id: low node id first");
-        assert_eq!(odd.ranked[0], PEER, "odd id: high node id first");
+        assert_eq!(odd.ranked[0], PEER);
+        assert!(odd.last_hop_backup);
+    }
+
+    #[test]
+    fn last_non_direct_of_two_is_the_flood_slot() {
+        let f = field_fixture();
+        let plan = plan_unicast_relay(&f.ctx(), 0xe0c9_25e5, PHONE, PHONE, DEST, GW, NOW, |_| {
+            false
+        })
+        .expect("we are a candidate");
+        assert_eq!(plan.slot_index, 1);
+        assert!(plan.has_nonfinal_flood_slot);
+        assert!(plan.nonfinal_flood, "last ranked non-direct floods");
+    }
+
+    #[test]
+    fn flood_slot_stays_for_named_sr_that_cannot_finish() {
+        let f = field_fixture();
+        let flags = UnicastSlotFlags {
+            nonfinal_flood: true,
+            nominated_next_hop: GW,
+            ..Default::default()
+        };
+        assert!(
+            !unicast_dupe_cancels_for(
+                &f.ctx(),
+                0x40,
+                DEST,
+                GW,
+                NOW,
+                Some(PEER),
+                flags,
+                (PEER & 0xFF) as u8
+            ),
+            "a named same-hop SR that cannot finish is not dest's ACK"
+        );
+        assert!(unicast_dupe_cancels_for(
+            &f.ctx(),
+            0x40,
+            DEST,
+            GW,
+            NOW,
+            Some(GW),
+            flags,
+            0
+        ));
+        assert!(unicast_dupe_cancels_for(
+            &f.ctx(),
+            0x40,
+            DEST,
+            GW,
+            NOW,
+            Some(DEST),
+            flags,
+            0
+        ));
+        assert!(
+            unicast_dupe_cancels_for(&f.ctx(), 0x40, DEST, GW, NOW, Some(PEER), flags, 0),
+            "another flood copy cancels"
+        );
+    }
+
+    #[test]
+    fn last_hop_backup_does_not_cancel_on_the_other_direct() {
+        let mut f = field_fixture();
+        f.capability.track_topology(DEST, true, NOW);
+        f.edges
+            .update_edge(ME, ME, DEST, 1.2, NOW, EdgeSource::Reported, true, 0);
+        f.edges.set_edge_hears_us(ME, DEST, true);
+        let flags = UnicastSlotFlags {
+            last_hop_backup: true,
+            ..Default::default()
+        };
+        assert!(
+            !unicast_dupe_cancels_for(&f.ctx(), 0x40, DEST, DEST, NOW, Some(PEER), flags, 0),
+            "another last hop is not dest's ACK"
+        );
+        assert!(unicast_dupe_cancels_for(
+            &f.ctx(),
+            0x40,
+            DEST,
+            DEST,
+            NOW,
+            Some(DEST),
+            flags,
+            0
+        ));
     }
 
     #[test]

@@ -1,11 +1,10 @@
-//! Reliable retransmit slots: want_ack packets we originate, and want_ack unicasts we forward
-//! with a designated next hop (retried until someone carries the packet on; the last retry is
-//! sent with `next_hop` cleared so any node may relay it, as Meshtastic's NextHopRouter does).
+//! Reliable retransmit slots: want_ack packets we originate, last-hop want_ack toward a
+//! non-SR dest, and a single flood insurance copy of a named non-final forward (next_hop
+//! cleared if the nominated hop never carries it).
 
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 
 use crate::router::MAX_WIRE_LEN;
-use crate::routing_ack::NUM_RELIABLE_RETX;
 
 pub const MAX_PENDING_RELIABLE: usize = 4;
 
@@ -16,8 +15,10 @@ pub struct PendingReliable {
     pub from: u32,
     pub packet_id: u32,
     pub to: u32,
-    /// Forwarded copy of someone else's unicast: last retry clears `next_hop`.
+    /// Forwarded copy of someone else's unicast.
     pub relayed: bool,
+    /// Last remaining attempt of a named forward: clear `next_hop` so stock may pick up.
+    pub flood_on_last: bool,
     pub num_retx: u8,
     pub next_tx_ms: u32,
     pub len: u8,
@@ -32,6 +33,7 @@ impl PendingReliable {
             packet_id: 0,
             to: 0,
             relayed: false,
+            flood_on_last: false,
             num_retx: 0,
             next_tx_ms: 0,
             len: 0,
@@ -50,6 +52,8 @@ pub fn schedule_reliable(
     bytes: [u8; MAX_WIRE_LEN],
     retx_delay_ms: u32,
     now_ms: u32,
+    num_retx: u8,
+    flood_on_last: bool,
 ) -> bool {
     if slots
         .iter()
@@ -67,7 +71,8 @@ pub fn schedule_reliable(
         packet_id,
         to,
         relayed,
-        num_retx: NUM_RELIABLE_RETX,
+        flood_on_last,
+        num_retx,
         next_tx_ms: now_ms.wrapping_add(retx_delay_ms),
         len,
         bytes,
@@ -145,7 +150,7 @@ pub fn due_retransmit(
         slot.num_retx -= 1;
         slot.next_tx_ms = now_ms.wrapping_add(retx_delay_for(slot.from, slot.packet_id, slot.len));
         let mut fallback = false;
-        if slot.relayed && slot.num_retx == 0 {
+        if slot.relayed && slot.num_retx == 0 && slot.flood_on_last {
             // Last try: release the packet to flooding so any neighbour may carry it.
             if let Ok(mut hdr) = PacketHeader::decode(&slot.bytes[..PACKET_HEADER_LEN]) {
                 if hdr.next_hop != 0 {

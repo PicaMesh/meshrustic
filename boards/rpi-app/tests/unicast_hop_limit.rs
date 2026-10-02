@@ -1,10 +1,10 @@
-//! Last-hop unicasts: to a direct hears-us neighbour while stock peers listen, the frame carries
-//! one hop and names the destination as next hop, whatever the link quality.
+//! Last-hop unicasts: a priced hop names the destination as next hop and decrements
+//! `hop_limit` like any other relay. Originated last hops still use `LAST_HOP_BUDGET`.
 
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_routing::{
     coordinated_relay, hops_away, relay_header_with_next_hop_opts, EdgeSource, InboundPacket,
-    ProcessResult, RelayPlan, Router, DEVICE_ROLE_ROUTER, LAST_HOP_BUDGET,
+    ProcessResult, RelayPlan, Router, DEVICE_ROLE_ROUTER,
 };
 use static_cell::StaticCell;
 
@@ -49,11 +49,11 @@ fn ready_relay(router: &mut Router, result: &ProcessResult, now_ms: u32) -> Rela
 }
 
 #[test]
-fn last_hop_has_one_hop_and_names_the_destination_on_any_link() {
+fn last_hop_decrements_and_names_the_destination_on_any_link() {
     for etx in [2.0, 4.0] {
         let hdr = relay_header_for(etx, 3, 5);
-        assert_eq!(hdr.hop_limit(), LAST_HOP_BUDGET);
-        assert_eq!(hdr.hop_start(), 4);
+        assert_eq!(hdr.hop_limit(), 2);
+        assert_eq!(hdr.hop_start(), 5);
         assert_eq!(hdr.parse().next_hop, (DEST & 0xFF) as u8);
     }
 }
@@ -80,7 +80,7 @@ fn all_sr_neighbors_skips_limit() {
 }
 
 #[test]
-fn router_relay_applies_limit_on_unicast() {
+fn router_relay_decrements_hop_limit_on_unicast() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let router = ROUTER.init(Router::new(ME));
     setup_router(router, 2.0);
@@ -102,7 +102,7 @@ fn router_relay_applies_limit_on_unicast() {
         .expect("inbound");
     let relay = ready_relay(router, &result, 0);
     let tx_hdr = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN]).expect("header");
-    assert_eq!(tx_hdr.hop_limit(), LAST_HOP_BUDGET);
-    assert_eq!(tx_hdr.hop_start(), 4);
+    assert_eq!(tx_hdr.hop_limit(), 2);
+    assert_eq!(tx_hdr.hop_start(), 5);
     assert_eq!(tx_hdr.parse().next_hop, (DEST & 0xFF) as u8);
 }

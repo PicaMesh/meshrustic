@@ -109,16 +109,22 @@ is actually waiting for.
   Replies (`Router::response_header`) use stock's hops-used-plus-margin rule from
   `hop_limit_for_response`. A request that reached us through a relay keeps its reply's hop
   budget. Tests: `reply_to_direct_hearing_neighbour_is_hop_limited_when_stock_nodes_are_around`.
-- **Last hop.** A unicast to a direct neighbour that hears us, while stock neighbours listen
-  (`NeighborGraph::caps_last_hop`), goes out with `LAST_HOP_BUDGET` (one hop) and the
-  destination's byte as next hop, whether we originate it (`Router::send_local`, replies, ACKs)
-  or relay it (`relay_header_with_next_hop_opts`, which rewrites `hop_start` so hops used stay
-  countable). Stock relays a unicast only when the next hop is unset or its own byte, so the
+- **Last hop (originated).** A unicast we originate or a reply to a direct neighbour that hears
+  us, while stock neighbours listen (`NeighborGraph::caps_last_hop`), goes out with
+  `LAST_HOP_BUDGET` (one hop) and the destination's byte as next hop (`Router::send_local`,
+  replies, ACKs). Stock relays a unicast only when the next hop is unset or its own byte, so the
   frame is left alone; the destination reads zero hops used and acknowledges; and `hop_start` is
   populated, which the Meshtastic Android app requires before it shows a traceroute reply. Among
   SR peers only, slot coordination suppresses relays and the budget stays untouched. Tests:
-  `last_hop_relay_has_one_hop_and_names_the_destination`, `unicast_hop_limit`,
-  `last_hop_reply_is_direct_for_stock_and_left_alone_by_stock_relays`.
+  `last_hop_reply_is_direct_for_stock_and_left_alone_by_stock_relays`,
+  `all_sr_neighbors_skips_limit`.
+- **Last hop (relayed).** A relay that has a priced hop to the destination names it as next hop
+  and decrements `hop_limit` like any other hop (`relay_header_with_next_hop_opts`); it does not
+  rewrite the remaining budget. If the incoming hop fields are inverted (`hop_start < hop_limit`),
+  `hop_start` is raised to the outgoing hop limit so `hops_away` stays readable (`Some(0)`:
+  only this hop is known). Tests: `last_hop_relay_decrements_and_names_the_destination`,
+  `last_hop_relay_treats_inconsistent_hop_fields_as_zero_travelled`,
+  `router_relay_decrements_hop_limit_on_unicast`.
 - **Relay byte.** Every frame we originate carries our own low node byte in `relay_node`, as
   stock does since 2.5 (`build_app_wire_frame`, the topology, nodeinfo and telemetry frame
   builders, the PKI frame builder). Receivers treat a relay byte equal to the sender's byte, or
@@ -162,12 +168,17 @@ is actually waiting for.
   stops on an ACK, a NAK or a module reply that carries the request id
   (`Router::process_reliable_rx`, stock's `ReliableRouter`). Test:
   `traceroute_reply_stops_our_reliable_retransmit`.
-- **Responses are acknowledged only when direct.** A response addressed to us (request or reply
-  id set) with WantAck gets a hop-0 ACK only if it travelled zero hops or named us as next hop
-  (`Router::process_reliable_rx`, stock's `ReliableRouter::sniffReceived`); a relayed response
-  was acknowledged implicitly by its relay. Response hop budgets follow stock's
-  `getHopLimitForResponse` (`hop_limit_for_response`): hops used plus margin, zero for a
-  zero-hop request, the configured limit when the hop count is unknown.
+- **A requested acknowledgement keeps its hop budget.** A unicast with `want_ack` is
+  acknowledged as before (`Router::process_reliable_rx`): a request uses `response_header` /
+  `hop_limit_for_response` (hops used plus margin, zero for a zero-hop request, the configured
+  limit when the hop count is unknown), and a response gets a hop-0 ACK only when it arrived
+  with zero hops or a designated next hop. A unicast that did not ask is acknowledged at hop
+  limit 0 only when the delivering transmitter is SR (`Router::delivering_relayer_is_sr`): hops
+  away 0 means the originator, otherwise the resolved relay byte. Stock last hops are not
+  waiting. A duplicate of a `want_ack` unicast, or of an SR-delivered unsolicited unicast, is
+  acknowledged again the same way. A module reply still replaces the ACK. Routing ACKs
+  themselves are not acknowledged. Test:
+  `unicast_to_us_is_acked_and_a_request_keeps_its_hop_budget`.
 - **Routing ACKs that retrace the link are not relayed** (`SrSkipReason::ReplyRetracesLink`).
 
 ## 3a. Unicast routes
@@ -260,6 +271,26 @@ is actually waiting for.
   the destination's own low byte is planned as one with no named relayer: the cost ranking
   decides, nobody owns slot 0 (`Router::evaluate_tx_plan`, `relayer_named`). Test:
   `next_hop_equal_to_the_destination_names_no_relayer`.
+- **Last hop slots.** When any candidate has a priced hop to the destination, at most two such
+  links get slots if the destination is SR (`CapabilityStatus::is_signal_routing`): the cheapest
+  early, the next as dest-ACK backup (`last_hop_backup`). Otherwise one. Extra directs return
+  `SrSkipReason::LastHopReserved`. The backup waits for dest's ACK of the early last hop
+  (early slot + that copy's airtime + dest-ACK wait) and cancels only on dest's own copy. Last
+  hops do not flood. Indirect candidates still take later slots. Tests:
+  `sr_dest_gives_two_last_hop_slots`,
+  `equal_costs_alternate_on_packet_id_parity`,
+  `last_hop_backup_does_not_cancel_on_the_other_direct`.
+- **Non-final flood salvage.** When two or more non-direct candidates remain, the last of them
+  is a flood slot (`nonfinal_flood`): `next_hop` cleared so stock neighbours may pick up after
+  named hops have had their chance. A flood slot cancels on dest, a transmitter that can
+  finish, the nominated hop, or another flood copy; it stays for a same-hop named SR copy that
+  cannot finish. Named forwards always arm one flood-insurance retry (`num_retx = 1`,
+  `flood_on_last`); a later flood slot in the ranking is not proof that neighbour overheard
+  this copy. Tests: `last_non_direct_of_two_is_the_flood_slot`,
+  `flood_slot_stays_for_named_sr_that_cannot_finish`,
+  `named_forward_still_arms_flood_insurance_when_ranking_has_a_later_flood_slot`,
+  `forwarded_want_ack_unicast_is_retried_then_released_to_flooding`,
+  `forwarded_unicast_without_want_ack_is_retried_then_flooded`.
 - **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
   names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
   the destination (`plan_unicast_relay`); the best placed keys up first. A heard copy cancels a
@@ -317,11 +348,17 @@ is actually waiting for.
   node knows nothing of the floor and starts contending the moment it hears the frame, so its
   copy is clear after its own worst case plus one airtime, and the floor only applies as a lower
   bound. Adding the floor to the stock case would count the same silence twice. Ranking `Err`
-  does not abort that backup. Forward and backup TX stamp **our path** next hop; flood
-  (`next_hop = 0`) only on the last relayed `want_ack` retry. Tests:
-  `unicast_designated_*`, `designated_hop_backup_survives_ranking_skip` (a coverage skip keeps
-  the backup, at its unranked slot rung rather than all backups sharing slot 1),
-  `forwarded_want_ack_unicast_is_retried_then_released_to_flooding`.
+  does not abort that backup. Forward and backup TX stamp **our path** next hop. A named
+  non-final forward always arms one flood-insurance copy (`next_hop` cleared) if the nominated
+  hop never carries it. Last-hop `want_ack` toward a non-SR dest keeps `NUM_RELIABLE_RETX`
+  without clearing next hop, including when the remaining budget is already zero. An
+  acknowledgement from the destination, or a copy that can finish, cancels them. Tests:
+  `unicast_designated_*`,
+  `designated_hop_backup_survives_ranking_skip` (a coverage skip keeps the backup, at its
+  unranked slot rung rather than all backups sharing slot 1),
+  `forwarded_want_ack_unicast_is_retried_then_released_to_flooding`,
+  `forwarded_unicast_without_want_ack_is_retried_then_flooded`,
+  `last_hop_want_ack_retries_when_the_remaining_budget_is_one`.
 
 ## 3b. Broadcast relay and T1
 

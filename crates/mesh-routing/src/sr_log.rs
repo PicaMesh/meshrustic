@@ -350,6 +350,9 @@ pub enum SrSkipReason {
     /// Unicast whose only route is the unverified inbound-gateway guess, pointing back at the
     /// node we heard the packet from: carrying it moves the packet away from its destination.
     UnverifiedBacktrack,
+    /// Last hop to the destination: a cheaper direct link already holds the early (and maybe
+    /// dest-ACK) slot, so we stay silent.
+    LastHopReserved,
 }
 
 /// Sink for periodic topology graph dumps (may emit many lines).

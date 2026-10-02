@@ -142,7 +142,7 @@ pub use traceroute::{
     RouteDiscovery, ROUTE_SIZE, TRACEROUTE_APP,
 };
 pub use unicast_relay::{
-    plan_unicast_relay, unicast_dupe_cancels, UnicastCandidate, UnicastRelayContext,
-    BEST_EFFORT_SELF_COST, COST_BUCKET_FIXED, DOWNSTREAM_TIER_COST, INDIRECT_TIER,
-    MAX_UNICAST_CANDIDATES,
+    plan_unicast_relay, unicast_dupe_cancels, unicast_dupe_cancels_for, UnicastCandidate,
+    UnicastRelayContext, UnicastSlotFlags, BEST_EFFORT_SELF_COST, COST_BUCKET_FIXED,
+    DOWNSTREAM_TIER_COST, INDIRECT_TIER, MAX_UNICAST_CANDIDATES,
 };

@@ -21,6 +21,13 @@ pub enum CapabilityStatus {
     SrActive,
 }
 
+impl CapabilityStatus {
+    /// MeshRustic or MT+SR, including mute/passive dests that still ACK.
+    pub fn is_signal_routing(self) -> bool {
+        matches!(self, Self::SrActive | Self::Passive)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CapabilityRecord {
     node_id: u32,

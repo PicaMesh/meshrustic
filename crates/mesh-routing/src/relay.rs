@@ -4,10 +4,7 @@
 //! ciphertext). Protobuf types exist only for ports the router must **parse** (routing, SR,
 //! nodeinfo, traceroute). Relay copies the encrypted payload bytes unchanged.
 
-use mesh_protocol::{PacketHeader, ParsedPacket, HOP_MAX};
-
-use crate::neighbor_graph::LAST_HOP_BUDGET;
-use crate::routing_ack::hops_away;
+use mesh_protocol::{PacketHeader, ParsedPacket};
 
 /// Whether this frame is eligible for relay consideration at the wire layer.
 ///
@@ -34,7 +31,8 @@ pub fn relay_header_with_next_hop(
     relay_header_with_next_hop_opts(rx, our_node, next_hop, false)
 }
 
-/// Build a relay header, optionally applying a direct-neighbor hop budget instead of decrementing.
+/// Build a relay header. `last_hop` names the destination as next hop so stock neighbours
+/// leave the frame alone; hop fields always decrement like any other hop.
 pub fn relay_header_with_next_hop_opts(
     rx: &ParsedPacket,
     our_node: u32,
@@ -45,7 +43,7 @@ pub fn relay_header_with_next_hop_opts(
         return None;
     }
 
-    let (hop_limit, hop_start) = relay_hop_fields(rx, last_hop)?;
+    let (hop_limit, hop_start) = relay_hop_fields(rx)?;
     let relay_node = (our_node & 0xFF) as u8;
     // Every relay names its own next hop or none, as stock NextHopRouter does. Copying the
     // incoming byte was wrong both ways: when it named us, the frame left still naming us, so
@@ -75,26 +73,22 @@ pub fn relay_header_with_next_hop_opts(
     ))
 }
 
-/// Outgoing hop fields for a relay: normal decrement, or the last-hop budget with `hop_start`
-/// rewritten so a receiver still recovers the hops used (`hop_start - hop_limit`).
+/// Outgoing hop fields for a relay: decrement `hop_limit`, keep `hop_start`.
 ///
-/// [`hops_away`] is `None` when the header is inconsistent (`hop_start < hop_limit`). That
-/// frame still gets the last-hop budget — dropping it would refuse a neighbour we can hear —
-/// but distance is taken as zero so the emitted pair stays internally consistent.
-pub fn relay_hop_fields(rx: &ParsedPacket, last_hop: bool) -> Option<(u8, u8)> {
+/// An inverted pair (`hop_start < hop_limit`) is unreadable: stock `getHopsAway` returns
+/// unknown and will not ACK a response. Treat travelled as zero so the emitted pair stays
+/// internally consistent, without rewriting the remaining hop budget.
+pub fn relay_hop_fields(rx: &ParsedPacket) -> Option<(u8, u8)> {
     if rx.hop_limit == 0 {
         return None;
     }
-    if last_hop {
-        let hops_away_rx = hops_away(rx.hop_start, rx.hop_limit, true).unwrap_or(0);
-        let hops_away_tx = hops_away_rx.saturating_add(1);
-        // hop_start is a 3-bit wire field; saturating at HOP_MAX keeps hop_start >= hop_limit
-        // so a receiver still reads a distance (understated by at most one at the ceiling).
-        let hop_start = hops_away_tx.saturating_add(LAST_HOP_BUDGET).min(HOP_MAX);
-        Some((LAST_HOP_BUDGET, hop_start))
+    let hop_limit = rx.hop_limit - 1;
+    let hop_start = if rx.hop_start != 0 && rx.hop_start < hop_limit {
+        hop_limit
     } else {
-        Some((rx.hop_limit - 1, rx.hop_start))
-    }
+        rx.hop_start
+    };
+    Some((hop_limit, hop_start))
 }
 
 /// Copy encrypted payload bytes unchanged into a TX pool slot.
@@ -109,6 +103,7 @@ pub fn copy_opaque_payload(dst: &mut crate::pool::PacketSlot, src: &crate::pool:
 mod tests {
     use super::*;
     use crate::pool::{PacketPool, POOL_SIZE};
+    use crate::routing_ack::hops_away;
     use mesh_protocol::PacketHeader;
     use static_cell::StaticCell;
 
@@ -281,10 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn last_hop_relay_has_one_hop_and_names_the_destination() {
+    fn last_hop_relay_decrements_and_names_the_destination() {
         let hdr = last_hop_header(3, 5);
-        assert_eq!(hdr.hop_limit(), LAST_HOP_BUDGET);
-        assert_eq!(hdr.hop_start(), 4);
+        assert_eq!(hdr.hop_limit(), 2);
+        assert_eq!(hdr.hop_start(), 5);
         assert_eq!(
             hops_away(hdr.hop_start(), hdr.hop_limit(), true),
             Some(3),
@@ -309,8 +304,8 @@ mod tests {
                 travelled + 1,
                 "hop_start={hop_start} hop_limit={hop_limit}"
             );
-            assert_eq!(hdr.hop_limit(), LAST_HOP_BUDGET);
-            assert_eq!(hdr.hop_start(), recovered + LAST_HOP_BUDGET);
+            assert_eq!(hdr.hop_limit(), hop_limit - 1);
+            assert_eq!(hdr.hop_start(), hop_start);
         }
     }
 
@@ -325,12 +320,14 @@ mod tests {
         );
         let hdr = relay_header_with_next_hop_opts(&parsed, 0xCC00_00CC, 0xEE00_00EE, true)
             .expect("last-hop still delivers");
-        assert_eq!(hdr.hop_limit(), LAST_HOP_BUDGET);
+        assert_eq!(hdr.hop_limit(), 4);
+        assert_eq!(hdr.hop_start(), 4);
         assert_eq!(
             hops_away(hdr.hop_start(), hdr.hop_limit(), true),
-            Some(1),
+            Some(0),
             "only this hop is known; inverted hop_limit-hop_start must not leak through"
         );
+        assert_eq!(hdr.parse().next_hop, 0xDD);
     }
 
     #[test]
@@ -338,7 +335,7 @@ mod tests {
         let parsed =
             PacketHeader::from_fields(0xDD00_00DD, 0xBB00_00BB, 1, 0, 3, 5, false, false, 0, 0)
                 .parse();
-        let (hop_limit, hop_start) = relay_hop_fields(&parsed, false).expect("relay");
+        let (hop_limit, hop_start) = relay_hop_fields(&parsed).expect("relay");
         assert_eq!(hop_limit, 2);
         assert_eq!(hop_start, 5);
     }
