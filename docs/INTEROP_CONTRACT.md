@@ -229,6 +229,20 @@ is actually waiting for.
   entirely either no change at all or a jump well above any bar between 0.2 and 1.0, so the
   saturated healthy band — not the threshold — is what keeps the graph quiet, and the dirty
   broadcast floor caps how often an early send can fire.
+- **Silence-aware variance is local scoring; the wire is unchanged.** Each node keeps
+  `last_heard` on its own `Reported` RX edges (direct originator or on-air relay gateway only).
+  Live route and delivery cost add a silence surcharge from age since that stamp (bands at
+  `T/2`, `T`, and `2T` for topology period `T`); Dijkstra uses `stored_variance×5` on peers'
+  lists and `effective_variance×10` on our RX edges, including the egress hop to a silent next
+  neighbour. After `≥T/2` quiet, the next RF hear folds the gap into the stored EWMA before
+  `last_heard` resets, so cost does not snap back to the fresh-link price. Packed
+  `etx_variance` and the dirty-topology bar still use stored EWMA only. Tests:
+  `silence_variance_follows_the_four_age_bands`, `delivery_cost_rises_with_silence_on_our_rx_edge`,
+  `variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent`,
+  `silence_fold_keeps_scar_after_a_long_gap_packet`, `last_heard_follows_the_on_air_transmitter`,
+  `in_window_hear_does_not_fold_silence_but_etx_jump_still_raises`,
+  `packed_variance_stays_stored_while_silence_does_not_dirty`,
+  `egress_silence_applies_only_after_we_have_heard_them`.
 - **An edge is one-directional evidence, priced at the receiver.** A node listing a neighbour
   says it hears that neighbour, at the RSSI and SNR it measured on that neighbour's signal.
   `calculate_route` therefore runs Dijkstra backwards from the destination: a settled node is

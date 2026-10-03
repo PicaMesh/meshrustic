@@ -1546,6 +1546,29 @@ impl NeighborGraph {
         heard_on: RadioId,
     ) -> i8 {
         self.edges.ensure_local_node(self.my_node, now_ms);
+        let prev_heard = self
+            .edges
+            .find_node(self.my_node)
+            .and_then(|n| n.find_edge(node_id))
+            .filter(|e| e.source == EdgeSource::Reported)
+            .map(|e| e.last_heard_ms)
+            .unwrap_or(0);
+        if prev_heard != 0 {
+            let gap = now_ms.wrapping_sub(prev_heard);
+            if gap >= TOPOLOGY_BROADCAST_MS / 2 {
+                let silence =
+                    crate::graph::edge::silence_etx_fixed_from_age(gap, TOPOLOGY_BROADCAST_MS)
+                        as f32
+                        / 100.0;
+                if let Some(edge) = self
+                    .edges
+                    .find_node_mut(self.my_node)
+                    .and_then(|n| n.find_edge_mut(node_id))
+                {
+                    edge.update_etx_variance(silence);
+                }
+            }
+        }
         let result = self.edges.update_edge_from_observation(
             self.my_node,
             self.my_node,
@@ -1575,6 +1598,13 @@ impl NeighborGraph {
             heard_on,
             self.modem_preset,
         );
+        if let Some(edge) = self
+            .edges
+            .find_node_mut(self.my_node)
+            .and_then(|n| n.find_edge_mut(node_id))
+        {
+            edge.last_heard_ms = now_ms;
+        }
         self.upsert_direct_signal(node_id, rssi, snr, now_ms);
         result
     }
@@ -2883,6 +2913,7 @@ mod tests {
         slot_time_for_preset, transmission_record_window_ms, tx_delay_ms_worst, DEFAULT_SLOT_MS,
     };
     use crate::decode_packed_neighbors;
+    use crate::graph::edge::effective_variance_byte;
     use crate::graph::{calculate_etx, etx_to_fixed};
     use crate::topology::{write_packed_header, PackedNeighbor};
     use mesh_radio::{MODEM_SHORT_FAST, MODEM_SHORT_SLOW};
@@ -3369,6 +3400,83 @@ mod tests {
         graph.fill_neighbor_entries(&mut entries);
         assert_eq!(entries[0].rssi, -75);
         assert_eq!(entries[0].snr, 11);
+    }
+
+    #[test]
+    fn last_heard_follows_the_on_air_transmitter() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const HUB: u32 = 0xCC00_00CC;
+        const ORIGIN: u32 = 0xDD00_00DD;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(PEER, -70, 8, 1_000, 0);
+        graph.observe_direct_neighbor(HUB, -72, 7, 2_000, 0);
+        graph.observe_packet(ORIGIN, 3, 2, (HUB & 0xFF) as u8, -65, 9, 3_000, 0, Some(HUB), 1);
+        let me = graph.edges().find_node(ME).unwrap();
+        assert_eq!(me.find_edge(PEER).unwrap().last_heard_ms, 1_000);
+        assert_eq!(me.find_edge(HUB).unwrap().last_heard_ms, 3_000);
+        assert!(me.find_edge(ORIGIN).is_none());
+    }
+
+    #[test]
+    fn in_window_hear_does_not_fold_silence_but_etx_jump_still_raises() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const T: u32 = TOPOLOGY_BROADCAST_MS;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        let t0 = 4_000_000u32;
+        graph.observe_direct_neighbor(PEER, -70, 8, t0, 0);
+        let quiet = graph
+            .edges()
+            .find_node(ME)
+            .and_then(|n| n.find_edge(PEER))
+            .unwrap()
+            .etx_variance;
+        graph.observe_direct_neighbor(PEER, -70, 8, t0 + T / 4, 0);
+        let still = graph
+            .edges()
+            .find_node(ME)
+            .and_then(|n| n.find_edge(PEER))
+            .unwrap()
+            .etx_variance;
+        assert_eq!(still, quiet, "an in-window copy must not fold silence into EWMA");
+        graph.observe_direct_neighbor(PEER, -90, -15, t0 + T / 4 + 1, 0);
+        let jumped = graph
+            .edges()
+            .find_node(ME)
+            .and_then(|n| n.find_edge(PEER))
+            .unwrap()
+            .etx_variance;
+        assert!(jumped > still, "|ΔETX| still raises variance inside T/2");
+    }
+
+    #[test]
+    fn packed_variance_stays_stored_while_silence_does_not_dirty() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const T: u32 = TOPOLOGY_BROADCAST_MS;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        let t0 = 2_000_000u32;
+        graph.observe_direct_neighbor(PEER, -70, 8, t0, 0);
+        graph.commit_topology_broadcast(t0, true);
+        let silent_at = t0 + 2 * T;
+        let edge = graph
+            .edges()
+            .find_node(ME)
+            .and_then(|n| n.find_edge(PEER))
+            .unwrap();
+        assert_eq!(edge.etx_variance, 0);
+        assert!(effective_variance_byte(edge, silent_at, T, true) > edge.etx_variance);
+        let mut buf = [0u8; 64];
+        let len = graph.build_topology_chunk(0, 1, &mut buf).unwrap();
+        let (_, listed) = decode_packed_neighbors(&buf[..len], 8).unwrap();
+        assert_eq!(listed[0].etx_variance, 0);
+        let report = graph.run_maintenance(silent_at);
+        assert!(!report.topology_dirty_send);
     }
 
     #[test]

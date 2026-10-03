@@ -2,8 +2,10 @@
 
 use mesh_radio::RadioId;
 
+use super::edge::{effective_variance_byte, Edge, EdgeSource};
 use super::is_placeholder_node;
 use super::{DownstreamTable, EdgeStore, MAX_GRAPH_NODES};
+use crate::neighbor_graph::TOPOLOGY_BROADCAST_MS;
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE;
 
@@ -215,11 +217,14 @@ pub fn publishes_topology(capability: Option<&CapabilityCache>, node: u32) -> bo
 }
 
 fn measured_etx(edges: &EdgeStore, node: u32, peer: u32) -> Option<u16> {
+    measured_edge(edges, node, peer).map(|e| e.etx_fixed)
+}
+
+fn measured_edge(edges: &EdgeStore, node: u32, peer: u32) -> Option<&Edge> {
     edges
         .find_node(node)
         .and_then(|n| n.find_edge(peer))
         .filter(|e| e.source.is_measured())
-        .map(|e| e.etx_fixed)
 }
 
 /// Cost of the hop `from → to`, priced at the receiver when it published a measurement of the
@@ -241,6 +246,51 @@ pub fn hop_cost_fixed(edges: &EdgeStore, from: u32, to: u32) -> Option<u16> {
     measured_etx(edges, from, to)
 }
 
+/// Route/delivery price for one directed hop taken from `list_owner`'s edge list.
+pub fn priced_hop_cost_fixed(
+    edge: &Edge,
+    list_owner: u32,
+    my_node: u32,
+    now_ms: u32,
+    unverified: bool,
+) -> u16 {
+    let etx = if unverified {
+        edge.etx_fixed.saturating_mul(UNVERIFIED_HOP_COST_FACTOR)
+    } else {
+        edge.etx_fixed
+    };
+    let our_rx = list_owner == my_node && edge.source == EdgeSource::Reported;
+    let var_byte = effective_variance_byte(edge, now_ms, TOPOLOGY_BROADCAST_MS, our_rx);
+    let weight = if our_rx { 10u16 } else { 5u16 };
+    etx.saturating_add(var_byte as u16 * weight).min(0xFFFE)
+}
+
+fn relax_priced(
+    edges: &EdgeStore,
+    my_node: u32,
+    now_ms: u32,
+    nodes: &mut [DNode; MAX_GRAPH_NODES],
+    node_count: &mut usize,
+    m: u32,
+    via: u32,
+    u_cost: u16,
+    list_owner: u32,
+    edge: &Edge,
+    unverified: bool,
+) {
+    let mut edge_cost = priced_hop_cost_fixed(edge, list_owner, my_node, now_ms, unverified);
+    if m == my_node {
+        if let Some(rx) = edges
+            .find_node(my_node)
+            .and_then(|n| n.find_edge(via))
+            .filter(|e| e.source == EdgeSource::Reported && e.last_heard_ms != 0)
+        {
+            edge_cost = edge_cost.max(priced_hop_cost_fixed(rx, my_node, my_node, now_ms, false));
+        }
+    }
+    relax(nodes, node_count, m, via, u_cost, edge_cost);
+}
+
 /// Price of delivering `from → to`. The receiver's measurement when it published one. When the
 /// only measurement is the sender's, that number is the reverse direction: a publisher that has
 /// not priced the arrival leaves the hop at [`UNVERIFIED_HOP_COST_FACTOR`] times that reverse
@@ -250,16 +300,15 @@ pub fn delivery_direction_cost_fixed(
     capability: Option<&CapabilityCache>,
     from: u32,
     to: u32,
+    now_ms: u32,
+    my_node: u32,
 ) -> Option<u16> {
-    if let Some(cost) = measured_etx(edges, to, from) {
-        return Some(cost);
+    if let Some(edge) = measured_edge(edges, to, from) {
+        return Some(priced_hop_cost_fixed(edge, to, my_node, now_ms, false));
     }
-    let reverse = measured_etx(edges, from, to)?;
-    if publishes_topology(capability, to) {
-        Some(reverse.saturating_mul(UNVERIFIED_HOP_COST_FACTOR))
-    } else {
-        Some(reverse)
-    }
+    let edge = measured_edge(edges, from, to)?;
+    let unverified = publishes_topology(capability, to);
+    Some(priced_hop_cost_fixed(edge, from, my_node, now_ms, unverified))
 }
 
 /// Hop cost for a deliverable `from → to` (see [`delivery_direction_cost_fixed`]). `None` if not
@@ -269,11 +318,13 @@ pub fn delivery_hop_cost_fixed(
     capability: Option<&CapabilityCache>,
     from: u32,
     to: u32,
+    now_ms: u32,
+    my_node: u32,
 ) -> Option<u16> {
     if !can_deliver(edges, capability, from, to) {
         return None;
     }
-    delivery_direction_cost_fixed(edges, capability, from, to)
+    delivery_direction_cost_fixed(edges, capability, from, to, now_ms, my_node)
 }
 
 /// Bucket width for comparing links when picking a coverage owner: two nodes price the same link
@@ -490,6 +541,7 @@ fn backward_search(
     edges: &EdgeStore,
     my_node: u32,
     destination: u32,
+    now_ms: u32,
     routable: Option<&RoutableFilter<'_>>,
     allow_unverified: bool,
 ) -> Option<(u16, u32, u8)> {
@@ -539,13 +591,18 @@ fn backward_search(
         if let Some(n_edges) = edges.find_node(n) {
             for e in 0..n_edges.edge_count as usize {
                 let edge = n_edges.edges[e];
-                relax(
+                relax_priced(
+                    edges,
+                    my_node,
+                    now_ms,
                     &mut nodes,
                     &mut node_count,
                     edge.to,
                     n,
                     u_cost,
-                    edge.etx_fixed,
+                    n,
+                    &edge,
+                    false,
                 );
             }
         }
@@ -570,10 +627,33 @@ fn backward_search(
                 continue;
             };
             if !n_publishes {
-                relax(&mut nodes, &mut node_count, m, n, u_cost, edge.etx_fixed);
+                relax_priced(
+                    edges,
+                    my_node,
+                    now_ms,
+                    &mut nodes,
+                    &mut node_count,
+                    m,
+                    n,
+                    u_cost,
+                    m,
+                    &edge,
+                    false,
+                );
             } else if allow_unverified {
-                let penalised = edge.etx_fixed.saturating_mul(UNVERIFIED_HOP_COST_FACTOR);
-                relax(&mut nodes, &mut node_count, m, n, u_cost, penalised);
+                relax_priced(
+                    edges,
+                    my_node,
+                    now_ms,
+                    &mut nodes,
+                    &mut node_count,
+                    m,
+                    n,
+                    u_cost,
+                    m,
+                    &edge,
+                    true,
+                );
             }
         }
     }
@@ -631,7 +711,7 @@ pub fn calculate_route(
     }
 
     if let Some((cost, next_hop, hops)) =
-        backward_search(edges, my_node, destination, routable, false)
+        backward_search(edges, my_node, destination, now_ms, routable, false)
     {
         result.cost_fixed = cost;
         result.next_hop = next_hop;
@@ -670,7 +750,7 @@ pub fn calculate_route(
 
     if result.next_hop == 0 {
         if let Some((cost, next_hop, hops)) =
-            backward_search(edges, my_node, destination, routable, true)
+            backward_search(edges, my_node, destination, now_ms, routable, true)
         {
             result.cost_fixed = cost;
             result.next_hop = next_hop;
@@ -1134,7 +1214,7 @@ mod tests {
         edges.set_edge_hears_us(TX, RX, true);
         assert!(can_deliver(&edges, Some(&capability), TX, RX));
         assert_eq!(
-            delivery_hop_cost_fixed(&edges, Some(&capability), TX, RX),
+            delivery_hop_cost_fixed(&edges, Some(&capability), TX, RX, 0, TX),
             Some(200 * UNVERIFIED_HOP_COST_FACTOR),
             "the receiver publishes and has not measured this hop, so the reverse SNR is penalised"
         );
@@ -1152,7 +1232,7 @@ mod tests {
         capability.track_topology(RX, true, 0);
         assert!(can_deliver(&edges, Some(&capability), TX, RX));
         assert_eq!(
-            delivery_hop_cost_fixed(&edges, Some(&capability), TX, RX),
+            delivery_hop_cost_fixed(&edges, Some(&capability), TX, RX, 0, TX),
             Some(300)
         );
     }
@@ -1165,7 +1245,10 @@ mod tests {
         edges.ensure_local_node(TX, 0);
         edges.update_edge(TX, TX, STOCK, 2.5, 0, EdgeSource::Reported, true, 0);
         assert!(can_deliver(&edges, None, TX, STOCK));
-        assert_eq!(delivery_hop_cost_fixed(&edges, None, TX, STOCK), Some(250));
+        assert_eq!(
+            delivery_hop_cost_fixed(&edges, None, TX, STOCK, 0, TX),
+            Some(250)
+        );
     }
 
     /// A hop confirmed once but priced hopeless is not coverage: the peer keeps `hears_us` while
@@ -1348,5 +1431,131 @@ mod tests {
         assert!(!route.verified);
         let hub = calculate_route(&edges, &downstream, HUB, DEST, 0, None);
         assert_eq!(hub.next_hop, PARENT);
+    }
+
+    #[test]
+    fn variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent() {
+        const ME: u32 = 0xAA00_00AA;
+        const QUIET: u32 = 0xBB00_00BB;
+        const NOISY: u32 = 0xCC00_00CC;
+        const DEST: u32 = 0xDD00_00DD;
+        const T: u32 = TOPOLOGY_BROADCAST_MS;
+        let t0 = 10_000_000u32;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, t0);
+        edges.update_edge(ME, ME, QUIET, 1.8, t0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, NOISY, 2.0, t0, EdgeSource::Reported, true, 0);
+        edges
+            .find_node_mut(ME)
+            .unwrap()
+            .find_edge_mut(QUIET)
+            .unwrap()
+            .last_heard_ms = t0;
+        edges
+            .find_node_mut(ME)
+            .unwrap()
+            .find_edge_mut(NOISY)
+            .unwrap()
+            .last_heard_ms = t0 + T;
+        edges.update_edge(ME, QUIET, DEST, 1.0, t0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, NOISY, DEST, 1.2, t0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, DEST, QUIET, 1.0, t0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, DEST, NOISY, 1.2, t0, EdgeSource::Mirrored, true, 0);
+        let downstream = DownstreamTable::new();
+        let now = t0 + 2 * T + 1;
+        let route = calculate_route(&edges, &downstream, ME, DEST, now, None);
+        assert_eq!(route.next_hop, NOISY);
+    }
+
+    #[test]
+    fn delivery_cost_rises_with_silence_on_our_rx_edge() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const T: u32 = TOPOLOGY_BROADCAST_MS;
+        let t0 = 5_000_000u32;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, t0);
+        edges.update_edge(ME, ME, PEER, 2.0, t0, EdgeSource::Reported, true, 0);
+        edges
+            .find_node_mut(ME)
+            .unwrap()
+            .find_edge_mut(PEER)
+            .unwrap()
+            .last_heard_ms = t0;
+        let inside =
+            delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + T / 4, ME).unwrap();
+        assert_eq!(inside, 200);
+        let loud =
+            delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + T + 1_000, ME).unwrap();
+        assert!(loud > inside);
+        let saturated =
+            delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + 2 * T, ME).unwrap();
+        assert!(saturated > loud);
+    }
+
+    #[test]
+    fn silence_fold_keeps_scar_after_a_long_gap_packet() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const T: u32 = TOPOLOGY_BROADCAST_MS;
+        let mut graph = crate::neighbor_graph::NeighborGraph::new();
+        graph.set_my_node(ME);
+        let t0 = 1_000_000u32;
+        graph.observe_direct_neighbor(PEER, -70, 8, t0, 0);
+        let fresh =
+            delivery_hop_cost_fixed(graph.edges(), None, PEER, ME, t0, ME).unwrap();
+        graph.observe_direct_neighbor(PEER, -70, 8, t0 + 2 * T + 1, 0);
+        let after =
+            delivery_hop_cost_fixed(graph.edges(), None, PEER, ME, t0 + 2 * T + 1, ME).unwrap();
+        assert!(after > fresh);
+    }
+
+    #[test]
+    fn unverified_priced_hop_saturates_instead_of_wrapping() {
+        const ME: u32 = 0xAA00_00AA;
+        let edge = Edge {
+            to: 0xBB00_00BB,
+            etx_fixed: 20_000,
+            last_update_ms: 0,
+            etx_variance: 0,
+            source: EdgeSource::Mirrored,
+            hears_us: false,
+            heard_on: 0,
+            last_heard_ms: 0,
+        };
+        assert_eq!(
+            priced_hop_cost_fixed(&edge, edge.to, ME, 0, true),
+            0xFFFE,
+            "etx*4 must saturate, not wrap a uint16"
+        );
+    }
+
+    #[test]
+    fn egress_silence_applies_only_after_we_have_heard_them() {
+        const ME: u32 = 0xAA00_00AA;
+        const HUB: u32 = 0xBB00_00BB;
+        const DEST: u32 = 0xCC00_00CC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, HUB, 5.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, HUB, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, HUB, DEST, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, DEST, HUB, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        let downstream = DownstreamTable::new();
+        let unheard = calculate_route(&edges, &downstream, ME, DEST, 0, None);
+        assert_eq!(unheard.next_hop, HUB);
+        assert_eq!(
+            unheard.cost_fixed, 200,
+            "a Reported edge we have never RF-heard must not replace their list of us"
+        );
+        edges
+            .find_node_mut(ME)
+            .unwrap()
+            .find_edge_mut(HUB)
+            .unwrap()
+            .last_heard_ms = 1;
+        let heard = calculate_route(&edges, &downstream, ME, DEST, 1, None);
+        assert_eq!(heard.next_hop, HUB);
+        assert!(heard.cost_fixed > unheard.cost_fixed);
     }
 }

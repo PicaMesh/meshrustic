@@ -2336,6 +2336,8 @@ impl Router {
                 Some(self.graph.capability()),
                 self.node_num,
                 parsed.to,
+                now_ms,
+                self.node_num,
             )
             .is_some();
         let stamp_hop = if unicast_plan.as_ref().is_some_and(|p| p.nonfinal_flood) {
@@ -3218,6 +3220,8 @@ impl Router {
             Some(self.graph.capability()),
             self.node_num,
             p.to,
+            now_ms,
+            self.node_num,
         )
         .is_some();
         if p.hop_limit == 0 && !last_hop {

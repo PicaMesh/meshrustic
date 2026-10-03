@@ -536,7 +536,14 @@ where
         let mut valid_costs = 0u8;
         for &target in &unique[..unique_count as usize] {
             if let Some(fixed) =
-                delivery_hop_cost_fixed(ctx.edges, Some(ctx.capability), candidate, target)
+                delivery_hop_cost_fixed(
+                    ctx.edges,
+                    Some(ctx.capability),
+                    candidate,
+                    target,
+                    now_ms,
+                    ctx.my_node,
+                )
             {
                 total_cost += fixed as f32 / 100.0;
                 valid_costs += 1;

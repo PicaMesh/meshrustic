@@ -52,6 +52,9 @@ pub struct Edge {
     pub hears_us: bool,
     /// Preset segment this edge was learned on (Phase 9 multi-radio).
     pub heard_on: RadioId,
+    /// Last time we RF-heard this neighbour as the on-air transmitter (our `Reported` edge only).
+    /// Zero means never heard: no live silence surcharge.
+    pub last_heard_ms: u32,
 }
 
 impl Edge {
@@ -73,6 +76,42 @@ impl Edge {
         let scaled = (updated * 20.0 + 0.5) as u16;
         self.etx_variance = scaled.min(255) as u8;
     }
+}
+
+/// Live silence surcharge in ETX×100 from age since [`Edge::last_heard_ms`]. `period_ms` is the
+/// topology broadcast interval (`T`).
+pub fn silence_etx_fixed_from_age(age_ms: u32, period_ms: u32) -> u16 {
+    let half = period_ms / 2;
+    if age_ms < half {
+        return 0;
+    }
+    if age_ms < period_ms {
+        let num = (age_ms - half) as u64 * 50;
+        let den = half as u64;
+        return (num / den) as u16;
+    }
+    let two = period_ms * 2;
+    if age_ms < two {
+        let num = (age_ms - period_ms) as u64 * 550;
+        let den = period_ms as u64;
+        return (50 + num / den) as u16;
+    }
+    1275
+}
+
+/// Silence component as stored variance units (ETX×20), capped at 255.
+pub fn silence_variance_byte_from_age(age_ms: u32, period_ms: u32) -> u8 {
+    let fixed = silence_etx_fixed_from_age(age_ms, period_ms);
+    ((fixed as u32 * 20 + 50) / 100).min(255) as u8
+}
+
+pub fn effective_variance_byte(edge: &Edge, now_ms: u32, period_ms: u32, our_rx: bool) -> u8 {
+    if !our_rx || edge.last_heard_ms == 0 {
+        return edge.etx_variance;
+    }
+    let age = now_ms.wrapping_sub(edge.last_heard_ms);
+    let silence = silence_variance_byte_from_age(age, period_ms);
+    edge.etx_variance.saturating_add(silence).min(255)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +177,7 @@ impl EdgeStore {
                     source: EdgeSource::Mirrored,
                     hears_us: false,
                     heard_on: 0,
+                    last_heard_ms: 0,
                 }; MAX_EDGES_PER_NODE],
             }; super::MAX_GRAPH_NODES],
             node_count: 0,
@@ -333,6 +373,7 @@ impl EdgeStore {
                 source,
                 hears_us: false,
                 heard_on,
+                last_heard_ms: 0,
             };
             self.nodes[from_idx].edge_count += 1;
             EDGE_NEW
@@ -368,6 +409,7 @@ impl EdgeStore {
                 source,
                 hears_us: false, // must be re-proven for the new neighbour
                 heard_on,
+                last_heard_ms: 0,
             };
             EDGE_NEW
         }
@@ -969,5 +1011,19 @@ mod tests {
             edges.update_edge(ME, ME, 0xBB, 1.0, 1_000, EdgeSource::Reported, true, 0),
             EDGE_NEW
         );
+    }
+
+    #[test]
+    fn silence_variance_follows_the_four_age_bands() {
+        const T: u32 = 600_000;
+        assert_eq!(silence_etx_fixed_from_age(T / 2 - 1, T), 0);
+        assert_eq!(silence_etx_fixed_from_age(T / 2, T), 0);
+        let slight = silence_etx_fixed_from_age(T / 2 + T / 8, T);
+        assert!(slight > 0 && slight < 50);
+        let mid = silence_etx_fixed_from_age(T + T / 2, T);
+        assert_eq!(mid, 325);
+        assert!(mid > slight);
+        assert_eq!(silence_etx_fixed_from_age(2 * T, T), 1275);
+        assert_eq!(silence_variance_byte_from_age(2 * T, T), 255);
     }
 }

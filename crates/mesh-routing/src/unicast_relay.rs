@@ -115,13 +115,28 @@ impl UnicastRelayContext<'_> {
     /// downstream parent. `can_deliver` alone is not enough — it is true for every unpublished dest.
     /// Being the first SR hop we would appoint (chain egress) is not last-hop finish.
     fn can_finish(&self, node: u32, destination: u32, now_ms: u32) -> bool {
-        delivery_hop_cost_fixed(self.edges, Some(self.capability), node, destination).is_some()
+        delivery_hop_cost_fixed(
+            self.edges,
+            Some(self.capability),
+            node,
+            destination,
+            now_ms,
+            self.my_node,
+        )
+        .is_some()
             || self.downstream_relay(destination, now_ms) == Some(node)
     }
 
     fn candidate_cost(&self, node: u32, destination: u32, my_next_hop: u32, now_ms: u32) -> u16 {
         if let Some(cost) =
-            delivery_hop_cost_fixed(self.edges, Some(self.capability), node, destination)
+            delivery_hop_cost_fixed(
+                self.edges,
+                Some(self.capability),
+                node,
+                destination,
+                now_ms,
+                self.my_node,
+            )
         {
             return bucket(cost.min(DOWNSTREAM_TIER_COST - 1));
         }
