@@ -3227,16 +3227,15 @@ impl Router {
         if p.hop_limit == 0 && !last_hop {
             return;
         }
-        let delay;
-        let num_retx;
-        let flood_on_last;
-        if last_hop {
+        let (delay, num_retx, flood_on_last) = if last_hop {
             if !p.want_ack || dest_sr || flags.last_hop_backup {
                 return;
             }
-            delay = self.reliable_retx_delay_ms(len, p.from, p.id);
-            num_retx = NUM_RELIABLE_RETX;
-            flood_on_last = false;
+            (
+                self.reliable_retx_delay_ms(len, p.from, p.id),
+                NUM_RELIABLE_RETX,
+                false,
+            )
         } else if flags.nonfinal_flood || p.next_hop == 0 {
             return;
         } else {
@@ -3247,10 +3246,8 @@ impl Router {
             } else {
                 p.next_hop as u32
             };
-            delay = self.next_hop_carry_wait_ms(nominated, airtime);
-            num_retx = 1;
-            flood_on_last = true;
-        }
+            (self.next_hop_carry_wait_ms(nominated, airtime), 1, true)
+        };
         if schedule_reliable(
             &mut self.pending_reliable,
             p.from,
@@ -4178,7 +4175,7 @@ impl Router {
         // with the module reply instead of a second ACK.
         if parsed.to == self.node_num
             && parsed.from != self.node_num
-            && !decoded_data.is_some_and(|d| d.portnum == ROUTING_APP)
+            && decoded_data.is_none_or(|d| d.portnum != ROUTING_APP)
             && !self.module_reply_suppresses_ack
         {
             let repeated = Self::is_repeated_reliable_tx(parsed, decoded_data);

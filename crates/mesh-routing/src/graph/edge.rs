@@ -111,7 +111,7 @@ pub fn effective_variance_byte(edge: &Edge, now_ms: u32, period_ms: u32, our_rx:
     }
     let age = now_ms.wrapping_sub(edge.last_heard_ms);
     let silence = silence_variance_byte_from_age(age, period_ms);
-    edge.etx_variance.saturating_add(silence).min(255)
+    edge.etx_variance.saturating_add(silence)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

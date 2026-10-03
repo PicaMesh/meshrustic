@@ -112,10 +112,8 @@ impl DownstreamTable {
             if relay == 0 || relay == cur {
                 return None;
             }
-            for i in 0..hops as usize {
-                if seen[i] == relay {
-                    return None;
-                }
+            if seen[..hops as usize].contains(&relay) {
+                return None;
             }
             seen[hops as usize] = relay;
             hops += 1;

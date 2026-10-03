@@ -637,7 +637,7 @@ fn backward_search(
                     n,
                     u_cost,
                     m,
-                    &edge,
+                    edge,
                     false,
                 );
             } else if allow_unverified {
@@ -651,7 +651,7 @@ fn backward_search(
                     n,
                     u_cost,
                     m,
-                    &edge,
+                    edge,
                     true,
                 );
             }
