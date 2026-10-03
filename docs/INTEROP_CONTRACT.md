@@ -230,13 +230,18 @@ is actually waiting for.
   saturated healthy band — not the threshold — is what keeps the graph quiet, and the dirty
   broadcast floor caps how often an early send can fire.
 - **Silence-aware variance is local scoring; the wire is unchanged.** Each node keeps
-  `last_heard` on its own `Reported` RX edges (direct originator or on-air relay gateway only).
-  Live route and delivery cost add a silence surcharge from age since that stamp (bands at
-  `T/2`, `T`, and `2T` for topology period `T`); Dijkstra uses `stored_variance×5` on peers'
-  lists and `effective_variance×10` on our RX edges, including the egress hop to a silent next
-  neighbour. After `≥T/2` quiet, the next RF hear folds the gap into the stored EWMA before
-  `last_heard` resets, so cost does not snap back to the fresh-link price. Packed
-  `etx_variance` and the dirty-topology bar still use stored EWMA only. Tests:
+  `last_heard` on its own `Reported` RX edges (direct originator or on-air relay gateway only;
+  zero means never heard: no live surcharge). Age since that stamp adds a silence component with
+  `T` the topology period (`TOPOLOGY_BROADCAST_MS` / `TOPOLOGY_BROADCAST_SECS` =
+  `SIGNAL_ROUTING_BROADCAST_SECS` = 600 s): `< T/2` none, `T/2…T` slight, `T…2T` much more,
+  `≥ 2T` saturate. Dijkstra and `delivery_hop_cost_fixed` / `deliveryHopCost` add
+  `stored_variance×5` on peers' lists and `effective_variance×10` on our RX edges. An unverified
+  reverse hop saturates `etx×UNVERIFIED_HOP_COST_FACTOR` first, then adds that variance term.
+  The egress hop `me → N` takes the dearer of N's list of us and our RX of N only when we have
+  RF-heard N (`last_heard != 0`). After `≥T/2` quiet, the next RF hear folds the gap into the
+  stored EWMA before `last_heard` resets, so cost does not snap back to the fresh-link price.
+  Packed `etx_variance`, `covers` / `hop_cost_fixed` / acknowledgements, and the dirty-topology
+  bar still use stored EWMA / raw mean ETX. Tests:
   `silence_variance_follows_the_four_age_bands`, `delivery_cost_rises_with_silence_on_our_rx_edge`,
   `variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent`,
   `silence_fold_keeps_scar_after_a_long_gap_packet`, `last_heard_follows_the_on_air_transmitter`,
@@ -254,7 +259,7 @@ is actually waiting for.
   split (`delivery_direction_cost_fixed`). Coverage keeps the raw measurement
   (`hop_cost_fixed`): a confirmed neighbour whose ETX is under the ceiling is still coverage.
   An edge is never used against its direction, and a confirmed hop costs what its receiver
-  measured.
+  measured plus that list's silence-aware variance (§3a).
   Intermediate hops must be routable; the destination need not. The route carries `hops`, logged
   as `Route to !X via !Y cost=C hops=H`. `find_better_positioned_neighbor` applies the same
   evidence rule through `route::can_deliver`. Tests: `one_way_edge_is_not_a_route`,
@@ -276,7 +281,7 @@ is actually waiting for.
 - **Inbound-gateway fallback.** When no confirmed path exists (and the downstream table has
   none either), the search runs again allowing hops into a topology-publishing node that has not
   published a measurement of the sender, at `UNVERIFIED_HOP_COST_FACTOR` times the sender's
-  reverse cost, so the node that hears
+  reverse ETX (saturating) plus the same variance term as a verified hop, so the node that hears
   the far side still carries the frame out; a one-way edge is usually a marginal link or a
   truncated list. The route is marked unverified (`Route::verified`, logged as `unverified`),
   a confirmed path of any length wins over it, and passive nodes are never chosen as the
@@ -609,7 +614,8 @@ is actually waiting for.
 
 ## 5. Topology reports
 
-- **Cadence.** Periodic every `TOPOLOGY_BROADCAST_MS`; a dirty broadcast no sooner than
+- **Cadence.** Periodic every `TOPOLOGY_BROADCAST_MS` (600 s; fork `SIGNAL_ROUTING_BROADCAST_SECS`
+  / `NeighborGraph::TOPOLOGY_BROADCAST_SECS`); a dirty broadcast no sooner than
   `TOPOLOGY_DIRTY_MIN_MS` after the last one; a header-only version-0 broadcast at boot; direct
   SR neighbours answer a boot broadcast once per `BOOTSTRAP_REPLY_MIN_MS` (120 s). Originated packets do
   not reset the timer.
@@ -678,11 +684,12 @@ is actually waiting for.
   which relayed frames each had happened to hear.
 - **Coverage is priced on measurements only; reachability may use a guess.** `hop_cost_fixed`
   skips `Inferred` edges and returns no price when only a guess exists, so `covers`,
-  `coverage_owner`, `acknowledgement_price_fixed` and both slot rankings (through
-  `delivery_hop_cost_fixed`)
-  refuse to let a guess excuse a transmission — no price means no coverage, which means we relay.
-  The route search prices its own hops straight from the edges and still travels over an inferred
-  edge, which is the one thing inferring an edge is for. A candidate's coverage set is likewise
+  `coverage_owner` and `acknowledgement_price_fixed` refuse to let a guess excuse a transmission —
+  no price means no coverage, which means we relay. Those three stay on the raw mean ETX.
+  Unicast and broadcast ranking costs use `delivery_hop_cost_fixed`, which is the same
+  measurement plus silence-aware variance (§3a). The route search prices its own hops straight
+  from the edges and still travels over an inferred edge, which is the one thing inferring an
+  edge is for. A candidate's coverage set is likewise
   what that candidate published, and for ourselves what we publish: `Inferred` edges are in
   nobody's set, in the ranking, in absorb and in the dupe-cancel path alike.
 - **A link we invent is only ever a link nobody will publish.** A relayed frame teaches an edge
