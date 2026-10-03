@@ -312,7 +312,11 @@ is actually waiting for.
   `forwarded_unicast_without_want_ack_is_retried_then_flooded`.
 - **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
   names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
-  the destination (`plan_unicast_relay`); the best placed keys up first. A heard copy cancels a
+  the destination (`plan_unicast_relay`); the best placed keys up first. A neighbour is a
+  candidate only when it is known to hear this copy's transmitter (`known_to_hear`: `hears_us`
+  on the transmitter's edge, or the neighbour listing the transmitter). We ourselves always
+  count — we overheard the frame. A path to the destination is not that evidence; ranking a
+  deaf neighbour made every overhearer wait for a slot that never fired. A heard copy cancels a
   later slot only when that transmitter can finish delivery (a priced hop to the destination, or
   being its downstream gateway) or is ranked ahead of us with a path; we keep the slot if we can
   finish and they cannot. An unresolved relay byte (or a placeholder identity) cancels only when
@@ -327,7 +331,8 @@ is actually waiting for.
   `dupe_kept_when_we_can_finish_and_they_cannot`,
   `dupe_cancels_when_relayer_is_ranked_ahead_with_a_path`,
   `dupe_kept_when_relayer_has_no_path`,
-  `unresolved_dupe_cancels_when_we_cannot_finish`.
+  `unresolved_dupe_cancels_when_we_cannot_finish`,
+  `neighbour_that_does_not_hear_the_transmitter_gets_no_slot`.
 - **Soft coverage skips.** `UnicastCovered` for a shared downstream gateway, or for a
   better-positioned SR neighbour, applies only when that node is known to hold this copy
   (`heard_from` or has already transmitted this id). A neighbour that *could* hear the

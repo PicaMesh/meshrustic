@@ -6027,9 +6027,16 @@ mod tests {
             node_id: UNI_ME,
             ..dest
         };
+        // RELAYER overheard SOURCE: without this, ranking would still give RELAYER a slot
+        // because it can reach DEST, and we would wait for a copy it never received.
+        let source = PackedNeighbor {
+            node_id: UNI_SOURCE,
+            hears_us: false,
+            ..dest
+        };
         router
             .graph_mut()
-            .merge_topology(UNI_RELAYER, &header, &[dest, us], true, 0, 0);
+            .merge_topology(UNI_RELAYER, &header, &[dest, us, source], true, 0, 0);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Every SR node that overhears a unicast computes the same candidate ordering from its graph,
 //! so the node best placed to deliver the packet keys up first and everybody else cancels on
-//! its copy. Candidates are ourselves plus our SR-active direct neighbours, ranked by cost to
-//! the destination:
+//! its copy. Candidates are ourselves (we overheard the frame) plus SR-active direct neighbours
+//! that are known to hear this copy's transmitter, ranked by cost to the destination:
 //!
 //! - deliverable hop to the destination ([`can_deliver`]), priced at the receiver when known;
 //! - known downstream relay of the destination: [`DOWNSTREAM_TIER_COST`];
@@ -24,9 +24,8 @@
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{
-    can_deliver, delivery_hop_cost_fixed, hop_cost_fixed, is_placeholder_node, DownstreamTable,
-    EdgeStore,
-    MAX_EDGES_PER_NODE,
+    can_deliver, delivery_hop_cost_fixed, hop_cost_fixed, is_placeholder_node, known_to_hear,
+    DownstreamTable, EdgeStore, MAX_EDGES_PER_NODE,
 };
 use crate::sr_log::SrSkipReason;
 
@@ -111,6 +110,12 @@ impl UnicastRelayContext<'_> {
         self.can_finish(node, destination, now_ms)
     }
 
+    /// A neighbour only gets a unicast slot if it is known to hear this copy's transmitter.
+    /// We ourselves always count: we are ranking because we received the frame.
+    fn heard_this_copy(&self, heard_from: u32, node: u32) -> bool {
+        heard_from == 0 || node == self.my_node || known_to_hear(self.edges, heard_from, node)
+    }
+
     /// Last-hop delivery: a priced hop to the destination, or we are its immediate
     /// downstream parent. `can_deliver` alone is not enough — it is true for every unpublished dest.
     /// Being the first SR hop we would appoint (chain egress) is not last-hop finish.
@@ -191,7 +196,9 @@ impl UnicastRelayContext<'_> {
 /// Rank the relay candidates for a unicast we overheard.
 ///
 /// `my_next_hop` is what our route picker answered for `destination` (0 = no route, our own
-/// id = "relay it ourselves"). Returns the plan with our slot, or the reason we stay silent.
+/// id = "relay it ourselves"). A neighbour that does not hear `heard_from` is not a candidate:
+/// a path to the destination is not evidence they received this copy. Returns the plan with our
+/// slot, or the reason we stay silent.
 ///
 /// A priced hop to the destination is a last hop: at most two such links if dest is SR, else
 /// one. The extra directs return [`SrSkipReason::LastHopReserved`]. Indirect candidates still
@@ -254,6 +261,9 @@ pub fn plan_unicast_relay(
             if ctx.capability.is_legacy_router(n)
                 || ctx.capability.status(n) != CapabilityStatus::SrActive
             {
+                continue;
+            }
+            if !ctx.heard_this_copy(heard_from, n) {
                 continue;
             }
             let cost = ctx.candidate_cost(n, destination, my_next_hop, now_ms);
@@ -488,9 +498,10 @@ mod tests {
             edges.update_edge(ME, ME, n, etx, NOW, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(ME, n, true);
         }
-        // The phone lists all three of us; the peer lists us and the phone.
+        // The phone lists all three of us and reports that we hear it; the peer lists us and the phone.
         for n in [ME, PEER, GW] {
             edges.update_edge(ME, PHONE, n, 1.2, NOW, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(PHONE, n, true);
         }
         for n in [ME, PHONE] {
             edges.update_edge(ME, PEER, n, 1.2, NOW, EdgeSource::Reported, true, 0);
@@ -538,6 +549,7 @@ mod tests {
         capability.track_topology(PEER, true, NOW);
         downstream.update(ME, DEST, PARENT, 2.0, NOW, false, 0);
         downstream.update(ME, PARENT, GW, 2.0, NOW, false, 0);
+        edges.update_edge(ME, GW, PHONE, 1.5, NOW, EdgeSource::Reported, true, 0);
         let ctx = UnicastRelayContext {
             my_node: ME,
             edges: &edges,
@@ -849,6 +861,40 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err, SrSkipReason::NoRelayPath);
+    }
+
+    #[test]
+    fn neighbour_that_does_not_hear_the_transmitter_gets_no_slot() {
+        const OURS: u32 = 0xAA00_00AA;
+        const HUB: u32 = 0xBB00_00BB;
+        const TX: u32 = 0x1100_0011;
+        const FAR: u32 = 0x2200_0022;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let mut downstream = DownstreamTable::new();
+        edges.ensure_local_node(OURS, NOW);
+        for n in [HUB, TX] {
+            edges.update_edge(OURS, OURS, n, 1.5, NOW, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(OURS, n, true);
+        }
+        capability.track_topology(HUB, true, NOW);
+        downstream.update(OURS, FAR, HUB, 2.0, NOW, false, 0);
+        let ctx = UnicastRelayContext {
+            my_node: OURS,
+            edges: &edges,
+            capability: &capability,
+            downstream: &downstream,
+            downstream_ttl_ms: TTL,
+        };
+        let plan = plan_unicast_relay(&ctx, 0x40, TX, TX, FAR, HUB, NOW, |_| false)
+            .expect("we overheard the copy");
+        assert_eq!(plan.slot_index, 0);
+        assert_eq!(plan.candidate_count, 1);
+        assert_eq!(plan.ranked[0], OURS);
+        assert!(
+            !plan.ranked[..plan.ranked_len as usize].contains(&HUB),
+            "a path to dest is not evidence HUB received this copy"
+        );
     }
 
     #[test]
