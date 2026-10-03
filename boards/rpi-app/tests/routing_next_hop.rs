@@ -58,6 +58,24 @@ fn downstream_fallback_when_no_graph_path() {
 }
 
 #[test]
+fn get_next_hop_walks_downstream_behind_the_neighbour() {
+    const ME: u32 = 0xAA;
+    const HUB: u32 = 0xF6;
+    const PARENT: u32 = 0x11;
+    const DEST: u32 = 0x22;
+    let mut graph = NeighborGraph::new();
+    graph.set_my_node(ME);
+    graph.observe_direct_neighbor(HUB, -70, 8, 0, 0);
+    graph
+        .downstream_mut()
+        .update(ME, DEST, PARENT, 2.0, 0, false, 0);
+    graph
+        .downstream_mut()
+        .update(ME, PARENT, HUB, 2.0, 0, false, 0);
+    assert_eq!(graph.get_next_hop(DEST, 0, 0, 0), HUB);
+}
+
+#[test]
 fn next_hop_requires_verified_connectivity() {
     const AA: u32 = 0xAA00_00AA;
     const BB: u32 = 0xBB00_00BB;

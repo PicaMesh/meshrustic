@@ -320,7 +320,7 @@ is actually waiting for.
   `unicast_not_relayed_back_to_the_relayer`, `next_hop_is_relayer_clears_when_they_cannot_finish`.
 - **A guessed route is never stamped.** The verdict belongs to the hop the picker returned, not
   to the searched route: `NeighborGraph::get_next_hop_verified` reports `false` for a
-  better-positioned neighbour, the downstream table, best-effort self relay and direct delivery,
+  better-positioned neighbour, inbound-gateway fallback, best-effort self relay and direct delivery,
   and `Route::verified` is false until the strict search sets it, so an empty route never claims
   one (test `only_the_confirmed_search_reports_a_verified_route`). Such a route may carry a
   unicast,
@@ -328,6 +328,15 @@ is actually waiting for.
   the destination, and a designation makes every other candidate stand down and wait for a copy
   that node may have no way to send. Cleared, we are one ranked candidate among several. Test:
   `guessed_route_is_never_stamped_as_next_hop`.
+- **A downstream chain onto a neighbour we hear is stamped.** Walk dest along `via` until the
+  current node is a neighbour we can name, any depth; dest need not be an RF neighbour of its
+  parent. A node with `DEST via PARENT` and `PARENT via HUB` stamps HUB; the hub with
+  `DEST via PARENT` stamps PARENT. That hop is not the inbound-gateway guess: the table
+  says dest sits behind the named node. Tests: `chain_walks_to_the_first_hearable_hop`,
+  `downstream_chain_appoints_the_neighbour_we_hear`,
+  `get_next_hop_walks_a_downstream_chain`,
+  `downstream_chain_is_stamped_as_next_hop`,
+  `downstream_parent_we_hear_is_stamped_as_next_hop`.
 - **A guessed route that runs back is contained.** If the only route is unverified *and* names
   the node we heard the packet from, and the frame was not addressed to us as its next hop, the
   relay is dropped, not merely stripped of its next hop
@@ -760,9 +769,15 @@ is actually waiting for.
   worst edge (ETX plus age) when a better one arrives (`EdgeStore::update_edge`).
 - **Inferred paths.** Edges learned from relayed packets are priced at a nominal link per hop
   travelled (`INFERRED_LINK_RSSI`, `INFERRED_LINK_SNR` in `observe_relayed_packet`), never at the
-  measured strength of the relay's link to us. A downstream row is kept only when that relay hears
-  us and the originator lists the relay: hearing the originator via the relay is the other
-  direction, and a path we cannot send to is not a path. A copy of a packet **we** transmitted
+  measured strength of the relay's link to us. A downstream row is kept when that relay hears
+  us. An SR-aware originator must also list the relay: their topology is the authority, and a
+  path they have not published is not a path. A stock originator never lists anyone, so the
+  relay observation is the only signal that they sit behind this hop
+  (`stock_originator_becomes_downstream_without_listing_the_relay`); an SR-aware originator
+  that has not listed the relay still does not earn a row
+  (`sr_aware_originator_still_must_list_the_relay`). Hearing the originator via the relay is
+  the other direction, and a path we cannot send to is not a path. A copy of a packet **we**
+  transmitted
   teaches nothing: the peer relaying it got it from us, so recording the source as downstream of
   that peer invents a path back through ourselves, and the two nodes then name each other as next
   hop for that destination until a unicast bounces between them. Our own transmissions are
@@ -770,7 +785,7 @@ is actually waiting for.
 - **A travelling neighbour heard only through a relay stops being a last hop immediately.** A
   sender we still listed as a `Reported` direct neighbour, heard only through a resolved relayer,
   is retracted (`retract_direct_link`). They are written as downstream of that relayer only when
-  the relayer hears us and they list it. Relayed copies
+  the relayer hears us and, if they publish topology, they list it. Relayed copies
   do not refresh our measurement of the sender, so without this a node that moved behind a hop
   kept drawing unicasts onto a dead last hop until `PUBLISHER_SILENCE_MS`. Their later topology
   must not reinstall `sender → us` unless we hear them again — Dijkstra would treat us as that

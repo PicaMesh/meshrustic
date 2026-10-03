@@ -3,6 +3,16 @@
 use mesh_radio::RadioId;
 
 pub const MAX_DOWNSTREAM: usize = 1100;
+/// Walk dest → relay → … at most this many hops before treating the chain as a cycle.
+pub const MAX_DOWNSTREAM_CHAIN: usize = 16;
+
+/// First neighbour we can hear on a downstream walk from a destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainEgress {
+    pub node: u32,
+    pub hops: u8,
+    pub cost_fixed: u16,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DownstreamEntry {
@@ -55,6 +65,11 @@ impl DownstreamTable {
     }
 
     pub fn get_relay(&self, destination: u32, now_ms: u32, ttl_ms: u32) -> Option<u32> {
+        self.relay_and_cost(destination, now_ms, ttl_ms)
+            .map(|(relay, _)| relay)
+    }
+
+    fn relay_and_cost(&self, destination: u32, now_ms: u32, ttl_ms: u32) -> Option<(u32, u16)> {
         let mut best_relay = None;
         let mut best_cost = u16::MAX;
         for i in 0..self.count as usize {
@@ -70,7 +85,50 @@ impl DownstreamTable {
                 best_relay = Some(entry.relay);
             }
         }
-        best_relay
+        best_relay.map(|relay| (relay, best_cost))
+    }
+
+    /// Walk `destination` along `via` until `is_egress` is true. Dest need not be a neighbour of
+    /// its parent — a downstream row is enough. Returns none on a missing hop or a cycle.
+    pub fn chain_egress(
+        &self,
+        destination: u32,
+        now_ms: u32,
+        ttl_ms: u32,
+        is_egress: impl Fn(u32) -> bool,
+    ) -> Option<ChainEgress> {
+        if destination == 0 {
+            return None;
+        }
+        let mut cur = destination;
+        let mut hops = 0u8;
+        let mut cost_fixed = 0u16;
+        let mut seen = [0u32; MAX_DOWNSTREAM_CHAIN];
+        loop {
+            if hops as usize >= MAX_DOWNSTREAM_CHAIN {
+                return None;
+            }
+            let (relay, hop_cost) = self.relay_and_cost(cur, now_ms, ttl_ms)?;
+            if relay == 0 || relay == cur {
+                return None;
+            }
+            for i in 0..hops as usize {
+                if seen[i] == relay {
+                    return None;
+                }
+            }
+            seen[hops as usize] = relay;
+            hops += 1;
+            cost_fixed = cost_fixed.saturating_add(hop_cost);
+            if is_egress(relay) {
+                return Some(ChainEgress {
+                    node: relay,
+                    hops,
+                    cost_fixed,
+                });
+            }
+            cur = relay;
+        }
     }
 
     pub fn count_for_relay(&self, relay: u32, now_ms: u32, ttl_ms: u32) -> usize {
@@ -372,5 +430,50 @@ mod tests {
         );
         assert!(nodes[..2].contains(&0xD1));
         assert!(nodes[..2].contains(&0xD2));
+    }
+
+    #[test]
+    fn chain_walks_to_the_first_hearable_hop() {
+        const ME: u32 = 0xAA;
+        const HUB: u32 = 0xF6;
+        const PARENT: u32 = 0x11;
+        const MID: u32 = 0x33;
+        const DEST: u32 = 0x22;
+        let mut table = DownstreamTable::new();
+        table.update(ME, DEST, MID, 1.5, 1_000, false, 0);
+        table.update(ME, MID, PARENT, 1.5, 1_000, false, 0);
+        table.update(ME, PARENT, HUB, 2.0, 1_000, false, 0);
+        let hearable = |n: u32| n == HUB;
+        let chain = table
+            .chain_egress(DEST, 1_500, 10_000, hearable)
+            .expect("a hearable hop on the chain");
+        assert_eq!(chain.node, HUB);
+        assert_eq!(chain.hops, 3);
+        assert_eq!(
+            table
+                .chain_egress(PARENT, 1_500, 10_000, hearable)
+                .map(|c| c.node),
+            Some(HUB)
+        );
+        assert!(
+            table
+                .chain_egress(DEST, 1_500, 10_000, |n| n == PARENT)
+                .is_some_and(|c| c.node == PARENT && c.hops == 2),
+            "the hub appointing the parent does not need dest as the parent's neighbour"
+        );
+    }
+
+    #[test]
+    fn chain_returns_none_on_a_cycle_or_a_broken_path() {
+        const ME: u32 = 0xAA;
+        let mut table = DownstreamTable::new();
+        table.update(ME, 0x22, 0x11, 1.0, 1_000, false, 0);
+        table.update(ME, 0x11, 0x22, 1.0, 1_000, false, 0);
+        assert!(table.chain_egress(0x22, 1_500, 10_000, |_| false).is_none());
+        let mut broken = DownstreamTable::new();
+        broken.update(ME, 0x22, 0x11, 1.0, 1_000, false, 0);
+        assert!(broken
+            .chain_egress(0x22, 1_500, 10_000, |n| n == 0xF6)
+            .is_none());
     }
 }

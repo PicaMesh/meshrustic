@@ -601,7 +601,8 @@ fn backward_search(
 /// and a confirmed hop is priced at its receiver.
 /// Intermediate hops must pass `is_node_routable`; the destination and we ourselves need not.
 ///
-/// When no path priced from receiver measurements exists, the downstream table is tried, then
+/// When no path priced from receiver measurements exists, the downstream table is walked from
+/// dest until a neighbour we hear (any depth; dest need not be that parent's RF neighbour), then
 /// the inbound-gateway fallback: the same search with reverse-only hops into a publisher allowed
 /// at a penalty, so the node that hears the far side still carries the frame out (a one-way edge
 /// is usually a marginal link or a truncated list, not silence). Such a route is marked
@@ -648,48 +649,21 @@ pub fn calculate_route(
 
     if result.next_hop == 0 {
         let my_edges = edges.find_node(my_node);
-        let mut best_cost = ROUTE_COST_UNKNOWN;
-        let mut best_relay = 0u32;
-        for i in 0..downstream.count() {
-            let Some(entry) = downstream.entry(i) else {
-                break;
-            };
-            if entry.destination != destination {
-                continue;
-            }
-            if edges.find_node(entry.relay).is_none() {
-                continue;
-            }
-            let cost_to_relay = my_edges
-                .and_then(|n| n.find_edge(entry.relay))
+        let is_egress =
+            |n: u32| n != 0 && n != my_node && my_edges.is_some_and(|me| me.find_edge(n).is_some());
+        if let Some(chain) = downstream.chain_egress(destination, now_ms, u32::MAX, is_egress) {
+            let cost_to_egress = my_edges
+                .and_then(|n| n.find_edge(chain.node))
                 .map(|e| e.etx_fixed)
                 .unwrap_or(ROUTE_COST_UNKNOWN);
-            if cost_to_relay >= 0xFFF0 || entry.cost_fixed >= 0xFFF0 {
-                continue;
-            }
-            let total = cost_to_relay.saturating_add(entry.cost_fixed);
-            if total < best_cost {
-                best_cost = total;
-                best_relay = entry.relay;
-            }
-        }
-        if best_relay != 0 {
-            result.next_hop = best_relay;
-            result.cost_fixed = best_cost;
-            result.verified = false;
-            result.egress_radio = my_edges
-                .and_then(|n| n.find_edge(best_relay))
-                .map(|e| e.heard_on)
-                .unwrap_or(0);
-            if result.egress_radio == 0 {
-                for i in 0..downstream.count() {
-                    if let Some(entry) = downstream.entry(i) {
-                        if entry.destination == destination && entry.relay == best_relay {
-                            result.egress_radio = entry.via_radio;
-                            break;
-                        }
-                    }
-                }
+            if cost_to_egress < 0xFFF0 && chain.cost_fixed < 0xFFF0 {
+                result.next_hop = chain.node;
+                result.cost_fixed = cost_to_egress.saturating_add(chain.cost_fixed);
+                result.verified = false;
+                result.egress_radio = my_edges
+                    .and_then(|n| n.find_edge(chain.node))
+                    .map(|e| e.heard_on)
+                    .unwrap_or(0);
             }
         }
     }
@@ -1352,5 +1326,27 @@ mod tests {
 
         let route = calculate_route(&edges, &downstream, ME, FAR, 0, None);
         assert_eq!(route.next_hop, GW, "the guessed hop still routes");
+    }
+
+    #[test]
+    fn downstream_chain_appoints_the_neighbour_we_hear() {
+        const ME: u32 = 0xAA;
+        const HUB: u32 = 0xF6;
+        const PARENT: u32 = 0x11;
+        const DEST: u32 = 0x22;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, HUB, 1.2, 0, EdgeSource::Reported, true, 0);
+        edges.ensure_local_node(HUB, 0);
+        edges.update_edge(HUB, HUB, PARENT, 1.4, 0, EdgeSource::Reported, true, 0);
+        let mut downstream = DownstreamTable::new();
+        downstream.update(ME, DEST, PARENT, 2.0, 0, false, 0);
+        downstream.update(ME, PARENT, HUB, 2.0, 0, false, 0);
+        downstream.update(HUB, DEST, PARENT, 2.0, 0, false, 0);
+        let route = calculate_route(&edges, &downstream, ME, DEST, 0, None);
+        assert_eq!(route.next_hop, HUB);
+        assert!(!route.verified);
+        let hub = calculate_route(&edges, &downstream, HUB, DEST, 0, None);
+        assert_eq!(hub.next_hop, PARENT);
     }
 }

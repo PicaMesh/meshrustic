@@ -6,7 +6,9 @@ pub mod etx;
 pub mod placeholder;
 pub mod route;
 
-pub use downstream::{DownstreamEntry, DownstreamTable, MAX_DOWNSTREAM};
+pub use downstream::{
+    ChainEgress, DownstreamEntry, DownstreamTable, MAX_DOWNSTREAM, MAX_DOWNSTREAM_CHAIN,
+};
 pub use edge::{
     Edge, EdgeSource, EdgeStore, NodeEdges, EDGE_NEW, EDGE_NO_CHANGE, EDGE_SIGNIFICANT_CHANGE,
     MAX_EDGES_PER_NODE,

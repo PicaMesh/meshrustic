@@ -661,10 +661,7 @@ impl NeighborGraph {
         if route.next_hop != 0 {
             return true;
         }
-        let Some(relay) = self.get_downstream_relay(destination, now_ms) else {
-            return false;
-        };
-        self.get_route(relay, now_ms).next_hop != 0
+        self.downstream_chain_egress(destination, now_ms).is_some()
     }
 
     pub fn is_known_relay_target(&self, destination: u32, now_ms: u32) -> bool {
@@ -1786,9 +1783,9 @@ impl NeighborGraph {
         let hears_us = self.maybe_confirm_hears_us_from_relay(gateway, from, packet_id);
 
         // Hearing the originator *via* a relay is the other direction from delivering *to* them.
-        // Keep the row only when we can send to the relay (it hears us) and the originator lists
-        // that relay (the arrival hop is one they have published). A placeholder or a relay we
-        // merely overheard does not earn a path.
+        // Keep the row when we can send to the relay (it hears us). An SR-aware originator must
+        // also list that relay — their topology is the authority. A stock originator never lists
+        // anyone, so the relay observation is the only signal that they sit behind this hop.
         let relay_hears_us = self
             .edges
             .find_node(self.my_node)
@@ -1799,7 +1796,7 @@ impl NeighborGraph {
             .find_node(from)
             .and_then(|n| n.find_edge(gateway))
             .is_some();
-        let can_infer_downstream = relay_hears_us && destination_lists_relay;
+        let can_infer_downstream = relay_hears_us && (destination_lists_relay || !source_sr_active);
         // Former direct neighbour heard only via this relay: still only when the two facts above
         // hold — they moved, and the path has to be one we can use.
         // Single-hop: sender went through the gateway to reach us.
@@ -1946,6 +1943,15 @@ impl NeighborGraph {
     pub fn get_downstream_relay(&self, destination: u32, now_ms: u32) -> Option<u32> {
         self.downstream
             .get_relay(destination, now_ms, NEIGHBOR_TTL_MS)
+    }
+
+    /// First neighbour we can hear on the downstream walk from `destination`.
+    pub fn downstream_chain_egress(&self, destination: u32, now_ms: u32) -> Option<u32> {
+        self.downstream
+            .chain_egress(destination, now_ms, NEIGHBOR_TTL_MS, |n| {
+                n != 0 && n != self.my_node && self.has_direct_edge(n)
+            })
+            .map(|c| c.node)
     }
 
     pub fn downstream_count_for_relay(&self, relay: u32, now_ms: u32) -> usize {
@@ -2110,12 +2116,11 @@ impl NeighborGraph {
             .0
     }
 
-    /// The next hop to stamp on a relayed unicast, and whether it came from a path the strict
-    /// search confirmed end to end. Every other source of a hop here — a better-positioned
-    /// neighbour, the downstream table, best-effort self relay, direct delivery — is a guess and
-    /// reports `false`, so a caller can refuse to designate a node that never proved it hears
-    /// the destination. Reading `Route::verified` instead described the searched route rather
-    /// than the hop actually returned.
+    /// The next hop to stamp on a relayed unicast, and whether that hop is safe to designate.
+    /// Dijkstra's confirmed search reports `true`. A downstream chain that egresses via a
+    /// neighbour we hear is also stampable: dest need not hear that neighbour, and need not be
+    /// its RF neighbour. Every other source — a better-positioned neighbour, inbound-gateway
+    /// fallback, best-effort self relay, direct delivery — is a guess and reports `false`.
     pub fn get_next_hop_verified(
         &mut self,
         destination: u32,
@@ -2139,6 +2144,9 @@ impl NeighborGraph {
         }
 
         let route = self.get_route(destination, now_ms);
+        let chain_egress = self.downstream_chain_egress(destination, now_ms);
+        let stampable =
+            |hop: u32, route_verified: bool| route_verified || chain_egress == Some(hop);
         if route.next_hop != 0 {
             let route_cost = route.cost();
             let mut next_hop_can_hear = true;
@@ -2164,11 +2172,11 @@ impl NeighborGraph {
                         return (better, false);
                     }
                 }
-                return (route.next_hop, route.verified);
+                return (route.next_hop, stampable(route.next_hop, route.verified));
             }
 
             if self.edge_hears_us(route.next_hop) {
-                return (route.next_hop, route.verified);
+                return (route.next_hop, stampable(route.next_hop, route.verified));
             }
 
             if allow_opportunistic {
@@ -2190,17 +2198,16 @@ impl NeighborGraph {
             return (self.my_node, false);
         }
 
-        if let Some(relay_for_dest) = self.get_downstream_relay(destination, now_ms) {
+        if let Some(egress) = chain_egress {
             let mut relay_can_hear = true;
             let mut connectivity_unknown = false;
-            if heard_from != 0 && relay_for_dest != heard_from {
-                let (verified, unknown) =
-                    self.has_verified_connectivity(heard_from, relay_for_dest);
+            if heard_from != 0 && egress != heard_from {
+                let (verified, unknown) = self.has_verified_connectivity(heard_from, egress);
                 relay_can_hear = verified;
                 connectivity_unknown = unknown;
             }
-            if relay_can_hear && !connectivity_unknown && self.has_direct_edge(relay_for_dest) {
-                return (relay_for_dest, false);
+            if relay_can_hear && !connectivity_unknown && self.has_direct_edge(egress) {
+                return (egress, true);
             }
         }
 
@@ -4282,7 +4289,7 @@ mod tests {
         assert_eq!(
             graph.get_downstream_relay(FROM, 200),
             None,
-            "an overheard relay is not a path until it hears us and the originator lists it"
+            "an overheard relay is not a path until it hears us"
         );
 
         graph.edges_mut().set_edge_hears_us(ME, placeholder, true);
@@ -4298,6 +4305,84 @@ mod tests {
         );
         graph.observe_packet(FROM, 3, 2, 0xCD, -70, 8, 150, 0, None, 1);
         assert_eq!(graph.get_downstream_relay(FROM, 200), Some(placeholder));
+    }
+
+    #[test]
+    fn stock_originator_becomes_downstream_without_listing_the_relay() {
+        const ME: u32 = 0xAA00_00AA;
+        const STOCK: u32 = 0x2200_0022;
+        const GATEWAY: u32 = 0x1100_0011;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(GATEWAY, -70, 8, 100, 0);
+        graph.edges_mut().set_edge_hears_us(ME, GATEWAY, true);
+        graph.observe_packet(
+            STOCK,
+            3,
+            2,
+            (GATEWAY & 0xFF) as u8,
+            -70,
+            8,
+            200,
+            0,
+            Some(GATEWAY),
+            1,
+        );
+        assert_eq!(graph.get_downstream_relay(STOCK, 300), Some(GATEWAY));
+        assert!(
+            !graph.test_has_edge(STOCK, GATEWAY),
+            "stock dests do not need an invented neighbour edge"
+        );
+    }
+
+    #[test]
+    fn sr_aware_originator_still_must_list_the_relay() {
+        const ME: u32 = 0xAA00_00AA;
+        const SRC: u32 = 0xBB00_00BB;
+        const GATEWAY: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(GATEWAY, -70, 8, 100, 0);
+        graph.edges_mut().set_edge_hears_us(ME, GATEWAY, true);
+        graph.capability_mut().track_topology(SRC, true, 100);
+        graph.observe_packet(
+            SRC,
+            3,
+            2,
+            (GATEWAY & 0xFF) as u8,
+            -70,
+            8,
+            200,
+            0,
+            Some(GATEWAY),
+            1,
+        );
+        assert_eq!(graph.get_downstream_relay(SRC, 300), None);
+    }
+
+    #[test]
+    fn get_next_hop_walks_a_downstream_chain() {
+        const ME: u32 = 0xAA00_00AA;
+        const HUB: u32 = 0xF600_00F6;
+        const PARENT: u32 = 0x1100_0011;
+        const DEST: u32 = 0x2200_0022;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_CLIENT);
+        graph.observe_direct_neighbor(HUB, -70, 8, 0, 0);
+        graph.confirm_direct_neighbor_hears_us(HUB);
+        graph
+            .downstream_mut()
+            .update(ME, DEST, PARENT, 2.0, 0, false, 0);
+        graph
+            .downstream_mut()
+            .update(ME, PARENT, HUB, 2.0, 0, false, 0);
+        assert_eq!(graph.downstream_chain_egress(DEST, 0), Some(HUB));
+        let (hop, stampable) = graph.get_next_hop_verified(DEST, 0, 0, 0);
+        assert_eq!(hop, HUB);
+        assert!(stampable, "a chain onto a neighbour we hear is designated");
     }
 
     #[test]

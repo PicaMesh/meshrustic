@@ -2122,7 +2122,8 @@ impl Router {
         // be stamped: the node it names never proved it hears the destination, and receivers
         // treat the byte as a designation, standing down and waiting for a copy from a node
         // that may have no way to send one. Cleared, we stay one candidate among the ranked
-        // slots and the others keep coordinating.
+        // slots and the others keep coordinating. A downstream chain that egresses via a
+        // neighbour we hear is not that guess — dest sits behind that neighbour — and is stamped.
         if !route_verified && next_hop != 0 {
             next_hop = 0;
             self.sr_log.push(SrLogEvent::RouteNextHop {
@@ -5988,6 +5989,9 @@ mod tests {
             .observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
         router
             .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_RELAYER);
+        router
+            .graph_mut()
             .downstream_mut()
             .update(UNI_ME, UNI_DEST, UNI_RELAYER, 2.0, 0, false, 0);
     }
@@ -6025,18 +6029,38 @@ mod tests {
     }
 
     #[test]
-    fn unverified_route_relays_with_next_hop_cleared() {
+    fn downstream_parent_we_hear_is_stamped_as_next_hop() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_downstream_only_graph(router);
-        // Route picker falls back to "relay ourselves": the frame must not carry our byte.
+        // DEST sits behind RELAYER; RELAYER is a neighbour we hear, so the chain is stamped.
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x600, true);
         let (sent, _) = forward_unicast(router, &wire, 0);
-        assert_eq!(sent.next_hop, 0);
-        assert!(
-            !router.has_pending_reliable(0x600),
-            "no designated hop, nothing to retry"
-        );
+        assert_eq!(sent.next_hop, (UNI_RELAYER & 0xFF) as u8);
+    }
+
+    #[test]
+    fn downstream_chain_is_stamped_as_next_hop() {
+        const PARENT: u32 = 0x1100_0011;
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_RELAYER);
+        router
+            .graph_mut()
+            .downstream_mut()
+            .update(UNI_ME, UNI_DEST, PARENT, 2.0, 0, false, 0);
+        router
+            .graph_mut()
+            .downstream_mut()
+            .update(UNI_ME, PARENT, UNI_RELAYER, 2.0, 0, false, 0);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x70b, true);
+        let (sent, _) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.next_hop, (UNI_RELAYER & 0xFF) as u8);
     }
 
     const UNI_PEER: u32 = 0xAB00_00AB;

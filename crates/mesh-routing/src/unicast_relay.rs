@@ -93,13 +93,27 @@ impl UnicastRelayContext<'_> {
             .get_relay(destination, now_ms, self.downstream_ttl_ms)
     }
 
-    fn reaches(&self, node: u32, destination: u32, now_ms: u32) -> bool {
-        can_deliver(self.edges, Some(self.capability), node, destination)
-            || self.downstream_relay(destination, now_ms) == Some(node)
+    fn chain_egress(&self, destination: u32, now_ms: u32) -> Option<u32> {
+        self.downstream
+            .chain_egress(destination, now_ms, self.downstream_ttl_ms, |n| {
+                n != 0
+                    && n != self.my_node
+                    && self
+                        .edges
+                        .find_node(self.my_node)
+                        .and_then(|e| e.find_edge(n))
+                        .is_some()
+            })
+            .map(|c| c.node)
     }
 
-    /// Last-hop delivery: a priced hop to the destination, or we are its downstream gateway.
-    /// `can_deliver` alone is not enough — it is true for every unpublished dest.
+    fn reaches(&self, node: u32, destination: u32, now_ms: u32) -> bool {
+        self.can_finish(node, destination, now_ms)
+    }
+
+    /// Last-hop delivery: a priced hop to the destination, or we are its immediate
+    /// downstream parent. `can_deliver` alone is not enough — it is true for every unpublished dest.
+    /// Being the first SR hop we would appoint (chain egress) is not last-hop finish.
     fn can_finish(&self, node: u32, destination: u32, now_ms: u32) -> bool {
         delivery_hop_cost_fixed(self.edges, Some(self.capability), node, destination).is_some()
             || self.downstream_relay(destination, now_ms) == Some(node)
@@ -112,6 +126,9 @@ impl UnicastRelayContext<'_> {
             return bucket(cost.min(DOWNSTREAM_TIER_COST - 1));
         }
         if self.downstream_relay(destination, now_ms) == Some(node) {
+            return DOWNSTREAM_TIER_COST;
+        }
+        if self.chain_egress(destination, now_ms) == Some(node) {
             return DOWNSTREAM_TIER_COST;
         }
         // Shared next hop must be a real forwarder (not us / dest) and reachable from `node`.
@@ -489,6 +506,34 @@ mod tests {
         );
         assert_eq!(&plan.ranked[..2], &[GW, ME]);
         assert_eq!(plan.reason, RelayReason::UnicastCost);
+    }
+
+    #[test]
+    fn chained_downstream_gateway_outranks_us() {
+        const PARENT: u32 = 0x1100_0011;
+        let mut edges = EdgeStore::new();
+        let mut capability = CapabilityCache::new();
+        let mut downstream = DownstreamTable::new();
+        edges.ensure_local_node(ME, NOW);
+        for n in [GW, PEER] {
+            edges.update_edge(ME, ME, n, 1.5, NOW, EdgeSource::Reported, true, 0);
+            edges.set_edge_hears_us(ME, n, true);
+        }
+        capability.track_topology(GW, true, NOW);
+        capability.track_topology(PEER, true, NOW);
+        downstream.update(ME, DEST, PARENT, 2.0, NOW, false, 0);
+        downstream.update(ME, PARENT, GW, 2.0, NOW, false, 0);
+        let ctx = UnicastRelayContext {
+            my_node: ME,
+            edges: &edges,
+            capability: &capability,
+            downstream: &downstream,
+            downstream_ttl_ms: TTL,
+        };
+        let plan = plan_unicast_relay(&ctx, 0x20, PHONE, PHONE, DEST, GW, NOW, |_| false)
+            .expect("we are a candidate");
+        assert_eq!(plan.ranked[0], GW);
+        assert!(plan.slot_index >= 1);
     }
 
     #[test]
