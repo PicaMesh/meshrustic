@@ -630,7 +630,7 @@ mod tests {
         assert!(even.has_nonfinal_flood_slot);
         assert!(
             !even.nonfinal_flood,
-            "a named slot still arms its own flood insurance"
+            "a named slot is not itself the flood slot"
         );
         // Odd id: higher node id first.
         let odd = plan_unicast_relay(&f.ctx(), 0xcfd2_d4db, PHONE, PHONE, DEST, GW, NOW, |_| {

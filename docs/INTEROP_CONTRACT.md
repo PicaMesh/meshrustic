@@ -303,13 +303,11 @@ is actually waiting for.
   is a flood slot (`nonfinal_flood`): `next_hop` cleared so stock neighbours may pick up after
   named hops have had their chance. A flood slot cancels on dest, a transmitter that can
   finish, the nominated hop, or another flood copy; it stays for a same-hop named SR copy that
-  cannot finish. Named forwards always arm one flood-insurance retry (`num_retx = 1`,
-  `flood_on_last`); a later flood slot in the ranking is not proof that neighbour overheard
-  this copy. Tests: `last_non_direct_of_two_is_the_flood_slot`,
+  cannot finish. Named forwards arm the named follow-up instead of clearing `next_hop` (see
+  below); a later flood slot in the ranking is not proof that neighbour overheard this copy.
+  Tests: `last_non_direct_of_two_is_the_flood_slot`,
   `flood_slot_stays_for_named_sr_that_cannot_finish`,
-  `named_forward_still_arms_flood_insurance_when_ranking_has_a_later_flood_slot`,
-  `forwarded_want_ack_unicast_is_retried_then_released_to_flooding`,
-  `forwarded_unicast_without_want_ack_is_retried_then_flooded`.
+  `named_forward_still_arms_followup_when_ranking_has_a_later_flood_slot`.
 - **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
   names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
   the destination (`plan_unicast_relay`); the best placed keys up first. A neighbour is a
@@ -382,16 +380,53 @@ is actually waiting for.
   copy is clear after its own worst case plus one airtime, and the floor only applies as a lower
   bound. Adding the floor to the stock case would count the same silence twice. Ranking `Err`
   does not abort that backup. Forward and backup TX stamp **our path** next hop. A named
-  non-final forward always arms one flood-insurance copy (`next_hop` cleared) if the nominated
-  hop never carries it. Last-hop `want_ack` toward a non-SR dest keeps `NUM_RELIABLE_RETX`
-  without clearing next hop, including when the remaining budget is already zero. An
-  acknowledgement from the destination, or a copy that can finish, cancels them. Tests:
-  `unicast_designated_*`,
+  non-final forward arms the named follow-up if the nominated hop never carries it (see
+  below). Last-hop `want_ack` toward a non-SR dest keeps `NUM_RELIABLE_RETX` without
+  clearing next hop, including when the remaining budget is already zero. An acknowledgement
+  from the destination, or a copy that can finish, cancels them. Tests: `unicast_designated_*`,
   `designated_hop_backup_survives_ranking_skip` (a coverage skip keeps the backup, at its
   unranked slot rung rather than all backups sharing slot 1),
-  `forwarded_want_ack_unicast_is_retried_then_released_to_flooding`,
-  `forwarded_unicast_without_want_ack_is_retried_then_flooded`,
+  `forwarded_want_ack_unicast_is_repeated_then_dropped_without_alternate`,
+  `forwarded_unicast_without_want_ack_arms_repeat_and_redirect_not_flood`,
   `last_hop_want_ack_retries_when_the_remaining_budget_is_one`.
+- **Originator retries.** A duplicate that is still a direct transmission from the originator
+  (`is_direct_packet`) with `next_hop` zero or our byte is re-planned like a fresh reception
+  when we have not transmitted, and hold neither a pending nor a committed relay for it.
+  Stock neighbours honour the originator's own final flood, so that schedule stays. An
+  intermediate relay cannot recruit a stock node that already heard any copy of the packet;
+  recovery through stock is only possible at the originator. Tests:
+  `originator_retry_replanned_next_hop_zero_relay_byte_matches`,
+  `originator_retry_replanned_next_hop_is_us`,
+  `originator_retry_replanned_relay_byte_zero`,
+  `relayed_flood_copy_and_foreign_named_retry_stay_duplicates`.
+- **Next-hop health.** A small RAM table keyed by `(destination, next hop)` records one miss
+  when a named follow-up reaches its redirect, and a success when the nominated hop carries
+  the packet or the destination answers. Two misses less than ten minutes apart make the hop
+  suspect until ten minutes after the last one; a success clears it. When stamping a next hop,
+  a suspect first hop prefers a stampable alternate from an excluded search, but never loses
+  the only path. Tests: `hop_health::*`, `suspect_first_hop_is_stamped_only_without_an_alternate`,
+  `nominated_hop_copy_clears_its_suspect_state`.
+- **Named follow-up.** Our relay is the originator's implicit ACK, so once we forward, the
+  originator's retries stop and recovery is ours. A named non-final forward arms two tries,
+  each one delay apart: our own contention and airtime, then the later of the nominated hop's
+  carry wait and the end of ranked slot 1 with its tie-break spread (a backup downstream of us
+  has no destination-ACK floor). The first try repeats our copy unchanged, for a nominated hop
+  that simply missed the frame. The second records a miss and searches the route excluding the
+  nominated hop, the upstream node, the originator and ourselves (never the destination; cache
+  bypassed). An alternate that is stampable, signal-routing active and does not share the
+  nominated byte is sent with the same hop fields and our relay byte; otherwise nothing is
+  sent. A stock alternate is refused because stock judges a duplicate by the first `next_hop`
+  it recorded and drops one that newly names it. A copy relayed by the nominated hop, by
+  another node, or the destination's reply cancels the follow-up; a copy from the upstream node
+  or the originator does not, because neither has carried the packet past us. If the nominated
+  hop did relay on an asymmetric link we could not hear, the redirect opens a parallel path and
+  the destination may receive two copies — accepted, because a duplicate costs less than a lost
+  unicast. Tests: `named_followup_waits_for_our_airtime_and_ranked_slot_one`,
+  `named_forward_repeats_then_redirects_to_stampable_alternate`,
+  `redirect_refuses_an_alternate_sharing_the_nominated_byte`,
+  `redirect_refuses_a_stock_alternate`, `upstream_and_originator_copies_keep_the_named_followup`,
+  `excluded_first_hop_yields_alternate_and_skips_only_path`,
+  `heard_copy_cancels_forwarded_retries`.
 
 ## 3b. Broadcast relay and T1
 
@@ -594,9 +629,12 @@ is actually waiting for.
 - **A duplicate that names us as next hop is a hand-off.** It is processed as a fresh reception
   and forwarded; if our route points back at the node that handed it over, it goes out with the
   next hop cleared instead of being dropped (`Router::process_inbound` duplicate branch,
-  `designated_repeat_id`). Stock's `NextHopRouter` does the same under `weWereNextHop`. Before
-  re-planning, the earlier copy's pending frame, relay commit and armed retry are cancelled.
-  Test: `duplicate_naming_us_as_next_hop_is_forwarded_with_next_hop_cleared`.
+  `designated_repeat_id`). Stock's `NextHopRouter` does the same under `weWereNextHop` when
+  that flag is set from history, but stock decides `weWereNextHop` from the first recorded
+  `next_hop`, so a duplicate that newly names a stock node is still dropped — another reason
+  recovery is directed at signal-routing nodes. Before re-planning, the earlier copy's pending
+  frame, relay commit and armed retry are cancelled. Test:
+  `duplicate_naming_us_as_next_hop_is_forwarded_with_next_hop_cleared`.
 - **One frame per packet.** The pending relay table holds at most one frame per packet
   (`Router::store_pending` replaces), and a packet we have already transmitted is never released
   again (`Router::poll_ready_relay`).

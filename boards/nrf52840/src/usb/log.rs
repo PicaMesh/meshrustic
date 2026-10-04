@@ -1879,18 +1879,73 @@ pub mod sr {
                 put_hex2(&mut line, &mut pos, next_hop);
                 finish_line(&mut line, pos);
             }
-            SrLogEvent::RelayRetxFired { id, fallback } => {
+            SrLogEvent::RelayRetxRepeat { id } => {
                 let mut line = [0u8; 128];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Relay retx for 0x";
                 put(&mut line, &mut pos, prefix);
                 put_hex8(&mut line, &mut pos, id);
-                let tail: &[u8] = if fallback {
-                    b" (last try, next hop cleared - flooding)"
-                } else {
-                    b" (designated next hop silent)"
-                };
-                put(&mut line, &mut pos, tail);
+                put(&mut line, &mut pos, b" (next hop silent, repeat)");
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RelayRetxRedirect { id, next_hop } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Relay retx for 0x";
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, id);
+                put(&mut line, &mut pos, b" (next hop silent, redirect to 0x");
+                put_hex2(&mut line, &mut pos, next_hop);
+                put(&mut line, &mut pos, b")");
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::RelayRetxNoAlternate { id } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                let prefix = b"[SR] Relay retx for 0x";
+                put(&mut line, &mut pos, prefix);
+                put_hex8(&mut line, &mut pos, id);
+                put(
+                    &mut line,
+                    &mut pos,
+                    b" (next hop silent, no alternate - dropped)",
+                );
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::OriginatorRetryReplanned { id } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[SR] Originator retry 0x");
+                put_hex8(&mut line, &mut pos, id);
+                put(&mut line, &mut pos, b" re-planned");
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::NextHopSuspect {
+                next_hop,
+                destination,
+                misses,
+            } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[SR] Next hop !");
+                put_hex8(&mut line, &mut pos, next_hop);
+                put(&mut line, &mut pos, b" suspect for !");
+                put_hex8(&mut line, &mut pos, destination);
+                put(&mut line, &mut pos, b" (misses=");
+                put_u32(&mut line, &mut pos, misses as u32);
+                put(&mut line, &mut pos, b")");
+                finish_line(&mut line, pos);
+            }
+            SrLogEvent::NextHopHealthy {
+                next_hop,
+                destination,
+            } => {
+                let mut line = [0u8; 128];
+                let mut pos = line_prefix(&mut line);
+                put(&mut line, &mut pos, b"[SR] Next hop !");
+                put_hex8(&mut line, &mut pos, next_hop);
+                put(&mut line, &mut pos, b" healthy for !");
+                put_hex8(&mut line, &mut pos, destination);
                 finish_line(&mut line, pos);
             }
             SrLogEvent::RelayRetxCanceled { id, reason } => {

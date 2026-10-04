@@ -274,19 +274,42 @@ pub enum SrLogEvent {
         id: u32,
         from: u32,
     },
-    /// We forwarded a want_ack unicast with a designated next hop and will retry it.
+    /// We forwarded a unicast with a designated next hop and armed its follow-up.
     RelayRetxArmed {
         id: u32,
         next_hop: u8,
     },
-    /// A retry went out; `fallback` marks the last one, sent with next_hop cleared.
-    RelayRetxFired {
+    /// Named hop stayed silent; the same copy was repeated to it.
+    RelayRetxRepeat {
         id: u32,
-        fallback: bool,
+    },
+    /// Named hop stayed silent after the repeat; retransmitted toward an alternate next hop.
+    RelayRetxRedirect {
+        id: u32,
+        next_hop: u8,
+    },
+    /// Named hop stayed silent and no stampable alternate existed; follow-up dropped.
+    RelayRetxNoAlternate {
+        id: u32,
     },
     RelayRetxCanceled {
         id: u32,
         reason: RelayRetxCancelReason,
+    },
+    /// An originator's own retry was accepted for re-planning like a fresh reception.
+    OriginatorRetryReplanned {
+        id: u32,
+    },
+    /// A next hop reached the consecutive-miss suspect threshold for a destination.
+    NextHopSuspect {
+        next_hop: u32,
+        destination: u32,
+        misses: u8,
+    },
+    /// A previously suspect next hop was cleared by a success.
+    NextHopHealthy {
+        next_hop: u32,
+        destination: u32,
     },
     TracerouteAppended {
         towards: bool,

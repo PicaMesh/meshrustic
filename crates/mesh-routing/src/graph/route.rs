@@ -18,10 +18,15 @@ pub struct RoutableFilter<'a> {
     pub capability: &'a CapabilityCache,
     pub my_node: u32,
     pub device_role: u32,
+    /// Intermediate hops to skip (named follow-up redirect). Empty for ordinary lookups.
+    pub excluded: &'a [u32],
 }
 
 pub fn is_node_routable(filter: &RoutableFilter<'_>, node_id: u32) -> bool {
     if node_id == 0 {
+        return false;
+    }
+    if filter.excluded.contains(&node_id) {
         return false;
     }
     if filter.device_role == DEVICE_ROLE_CLIENT_MUTE && node_id == filter.my_node {
@@ -729,8 +734,12 @@ pub fn calculate_route(
 
     if result.next_hop == 0 {
         let my_edges = edges.find_node(my_node);
-        let is_egress =
-            |n: u32| n != 0 && n != my_node && my_edges.is_some_and(|me| me.find_edge(n).is_some());
+        let is_egress = |n: u32| {
+            n != 0
+                && n != my_node
+                && my_edges.is_some_and(|me| me.find_edge(n).is_some())
+                && !routable.is_some_and(|f| f.excluded.contains(&n))
+        };
         if let Some(chain) = downstream.chain_egress(destination, now_ms, u32::MAX, is_egress) {
             let cost_to_egress = my_edges
                 .and_then(|n| n.find_edge(chain.node))
@@ -815,6 +824,7 @@ pub fn find_better_positioned_neighbor(
         capability,
         my_node,
         device_role,
+        excluded: &[],
     };
     let mut best_neighbor = 0u32;
     let mut best_cost = our_route_cost;
@@ -907,6 +917,7 @@ mod tests {
             capability: &capability,
             my_node: ME,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         let fallback = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter));
         assert!(
@@ -927,6 +938,7 @@ mod tests {
             capability: &stock,
             my_node: ME,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         assert_eq!(
             calculate_route(&edges, &downstream, ME, DEST, 0, Some(&stock_filter)).next_hop,
@@ -992,6 +1004,7 @@ mod tests {
             capability: &capability,
             my_node: ME,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         let downstream = DownstreamTable::new();
         let route = calculate_route(&edges, &downstream, ME, HUB, 0, Some(&filter));
@@ -1016,6 +1029,7 @@ mod tests {
             capability: &capability,
             my_node: ME,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         let route = calculate_route(&edges, &downstream, ME, HUB, 0, Some(&filter));
         assert!(route.verified);
@@ -1043,6 +1057,7 @@ mod tests {
             capability: &capability,
             my_node: ME,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         let route = calculate_route(&edges, &DownstreamTable::new(), ME, DEST, 0, Some(&filter));
         assert_eq!(route.next_hop, RELAY);
@@ -1088,6 +1103,7 @@ mod tests {
             capability: &capability,
             my_node: ME,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         let route = calculate_route(&edges, &DownstreamTable::new(), ME, DEST, 0, Some(&filter));
         assert_eq!(route.next_hop, MEASURED);
@@ -1169,6 +1185,7 @@ mod tests {
             capability: &capability,
             my_node: 0xAA,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         assert!(!is_node_routable(&filter, P));
         let downstream = DownstreamTable::new();
@@ -1195,6 +1212,7 @@ mod tests {
             capability: &capability,
             my_node: 0xAA,
             device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
         };
         let downstream = DownstreamTable::new();
         let route = calculate_route(&edges, &downstream, 0xAA, 0xCC, 0, Some(&filter));
@@ -1558,4 +1576,62 @@ mod tests {
         assert_eq!(heard.next_hop, HUB);
         assert!(heard.cost_fixed > unheard.cost_fixed);
     }
+
+    #[test]
+    fn excluded_first_hop_yields_alternate_and_skips_only_path() {
+        const ME: u32 = 0xAA00_00AA;
+        const HOP_A: u32 = 0xBB00_00BB;
+        const HOP_B: u32 = 0xCC00_00CC;
+        const DEST: u32 = 0xDD00_00DD;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, HOP_A, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, HOP_B, 1.5, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, HOP_A, DEST, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, HOP_B, DEST, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, DEST, HOP_A, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, DEST, HOP_B, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(HOP_A, true, 0);
+        capability.track_topology(HOP_B, true, 0);
+        capability.track_topology(DEST, true, 0);
+        let downstream = DownstreamTable::new();
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
+        };
+        let primary = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter));
+        assert_eq!(primary.next_hop, HOP_A);
+        let excl = [HOP_A];
+        let filter_ex = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+            excluded: &excl,
+        };
+        let alt = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter_ex));
+        assert_eq!(alt.next_hop, HOP_B);
+        let excl_both = [HOP_A, HOP_B];
+        let filter_none = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+            excluded: &excl_both,
+        };
+        let none = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter_none));
+        assert_eq!(none.next_hop, 0);
+        // Destination itself is never filtered out even if listed.
+        let excl_dest = [DEST];
+        let filter_dest = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+            excluded: &excl_dest,
+        };
+        let still = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter_dest));
+        assert_eq!(still.next_hop, HOP_A);
+    }
+
 }

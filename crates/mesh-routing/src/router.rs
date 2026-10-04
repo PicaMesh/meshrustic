@@ -37,8 +37,8 @@ use crate::rate_limit::NodeRateLimiter;
 use crate::relay::{copy_opaque_payload, relay_header_with_next_hop_opts, wire_may_relay};
 use crate::relay_identity::RelayIdentityCache;
 use crate::reliable::{
-    bump_reliable_delays, due_retransmit, schedule_reliable, stop_reliable, stop_reliable_for,
-    PendingReliable, MAX_PENDING_RELIABLE,
+    bump_reliable_delays, due_retransmit, named_followup, schedule_reliable, stop_reliable,
+    stop_reliable_for, NamedFollowup, PendingReliable, MAX_PENDING_RELIABLE, NAMED_FOLLOWUP_TRIES,
 };
 use crate::routing_ack::{
     build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
@@ -869,9 +869,23 @@ impl Router {
                     && parsed.hop_limit > 0
                     && self.graph.is_active_routing_role()
                     && !self.graph.has_our_transmission(parsed.id);
-                if designated_repeat {
-                    // The first copy (naming someone else) may have left a later-slot frame, a
-                    // relay commit at that slot and an armed retry: all superseded by the hand-off.
+                let originator_retry = parsed.to != NODENUM_BROADCAST
+                    && parsed.to != self.node_num
+                    && parsed.from != self.node_num
+                    && is_direct_packet(
+                        parsed.from,
+                        parsed.hop_start,
+                        parsed.hop_limit,
+                        parsed.relay_node,
+                    )
+                    && (parsed.next_hop == 0 || parsed.next_hop == our_byte)
+                    && parsed.hop_limit > 0
+                    && !self.graph.has_our_transmission(parsed.id)
+                    && !self.has_pending_relay(parsed.from, parsed.id)
+                    && !self.graph.is_committed_relay(parsed.from, parsed.id);
+                if designated_repeat || originator_retry {
+                    // Hand-off or originator retry: drop any later-slot frame / commit / retry
+                    // left by an earlier copy, then fall through like a fresh reception.
                     self.cancel_pending(parsed.from, parsed.id);
                     self.graph.cancel_relay(parsed.from, parsed.id);
                     self.cancel_relayed_retx(
@@ -879,7 +893,13 @@ impl Router {
                         parsed.id,
                         RelayRetxCancelReason::CopyHeard,
                     );
-                    self.designated_repeat_id = Some(parsed.id);
+                    if designated_repeat {
+                        self.designated_repeat_id = Some(parsed.id);
+                    }
+                    if originator_retry {
+                        self.sr_log
+                            .push(SrLogEvent::OriginatorRetryReplanned { id: parsed.id });
+                    }
                 } else {
                     self.handle_duplicate_rx(
                         &parsed,
@@ -1611,7 +1631,7 @@ impl Router {
                     delay,
                     now_ms,
                     NUM_RELIABLE_RETX,
-                    false,
+                    None,
                 );
             }
         }
@@ -2569,7 +2589,7 @@ impl Router {
             .set_unicast_commit_flags(parsed.from, parsed.id, unicast_flags);
 
         if delay_ms == 0 {
-            self.arm_relayed_unicast_followup(len, bytes, now_ms, unicast_flags);
+            self.arm_relayed_unicast_followup(len, bytes, now_ms, unicast_flags, heard_from);
             let relay = RelayPlan {
                 len,
                 bytes,
@@ -2604,7 +2624,7 @@ impl Router {
             return plan;
         }
 
-        self.arm_relayed_unicast_followup(len, bytes, now_ms, unicast_flags);
+        self.arm_relayed_unicast_followup(len, bytes, now_ms, unicast_flags, heard_from);
         let relay = RelayPlan {
             len,
             bytes,
@@ -2656,11 +2676,16 @@ impl Router {
         // (`note_tx_done`): a copy heard while the frame waits in the radio queue still runs
         // the coverage check and can pull the frame back. Release used to forget the relay here,
         // which let the frame go out regardless of what arrived in the meantime.
+        let upstream = self
+            .graph
+            .committed_heard_from(pending.from, pending.id)
+            .unwrap_or(0);
         self.arm_relayed_unicast_followup(
             pending.len,
             pending.bytes,
             now_ms,
             pending.unicast_flags,
+            upstream,
         );
         Some(RelayPlan {
             len: pending.len,
@@ -3120,7 +3145,7 @@ impl Router {
                 delay,
                 now_ms,
                 NUM_RELIABLE_RETX,
-                false,
+                None,
             );
         }
         if to == NODENUM_BROADCAST && portnum != SIGNAL_ROUTING_APP {
@@ -3183,29 +3208,101 @@ impl Router {
             Self::retx_delay_for(preset, util, node_num, from, id, len)
         };
         let due = due_retransmit(&mut self.pending_reliable, now_ms, delay_for)?;
-        if due.relayed {
-            self.sr_log.push(SrLogEvent::RelayRetxFired {
-                id: due.packet_id,
-                fallback: due.fallback,
+        let Some(named) = due.named else {
+            return Some(RelayPlan {
+                len: due.len,
+                bytes: due.bytes,
+                delay_ms: 0,
+            });
+        };
+        if !due.redirect {
+            // The nominated hop may simply have missed our frame: give it the same copy again.
+            self.sr_log
+                .push(SrLogEvent::RelayRetxRepeat { id: due.packet_id });
+            return Some(RelayPlan {
+                len: due.len,
+                bytes: due.bytes,
+                delay_ms: 0,
             });
         }
+        // Named hop silent twice: record one miss, then one directed alternate or drop.
+        if let crate::hop_health::HopHealthEvent::BecameSuspect {
+            next_hop,
+            destination,
+            misses,
+        } = self
+            .graph
+            .record_hop_miss(due.to, named.nominated_hop, now_ms)
+        {
+            self.sr_log.push(SrLogEvent::NextHopSuspect {
+                next_hop,
+                destination,
+                misses,
+            });
+        }
+        // Exclude nominated hop, upstream, originator and ourselves; never the destination.
+        let mut excl_buf = [0u32; 4];
+        let mut n_excl = 0usize;
+        for id in [named.nominated_hop, named.upstream, due.from, self.node_num] {
+            if id == 0 || id == due.to {
+                continue;
+            }
+            if excl_buf[..n_excl].contains(&id) {
+                continue;
+            }
+            excl_buf[n_excl] = id;
+            n_excl += 1;
+        }
+        let alt_route = self
+            .graph
+            .route_excluding(due.to, now_ms, &excl_buf[..n_excl]);
+        let chain_egress = self.graph.downstream_chain_egress(due.to, now_ms);
+        let alt_byte = (alt_route.next_hop & 0xFF) as u8;
+        // An alternate sharing the nominated byte would be read as the silent hop again. A stock
+        // neighbour judges a duplicate by the first next_hop it recorded, so having heard our
+        // first copy it drops one that newly names it: only an SR alternate can take it.
+        let stampable = alt_route.next_hop != 0
+            && alt_byte != named.nominated_byte
+            && (alt_route.verified || chain_egress == Some(alt_route.next_hop))
+            && self.graph.capability_status(alt_route.next_hop)
+                == crate::capability::CapabilityStatus::SrActive;
+        if !stampable {
+            self.sr_log
+                .push(SrLogEvent::RelayRetxNoAlternate { id: due.packet_id });
+            return None;
+        }
+        let mut bytes = due.bytes;
+        let Ok(mut hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) else {
+            self.sr_log
+                .push(SrLogEvent::RelayRetxNoAlternate { id: due.packet_id });
+            return None;
+        };
+        hdr.next_hop = alt_byte;
+        if let Ok(out) = (&mut bytes[..PACKET_HEADER_LEN]).try_into() {
+            hdr.encode_to(out);
+        }
+        self.sr_log.push(SrLogEvent::RelayRetxRedirect {
+            id: due.packet_id,
+            next_hop: hdr.next_hop,
+        });
         Some(RelayPlan {
             len: due.len,
-            bytes: due.bytes,
+            bytes,
             delay_ms: 0,
         })
     }
 
-    /// Named forwards: one flood insurance even when ranking assigned a later flood slot
-    /// (that neighbour may never have overheard this copy). Last-hop `want_ack` toward a
-    /// non-SR dest keeps retries until dest answers, including hop_limit 0. Flood slots and
-    /// last-hop backups do not arm a follow-up.
+    /// Named forwards: when the nominated hop stays silent, repeat the copy to it once, then
+    /// try one directed alternate. Last-hop `want_ack` toward a non-SR dest keeps retries
+    /// until dest answers, including hop_limit 0. Flood slots and last-hop backups do not arm
+    /// a follow-up.
     fn arm_relayed_unicast_followup(
         &mut self,
         len: u8,
         bytes: [u8; MAX_WIRE_LEN],
         now_ms: u32,
         flags: crate::unicast_relay::UnicastSlotFlags,
+        upstream: u32,
     ) {
         let Ok(hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) else {
             return;
@@ -3227,26 +3324,37 @@ impl Router {
         if p.hop_limit == 0 && !last_hop {
             return;
         }
-        let (delay, num_retx, flood_on_last) = if last_hop {
+        let (delay, num_retx, named) = if last_hop {
             if !p.want_ack || dest_sr || flags.last_hop_backup {
                 return;
             }
             (
                 self.reliable_retx_delay_ms(len, p.from, p.id),
                 NUM_RELIABLE_RETX,
-                false,
+                None,
             )
         } else if flags.nonfinal_flood || p.next_hop == 0 {
             return;
         } else {
             let cfg = eu868_config_for_preset(self.modem_preset);
             let airtime = packet_time_ms(&cfg, len as usize, false).max(1);
-            let nominated = if flags.nominated_next_hop != 0 {
+            let nominated_hop = if flags.nominated_next_hop != 0
+                && (flags.nominated_next_hop & 0xFF) as u8 == p.next_hop
+            {
                 flags.nominated_next_hop
             } else {
-                p.next_hop as u32
+                self.graph
+                    .match_relay_byte_on_outgoing_edges(p.next_hop)
+                    .unwrap_or(0)
             };
-            (self.next_hop_carry_wait_ms(nominated, airtime), 1, true)
+            let delay = self.named_followup_delay_ms(nominated_hop, airtime);
+            let named = NamedFollowup {
+                nominated_hop,
+                nominated_byte: p.next_hop,
+                upstream,
+                delay_ms: delay,
+            };
+            (delay, NAMED_FOLLOWUP_TRIES, Some(named))
         };
         if schedule_reliable(
             &mut self.pending_reliable,
@@ -3259,7 +3367,7 @@ impl Router {
             delay,
             now_ms,
             num_retx,
-            flood_on_last,
+            named,
         ) {
             self.sr_log.push(SrLogEvent::RelayRetxArmed {
                 id: p.id,
@@ -3279,6 +3387,22 @@ impl Router {
         } else {
             tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
         }
+    }
+
+    /// Wait between named follow-up tries, counted from when our frame is handed to the radio:
+    /// our own contention and airtime, then the later of the nominated hop's carry wait and the
+    /// end of ranked slot 1 including its tie-break spread. A backup's copy downstream of us
+    /// has no destination-ACK floor, because that floor applies only to the source's own frame.
+    fn named_followup_delay_ms(&self, nominated_hop: u32, airtime_ms: u32) -> u32 {
+        let half = crate::coordinated_relay::half_airtime_ms(airtime_ms);
+        let slot1_end = self
+            .unicast_named_slot_delay_ms(1, 0, half, airtime_ms)
+            .saturating_add(crate::coordinated_relay::tie_break_range_ms(half))
+            .saturating_add(airtime_ms);
+        self.sr_peer_relay_wait_ms(airtime_ms).saturating_add(
+            self.next_hop_carry_wait_ms(nominated_hop, airtime_ms)
+                .max(slot1_end),
+        )
     }
 
     fn unicast_named_slot_delay_ms(
@@ -3328,9 +3452,39 @@ impl Router {
     }
 
     fn cancel_relayed_retx(&mut self, from: u32, id: u32, reason: RelayRetxCancelReason) {
-        if stop_reliable_for(&mut self.pending_reliable, from, id) {
-            self.sr_log
-                .push(SrLogEvent::RelayRetxCanceled { id, reason });
+        self.cancel_relayed_retx_from(from, id, reason, false);
+    }
+
+    /// Cancel a relayed follow-up. When the copy came from the nominated hop (or the reason
+    /// is a destination reply), record a hop-health success; any other copy is neutral.
+    fn cancel_relayed_retx_from(
+        &mut self,
+        from: u32,
+        id: u32,
+        reason: RelayRetxCancelReason,
+        from_nominated: bool,
+    ) {
+        let Some((dest, nominated)) = stop_reliable_for(&mut self.pending_reliable, from, id)
+        else {
+            return;
+        };
+        self.sr_log
+            .push(SrLogEvent::RelayRetxCanceled { id, reason });
+        let success = match reason {
+            RelayRetxCancelReason::ReplyHeard => true,
+            RelayRetxCancelReason::CopyHeard => from_nominated,
+        };
+        if success {
+            if let crate::hop_health::HopHealthEvent::BecameHealthy {
+                next_hop,
+                destination,
+            } = self.graph.record_hop_success(dest, nominated)
+            {
+                self.sr_log.push(SrLogEvent::NextHopHealthy {
+                    next_hop,
+                    destination,
+                });
+            }
         }
     }
 
@@ -4140,7 +4294,12 @@ impl Router {
             self.sr_log
                 .push(SrLogEvent::UnicastReplyCancel { id: cancel_id });
         }
-        self.cancel_relayed_retx(parsed.to, cancel_id, RelayRetxCancelReason::ReplyHeard);
+        self.cancel_relayed_retx_from(
+            parsed.to,
+            cancel_id,
+            RelayRetxCancelReason::ReplyHeard,
+            false,
+        );
     }
 
     fn handle_duplicate_rx(
@@ -4155,9 +4314,39 @@ impl Router {
             self.maybe_cancel_relay_for_foreign_ack(parsed, data);
         }
 
-        // Any further copy of a unicast we forwarded means it is moving on: stop retrying it.
+        // A further copy of a unicast we forwarded means it is moving on: stop retrying it.
+        // A copy from the nominated hop is a hop-health success; any other transmitter is
+        // neutral. The node we got it from, or the originator retrying, has not carried it
+        // past us, so their copy leaves a named follow-up armed.
         if parsed.to != NODENUM_BROADCAST && parsed.from != self.node_num {
-            self.cancel_relayed_retx(parsed.from, parsed.id, RelayRetxCancelReason::CopyHeard);
+            let transmitter = self.resolve_heard_from_node(
+                parsed.relay_node,
+                parsed.from,
+                packet.rssi,
+                packet.snr,
+                now_ms,
+            );
+            let named = named_followup(&self.pending_reliable, parsed.from, parsed.id);
+            let from_nominated = named.is_some_and(|n| {
+                parsed.relay_node == n.nominated_byte
+                    || (n.nominated_hop != 0 && transmitter == n.nominated_hop)
+            });
+            let from_behind = !from_nominated
+                && parsed.relay_node != 0
+                && named.is_some_and(|n| {
+                    parsed.relay_node == (parsed.from & 0xFF) as u8
+                        || (n.upstream != 0
+                            && (transmitter == n.upstream
+                                || parsed.relay_node == (n.upstream & 0xFF) as u8))
+                });
+            if !from_behind {
+                self.cancel_relayed_retx_from(
+                    parsed.from,
+                    parsed.id,
+                    RelayRetxCancelReason::CopyHeard,
+                    from_nominated,
+                );
+            }
         }
 
         // Hearing our own frame (rebroadcast) is an implicit ACK — always cancel
@@ -5147,7 +5336,9 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(0x1111_1111));
 
-        let header = PacketHeader::from_fields(1, 2, 99, 0, 2, 2, false, false, 0, 0);
+        // Relayed copy (foreign relay byte): not an originator retry, so it stays a plain
+        // duplicate and must not schedule another relay.
+        let header = PacketHeader::from_fields(1, 2, 99, 0, 1, 2, false, false, 0, 0xAB);
         let wire = encode_wire(header, &[1, 2, 3]);
 
         let inbound = InboundPacket {
@@ -6345,15 +6536,43 @@ mod tests {
         )
     }
 
+    /// Wait between named follow-up tries for a forward of `wire` nominating `nominated`.
+    fn named_followup_delay(router: &Router, wire: &[u8], nominated: u32) -> u32 {
+        let cfg = eu868_config_for_preset(router.modem_preset());
+        let airtime = packet_time_ms(&cfg, wire.len(), false).max(1);
+        router.named_followup_delay_ms(nominated, airtime)
+    }
+
+    /// Fire the named repeat and check it is our first copy unchanged; returns when it fired.
+    fn expect_named_repeat(router: &mut Router, sent: &ParsedPacket, id: u32, at: u32) -> u32 {
+        let repeat = router.poll_reliable_retransmit(at).expect("repeat due");
+        let hdr = PacketHeader::decode(&repeat.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert_eq!(hdr.next_hop, sent.next_hop, "repeat names the same hop");
+        assert_eq!(hdr.hop_limit, sent.hop_limit);
+        assert_eq!(hdr.relay_node, sent.relay_node);
+        assert!(router.has_pending_reliable(id), "redirect still to come");
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::RelayRetxRepeat { id: eid } if *eid == id)));
+        at
+    }
+
     #[test]
-    fn forwarded_want_ack_unicast_is_retried_then_released_to_flooding() {
+    fn forwarded_want_ack_unicast_is_repeated_then_dropped_without_alternate() {
+        // Single path via RELAYER. Our relay was the originator's implicit ACK, so its
+        // retries have stopped: the repeat to RELAYER is the recovery, and with no
+        // stampable alternate nothing else is sent (no flood).
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x601, true);
         let (sent, armed_at) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB, "route to DEST goes via RELAYER");
-        assert!(router.has_pending_reliable(0x601), "flood insurance armed");
+        assert!(router.has_pending_reliable(0x601), "named follow-up armed");
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
         assert!(logs.iter().any(|e| matches!(
@@ -6364,21 +6583,30 @@ mod tests {
             }
         )));
 
-        let flood = router
-            .poll_reliable_retransmit(armed_at.saturating_add(60_000))
-            .expect("flood insurance due");
-        let hdr = PacketHeader::decode(&flood.bytes[..PACKET_HEADER_LEN])
-            .unwrap()
-            .parse();
-        assert_eq!(hdr.next_hop, 0, "named hop silent: release to flooding");
-        assert!(router
-            .poll_reliable_retransmit(armed_at.saturating_add(120_000))
-            .is_none());
+        let delay = named_followup_delay(router, &wire, UNI_RELAYER);
+        let repeated_at = expect_named_repeat(router, &sent, 0x601, armed_at + delay);
+        assert!(
+            router
+                .poll_reliable_retransmit(repeated_at + delay - 1)
+                .is_none(),
+            "redirect waits a full follow-up delay after the repeat"
+        );
+        assert!(
+            router
+                .poll_reliable_retransmit(repeated_at + delay)
+                .is_none(),
+            "no alternate: directed retry drops rather than flooding"
+        );
         assert!(!router.has_pending_reliable(0x601));
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::RelayRetxNoAlternate { id: 0x601 })));
     }
 
     #[test]
-    fn forwarded_unicast_without_want_ack_is_retried_then_flooded() {
+    fn forwarded_unicast_without_want_ack_arms_repeat_and_redirect_not_flood() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
@@ -6386,17 +6614,19 @@ mod tests {
         let (sent, armed_at) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB);
         assert!(router.has_pending_reliable(0x602));
-        let flood = router
-            .poll_reliable_retransmit(armed_at.saturating_add(60_000))
-            .expect("flood insurance due");
-        let hdr = PacketHeader::decode(&flood.bytes[..PACKET_HEADER_LEN])
-            .unwrap()
-            .parse();
-        assert_eq!(hdr.next_hop, 0);
+        let delay = named_followup_delay(router, &wire, UNI_RELAYER);
+        let repeated_at = expect_named_repeat(router, &sent, 0x602, armed_at + delay);
+        assert!(
+            router
+                .poll_reliable_retransmit(repeated_at + delay)
+                .is_none(),
+            "named hop silent with no alternate: nothing transmitted"
+        );
+        assert!(!router.has_pending_reliable(0x602));
     }
 
     #[test]
-    fn named_forward_still_arms_flood_insurance_when_ranking_has_a_later_flood_slot() {
+    fn named_forward_still_arms_followup_when_ranking_has_a_later_flood_slot() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
@@ -6430,7 +6660,409 @@ mod tests {
         assert_eq!(sent.next_hop, 0xBB);
         assert!(
             router.has_pending_reliable(0x611),
-            "named hop still insures even if ranking assigned someone else a flood slot"
+            "named hop still arms a follow-up even if ranking assigned someone else a flood slot"
+        );
+    }
+
+    fn assert_originator_retry_replanned(next_hop: u8, relay: u8, id: u32, router: &mut Router) {
+        setup_unicast_graph(router);
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        // First copy names someone else so we do not commit as designated.
+        let first = unicast_wire_ack(3, 3, 0x55, 0xDD, id, false);
+        let _ = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &first,
+                },
+                0,
+            )
+            .unwrap();
+        let retry = unicast_wire_ack(3, 3, next_hop, relay, id, false);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &retry,
+                },
+                100,
+            )
+            .unwrap();
+        assert!(
+            !result.duplicate,
+            "originator retry next_hop={next_hop:#x} relay={relay:#x} must be re-planned"
+        );
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::OriginatorRetryReplanned { id: eid } if *eid == id)));
+    }
+
+    #[test]
+    fn originator_retry_replanned_next_hop_zero_relay_byte_matches() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        assert_originator_retry_replanned(0, 0xDD, 0x711, router);
+    }
+
+    #[test]
+    fn originator_retry_replanned_next_hop_is_us() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        assert_originator_retry_replanned((UNI_ME & 0xFF) as u8, 0xDD, 0x712, router);
+    }
+
+    #[test]
+    fn originator_retry_replanned_relay_byte_zero() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        assert_originator_retry_replanned(0, 0, 0x713, router);
+    }
+
+    #[test]
+    fn relayed_flood_copy_and_foreign_named_retry_stay_duplicates() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let first = unicast_wire_ack(3, 3, 0x55, 0xDD, 0x702, false);
+        let _ = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &first,
+                },
+                0,
+            )
+            .unwrap();
+        // Relayed copy with next_hop 0 (foreign relay byte): not an originator retry.
+        let relayed = unicast_wire_ack(2, 3, 0, 0xAA, 0x702, false);
+        assert!(router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &relayed,
+                },
+                50,
+            )
+            .unwrap()
+            .duplicate);
+        // Originator retry naming another node stays a duplicate.
+        let named_other = unicast_wire_ack(3, 3, 0x55, 0xDD, 0x702, false);
+        assert!(router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &named_other,
+                },
+                60,
+            )
+            .unwrap()
+            .duplicate);
+        // Preserved hop_limit with foreign relay byte is not an originator retry.
+        let preserved = unicast_wire_ack(3, 3, 0, 0xAA, 0x702, false);
+        assert!(router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &preserved,
+                },
+                70,
+            )
+            .unwrap()
+            .duplicate);
+    }
+
+    #[test]
+    fn named_followup_waits_for_our_airtime_and_ranked_slot_one() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x612, false);
+        let (sent, armed_at) = forward_unicast(router, &wire, 1_000);
+        assert_eq!(sent.next_hop, 0xBB);
+        let cfg = eu868_config_for_preset(router.modem_preset());
+        let airtime = packet_time_ms(&cfg, wire.len(), false).max(1);
+        let half = coordinated_relay::half_airtime_ms(airtime);
+        // Our frame leaves the air, then a slot-1 backup (with its tie-break spread) does.
+        let own_tx = router.sr_peer_relay_wait_ms(airtime);
+        let slot1_end = router.unicast_named_slot_delay_ms(1, 0, half, airtime)
+            + coordinated_relay::tie_break_range_ms(half)
+            + airtime;
+        let carry = router.next_hop_carry_wait_ms(UNI_RELAYER, airtime);
+        let delay = router.named_followup_delay_ms(UNI_RELAYER, airtime);
+        assert!(
+            delay >= own_tx + slot1_end,
+            "{delay} < {own_tx} + {slot1_end}"
+        );
+        assert!(delay >= own_tx + carry, "{delay} < {own_tx} + {carry}");
+        assert!(
+            router
+                .poll_reliable_retransmit(armed_at + delay - 1)
+                .is_none(),
+            "must not fire before our airtime and slot 1 have passed"
+        );
+        assert!(router.has_pending_reliable(0x612));
+        expect_named_repeat(router, &sent, 0x612, armed_at + delay);
+    }
+
+    /// A second, verified path to DEST via `peer`.
+    fn add_second_path(router: &mut Router, peer: u32) {
+        router
+            .graph_mut()
+            .observe_direct_neighbor(peer, -70, 8, 0, 0);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(peer, true, 0);
+        router.graph_mut().confirm_direct_neighbor_hears_us(peer);
+        router.graph_mut().edges_mut().update_edge(
+            UNI_ME,
+            peer,
+            UNI_DEST,
+            1.2,
+            0,
+            EdgeSource::Reported,
+            true,
+            0,
+        );
+        router
+            .graph_mut()
+            .edges_mut()
+            .set_edge_hears_us(peer, UNI_DEST, true);
+        router.graph_mut().edges_mut().update_edge(
+            UNI_ME,
+            UNI_DEST,
+            peer,
+            1.2,
+            0,
+            EdgeSource::Mirrored,
+            true,
+            0,
+        );
+    }
+
+    #[test]
+    fn named_forward_repeats_then_redirects_to_stampable_alternate() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        add_second_path(router, UNI_PEER);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x613, false);
+        let (sent, armed_at) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.next_hop, 0xBB);
+        let delay = named_followup_delay(router, &wire, UNI_RELAYER);
+        let repeated_at = expect_named_repeat(router, &sent, 0x613, armed_at + delay);
+        let retx = router
+            .poll_reliable_retransmit(repeated_at + delay)
+            .expect("redirect due");
+        let hdr = PacketHeader::decode(&retx.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert_eq!(hdr.next_hop, (UNI_PEER & 0xFF) as u8);
+        assert_eq!(hdr.hop_start, sent.hop_start);
+        assert_eq!(hdr.hop_limit, sent.hop_limit);
+        assert_eq!(hdr.relay_node, sent.relay_node);
+        assert!(!router.has_pending_reliable(0x613));
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::RelayRetxRedirect { id: 0x613, next_hop } if *next_hop == hdr.next_hop
+        )));
+    }
+
+    #[test]
+    fn redirect_refuses_an_alternate_sharing_the_nominated_byte() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        // Same low byte as RELAYER: a frame naming it would read as the silent hop again.
+        add_second_path(router, 0xAB00_00BB);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x614, false);
+        let (sent, armed_at) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.next_hop, 0xBB);
+        let delay = named_followup_delay(router, &wire, UNI_RELAYER);
+        let repeated_at = expect_named_repeat(router, &sent, 0x614, armed_at + delay);
+        assert!(router
+            .poll_reliable_retransmit(repeated_at + delay)
+            .is_none());
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::RelayRetxNoAlternate { id: 0x614 })));
+    }
+
+    #[test]
+    fn redirect_refuses_a_stock_alternate() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        add_second_path(router, UNI_PEER);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x617, false);
+        let (sent, armed_at) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.next_hop, 0xBB);
+        // PEER stops looking like an SR node: its route stays, its status becomes unknown.
+        router.graph_mut().capability_mut().clear();
+        let alt =
+            router
+                .graph
+                .route_excluding(UNI_DEST, armed_at, &[UNI_RELAYER, UNI_SOURCE, UNI_ME]);
+        assert_eq!(
+            alt.next_hop, UNI_PEER,
+            "precondition: PEER is still the alternate"
+        );
+        let delay = named_followup_delay(router, &wire, UNI_RELAYER);
+        let repeated_at = expect_named_repeat(router, &sent, 0x617, armed_at + delay);
+        assert!(router
+            .poll_reliable_retransmit(repeated_at + delay)
+            .is_none());
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::RelayRetxNoAlternate { id: 0x617 })));
+    }
+
+    #[test]
+    fn upstream_and_originator_copies_keep_the_named_followup() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x615, false);
+        let (sent, _) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.next_hop, 0xBB);
+        // SOURCE did not hear our relay and retries: it has not carried the packet past us.
+        let retry = unicast_wire_ack(3, 3, 0, 0xDD, 0x615, false);
+        let dupe = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &retry,
+                },
+                200,
+            )
+            .unwrap();
+        assert!(dupe.duplicate);
+        assert!(
+            router.has_pending_reliable(0x615),
+            "originator's copy must not cancel our follow-up"
+        );
+        // RELAYER's copy is the packet moving on.
+        let carried = unicast_wire_ack(2, 3, 0, 0xBB, 0x615, false);
+        let _ = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &carried,
+                },
+                400,
+            )
+            .unwrap();
+        assert!(!router.has_pending_reliable(0x615));
+    }
+
+    #[test]
+    fn upstream_relay_copy_keeps_the_named_followup() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_PEER, -70, 8, 0, 0);
+        let upstream_byte = (UNI_PEER & 0xFF) as u8;
+        let wire = unicast_wire_ack(2, 3, 0, upstream_byte, 0x618, false);
+        let (sent, _) = forward_unicast(router, &wire, 0);
+        assert_eq!(sent.next_hop, 0xBB);
+        // PEER did not hear our relay and repeats its own frame.
+        let _ = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                200,
+            )
+            .unwrap();
+        assert!(
+            router.has_pending_reliable(0x618),
+            "upstream's copy must not cancel our follow-up"
+        );
+    }
+
+    #[test]
+    fn nominated_hop_copy_clears_its_suspect_state() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let _ = router.graph_mut().record_hop_miss(UNI_DEST, UNI_RELAYER, 0);
+        let _ = router.graph_mut().record_hop_miss(UNI_DEST, UNI_RELAYER, 1);
+        // Only path: a suspect hop is still stamped.
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x616, false);
+        let (sent, _) = forward_unicast(router, &wire, 10);
+        assert_eq!(sent.next_hop, 0xBB);
+        let carried = unicast_wire_ack(2, 3, 0, 0xBB, 0x616, false);
+        let _ = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &carried,
+                },
+                400,
+            )
+            .unwrap();
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs.iter().any(|e| matches!(
+            e,
+            SrLogEvent::NextHopHealthy {
+                next_hop: UNI_RELAYER,
+                destination: UNI_DEST
+            }
+        )));
+    }
+
+    #[test]
+    fn suspect_first_hop_is_stamped_only_without_an_alternate() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        add_second_path(router, UNI_PEER);
+        assert_eq!(
+            router
+                .graph_mut()
+                .get_next_hop_verified(UNI_DEST, UNI_SOURCE, UNI_SOURCE, 0),
+            (UNI_RELAYER, true)
+        );
+        let _ = router.graph_mut().record_hop_miss(UNI_DEST, UNI_RELAYER, 0);
+        let _ = router.graph_mut().record_hop_miss(UNI_DEST, UNI_RELAYER, 1);
+        assert_eq!(
+            router
+                .graph_mut()
+                .get_next_hop_verified(UNI_DEST, UNI_SOURCE, UNI_SOURCE, 2),
+            (UNI_PEER, true),
+            "suspect hop gives way to a stampable alternate"
         );
     }
 

@@ -1,12 +1,26 @@
 //! Reliable retransmit slots: want_ack packets we originate, last-hop want_ack toward a
-//! non-SR dest, and a single flood insurance copy of a named non-final forward (next_hop
-//! cleared if the nominated hop never carries it).
-
-use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
+//! non-SR dest, and the follow-up of a named non-final forward when the nominated hop stays
+//! silent: one repeat to the same hop, then one directed alternate retry.
 
 use crate::router::MAX_WIRE_LEN;
 
 pub const MAX_PENDING_RELIABLE: usize = 4;
+
+/// Follow-up tries of a named forward: the repeat to the nominated hop, then the redirect.
+pub const NAMED_FOLLOWUP_TRIES: u8 = 2;
+
+/// Follow-up state of a named non-final forward.
+#[derive(Clone, Copy)]
+pub struct NamedFollowup {
+    /// Nominated next hop (full node id); 0 when its relay byte did not resolve.
+    pub nominated_hop: u32,
+    /// The `next_hop` byte we stamped. A copy relayed under it is the nominated hop's.
+    pub nominated_byte: u8,
+    /// Node we heard the packet from when arming the follow-up.
+    pub upstream: u32,
+    /// Wait after each try before the next one is due.
+    pub delay_ms: u32,
+}
 
 #[derive(Clone, Copy)]
 pub struct PendingReliable {
@@ -17,8 +31,7 @@ pub struct PendingReliable {
     pub to: u32,
     /// Forwarded copy of someone else's unicast.
     pub relayed: bool,
-    /// Last remaining attempt of a named forward: clear `next_hop` so stock may pick up.
-    pub flood_on_last: bool,
+    pub named: Option<NamedFollowup>,
     pub num_retx: u8,
     pub next_tx_ms: u32,
     pub len: u8,
@@ -33,7 +46,7 @@ impl PendingReliable {
             packet_id: 0,
             to: 0,
             relayed: false,
-            flood_on_last: false,
+            named: None,
             num_retx: 0,
             next_tx_ms: 0,
             len: 0,
@@ -53,7 +66,7 @@ pub fn schedule_reliable(
     retx_delay_ms: u32,
     now_ms: u32,
     num_retx: u8,
-    flood_on_last: bool,
+    named: Option<NamedFollowup>,
 ) -> bool {
     if slots
         .iter()
@@ -71,7 +84,7 @@ pub fn schedule_reliable(
         packet_id,
         to,
         relayed,
-        flood_on_last,
+        named,
         num_retx,
         next_tx_ms: now_ms.wrapping_add(retx_delay_ms),
         len,
@@ -80,17 +93,30 @@ pub fn schedule_reliable(
     true
 }
 
+/// The named follow-up armed for a frame, if any.
+pub fn named_followup(
+    slots: &[PendingReliable; MAX_PENDING_RELIABLE],
+    from: u32,
+    packet_id: u32,
+) -> Option<NamedFollowup> {
+    slots
+        .iter()
+        .find(|s| s.active && s.from == from && s.packet_id == packet_id)
+        .and_then(|s| s.named)
+}
+
 /// Stop retries of a frame identified by originator and id (relayed copies included).
+/// Returns the cleared slot's destination and nominated hop when one was active.
 pub fn stop_reliable_for(
     slots: &mut [PendingReliable; MAX_PENDING_RELIABLE],
     from: u32,
     packet_id: u32,
-) -> bool {
-    let mut stopped = false;
+) -> Option<(u32, u32)> {
+    let mut stopped = None;
     for slot in slots.iter_mut() {
         if slot.active && slot.from == from && slot.packet_id == packet_id {
+            stopped = Some((slot.to, slot.named.map_or(0, |n| n.nominated_hop)));
             slot.active = false;
-            stopped = true;
         }
     }
     stopped
@@ -115,15 +141,16 @@ pub fn bump_reliable_delays(slots: &mut [PendingReliable; MAX_PENDING_RELIABLE],
     }
 }
 
-/// Pop the next due retransmit. `retx_delay_for(len)` yields the delay until the following
-/// attempt for a frame of that wire length (airtime depends on the frame, not on a constant).
-/// A frame due for retransmission. `fallback` is set on the final retry of a relayed copy,
-/// whose header has just had `next_hop` cleared.
+/// A frame due for retransmission. `redirect` marks the last try of a named follow-up: the
+/// router must search for an alternate and patch or drop the frame. An earlier named try is
+/// the unchanged repeat to the nominated hop.
 pub struct DueRetransmit {
     pub from: u32,
     pub packet_id: u32,
+    pub to: u32,
     pub relayed: bool,
-    pub fallback: bool,
+    pub named: Option<NamedFollowup>,
+    pub redirect: bool,
     pub len: u8,
     pub bytes: [u8; MAX_WIRE_LEN],
 }
@@ -148,25 +175,24 @@ pub fn due_retransmit(
             continue;
         }
         slot.num_retx -= 1;
-        slot.next_tx_ms = now_ms.wrapping_add(retx_delay_for(slot.from, slot.packet_id, slot.len));
-        let mut fallback = false;
-        if slot.relayed && slot.num_retx == 0 && slot.flood_on_last {
-            // Last try: release the packet to flooding so any neighbour may carry it.
-            if let Ok(mut hdr) = PacketHeader::decode(&slot.bytes[..PACKET_HEADER_LEN]) {
-                if hdr.next_hop != 0 {
-                    hdr.next_hop = 0;
-                    if let Ok(out) = (&mut slot.bytes[..PACKET_HEADER_LEN]).try_into() {
-                        hdr.encode_to(out);
-                    }
-                    fallback = true;
-                }
-            }
+        let delay = match slot.named {
+            Some(n) => n.delay_ms,
+            None => retx_delay_for(slot.from, slot.packet_id, slot.len),
+        };
+        slot.next_tx_ms = now_ms.wrapping_add(delay);
+        let redirect = slot.named.is_some() && slot.num_retx == 0;
+        // A redirect is the only further attempt: clear the slot now so a drop leaves nothing pending.
+        if redirect {
+            slot.active = false;
         }
+        // The header stays as we first sent it; the router patches next_hop for a redirect.
         return Some(DueRetransmit {
             from: slot.from,
             packet_id: slot.packet_id,
+            to: slot.to,
             relayed: slot.relayed,
-            fallback,
+            named: slot.named,
+            redirect,
             len: slot.len,
             bytes: slot.bytes,
         });

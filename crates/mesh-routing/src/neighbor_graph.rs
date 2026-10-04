@@ -11,6 +11,7 @@ use crate::graph::{
     EdgeStore, RoutableFilter, Route, RouteCache, EDGE_NEW, EDGE_SIGNIFICANT_CHANGE,
     MAX_EDGES_PER_NODE,
 };
+use crate::hop_health::{HopHealth, HopHealthEvent};
 use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE};
 use crate::sr_role::role_is_active_routing;
 use crate::topology::{
@@ -178,6 +179,7 @@ pub struct NeighborGraph {
     merge_asymmetric_skips: [(u32, u32); 4],
     merge_asymmetric_skip_count: u8,
     dropped_coverage: crate::rate_limit::YoungCoverageGate,
+    hop_health: HopHealth,
 }
 
 impl Default for NeighborGraph {
@@ -246,6 +248,7 @@ impl NeighborGraph {
             merge_asymmetric_skips: [(0, 0); 4],
             merge_asymmetric_skip_count: 0,
             dropped_coverage: crate::rate_limit::YoungCoverageGate::empty(),
+            hop_health: HopHealth::new(),
         }
     }
 
@@ -2098,6 +2101,7 @@ impl NeighborGraph {
             capability: &self.capability,
             my_node: self.my_node,
             device_role: self.device_role,
+            excluded: &[],
         };
         let route = calculate_route(
             &self.edges,
@@ -2111,6 +2115,44 @@ impl NeighborGraph {
             self.route_cache.insert(route);
         }
         route
+    }
+
+    /// Route search with intermediate hops excluded. Never reads or writes the route cache.
+    pub fn route_excluding(&self, destination: u32, now_ms: u32, excluded: &[u32]) -> Route {
+        let filter = RoutableFilter {
+            capability: &self.capability,
+            my_node: self.my_node,
+            device_role: self.device_role,
+            excluded,
+        };
+        calculate_route(
+            &self.edges,
+            &self.downstream,
+            self.my_node,
+            destination,
+            now_ms,
+            Some(&filter),
+        )
+    }
+
+    pub fn record_hop_miss(
+        &mut self,
+        destination: u32,
+        next_hop: u32,
+        now_ms: u32,
+    ) -> HopHealthEvent {
+        self.hop_health.record_miss(destination, next_hop, now_ms)
+    }
+
+    pub fn record_hop_success(&mut self, destination: u32, next_hop: u32) -> HopHealthEvent {
+        self.hop_health.record_success(destination, next_hop)
+    }
+
+    pub fn committed_heard_from(&self, from: u32, id: u32) -> Option<u32> {
+        self.relay_states
+            .iter()
+            .find(|r| r.active && r.from == from && r.id == id)
+            .map(|r| r.original_heard_from)
     }
 
     /// Route lookup including which radio should egress the first hop (Phase 9).
@@ -2131,6 +2173,7 @@ impl NeighborGraph {
             capability: &self.capability,
             my_node: self.my_node,
             device_role: self.device_role,
+            excluded: &[],
         };
         is_node_routable(&filter, node_id)
     }
@@ -2173,10 +2216,22 @@ impl NeighborGraph {
             return (0, false);
         }
 
-        let route = self.get_route(destination, now_ms);
+        let mut route = self.get_route(destination, now_ms);
         let chain_egress = self.downstream_chain_egress(destination, now_ms);
         let stampable =
             |hop: u32, route_verified: bool| route_verified || chain_egress == Some(hop);
+        // Suspect first hop: prefer a stampable alternate; never lose the only path.
+        if route.next_hop != 0
+            && self
+                .hop_health
+                .is_suspect(destination, route.next_hop, now_ms)
+        {
+            let excluded = [route.next_hop];
+            let alt = self.route_excluding(destination, now_ms, &excluded);
+            if alt.next_hop != 0 && stampable(alt.next_hop, alt.verified) {
+                route = alt;
+            }
+        }
         if route.next_hop != 0 {
             let route_cost = route.cost();
             let mut next_hop_can_hear = true;
