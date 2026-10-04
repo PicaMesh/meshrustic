@@ -315,14 +315,14 @@ is actually waiting for.
   on the transmitter's edge, or the neighbour listing the transmitter). We ourselves always
   count — we overheard the frame. A path to the destination is not that evidence; ranking a
   deaf neighbour made every overhearer wait for a slot that never fired. A heard copy cancels a
-  later slot only when that transmitter can finish delivery (a priced hop to the destination, or
+  later slot when that transmitter can finish delivery (a priced hop to the destination, or
   being its downstream gateway) or is ranked ahead of us with a path; we keep the slot if we can
   finish and they cannot. An unresolved relay byte (or a placeholder identity) cancels only when
-  we cannot finish ourselves (the designated or stock hop we were waiting for). Slot 0 waits the
-  largest floor that applies to it — stock's own contention floor
-  (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where that is longer;
-  later slots take the larger of that floor and the leader's peer relay window, then space by
-  half an airtime. There is no delay clamp that bunches late rungs. Tests:
+  we cannot finish ourselves (the designated or stock hop we were waiting for). Named backups add
+  a graph-independent cancel (below). Slot 0 waits the largest floor that applies to it — stock's
+  own contention floor (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where
+  that is longer; later slots take the larger of that floor and the leader's peer relay window,
+  then space by half an airtime. There is no delay clamp that bunches late rungs. Tests:
   `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
   `undesignated_unicast_slot_zero_waits_stocks_contention_floor`,
   `dupe_cancels_when_the_relayer_can_finish`,
@@ -379,13 +379,23 @@ is actually waiting for.
   node knows nothing of the floor and starts contending the moment it hears the frame, so its
   copy is clear after its own worst case plus one airtime, and the floor only applies as a lower
   bound. Adding the floor to the stock case would count the same silence twice. Ranking `Err`
-  does not abort that backup. Forward and backup TX stamp **our path** next hop. A named
-  non-final forward arms the named follow-up if the nominated hop never carries it (see
-  below). Last-hop `want_ack` toward a non-SR dest keeps `NUM_RELIABLE_RETX` without
-  clearing next hop, including when the remaining budget is already zero. An acknowledgement
-  from the destination, or a copy that can finish, cancels them. Tests: `unicast_designated_*`,
+  does not abort that backup. Forward and backup TX stamp **our path** next hop — a named backup
+  transmits only when that stamp is neither empty, nor the designation already on the packet,
+  nor the transmitter it heard (`SrSkipReason::NoRelayPath` otherwise; clearing the byte is not
+  another path and the originator treats it as an implicit ACK). When a named backup is armed,
+  `UnicastSlotFlags` remembers the incoming designation byte and `hop_limit`; a heard copy
+  cancels on that relay byte (or resolved identity), or when a later copy still names that
+  designation with a strictly lower `hop_limit`, even if the graph cannot yet prove the hop
+  finishes. An acknowledgement from the destination, or a copy that can finish / is ranked
+  ahead, still cancels as for undesignated unicasts. A named non-final forward arms the named
+  follow-up if the nominated hop never carries it (see below). Last-hop `want_ack` toward a
+  non-SR dest keeps `NUM_RELIABLE_RETX` without clearing next hop, including when the remaining
+  budget is already zero. Tests: `unicast_designated_*`,
   `designated_hop_backup_survives_ranking_skip` (a coverage skip keeps the backup, at its
   unranked slot rung rather than all backups sharing slot 1),
+  `named_backup_without_another_hop_does_not_relay`,
+  `named_backup_cancels_on_designated_hop_without_finish_proof`,
+  `named_backup_cancels_on_designated_hop_when_finish_unknown`,
   `forwarded_want_ack_unicast_is_repeated_then_dropped_without_alternate`,
   `forwarded_unicast_without_want_ack_arms_repeat_and_redirect_not_flood`,
   `last_hop_want_ack_retries_when_the_remaining_budget_is_one`.
@@ -639,9 +649,9 @@ is actually waiting for.
   (`Router::store_pending` replaces), and a packet we have already transmitted is never released
   again (`Router::poll_ready_relay`).
 - **Other duplicates cancel our pending copy** when `Router::perhaps_cancel_dupe` says so.
-  Unicast copies use `unicast_dupe_cancels` (finish / ranked-ahead-with-a-path, above);
-  broadcast copies are pulled back only when the transmitters heard so far cover every
-  neighbour we reach.
+  Unicast copies use `unicast_dupe_cancels` (finish / ranked-ahead-with-a-path, or named-backup
+  designated-hop / hop-limit progress, above); broadcast copies are pulled back only when the
+  transmitters heard so far cover every neighbour we reach.
 - **Coverage decides a committed relay's cancel; our role decides everything else.** The two
   gates answer different questions. Coverage is about the packet — the neighbours we would have
   carried have been carried by somebody else, so our copy would add a duplicate and nothing

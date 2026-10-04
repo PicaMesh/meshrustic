@@ -794,6 +794,8 @@ impl NeighborGraph {
         dupe_relayer: Option<u32>,
         flags: crate::unicast_relay::UnicastSlotFlags,
         dupe_next_hop: u8,
+        dupe_relay_byte: u8,
+        dupe_hop_limit: u8,
     ) -> bool {
         let ctx = crate::unicast_relay::UnicastRelayContext {
             my_node: self.my_node,
@@ -811,6 +813,8 @@ impl NeighborGraph {
             dupe_relayer,
             flags,
             dupe_next_hop,
+            dupe_relay_byte,
+            dupe_hop_limit,
         )
     }
 

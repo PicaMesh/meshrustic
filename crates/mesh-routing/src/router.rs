@@ -2297,7 +2297,8 @@ impl Router {
 
         // A unicast that already names a next hop keeps SR coordination: the designated node
         // owns slot 0 and every other candidate shifts down one slot. A heard copy cancels that
-        // backup when the transmitter can finish or is ranked ahead; not merely because it exists.
+        // backup on the designated hop's relay byte (even without finish proof), or when the
+        // transmitter can finish / is ranked ahead.
         let designated_plan = if parsed.to != NODENUM_BROADCAST && relayer_named {
             Some(self.plan_designated_unicast(
                 &parsed,
@@ -2580,10 +2581,14 @@ impl Router {
             delay_ms,
         });
 
+        let nonfinal_flood = unicast_plan.as_ref().is_some_and(|p| p.nonfinal_flood);
+        let named_backup = relayer_named && !we_are_designated_hop && !nonfinal_flood;
         let unicast_flags = crate::unicast_relay::UnicastSlotFlags {
             last_hop_backup: unicast_plan.as_ref().is_some_and(|p| p.last_hop_backup),
-            nonfinal_flood: unicast_plan.as_ref().is_some_and(|p| p.nonfinal_flood),
+            nonfinal_flood,
             nominated_next_hop: next_hop,
+            designated_next_hop: if named_backup { parsed.next_hop } else { 0 },
+            armed_hop_limit: if named_backup { parsed.hop_limit } else { 0 },
         };
         self.graph
             .set_unicast_commit_flags(parsed.from, parsed.id, unicast_flags);
@@ -2779,9 +2784,10 @@ impl Router {
     /// The designated node owns slot 0. If that is us we relay at once. Otherwise we keep our
     /// normal unicast rank shifted by one slot, behind a slot-0 wait sized for the designated
     /// node: one half-airtime for an SR peer (deterministic), the worst-case stock contention
-    /// window plus one airtime for a stock or unknown node. A heard copy cancels that backup
-    /// when the transmitter can finish or is ranked ahead (`perhaps_cancel_dupe`). Bystanders
-    /// therefore recover a failed designated hop within a slot instead of staying silent.
+    /// window plus one airtime for a stock or unknown node. A heard copy cancels that backup on
+    /// the designated hop's relay byte (boot-graph safe) or when the transmitter can finish /
+    /// is ranked ahead (`perhaps_cancel_dupe`). Bystanders therefore recover a failed designated
+    /// hop within a slot instead of staying silent.
     fn plan_designated_unicast(
         &mut self,
         parsed: &ParsedPacket,
@@ -4440,8 +4446,9 @@ impl Router {
             }
         }
 
-        // Unicast: cancel only when the heard copy can finish delivery, or is ranked ahead of
-        // us with a path. Keep the slot if we can finish and they cannot — a worse-placed copy
+        // Unicast: cancel when the heard copy can finish delivery, is ranked ahead with a path,
+        // or (for a named backup) is the designated hop / shows hop-limit progress on that
+        // designation. Keep the slot if we can finish and they cannot — a worse-placed copy
         // must not kill the last hop. Broadcast coverage reasoning below does not apply.
         let in_flight = self.graph.has_our_transmission(parsed.id);
         if parsed.to != NODENUM_BROADCAST && (committed || has_pending || in_flight) {
@@ -4462,6 +4469,8 @@ impl Router {
                     dupe_relayer,
                     flags,
                     parsed.next_hop,
+                    parsed.relay_node,
+                    parsed.hop_limit,
                 )
             {
                 self.graph.cancel_relay(parsed.from, parsed.id);
@@ -7471,6 +7480,86 @@ mod tests {
         assert!(logs
             .iter()
             .any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
+    }
+
+    /// Named backup armed with a real alternate stamp: the designated hop is known but cannot
+    /// finish, so finish/rank would keep our slot. Hearing its relay byte must still cancel —
+    /// that is the flag wiring through commit → `perhaps_cancel_dupe`.
+    #[test]
+    fn named_backup_cancels_on_designated_hop_when_finish_unknown() {
+        const DESIG: u32 = 0x9900_0099;
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(DESIG, -80, 5, 0, 0);
+        router.graph_mut().confirm_direct_neighbor_hears_us(DESIG);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(DESIG, true, 0);
+        router.remember_relay_identity(DESIG, 0x99, 0);
+
+        // Packet names DESIG; our path stamps RELAYER — a real named backup.
+        let wire = unicast_wire(7, 7, 0x99, 0xDD, 0x509);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
+        assert!(plan.relay.is_none(), "backup waits behind designated slot 0");
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x509, 0)
+            .expect("named backup armed");
+        let flags = router.graph_mut().unicast_commit_flags(UNI_SOURCE, 0x509);
+        assert_eq!(flags.designated_next_hop, 0x99);
+        assert_eq!(flags.armed_hop_limit, 7);
+        assert!(
+            !router.graph_mut().unicast_dupe_cancels(
+                0x509,
+                UNI_DEST,
+                UNI_RELAYER,
+                0,
+                Some(DESIG),
+                crate::unicast_relay::UnicastSlotFlags::EMPTY,
+                0,
+                0,
+                0,
+            ),
+            "without designation flags a non-finisher does not cancel"
+        );
+
+        let copy = unicast_wire(6, 7, 0, 0x99, 0x509);
+        let dupe = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &copy,
+                },
+                100,
+            )
+            .unwrap();
+        assert!(dupe.duplicate);
+        assert!(
+            router.relay_tx_after(UNI_SOURCE, 0x509, 0).is_none(),
+            "designated hop copy must cancel even when it cannot finish"
+        );
+        assert!(router.poll_ready_relay(tx_after + 1).is_none());
+        let mut logs = heapless::Vec::new();
+        router.drain_sr_logs(&mut logs);
+        assert!(logs
+            .iter()
+            .any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x509, .. })));
     }
 
     #[test]

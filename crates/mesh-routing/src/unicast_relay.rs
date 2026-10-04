@@ -12,9 +12,11 @@
 //! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Within a bucket, ties
 //! break by node id (packet-id parity). Before ranking, suppress only when a coverer is known to
 //! hold this copy (heard from them, or they already transmitted this id). A heard copy cancels a
-//! later slot only when that transmitter can finish delivery, or is ranked ahead of us and has a
-//! path; we keep the slot if we can finish and they cannot. Finishing is a priced hop to the
-//! destination, or being its downstream gateway — not stock optimism without a link.
+//! later slot when that transmitter can finish delivery, is ranked ahead of us with a path, or
+//! (for a named backup) is the designated hop / shows hop-limit progress on that designation —
+//! even when the graph cannot yet prove finish. We keep the slot if we can finish and they
+//! cannot. Finishing is a priced hop to the destination, or being its downstream gateway — not
+//! stock optimism without a link.
 //!
 //! Last hop (a priced hop to the destination): at most two such links if dest is SR, otherwise
 //! one. The second waits for dest's ACK. Indirect candidates still take later slots. Non-final
@@ -64,6 +66,12 @@ pub struct UnicastSlotFlags {
     pub last_hop_backup: bool,
     pub nonfinal_flood: bool,
     pub nominated_next_hop: u32,
+    /// Incoming `next_hop` byte when we armed as a named backup (0 = undesignated / not a backup).
+    /// Hearing that hop's copy cancels us even when the graph cannot yet prove it finishes.
+    pub designated_next_hop: u8,
+    /// `hop_limit` on the copy we armed from; a later copy that still names `designated_next_hop`
+    /// with a strictly lower hop_limit means that hop progressed the frame.
+    pub armed_hop_limit: u8,
 }
 
 impl UnicastSlotFlags {
@@ -71,6 +79,8 @@ impl UnicastSlotFlags {
         last_hop_backup: false,
         nonfinal_flood: false,
         nominated_next_hop: 0,
+        designated_next_hop: 0,
+        armed_hop_limit: 0,
     };
 }
 
@@ -379,6 +389,8 @@ pub fn unicast_dupe_cancels(
         dupe_relayer,
         UnicastSlotFlags::default(),
         0,
+        0,
+        0,
     )
 }
 
@@ -391,6 +403,9 @@ pub fn unicast_dupe_cancels(
 /// Last-hop backup: only dest's own copy (or dest ACK, handled elsewhere) cancels. A flood slot
 /// stays for a same-hop named SR copy that cannot finish, and cancels when the nominated hop,
 /// dest, a finisher, or another flood copy is heard.
+///
+/// Named backup: hearing the designated `next_hop` byte (or a lower hop_limit still naming it)
+/// cancels even when `can_finish` is unknown — boot graphs must not keep the backup.
 pub fn unicast_dupe_cancels_for(
     ctx: &UnicastRelayContext<'_>,
     packet_id: u32,
@@ -400,7 +415,31 @@ pub fn unicast_dupe_cancels_for(
     dupe_relayer: Option<u32>,
     flags: UnicastSlotFlags,
     dupe_next_hop: u8,
+    dupe_relay_byte: u8,
+    dupe_hop_limit: u8,
 ) -> bool {
+    // Named-backup cancel that does not need a complete graph: the byte on the wire is enough.
+    if flags.designated_next_hop != 0 {
+        if dupe_relay_byte == flags.designated_next_hop {
+            return true;
+        }
+        if let Some(relayer) = dupe_relayer {
+            if relayer != 0
+                && !is_placeholder_node(relayer)
+                && (relayer & 0xFF) as u8 == flags.designated_next_hop
+            {
+                return true;
+            }
+        }
+        // Designation progressed: same next_hop byte, strictly fewer hops remaining.
+        if dupe_next_hop == flags.designated_next_hop
+            && flags.armed_hop_limit != 0
+            && dupe_hop_limit < flags.armed_hop_limit
+        {
+            return true;
+        }
+    }
+
     let me = ctx.my_node;
     let we_finish = ctx.can_finish(me, destination, now_ms);
     let Some(relayer) = dupe_relayer.filter(|&n| n != 0 && n != me && !is_placeholder_node(n)) else {
@@ -726,7 +765,9 @@ mod tests {
                 NOW,
                 Some(PEER),
                 flags,
-                (PEER & 0xFF) as u8
+                (PEER & 0xFF) as u8,
+                0,
+                0,
             ),
             "a named same-hop SR that cannot finish is not dest's ACK"
         );
@@ -738,7 +779,9 @@ mod tests {
             NOW,
             Some(GW),
             flags,
-            0
+            0,
+            0,
+            0,
         ));
         assert!(unicast_dupe_cancels_for(
             &f.ctx(),
@@ -748,11 +791,75 @@ mod tests {
             NOW,
             Some(DEST),
             flags,
-            0
+            0,
+            0,
+            0,
         ));
         assert!(
-            unicast_dupe_cancels_for(&f.ctx(), 0x40, DEST, GW, NOW, Some(PEER), flags, 0),
+            unicast_dupe_cancels_for(&f.ctx(), 0x40, DEST, GW, NOW, Some(PEER), flags, 0, 0, 0),
             "another flood copy cancels"
+        );
+    }
+
+    #[test]
+    fn named_backup_cancels_on_designated_hop_without_finish_proof() {
+        // Empty graph: cannot can_finish anyone toward DEST. Hearing the designated byte must
+        // still cancel — the field failure when a thin boot graph kept the backup after Czar.
+        let edges = EdgeStore::new();
+        let capability = CapabilityCache::new();
+        let downstream = DownstreamTable::new();
+        let ctx = UnicastRelayContext {
+            my_node: ME,
+            edges: &edges,
+            capability: &capability,
+            downstream: &downstream,
+            downstream_ttl_ms: TTL,
+        };
+        let gw_byte = (GW & 0xFF) as u8;
+        let peer_byte = (PEER & 0xFF) as u8;
+        let flags = UnicastSlotFlags {
+            designated_next_hop: gw_byte,
+            armed_hop_limit: 7,
+            ..Default::default()
+        };
+        assert!(!ctx.can_finish(GW, DEST, NOW));
+        assert!(
+            unicast_dupe_cancels_for(&ctx, 0x50, DEST, 0, NOW, None, flags, 0, gw_byte, 6),
+            "relay byte matching designated next_hop cancels even when identity is unresolved"
+        );
+        assert!(
+            unicast_dupe_cancels_for(&ctx, 0x51, DEST, 0, NOW, Some(GW), flags, 0, 0, 6),
+            "resolved designated hop cancels without finish proof"
+        );
+        assert!(
+            unicast_dupe_cancels_for(
+                &ctx,
+                0x52,
+                DEST,
+                0,
+                NOW,
+                Some(PEER),
+                flags,
+                gw_byte,
+                peer_byte,
+                5,
+            ),
+            "lower hop_limit still naming the designation means that hop progressed"
+        );
+        assert!(
+            !unicast_dupe_cancels_for(
+                &ctx,
+                0x53,
+                DEST,
+                0,
+                NOW,
+                Some(PEER),
+                flags,
+                0,
+                peer_byte,
+                6,
+            ),
+            "an unrelated peer copy does not cancel on designation alone when finish/rank are unknown"
         );
     }
 
@@ -768,7 +875,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !unicast_dupe_cancels_for(&f.ctx(), 0x40, DEST, DEST, NOW, Some(PEER), flags, 0),
+            !unicast_dupe_cancels_for(&f.ctx(), 0x40, DEST, DEST, NOW, Some(PEER), flags, 0, 0, 0),
             "another last hop is not dest's ACK"
         );
         assert!(unicast_dupe_cancels_for(
@@ -779,7 +886,9 @@ mod tests {
             NOW,
             Some(DEST),
             flags,
-            0
+            0,
+            0,
+            0,
         ));
     }
 
