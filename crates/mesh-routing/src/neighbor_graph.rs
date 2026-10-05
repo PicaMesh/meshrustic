@@ -1349,12 +1349,21 @@ impl NeighborGraph {
                 }
             }
 
+            // Direct = our Reported observation of them (us→them). The reverse of an RF
+            // hearing is only Inferred, and a peer listing us is Mirrored — neither is
+            // evidence we hear them. Checking Reported them→us never fired after the
+            // Inferred-reverse change and wrongly parked neighbours we hear as
+            // downstream of the topology sender.
             let has_direct_connection = neighbor.node_id == self.my_node
                 || self
                     .edges
-                    .has_direct_reported_edge_to(neighbor.node_id, self.my_node);
+                    .has_direct_reported_edge_to(self.my_node, neighbor.node_id);
 
-            if !has_direct_connection && neighbor.hears_us {
+            if has_direct_connection {
+                if neighbor.node_id != self.my_node {
+                    self.downstream.clear_for_destination(neighbor.node_id);
+                }
+            } else if neighbor.hears_us {
                 let via_radio = self.edges.relay_heard_on(self.my_node, sender);
                 self.downstream.update(
                     self.my_node,
@@ -1365,10 +1374,7 @@ impl NeighborGraph {
                     relay_has_edge,
                     via_radio,
                 );
-            } else if !has_direct_connection
-                && !neighbor.hears_us
-                && neighbor.node_id != self.my_node
-            {
+            } else if neighbor.node_id != self.my_node {
                 self.record_merge_asymmetric_skip(sender, neighbor.node_id);
             }
         }
@@ -4897,6 +4903,68 @@ mod tests {
         assert!(matches!(result, TopologyMergeResult::Applied { .. }));
         let skips: heapless::Vec<_, 4> = graph.drain_merge_asymmetric_skips().collect();
         assert_eq!(skips.as_slice(), &[(0xBB, 0xCC)]);
+    }
+
+    #[test]
+    fn merge_topology_does_not_park_a_heard_neighbour_as_downstream() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const HEARD: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+        graph.observe_direct_neighbor(HEARD, -75, 11, 100, 0);
+        // A stale row from before we heard them, or from the old them→us check.
+        graph
+            .downstream_mut()
+            .update(ME, HEARD, PEER, 2.0, 100, false, 0);
+        assert_eq!(graph.get_downstream_relay(HEARD, 200), Some(PEER));
+
+        let listed = PackedNeighbor {
+            node_id: HEARD,
+            rssi: -76,
+            snr: 12,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let result = graph.merge_topology(PEER, &header, &[listed], true, 200, 0);
+        assert!(matches!(result, TopologyMergeResult::Applied { .. }));
+        assert_eq!(
+            graph.get_downstream_relay(HEARD, 200),
+            None,
+            "a neighbour we hear directly must not sit downstream of the topology sender"
+        );
+    }
+
+    #[test]
+    fn merge_topology_still_learns_downstream_for_nodes_we_do_not_hear() {
+        const ME: u32 = 0xAA00_00AA;
+        const PEER: u32 = 0xBB00_00BB;
+        const REMOTE: u32 = 0xDD00_00DD;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
+
+        let listed = PackedNeighbor {
+            node_id: REMOTE,
+            rssi: -80,
+            snr: 6,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let result = graph.merge_topology(PEER, &header, &[listed], true, 200, 0);
+        assert!(matches!(result, TopologyMergeResult::Applied { .. }));
+        assert_eq!(graph.get_downstream_relay(REMOTE, 200), Some(PEER));
     }
 
     const COV_ME: u32 = 0x1000_0001;

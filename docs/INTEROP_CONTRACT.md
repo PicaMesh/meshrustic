@@ -802,7 +802,12 @@ is actually waiting for.
   neighbour's own published measurement of us, and priced our link from our own guess while every
   peer priced it from our published list, so each node credited itself with more coverage than any
   peer credited it with. Our direct-neighbour count is therefore the set we measured and publish,
-  not the set that holds an edge back to us.
+  not the set that holds an edge back to us. Topology merge uses the same rule for downstream
+  rows: a listed node is "direct" only when we hold Reported `us → them`. Checking Reported
+  `them → us` never fired after the reverse became Inferred and wrongly parked neighbours we hear
+  as downstream of the topology sender. Tests:
+  `merge_topology_does_not_park_a_heard_neighbour_as_downstream`,
+  `merge_topology_still_learns_downstream_for_nodes_we_do_not_hear`.
 - **Noting that a node is alive never creates a graph node for it.** A relayed frame proves the
   source exists, not that we know a link to it. `update_node_activity` refreshes an existing node
   only: creating an edgeless one meant the next maintenance pass removed it and, with it, every
