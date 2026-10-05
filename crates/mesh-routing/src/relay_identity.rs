@@ -234,12 +234,12 @@ impl RelayIdentityCache {
     }
 
     fn pick_best_direct_candidate(
-        bucket: &RelayIdentityBucket,
+        _bucket: &RelayIdentityBucket,
         direct: &[u32],
         direct_etx: &[u16],
         rssi: i16,
         snr: i8,
-        now_ms: u32,
+        _now_ms: u32,
         modem_preset: u8,
     ) -> u32 {
         if direct.is_empty() {
@@ -253,30 +253,27 @@ impl RelayIdentityCache {
             let packet_etx_fixed = (packet_etx * 100.0).clamp(1.0, 65535.0) as u16;
             let mut best = direct[0];
             let mut best_diff = u16::MAX;
+            let mut tied = false;
             for (i, &node) in direct.iter().enumerate() {
                 let edge_etx = direct_etx[i];
                 let diff = packet_etx_fixed.abs_diff(edge_etx);
                 if diff < best_diff {
                     best_diff = diff;
                     best = node;
+                    tied = false;
+                } else if diff == best_diff && node != best {
+                    tied = true;
                 }
             }
-            return best;
+            // Two neighbours sharing a last byte with the same ETX distance cannot be told
+            // apart from the frame alone. No answer is safer than naming the wrong one.
+            return if tied { 0 } else { best };
         }
 
-        let mut best_direct = 0u32;
-        let mut newest_direct = 0u32;
-        for i in 0..bucket.entry_count as usize {
-            let entry = bucket.entries[i];
-            if now_ms.wrapping_sub(entry.last_heard_ms) > RELAY_ID_CACHE_TTL_MS {
-                continue;
-            }
-            if direct.contains(&entry.node_id) && entry.last_heard_ms >= newest_direct {
-                newest_direct = entry.last_heard_ms;
-                best_direct = entry.node_id;
-            }
-        }
-        best_direct
+        // Without RX metrics, two direct candidates that share a byte are ambiguous — the same
+        // rule as `match_relay_byte_on_outgoing_edges`. Picking the newest used to collapse
+        // distinct full IDs (e.g. Czar and Z00b both `0x8c`) into whichever spoke last.
+        0
     }
 }
 
@@ -337,6 +334,39 @@ mod tests {
         assert_eq!(
             cache.resolve_heard_from(0xAB, 0xBEEF, -70, 8, &graph, 0),
             placeholder_node_id(0xAB)
+        );
+    }
+
+    #[test]
+    fn shared_last_byte_keeps_both_identities_and_stays_ambiguous_without_rssi() {
+        let mut cache = RelayIdentityCache::new();
+        let mut graph = NeighborGraph::new();
+        const ME: u32 = 0x1080_006C;
+        const CZAR: u32 = 0x63DC_8F8C;
+        const ZOOB: u32 = 0x49B5_E08C;
+        graph.set_my_node(ME);
+        graph.observe_direct_neighbor(CZAR, -95, 6, 0, 0);
+        graph.observe_direct_neighbor(ZOOB, -70, 8, 0, 0);
+
+        cache.remember_relay_identity(CZAR, 0x8C, 1_000);
+        cache.remember_relay_identity(ZOOB, 0x8C, 2_000);
+        // Both full IDs remain; without RX metrics we must not collapse them to "newest".
+        assert_eq!(
+            cache.resolve_relay_identity(0x8C, 0, 0, graph.edges(), ME, 3_000, graph.modem_preset()),
+            None
+        );
+        // Strong local RX matches ZOOB's edge, not CZAR's weaker city link.
+        assert_eq!(
+            cache.resolve_relay_identity(
+                0x8C,
+                -70,
+                8,
+                graph.edges(),
+                ME,
+                3_000,
+                graph.modem_preset()
+            ),
+            Some(ZOOB)
         );
     }
 }

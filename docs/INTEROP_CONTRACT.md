@@ -179,7 +179,14 @@ is actually waiting for.
   acknowledged again the same way. A module reply still replaces the ACK. Routing ACKs
   themselves are not acknowledged. Test:
   `unicast_to_us_is_acked_and_a_request_keeps_its_hop_budget`.
-- **Routing ACKs that retrace the link are not relayed** (`SrSkipReason::ReplyRetracesLink`).
+- **Routing ACKs that retrace a local link are not relayed** (`SrSkipReason::ReplyRetracesLink`).
+  Heard straight from the ACK originator, whose topology lists the ACK destination on a
+  **measured** edge below the coverage ETX ceiling, and we have **no useful onward path**
+  (`get_next_hop` empty or equal to the transmitter) **or** the destination is our direct
+  neighbour that already heard this TX (`hears_us` on that edge): suppress. A hub that still
+  has a path toward a multi-hop originator relays and stamps that hop. Tests:
+  `routing_ack_toward_a_node_the_sender_heard_is_not_relayed`,
+  `routing_ack_from_a_remote_leaf_is_relayed_toward_the_originator`.
 
 ## 3a. Unicast routes
 

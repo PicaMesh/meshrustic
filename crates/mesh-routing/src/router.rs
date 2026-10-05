@@ -2108,6 +2108,9 @@ impl Router {
         } else {
             picked_hop
         };
+        // Path pick before guessed-route clearing: Routing ACK retrace suppress needs to know
+        // whether we still have an onward hop that is not the transmitter we heard.
+        let onward_hop = next_hop;
 
         // The packet names us as its next hop: the sender asked us to carry it, so no
         // "somebody else is better placed" reason applies. Without this, a designated hop whose
@@ -2316,12 +2319,10 @@ impl Router {
         };
         let unicast_plan = unicast_plan.or(designated_plan);
 
-        // Heard straight from the source, and the source's own topology says the destination
-        // hears it: the destination most likely has the packet already. A routing ACK on that
-        // link is never relayed (a lost ACK is covered by the sender's retransmission). Anything
-        // else waits for the destination's ACK or reply, which cancels the queued relay; only
-        // silence lets the relay go. Colocated receivers lose about half the frames of a very
-        // strong neighbour here, so the relay must stay available, just not be first.
+        // Heard straight from the source, and the source's own topology lists the destination:
+        // a Routing ACK on a true local link is not relayed when we cannot improve delivery
+        // (no onward hop, hop is back at the transmitter, or dest already heard this TX). A hub
+        // that still has a path toward a multi-hop originator must carry the receipt.
         if parsed.to != NODENUM_BROADCAST && heard_from == parsed.from {
             let src_edge = self
                 .graph
@@ -2333,12 +2334,19 @@ impl Router {
                 let is_routing_reply = result.decoded_portnum == Some(ROUTING_APP)
                     && result.decoded_data.is_some_and(|d| d.request_id != 0);
                 if is_routing_reply {
-                    self.pool.release(handle);
-                    self.sr_log.push(SrLogEvent::RelaySkip {
-                        from: parsed.from,
-                        reason: SrSkipReason::ReplyRetracesLink,
-                    });
-                    return plan;
+                    let local_measured = edge.source.is_measured()
+                        && edge.etx_fixed <= crate::graph::COVERAGE_ETX_CEILING_FIXED;
+                    let no_useful_onward = onward_hop == 0 || onward_hop == heard_from;
+                    let dest_already_has_it =
+                        edge.hears_us && self.graph.has_direct_edge(parsed.to);
+                    if local_measured && (no_useful_onward || dest_already_has_it) {
+                        self.pool.release(handle);
+                        self.sr_log.push(SrLogEvent::RelaySkip {
+                            from: parsed.from,
+                            reason: SrSkipReason::ReplyRetracesLink,
+                        });
+                        return plan;
+                    }
                 }
                 // The wait itself is already folded into every candidate's base above; this
                 // only records that it applied, so a capture shows why the ladder sits late.
@@ -8200,6 +8208,61 @@ mod tests {
         let (scheduled, reason) = unicast_skip_reason(router, &ack[..len as usize]);
         assert!(!scheduled);
         assert_eq!(reason, Some(SrSkipReason::ReplyRetracesLink));
+    }
+
+    /// Hub between a remote leaf and a multi-hop originator: the leaf's Routing ACK must be
+    /// carried toward the originator even when the leaf's topology spuriously lists that node.
+    #[test]
+    fn routing_ack_from_a_remote_leaf_is_relayed_toward_the_originator() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        const HUB: u32 = 0x1080_006C; // FCM6-like last byte
+        const LEAF: u32 = 0x49B5_E08C; // Z00b-like, shares 0x8c with city peer
+        const CITY: u32 = 0x63DC_8F8C; // Czar-like
+        const ORIG: u32 = 0x979E_D146; // Dura-like originator behind CITY
+        let router = ROUTER.init(Router::new(HUB));
+        let g = router.graph_mut();
+        for n in [LEAF, CITY] {
+            g.observe_direct_neighbor(n, -70, 8, 0, 0);
+            g.confirm_direct_neighbor_hears_us(n);
+            g.capability_mut().track_topology(n, true, 0);
+        }
+        g.capability_mut().track_topology(ORIG, true, 0);
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let nb = |id: u32, hears: bool| PackedNeighbor {
+            node_id: id,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: hears,
+            etx_variance: 0,
+        };
+        // CITY reaches ORIG; LEAF spuriously lists ORIG (the old over-broad suppress trigger).
+        g.merge_topology(CITY, &header, &[nb(ORIG, true), nb(HUB, true)], true, 0, 0);
+        g.merge_topology(LEAF, &header, &[nb(ORIG, false), nb(HUB, true)], true, 0, 0);
+        g.merge_topology(ORIG, &header, &[nb(CITY, true)], true, 0, 0);
+
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let (len, ack) = build_ack_nak_frame(
+            ORIG,
+            LEAF,
+            0x7008,
+            0x2a29669d,
+            router.channel_hash(),
+            3,
+            ROUTING_ERROR_NONE,
+            &key,
+            false,
+            0,
+        )
+        .unwrap();
+        let (scheduled, reason) = unicast_skip_reason(router, &ack[..len as usize]);
+        assert!(
+            scheduled,
+            "hub must relay the leaf's Routing ACK toward the originator, got skip {reason:?}"
+        );
+        assert_ne!(reason, Some(SrSkipReason::ReplyRetracesLink));
     }
 
     /// Field case of 2026-09-03: the relayer that actually reaches the destination must own
