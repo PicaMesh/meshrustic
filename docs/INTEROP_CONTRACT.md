@@ -856,12 +856,17 @@ is actually waiting for.
 - **Inferred paths.** Edges learned from relayed packets are priced at a nominal link per hop
   travelled (`INFERRED_LINK_RSSI`, `INFERRED_LINK_SNR` in `observe_relayed_packet`), never at the
   measured strength of the relay's link to us. A downstream row is kept when that relay hears
-  us. An SR-aware originator must also list the relay: their topology is the authority, and a
-  path they have not published is not a path. A stock originator never lists anyone, so the
+  us. A topology publisher (SR-active or passive) must also list the relay: their topology is the
+  authority for the TX path, including multi-hop dests reached only through further published
+  edges — a forwarded copy is not a path. A stock originator never lists anyone, so the
   relay observation is the only signal that they sit behind this hop
-  (`stock_originator_becomes_downstream_without_listing_the_relay`); an SR-aware originator
+  (`stock_originator_becomes_downstream_without_listing_the_relay`); a publisher
   that has not listed the relay still does not earn a row
-  (`sr_aware_originator_still_must_list_the_relay`). Hearing the originator via the relay is
+  (`sr_aware_originator_still_must_list_the_relay`,
+  `passive_originator_must_list_the_relay_too`). A relayed hearing must not displace a live
+  downstream parent without that list claim
+  (`relayed_hearing_does_not_steal_an_existing_downstream_parent`). Hearing the originator via
+  the relay is
   the other direction, and a path we cannot send to is not a path. A copy of a packet **we**
   transmitted
   teaches nothing: the peer relaying it got it from us, so recording the source as downstream of

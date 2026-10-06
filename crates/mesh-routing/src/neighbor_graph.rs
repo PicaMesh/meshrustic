@@ -1775,7 +1775,10 @@ impl NeighborGraph {
             self.observe_relay_gateway_signal(gateway, rssi, snr, now_ms, heard_on);
 
         let single_hop = hops_used == 1;
-        let source_sr_active = matches!(self.capability.status(from), CapabilityStatus::SrActive);
+        // Anyone who publishes a neighbour list (SR-active or passive/mute) is authority for who
+        // sits behind which hop. Only a source that never lists (!publishes_topology: Legacy or
+        // still-Unknown stock) may be parked from a relay observation alone.
+        let source_publishes = self.capability.publishes_topology(from);
 
         // The edge we would write is `gateway → from`, and the gateway is the only node that can
         // publish it. Invent it only when the gateway never will: a stock node, or a placeholder
@@ -1826,9 +1829,10 @@ impl NeighborGraph {
         let hears_us = self.maybe_confirm_hears_us_from_relay(gateway, from, packet_id);
 
         // Hearing the originator *via* a relay is the other direction from delivering *to* them.
-        // Keep the row when we can send to the relay (it hears us). An SR-aware originator must
-        // also list that relay — their topology is the authority. A stock originator never lists
-        // anyone, so the relay observation is the only signal that they sit behind this hop.
+        // Keep the row when we can send to the relay (it hears us). A topology publisher (active
+        // or passive) must also list that relay — their list is the TX-path authority, including
+        // multi-hop dests that only appear further down the published edge graph. A source that
+        // never lists anyone leaves the relay observation as the only signal.
         let relay_hears_us = self
             .edges
             .find_node(self.my_node)
@@ -1839,13 +1843,15 @@ impl NeighborGraph {
             .find_node(from)
             .and_then(|n| n.find_edge(gateway))
             .is_some();
-        let can_infer_downstream = relay_hears_us && (destination_lists_relay || !source_sr_active);
+        let can_infer_downstream =
+            relay_hears_us && (destination_lists_relay || !source_publishes);
         // Former direct neighbour heard only via this relay: still only when the two facts above
         // hold — they moved, and the path has to be one we can use.
         // Single-hop: sender went through the gateway to reach us.
-        // Multi-hop, non-SR source: stock nodes never advertise topology.
-        // Multi-hop SR-aware that was never our neighbour: skip — their own lists are better.
-        let infer_downstream = was_direct_neighbor || single_hop || !source_sr_active;
+        // Multi-hop, non-publisher: stock nodes never advertise topology.
+        // Multi-hop publisher that was never our neighbour: skip — Dijkstra on their (and their
+        // peers') lists is the multi-hop TX path; a forwarded copy is not.
+        let infer_downstream = was_direct_neighbor || single_hop || !source_publishes;
         if active_routing && can_infer_downstream && infer_downstream {
             if was_direct_neighbor {
                 // Write even when the relayer already published an edge to them: they still
@@ -1861,16 +1867,25 @@ impl NeighborGraph {
                 );
                 self.route_cache.clear();
             } else if !self.is_downstream_relay_for(gateway, from, now_ms) {
-                self.downstream.update(
-                    self.my_node,
-                    from,
-                    gateway,
-                    path_etx,
-                    now_ms,
-                    false,
-                    heard_on,
-                );
-                self.route_cache.clear();
+                // Sticky parent: a relayed hearing must not park the dest behind a new gateway
+                // while another live parent already holds it, unless this gateway is on the
+                // originator's published list (TX-path evidence). Otherwise a desk node that
+                // merely forwarded a far mute steals the branch gateway's claim.
+                let existing_parent = self.get_downstream_relay(from, now_ms);
+                let steals_without_list = existing_parent.is_some_and(|p| p != gateway)
+                    && !destination_lists_relay;
+                if !steals_without_list {
+                    self.downstream.update(
+                        self.my_node,
+                        from,
+                        gateway,
+                        path_etx,
+                        now_ms,
+                        false,
+                        heard_on,
+                    );
+                    self.route_cache.clear();
+                }
             }
         }
 
@@ -4533,6 +4548,74 @@ mod tests {
             1,
         );
         assert_eq!(graph.get_downstream_relay(SRC, 300), None);
+    }
+
+    #[test]
+    fn passive_originator_must_list_the_relay_too() {
+        // CLIENT_MUTE / passive still publishes topology; a forwarded copy via a desk node must
+        // not invent a TX path the mute never claimed (field: Z005 via angl).
+        const ME: u32 = 0xAA00_00AA;
+        const MUTE: u32 = 0x4F51_78DC;
+        const GATEWAY: u32 = 0x5879_FA8F;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(GATEWAY, -70, 8, 100, 0);
+        graph.edges_mut().set_edge_hears_us(ME, GATEWAY, true);
+        graph.capability_mut().track_topology(MUTE, false, 100);
+        graph.observe_packet(
+            MUTE,
+            3,
+            2,
+            (GATEWAY & 0xFF) as u8,
+            -70,
+            8,
+            200,
+            0,
+            Some(GATEWAY),
+            1,
+        );
+        assert_eq!(graph.get_downstream_relay(MUTE, 300), None);
+    }
+
+    #[test]
+    fn relayed_hearing_does_not_steal_an_existing_downstream_parent() {
+        // Branch gateway already holds the dest; a peer that merely forwarded the mute must not
+        // become a competing parent without appearing on the originator's list.
+        const ME: u32 = 0xAA00_00AA;
+        const DEST: u32 = 0x4F51_78DC;
+        const BRANCH: u32 = 0x63DC_8F8C;
+        const DESK: u32 = 0x5879_FA8F;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(BRANCH, -70, 8, 100, 0);
+        graph.observe_direct_neighbor(DESK, -80, 6, 100, 0);
+        graph.edges_mut().set_edge_hears_us(ME, BRANCH, true);
+        graph.edges_mut().set_edge_hears_us(ME, DESK, true);
+        graph
+            .downstream_mut()
+            .update(ME, DEST, BRANCH, 2.0, 100, false, 0);
+        assert_eq!(graph.get_downstream_relay(DEST, 150), Some(BRANCH));
+
+        graph.observe_packet(
+            DEST,
+            3,
+            2,
+            (DESK & 0xFF) as u8,
+            -70,
+            8,
+            200,
+            0,
+            Some(DESK),
+            1,
+        );
+        assert_eq!(
+            graph.get_downstream_relay(DEST, 300),
+            Some(BRANCH),
+            "stock-like hearing via desk must not displace the branch parent"
+        );
+        assert!(!graph.is_downstream_relay_for(DESK, DEST, 300));
     }
 
     #[test]
