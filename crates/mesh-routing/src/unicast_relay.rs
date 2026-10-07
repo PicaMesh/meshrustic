@@ -249,9 +249,9 @@ pub fn plan_unicast_relay(
     let mut count = 0usize;
 
     let mut my_cost = ctx.candidate_cost(me, destination, my_next_hop, now_ms);
-    if my_cost == NO_PATH && (my_next_hop == me || my_next_hop == 0) {
-        // The route picker fell back to us (or has no coordinated hop at all): stay in the
-        // ranking as the last resort so the packet is not dropped when nobody else qualifies.
+    if my_cost == NO_PATH && my_next_hop == me {
+        // The route picker fell back to us: stay in the ranking as last resort. A cleared
+        // next hop (flood) must not invent a cost slot — that path uses broadcast coverage.
         my_cost = BEST_EFFORT_SELF_COST;
     }
     if my_cost != NO_PATH {

@@ -43,7 +43,7 @@ use crate::reliable::{
 use crate::routing_ack::{
     build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
     hops_away, retransmission_delay_ms, NUM_RELIABLE_RETX, ROUTING_APP, ROUTING_ERROR_NONE,
-    ROUTING_ERROR_NO_CHANNEL,
+    ROUTING_ERROR_NO_CHANNEL, ROUTING_ERROR_NO_ROUTE,
 };
 use crate::rx_decode::{summarize_decrypted, RxDecodeInfo};
 use crate::sr_log::{
@@ -2235,13 +2235,46 @@ impl Router {
             0
         };
 
-        // Unicasts coordinate by cost to the destination: every SR node that overheard the
-        // packet ranks itself and its SR neighbours the same way, the best placed one keys up
-        // first and the rest cancel on its copy. Node id used to decide this order, which let
-        // the lowest id in the neighbourhood pre-empt the gateway on every unicast.
+        // A next hop equal to the destination's own byte names no relayer: the source expects
+        // direct delivery (stock learns the destination as its own next hop from a direct
+        // reply). Nobody owns slot 0 then; cost or coverage decides as for an unnamed hop.
+        let relayer_named = parsed.next_hop != 0 && parsed.next_hop != (parsed.to & 0xFF) as u8;
+        // Last-hop finish only when we actually have a direct edge: `can_deliver` alone is true
+        // for non-publishing (stock) destinations even without one, which would skip the flood
+        // coverage path for every NodeDB-only dest.
+        let we_can_finish = parsed.to != NODENUM_BROADCAST
+            && (self.graph.caps_last_hop(parsed.to)
+                || (self.graph.has_direct_edge(parsed.to)
+                    && crate::graph::can_deliver(
+                        self.graph.edges(),
+                        Some(self.graph.capability()),
+                        self.node_num,
+                        parsed.to,
+                    )));
+
+        // Designated hop with no route at all: NACK the originator and leave the data copy
+        // silent so named backups (or a later flood retry) can try another path. A hand-off
+        // whose only route points back at the peer still floods with next_hop cleared
+        // (`picked_hop != 0`); that is not a NO_ROUTE. Flood unicasts do not NACK.
+        if we_are_designated_hop && picked_hop == 0 && !we_can_finish {
+            self.pool.release(handle);
+            self.schedule_nak(&parsed, false, ROUTING_ERROR_NO_ROUTE, now_ms);
+            self.sr_log.push(SrLogEvent::RelaySkip {
+                from: parsed.from,
+                reason: SrSkipReason::NoRelayPath,
+            });
+            return plan;
+        }
+
+        // Cost rank when the route picker found a path (or we can finish the last hop). The
+        // stamp on the air may still be cleared (unverified guess, hand-off backtrack); that is
+        // independent of whether cost ranking applies. Undesignated with no path at all →
+        // broadcast unique coverage (silent when nothing unique; no ack / Sparse echo).
+        let has_cost_path = we_can_finish || picked_hop != 0;
         let unicast_ranking = if parsed.to != NODENUM_BROADCAST
             && parsed.to != self.node_num
             && self.graph.signal_routing_active()
+            && has_cost_path
         {
             Some(self.graph.plan_unicast_relay(
                 parsed.id,
@@ -2254,10 +2287,6 @@ impl Router {
         } else {
             None
         };
-        // A next hop equal to the destination's own byte names no relayer: the source expects
-        // direct delivery (stock learns the destination as its own next hop from a direct
-        // reply). Nobody owns slot 0 then; the cost ranking decides as for an unnamed hop.
-        let relayer_named = parsed.next_hop != 0 && parsed.next_hop != (parsed.to & 0xFF) as u8;
         let unicast_plan = match unicast_ranking {
             Some(Err(reason)) if !relayer_named => {
                 self.pool.release(handle);
@@ -2278,6 +2307,60 @@ impl Router {
                 Some(ranked)
             }
             _ => None,
+        };
+        let unicast_plan = if unicast_plan.is_none() && !relayer_named && parsed.to != NODENUM_BROADCAST
+            && parsed.to != self.node_num
+            && self.graph.signal_routing_active()
+        {
+            if self.graph.topology_healthy_for_broadcast() {
+                let cover = self.graph.plan_broadcast_relay(
+                    parsed.id,
+                    parsed.from,
+                    heard_from,
+                    parsed.to,
+                    now_ms,
+                    half_airtime,
+                    false,
+                );
+                // Broadcast invents a Sparse sole-candidate echo when unique coverage is empty
+                // so want_ack senders hear a rebroadcast. Undesignated unicast floods must not:
+                // stay silent and let the originator retry (no flood NACKs either).
+                let cover_carries = cover.should_relay
+                    && cover.reason != crate::broadcast_relay::RelayReason::Sparse;
+                if cover_carries {
+                    if cover.coverage_for != 0 {
+                        self.sr_log.push(SrLogEvent::CoverageFor {
+                            neighbor: cover.coverage_for,
+                        });
+                    }
+                    Some(cover)
+                } else {
+                    self.pool.release(handle);
+                    self.log_slot_scheduling(&parsed, &cover, half_airtime);
+                    self.sr_log.push(SrLogEvent::RelaySkip {
+                        from: parsed.from,
+                        reason: SrSkipReason::AlreadyCovered,
+                    });
+                    return plan;
+                }
+            } else {
+                // Too thin to judge coverage: same unranked carry as a thin broadcast graph.
+                self.sr_log.push(SrLogEvent::BroadcastUnrankedThinGraph {
+                    from: parsed.from,
+                    direct_neighbors: self.graph.neighbor_count(),
+                });
+                Some(crate::broadcast_relay::BroadcastRelayPlan {
+                    should_relay: true,
+                    slot_delay_ms: crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms())
+                        .max(dest_ack_floor),
+                    slot_index: 0,
+                    candidate_count: 1,
+                    reason: crate::broadcast_relay::RelayReason::Sparse,
+                    ..Default::default()
+                })
+            }
+        } else {
+            unicast_plan
         };
 
         // A named backup transmits only when it will stamp a hop that is not the designated
@@ -7542,8 +7625,10 @@ mod tests {
             SrLogEvent::UnicastDesignated { next_hop: 0x99, is_us: false, sr_active: false, slot, .. } if *slot >= 1
         )));
 
-        // The designated node relays (copy with one hop used, relay byte 0x99): we stand down.
-        let copy = unicast_wire(2, 3, 0, 0x99, 0x503);
+        // Designated hop advances with a stamped onward next_hop: named backup stands down.
+        // A weak flood (next_hop unset) from that hop must not cancel — see
+        // `named_backup_cancels_on_strong_designated_copy_not_weak_flood`.
+        let copy = unicast_wire(2, 3, (UNI_DEST & 0xFF) as u8, 0x99, 0x503);
         let dupe = router
             .process_inbound(
                 &InboundPacket {
@@ -8504,6 +8589,77 @@ mod tests {
             tx_after < floor + ack_wait,
             "the two floors must not stack: {tx_after} reached {floor} + {ack_wait}"
         );
+    }
+
+    /// Flood unicast (`next_hop=0`) with no stampable path: use broadcast unique coverage.
+    /// A neighbour that adds nothing beyond the originator's TX stays silent (Lab: angl).
+    #[test]
+    fn undesignated_flood_without_route_stays_silent_when_already_covered() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        // Only the originator as neighbour: its TX already covers everyone we reach.
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_SOURCE, -40, 12, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_SOURCE);
+        router
+            .graph_mut()
+            .capability_mut()
+            .track_topology(UNI_SOURCE, true, 0);
+        // Dest is known in the graph but we have no stampable path to it.
+        router.graph_mut().edges_mut().ensure_local_node(UNI_DEST, 0);
+        let wire = unicast_wire(7, 7, 0, 0xDD, 0x7a01);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled, "silent expected, scheduled={scheduled} reason={reason:?}");
+        assert_eq!(reason, Some(SrSkipReason::AlreadyCovered));
+    }
+
+    /// Designated next hop with no route: Routing NO_ROUTE to the originator, no data relay.
+    #[test]
+    fn designated_hop_with_no_route_nacks_originator() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(UNI_SOURCE, -40, 12, 0, 0);
+        router
+            .graph_mut()
+            .confirm_direct_neighbor_hears_us(UNI_SOURCE);
+        router.graph_mut().edges_mut().ensure_local_node(UNI_DEST, 0);
+        let wire = unicast_wire(3, 3, (UNI_ME & 0xFF) as u8, 0xDD, 0x7a02);
+        let (scheduled, reason) = unicast_skip_reason(router, &wire);
+        assert!(!scheduled, "no data relay when designated with no route");
+        assert_eq!(reason, Some(SrSkipReason::NoRelayPath));
+        let nak = router
+            .poll_ack_tx(0)
+            .expect("NO_ROUTE NAK queued for the originator");
+        let hdr = PacketHeader::decode(&nak.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert_eq!(hdr.to, UNI_SOURCE);
+        assert_eq!(hdr.from, UNI_ME);
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut cipher = nak.bytes[PACKET_HEADER_LEN..nak.len as usize].to_vec();
+        // NAK is channel-encrypted with the inbound frame's channel byte (0x77 in these
+        // fixtures), which may differ from the router's primary hash under the default preset.
+        let ch = hdr.channel;
+        let (data, inner) = crate::topology::try_decrypt_data_full(
+            &key,
+            hdr.from,
+            hdr.id,
+            ch,
+            ch,
+            &mut cipher,
+        )
+        .expect("NAK decrypts");
+        assert_eq!(data.portnum, ROUTING_APP);
+        assert_eq!(data.request_id, 0x7a02);
+        let routing = decode_routing_payload(&inner).expect("routing payload");
+        assert_eq!(routing.error_reason, Some(ROUTING_ERROR_NO_ROUTE));
     }
 
     #[test]

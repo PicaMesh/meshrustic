@@ -9,6 +9,7 @@ use crate::topology::{build_app_wire_frame, DataBitfield, DataEncodeOpts};
 pub const ROUTING_APP: u32 = 5;
 
 pub const ROUTING_ERROR_NONE: u32 = 0;
+pub const ROUTING_ERROR_NO_ROUTE: u32 = 1;
 pub const ROUTING_ERROR_MAX_RETRANSMIT: u32 = 5;
 pub const ROUTING_ERROR_NO_CHANNEL: u32 = 6;
 

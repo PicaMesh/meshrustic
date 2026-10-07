@@ -118,6 +118,7 @@ pub use routing_ack::{
     build_ack_nak_frame, decode_routing_payload, hop_limit_for_response, hops_away,
     retransmission_delay_ms, RoutingDecode, NUM_RELIABLE_RETX, RETX_PROCESSING_TIME_MS,
     ROUTING_APP, ROUTING_ERROR_MAX_RETRANSMIT, ROUTING_ERROR_NONE, ROUTING_ERROR_NO_CHANNEL,
+    ROUTING_ERROR_NO_ROUTE,
 };
 pub use rx_decode::{summarize_decrypted, RxDecodeInfo, RxPayloadSummary};
 pub use sr_log::{

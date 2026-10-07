@@ -320,27 +320,38 @@ is actually waiting for.
   `named_forward_still_arms_followup_when_ranking_has_a_later_flood_slot`.
 - **Cost-ranked unicast coordination.** When no next hop is named (or the destination byte
   names none), every SR overhearer ranks itself and its SR neighbours by deliverable cost to
-  the destination (`plan_unicast_relay`); the best placed keys up first. A neighbour is a
-  candidate only when it is known to hear this copy's transmitter (`known_to_hear`: `hears_us`
-  on the transmitter's edge, or the neighbour listing the transmitter). We ourselves always
-  count — we overheard the frame. A path to the destination is not that evidence; ranking a
-  deaf neighbour made every overhearer wait for a slot that never fired. A heard copy cancels a
-  later slot when that transmitter can finish delivery (a priced hop to the destination, or
-  being its downstream gateway) or is ranked ahead of us with a path; we keep the slot if we can
-  finish and they cannot. An unresolved relay byte (or a placeholder identity) cancels only when
-  we cannot finish ourselves (the designated or stock hop we were waiting for). Named backups add
-  a graph-independent cancel (below). Slot 0 waits the largest floor that applies to it — stock's
-  own contention floor (`coordinated_relay::relay_floor_ms`), or the destination's ACK wait where
-  that is longer; later slots take the larger of that floor and the leader's peer relay window,
-  then space by half an airtime. There is no delay clamp that bunches late rungs. Tests:
-  `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
+  the destination (`plan_unicast_relay`); the best placed keys up first. That cost ladder applies
+  when the route picker found a path (or we can finish the last hop) — even if the stamp on the air
+  is later cleared. An undesignated flood with **no** path uses the **broadcast unique-coverage**
+  ladder instead (`plan_broadcast_relay` with no acknowledgement pass and no Sparse sole-candidate
+  echo): stay silent when nothing unique remains. Flood unicasts do not emit `NO_ROUTE`; failure is
+  `want_ack` / `MAX_RETRANSMIT`.
+  A neighbour is a cost candidate only when it is known to hear this copy's transmitter
+  (`known_to_hear`: `hears_us` on the transmitter's edge, or the neighbour listing the transmitter).
+  We ourselves always count — we overheard the frame. A path to the destination is not that
+  evidence; ranking a deaf neighbour made every overhearer wait for a slot that never fired. A
+  heard copy cancels a later cost slot when that transmitter can finish delivery (a priced hop to
+  the destination, or being its downstream gateway) or is ranked ahead of us with a path; we keep
+  the slot if we can finish and they cannot. An unresolved relay byte (or a placeholder identity)
+  cancels only when we cannot finish ourselves (the designated or stock hop we were waiting for).
+  Named backups add a graph-independent cancel (below). Slot 0 waits the largest floor that applies
+  to it — stock's own contention floor (`coordinated_relay::relay_floor_ms`), or the destination's
+  ACK wait where that is longer; later slots take the larger of that floor and the leader's peer
+  relay window, then space by half an airtime. There is no delay clamp that bunches late rungs.
+  Tests: `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
   `undesignated_unicast_slot_zero_waits_stocks_contention_floor`,
+  `undesignated_flood_without_route_stays_silent_when_already_covered`,
   `dupe_cancels_when_the_relayer_can_finish`,
   `dupe_kept_when_we_can_finish_and_they_cannot`,
   `dupe_cancels_when_relayer_is_ranked_ahead_with_a_path`,
   `dupe_kept_when_relayer_has_no_path`,
   `unresolved_dupe_cancels_when_we_cannot_finish`,
   `neighbour_that_does_not_hear_the_transmitter_gets_no_slot`.
+- **Designated hop with no route NACKs.** When we are the named `next_hop` and the route picker
+  returns nothing (and we cannot finish the last hop), send a unicast Routing `NO_ROUTE` to the
+  originator and do not relay the data. A hand-off whose only route points back at the peer still
+  floods with `next_hop` cleared — that is not `NO_ROUTE`. Test:
+  `designated_hop_with_no_route_nacks_originator`.
 - **Soft coverage skips.** `UnicastCovered` for a shared downstream gateway, or for a
   better-positioned SR neighbour, applies only when that node is known to hold this copy
   (`heard_from` or has already transmitted this id). A neighbour that *could* hear the
