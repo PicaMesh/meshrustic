@@ -2369,12 +2369,29 @@ impl Router {
                 self.node_num,
             )
             .is_some();
+        // Strong hop: stamp it. Weak: flood on the air (next unset) but remember the intended
+        // peer so only that node can cancel our follow-up.
+        let intended_hop = if priced_last_hop { parsed.to } else { next_hop };
+        let strong_intended = if intended_hop == 0 {
+            false
+        } else if priced_last_hop {
+            crate::graph::has_strong_delivery_hop(
+                self.graph.edges(),
+                Some(self.graph.capability()),
+                self.node_num,
+                intended_hop,
+                now_ms,
+                self.node_num,
+            )
+        } else {
+            crate::graph::has_strong_hop_to(self.graph.edges(), self.node_num, intended_hop)
+        };
         let stamp_hop = if unicast_plan.as_ref().is_some_and(|p| p.nonfinal_flood) {
             0
-        } else if priced_last_hop {
-            parsed.to
+        } else if strong_intended {
+            intended_hop
         } else {
-            next_hop
+            0
         };
         let relay_hdr = match relay_header_with_next_hop_opts(
             &parsed,
@@ -2594,7 +2611,7 @@ impl Router {
         let unicast_flags = crate::unicast_relay::UnicastSlotFlags {
             last_hop_backup: unicast_plan.as_ref().is_some_and(|p| p.last_hop_backup),
             nonfinal_flood,
-            nominated_next_hop: next_hop,
+            nominated_next_hop: if nonfinal_flood { 0 } else { intended_hop },
             designated_next_hop: if named_backup { parsed.next_hop } else { 0 },
             armed_hop_limit: if named_backup { parsed.hop_limit } else { 0 },
         };
@@ -3306,10 +3323,10 @@ impl Router {
         })
     }
 
-    /// Named forwards: when the nominated hop stays silent, repeat the copy to it once, then
-    /// try one directed alternate. Last-hop `want_ack` toward a non-SR dest keeps retries
-    /// until dest answers, including hop_limit 0. Flood slots and last-hop backups do not arm
-    /// a follow-up.
+    /// Nominated forwards: when the intended hop stays silent, repeat once; strong named hops
+    /// then try one directed alternate. Weak hops (next unset) and priced last hops arm one
+    /// follow-up cancelled only by that nominee. Flood-salvage slots and last-hop backups do
+    /// not arm.
     fn arm_relayed_unicast_followup(
         &mut self,
         len: u8,
@@ -3325,7 +3342,6 @@ impl Router {
         if p.to == NODENUM_BROADCAST || p.from == self.node_num {
             return;
         }
-        let dest_sr = self.graph.capability_status(p.to).is_signal_routing();
         let last_hop = crate::graph::delivery_hop_cost_fixed(
             self.graph.edges(),
             Some(self.graph.capability()),
@@ -3338,38 +3354,64 @@ impl Router {
         if p.hop_limit == 0 && !last_hop {
             return;
         }
+        if flags.nonfinal_flood {
+            return;
+        }
+        let cfg = eu868_config_for_preset(self.modem_preset);
+        let airtime = packet_time_ms(&cfg, len as usize, false).max(1);
         let (delay, num_retx, named) = if last_hop {
-            if !p.want_ack || dest_sr || flags.last_hop_backup {
+            if flags.last_hop_backup {
                 return;
             }
-            (
-                self.reliable_retx_delay_ms(len, p.from, p.id),
-                NUM_RELIABLE_RETX,
-                None,
-            )
-        } else if flags.nonfinal_flood || p.next_hop == 0 {
-            return;
-        } else {
-            let cfg = eu868_config_for_preset(self.modem_preset);
-            let airtime = packet_time_ms(&cfg, len as usize, false).max(1);
-            let nominated_hop = if flags.nominated_next_hop != 0
-                && (flags.nominated_next_hop & 0xFF) as u8 == p.next_hop
-            {
+            let nominated_hop = if flags.nominated_next_hop != 0 {
                 flags.nominated_next_hop
             } else {
+                p.to
+            };
+            let delay = self.next_hop_carry_wait_ms(nominated_hop, airtime);
+            let named = NamedFollowup {
+                nominated_hop,
+                nominated_byte: (nominated_hop & 0xFF) as u8,
+                upstream,
+                delay_ms: delay,
+                redirect_on_last: false,
+            };
+            (delay, 1, Some(named))
+        } else {
+            let nominated_hop = if flags.nominated_next_hop != 0 {
+                flags.nominated_next_hop
+            } else if p.next_hop != 0 {
                 self.graph
                     .match_relay_byte_on_outgoing_edges(p.next_hop)
                     .unwrap_or(0)
+            } else {
+                0
             };
-            let delay = self.named_followup_delay_ms(nominated_hop, airtime);
+            if nominated_hop == 0 && p.next_hop == 0 {
+                return;
+            }
+            let weak_flood = p.next_hop == 0;
+            let delay = if weak_flood {
+                self.next_hop_carry_wait_ms(nominated_hop, airtime)
+            } else {
+                self.named_followup_delay_ms(nominated_hop, airtime)
+            };
+            let nominated_byte = if nominated_hop != 0 {
+                (nominated_hop & 0xFF) as u8
+            } else {
+                p.next_hop
+            };
             let named = NamedFollowup {
                 nominated_hop,
-                nominated_byte: p.next_hop,
+                nominated_byte,
                 upstream,
                 delay_ms: delay,
+                redirect_on_last: !weak_flood,
             };
-            (delay, NAMED_FOLLOWUP_TRIES, Some(named))
+            let tries = if weak_flood { 1 } else { NAMED_FOLLOWUP_TRIES };
+            (delay, tries, Some(named))
         };
+        let armed_byte = named.as_ref().map_or(p.next_hop, |n| n.nominated_byte);
         if schedule_reliable(
             &mut self.pending_reliable,
             p.from,
@@ -3385,7 +3427,7 @@ impl Router {
         ) {
             self.sr_log.push(SrLogEvent::RelayRetxArmed {
                 id: p.id,
-                next_hop: p.next_hop,
+                next_hop: armed_byte,
             });
         }
     }
@@ -4328,10 +4370,8 @@ impl Router {
             self.maybe_cancel_relay_for_foreign_ack(parsed, data);
         }
 
-        // A further copy of a unicast we forwarded means it is moving on: stop retrying it.
-        // A copy from the nominated hop is a hop-health success; any other transmitter is
-        // neutral. The node we got it from, or the originator retrying, has not carried it
-        // past us, so their copy leaves a named follow-up armed.
+        // A nominated follow-up ends only when that hop carries the packet. Upstream,
+        // originator, and other peers leave it armed — coverage rank does not cancel it.
         if parsed.to != NODENUM_BROADCAST && parsed.from != self.node_num {
             let transmitter = self.resolve_heard_from_node(
                 parsed.relay_node,
@@ -4342,23 +4382,22 @@ impl Router {
             );
             let named = named_followup(&self.pending_reliable, parsed.from, parsed.id);
             let from_nominated = named.is_some_and(|n| {
-                parsed.relay_node == n.nominated_byte
+                (n.nominated_byte != 0 && parsed.relay_node == n.nominated_byte)
                     || (n.nominated_hop != 0 && transmitter == n.nominated_hop)
             });
-            let from_behind = !from_nominated
-                && parsed.relay_node != 0
-                && named.is_some_and(|n| {
-                    parsed.relay_node == (parsed.from & 0xFF) as u8
-                        || (n.upstream != 0
-                            && (transmitter == n.upstream
-                                || parsed.relay_node == (n.upstream & 0xFF) as u8))
-                });
-            if !from_behind {
+            if from_nominated {
                 self.cancel_relayed_retx_from(
                     parsed.from,
                     parsed.id,
                     RelayRetxCancelReason::CopyHeard,
-                    from_nominated,
+                    true,
+                );
+            } else if named.is_none() {
+                self.cancel_relayed_retx_from(
+                    parsed.from,
+                    parsed.id,
+                    RelayRetxCancelReason::CopyHeard,
+                    false,
                 );
             }
         }
@@ -7175,6 +7214,34 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_peer_copy_keeps_the_nominated_followup() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        setup_unicast_graph(router);
+        let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x619, true);
+        let _ = forward_unicast(router, &wire, 0);
+        assert!(router.has_pending_reliable(0x619));
+        // PEER is not the nominated hop: its copy must not cancel our follow-up.
+        let peer_copy = unicast_wire_ack(2, 3, 0, (UNI_PEER & 0xFF) as u8, 0x619, true);
+        let dupe = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &peer_copy,
+                },
+                500,
+            )
+            .unwrap();
+        assert!(dupe.duplicate);
+        assert!(
+            router.has_pending_reliable(0x619),
+            "only the nominated hop cancels a nominated follow-up"
+        );
+    }
+
+    #[test]
     fn reply_to_origin_cancels_forwarded_retries() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
@@ -8580,7 +8647,7 @@ mod tests {
         assert_eq!(sent.next_hop, (UNI_DEST & 0xFF) as u8);
         assert!(
             router.has_pending_reliable(0x507),
-            "a hop-0 last hop toward a non-SR dest still retries until dest ACKs"
+            "a hop-0 last hop arms a follow-up cancelled only by dest"
         );
     }
 

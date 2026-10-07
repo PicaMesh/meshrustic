@@ -1,25 +1,29 @@
-//! Reliable retransmit slots: want_ack packets we originate, last-hop want_ack toward a
-//! non-SR dest, and the follow-up of a named non-final forward when the nominated hop stays
-//! silent: one repeat to the same hop, then one directed alternate retry.
+//! Reliable retransmit slots: want_ack packets we originate, priced last-hop follow-ups, and
+//! the follow-up of a named non-final forward when the nominated hop stays silent: one repeat
+//! to the same hop, then (when `redirect_on_last`) one directed alternate retry.
 
 use crate::router::MAX_WIRE_LEN;
 
 pub const MAX_PENDING_RELIABLE: usize = 4;
 
-/// Follow-up tries of a named forward: the repeat to the nominated hop, then the redirect.
+/// Follow-up tries of a strong named forward: the repeat to the nominated hop, then the redirect.
 pub const NAMED_FOLLOWUP_TRIES: u8 = 2;
 
-/// Follow-up state of a named non-final forward.
+/// Follow-up state of a nominated forward (named intermediate or last hop).
 #[derive(Clone, Copy)]
 pub struct NamedFollowup {
     /// Nominated next hop (full node id); 0 when its relay byte did not resolve.
     pub nominated_hop: u32,
-    /// The `next_hop` byte we stamped. A copy relayed under it is the nominated hop's.
+    /// The `next_hop` byte we stamped, or the nominee's node byte when we flooded a weak hop.
+    /// A copy whose `relay_node` matches is the nominated hop's.
     pub nominated_byte: u8,
     /// Node we heard the packet from when arming the follow-up.
     pub upstream: u32,
     /// Wait after each try before the next one is due.
     pub delay_ms: u32,
+    /// When true, the last try searches for a directed alternate. Weak floods and last hops
+    /// leave this false and simply repeat the on-air header.
+    pub redirect_on_last: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -180,7 +184,7 @@ pub fn due_retransmit(
             None => retx_delay_for(slot.from, slot.packet_id, slot.len),
         };
         slot.next_tx_ms = now_ms.wrapping_add(delay);
-        let redirect = slot.named.is_some() && slot.num_retx == 0;
+        let redirect = slot.named.is_some_and(|n| n.redirect_on_last) && slot.num_retx == 0;
         // A redirect is the only further attempt: clear the slot now so a drop leaves nothing pending.
         if redirect {
             slot.active = false;

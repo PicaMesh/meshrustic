@@ -332,6 +332,27 @@ pub fn delivery_hop_cost_fixed(
     delivery_direction_cost_fixed(edges, capability, from, to, now_ms, my_node)
 }
 
+/// Measured link at or under [`COVERAGE_ETX_CEILING_FIXED`] (the poor-link threshold).
+pub fn has_strong_hop_to(edges: &EdgeStore, from: u32, peer: u32) -> bool {
+    if peer == 0 {
+        return false;
+    }
+    hop_cost_fixed(edges, from, peer).is_some_and(|c| c <= COVERAGE_ETX_CEILING_FIXED)
+}
+
+/// Priced last hop whose measured link is strong enough to stamp the destination as `next_hop`.
+pub fn has_strong_delivery_hop(
+    edges: &EdgeStore,
+    capability: Option<&CapabilityCache>,
+    from: u32,
+    dest: u32,
+    now_ms: u32,
+    my_node: u32,
+) -> bool {
+    delivery_hop_cost_fixed(edges, capability, from, dest, now_ms, my_node).is_some()
+        && has_strong_hop_to(edges, from, dest)
+}
+
 /// Bucket width for comparing links when picking a coverage owner: two nodes price the same link
 /// a few hundredths apart, and an exact comparison would hand ownership to a different node on
 /// every graph, so only a real difference counts.

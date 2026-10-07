@@ -301,11 +301,14 @@ is actually waiting for.
   links get slots if the destination is SR (`CapabilityStatus::is_signal_routing`): the cheapest
   early, the next as dest-ACK backup (`last_hop_backup`). Otherwise one. Extra directs return
   `SrSkipReason::LastHopReserved`. The backup waits for dest's ACK of the early last hop
-  (early slot + that copy's airtime + dest-ACK wait) and cancels only on dest's own copy. Last
-  hops do not flood. Indirect candidates still take later slots. Tests:
+  (early slot + that copy's airtime + dest-ACK wait) and cancels only on dest's own copy. A
+  **strong** last hop (measured ETX ≤ coverage/poor-link ceiling) stamps the destination as
+  `next_hop`; a **weak** one floods (`next_hop` unset). Both arm one follow-up cancelled only by
+  the destination (or its ACK/reply). Indirect candidates still take later slots. Tests:
   `sr_dest_gives_two_last_hop_slots`,
   `equal_costs_alternate_on_packet_id_parity`,
-  `last_hop_backup_does_not_cancel_on_the_other_direct`.
+  `last_hop_backup_does_not_cancel_on_the_other_direct`,
+  `last_hop_want_ack_retries_when_the_remaining_budget_is_one`.
 - **Non-final flood salvage.** When two or more non-direct candidates remain, the last of them
   is a flood slot (`nonfinal_flood`): `next_hop` cleared so stock neighbours may pick up after
   named hops have had their chance. A flood slot cancels on dest, a transmitter that can
@@ -423,27 +426,22 @@ is actually waiting for.
   a suspect first hop prefers a stampable alternate from an excluded search, but never loses
   the only path. Tests: `hop_health::*`, `suspect_first_hop_is_stamped_only_without_an_alternate`,
   `nominated_hop_copy_clears_its_suspect_state`.
-- **Named follow-up.** Our relay is the originator's implicit ACK, so once we forward, the
-  originator's retries stop and recovery is ours. A named non-final forward arms two tries,
-  each one delay apart: our own contention and airtime, then the later of the nominated hop's
-  carry wait and the end of ranked slot 1 with its tie-break spread (a backup downstream of us
-  has no destination-ACK floor). The first try repeats our copy unchanged, for a nominated hop
-  that simply missed the frame. The second records a miss and searches the route excluding the
-  nominated hop, the upstream node, the originator and ourselves (never the destination; cache
-  bypassed). An alternate that is stampable, signal-routing active and does not share the
-  nominated byte is sent with the same hop fields and our relay byte; otherwise nothing is
-  sent. A stock alternate is refused because stock judges a duplicate by the first `next_hop`
-  it recorded and drops one that newly names it. A copy relayed by the nominated hop, by
-  another node, or the destination's reply cancels the follow-up; a copy from the upstream node
-  or the originator does not, because neither has carried the packet past us. If the nominated
-  hop did relay on an asymmetric link we could not hear, the redirect opens a parallel path and
-  the destination may receive two copies — accepted, because a duplicate costs less than a lost
-  unicast. Tests: `named_followup_waits_for_our_airtime_and_ranked_slot_one`,
+- **Nominated follow-up.** Our relay is the originator's implicit ACK, so once we forward, the
+  originator's retries stop and recovery is ours. A **strong** non-final hop stamps `next_hop`
+  and arms two tries (repeat, then directed alternate). A **weak** onward hop floods
+  (`next_hop` unset) but keeps `nominated_next_hop` and arms one flood follow-up. Only the
+  nominated hop's copy (or the destination's reply/ACK) cancels the follow-up; upstream,
+  originator, and other peers leave it armed. Strong named delay: our contention and airtime,
+  then the later of the nominated hop's carry wait and ranked slot 1 with its tie-break. The
+  alternate search excludes the nominated hop, upstream, originator and ourselves (never the
+  destination; cache bypassed). A stock alternate is refused because stock judges a duplicate
+  by the first `next_hop` it recorded. Tests: `named_followup_waits_for_our_airtime_and_ranked_slot_one`,
   `named_forward_repeats_then_redirects_to_stampable_alternate`,
   `redirect_refuses_an_alternate_sharing_the_nominated_byte`,
   `redirect_refuses_a_stock_alternate`, `upstream_and_originator_copies_keep_the_named_followup`,
   `excluded_first_hop_yields_alternate_and_skips_only_path`,
-  `heard_copy_cancels_forwarded_retries`.
+  `heard_copy_cancels_forwarded_retries`,
+  `unrelated_peer_copy_keeps_the_nominated_followup`.
 
 ## 3b. Broadcast relay and T1
 
