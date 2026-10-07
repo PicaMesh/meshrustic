@@ -352,14 +352,16 @@ is actually waiting for.
   `unicast_not_relayed_back_to_the_relayer`, `next_hop_is_relayer_clears_when_they_cannot_finish`.
 - **A guessed route is never stamped.** The verdict belongs to the hop the picker returned, not
   to the searched route: `NeighborGraph::get_next_hop_verified` reports `false` for a
-  better-positioned neighbour, inbound-gateway fallback, best-effort self relay and direct delivery,
-  and `Route::verified` is false until the strict search sets it, so an empty route never claims
-  one (test `only_the_confirmed_search_reports_a_verified_route`). Such a route may carry a
-  unicast,
-  but its next hop is cleared before transmission: the node it names never confirmed it hears
-  the destination, and a designation makes every other candidate stand down and wait for a copy
-  that node may have no way to send. Cleared, we are one ranked candidate among several. Test:
-  `guessed_route_is_never_stamped_as_next_hop`.
+  better-positioned neighbour, bare inbound-gateway fallback, best-effort self relay and direct
+  delivery, and `Route::verified` is false until the strict search sets it, so an empty route
+  never claims one (test `only_the_confirmed_search_reports_a_verified_route`). A downstream-chain
+  egress remains stampable even when `calculate_route` returns it with `verified=false`. Such a
+  non-stampable route may carry a unicast, but its next hop is cleared before transmission: the
+  node it names never confirmed it hears the destination, and a designation makes every other
+  candidate stand down and wait for a copy that node may have no way to send. Cleared, we are one
+  ranked candidate among several. Originated unicasts stamp only when that stampable/verified
+  flag is true — they must not keep a stale NodeDB next-hop byte otherwise (last-hop dest byte
+  still applies when `caps_last_hop`). Test: `guessed_route_is_never_stamped_as_next_hop`.
 - **A downstream chain onto a neighbour we hear is stamped.** Walk dest along `via` until the
   current node is a neighbour we can name, any depth; dest need not be an RF neighbour of its
   parent. A node with `DEST via PARENT` and `PARENT via HUB` stamps HUB; the hub with
@@ -394,9 +396,12 @@ is actually waiting for.
   nor the transmitter it heard (`SrSkipReason::NoRelayPath` otherwise; clearing the byte is not
   another path and the originator treats it as an implicit ACK). When a named backup is armed,
   `UnicastSlotFlags` remembers the incoming designation byte and `hop_limit`; a heard copy
-  cancels on that relay byte (or resolved identity), or when a later copy still names that
-  designation with a strictly lower `hop_limit`, even if the graph cannot yet prove the hop
-  finishes. An acknowledgement from the destination, or a copy that can finish / is ranked
+  cancels when that hop **advances** the route — a non-zero `next_hop` on its copy (or resolved
+  identity with a non-zero stamp), or a later copy that still names that designation with a
+  strictly lower `hop_limit` — even if the graph cannot yet prove the hop finishes. A **weak
+  flood** from the designated hop (`next_hop` unset) does **not** cancel the backup: that hop
+  admitted it has no stampable onward path, so a backup that would stamp a different hop must
+  stay armed. An acknowledgement from the destination, or a copy that can finish / is ranked
   ahead, still cancels as for undesignated unicasts. A named non-final forward arms the named
   follow-up if the nominated hop never carries it (see below). Last-hop `want_ack` toward a
   non-SR dest keeps `NUM_RELIABLE_RETX` without clearing next hop, including when the remaining
@@ -404,7 +409,7 @@ is actually waiting for.
   `designated_hop_backup_survives_ranking_skip` (a coverage skip keeps the backup, at its
   unranked slot rung rather than all backups sharing slot 1),
   `named_backup_without_another_hop_does_not_relay`,
-  `named_backup_cancels_on_designated_hop_without_finish_proof`,
+  `named_backup_cancels_on_strong_designated_copy_not_weak_flood`,
   `named_backup_cancels_on_designated_hop_when_finish_unknown`,
   `forwarded_want_ack_unicast_is_repeated_then_dropped_without_alternate`,
   `forwarded_unicast_without_want_ack_arms_repeat_and_redirect_not_flood`,

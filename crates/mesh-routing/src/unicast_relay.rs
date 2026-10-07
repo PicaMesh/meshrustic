@@ -404,8 +404,9 @@ pub fn unicast_dupe_cancels(
 /// stays for a same-hop named SR copy that cannot finish, and cancels when the nominated hop,
 /// dest, a finisher, or another flood copy is heard.
 ///
-/// Named backup: hearing the designated `next_hop` byte (or a lower hop_limit still naming it)
-/// cancels even when `can_finish` is unknown — boot graphs must not keep the backup.
+/// Named backup: cancel when the designated hop **advances** the route (stamps a non-zero
+/// `next_hop`, or the same designation with a lower `hop_limit`). A weak flood from that hop
+/// (`next_hop` unset) is not success — backups that can stamp a different path must stay armed.
 pub fn unicast_dupe_cancels_for(
     ctx: &UnicastRelayContext<'_>,
     packet_id: u32,
@@ -418,18 +419,17 @@ pub fn unicast_dupe_cancels_for(
     dupe_relay_byte: u8,
     dupe_hop_limit: u8,
 ) -> bool {
-    // Named-backup cancel that does not need a complete graph: the byte on the wire is enough.
+    // Named-backup cancel that does not need a complete graph: the wire bytes are enough.
     if flags.designated_next_hop != 0 {
-        if dupe_relay_byte == flags.designated_next_hop {
+        let from_designated = dupe_relay_byte == flags.designated_next_hop
+            || dupe_relayer.is_some_and(|relayer| {
+                relayer != 0
+                    && !is_placeholder_node(relayer)
+                    && (relayer & 0xFF) as u8 == flags.designated_next_hop
+            });
+        // Strong / onward stamp from the designated hop: designation succeeded.
+        if from_designated && dupe_next_hop != 0 {
             return true;
-        }
-        if let Some(relayer) = dupe_relayer {
-            if relayer != 0
-                && !is_placeholder_node(relayer)
-                && (relayer & 0xFF) as u8 == flags.designated_next_hop
-            {
-                return true;
-            }
         }
         // Designation progressed: same next_hop byte, strictly fewer hops remaining.
         if dupe_next_hop == flags.designated_next_hop
@@ -437,6 +437,11 @@ pub fn unicast_dupe_cancels_for(
             && dupe_hop_limit < flags.armed_hop_limit
         {
             return true;
+        }
+        // Weak flood (next unset) from the designated hop: do not fall through to
+        // `!we_finish` — that would cancel on an unresolved relay byte alone.
+        if from_designated {
+            return false;
         }
     }
 
@@ -802,9 +807,10 @@ mod tests {
     }
 
     #[test]
-    fn named_backup_cancels_on_designated_hop_without_finish_proof() {
-        // Empty graph: cannot can_finish anyone toward DEST. Hearing the designated byte must
-        // still cancel — the field failure when a thin boot graph kept the backup after Czar.
+    fn named_backup_cancels_on_strong_designated_copy_not_weak_flood() {
+        // Empty graph: cannot can_finish anyone toward DEST. A strong designated copy still
+        // cancels without finish proof; a weak flood must not (Lab: MB59 flooded next=0 and
+        // silenced Czar/MR3a backups that would have stamped a real path).
         let edges = EdgeStore::new();
         let capability = CapabilityCache::new();
         let downstream = DownstreamTable::new();
@@ -817,6 +823,7 @@ mod tests {
         };
         let gw_byte = (GW & 0xFF) as u8;
         let peer_byte = (PEER & 0xFF) as u8;
+        let onward = 0x6cu8;
         let flags = UnicastSlotFlags {
             designated_next_hop: gw_byte,
             armed_hop_limit: 7,
@@ -824,12 +831,20 @@ mod tests {
         };
         assert!(!ctx.can_finish(GW, DEST, NOW));
         assert!(
-            unicast_dupe_cancels_for(&ctx, 0x50, DEST, 0, NOW, None, flags, 0, gw_byte, 6),
-            "relay byte matching designated next_hop cancels even when identity is unresolved"
+            !unicast_dupe_cancels_for(&ctx, 0x50, DEST, 0, NOW, None, flags, 0, gw_byte, 6),
+            "weak flood from designated hop must not cancel the named backup"
         );
         assert!(
-            unicast_dupe_cancels_for(&ctx, 0x51, DEST, 0, NOW, Some(GW), flags, 0, 0, 6),
-            "resolved designated hop cancels without finish proof"
+            !unicast_dupe_cancels_for(&ctx, 0x51, DEST, 0, NOW, Some(GW), flags, 0, 0, 6),
+            "resolved designated hop flooding next=0 must not cancel"
+        );
+        assert!(
+            unicast_dupe_cancels_for(&ctx, 0x54, DEST, 0, NOW, None, flags, onward, gw_byte, 6),
+            "strong designated copy cancels without finish proof"
+        );
+        assert!(
+            unicast_dupe_cancels_for(&ctx, 0x55, DEST, 0, NOW, Some(GW), flags, onward, 0, 6),
+            "resolved designated hop with onward stamp cancels without finish proof"
         );
         assert!(
             unicast_dupe_cancels_for(

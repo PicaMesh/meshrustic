@@ -2300,8 +2300,8 @@ impl Router {
 
         // A unicast that already names a next hop keeps SR coordination: the designated node
         // owns slot 0 and every other candidate shifts down one slot. A heard copy cancels that
-        // backup on the designated hop's relay byte (even without finish proof), or when the
-        // transmitter can finish / is ranked ahead.
+        // backup when the designated hop advances the route (non-zero next_hop / hop_limit
+        // progress), or when the transmitter can finish / is ranked ahead — not on a weak flood.
         let designated_plan = if parsed.to != NODENUM_BROADCAST && relayer_named {
             Some(self.plan_designated_unicast(
                 &parsed,
@@ -3145,6 +3145,16 @@ impl Router {
         if to != NODENUM_BROADCAST && self.graph.caps_last_hop(to) {
             hop = hop.min(LAST_HOP_BUDGET);
             next_hop = (to & 0xFF) as u8;
+        } else if to != NODENUM_BROADCAST {
+            // Originate-stamp only a confirmed path. Inbound-gateway / unverified guesses stay
+            // clear so the mesh cost-ranks instead of locking onto a Lab neighbour that cannot
+            // finish (field: Dura named MB59 for MR22).
+            let (sr_hop, verified) =
+                self.graph
+                    .get_next_hop_verified(to, self.node_num, self.node_num, now_ms);
+            if verified && sr_hop != 0 && sr_hop != self.node_num {
+                next_hop = (sr_hop & 0xFF) as u8;
+            }
         }
         let (len, frame) = build_app_wire_frame(
             to,
@@ -7558,8 +7568,8 @@ mod tests {
     }
 
     /// Named backup armed with a real alternate stamp: the designated hop is known but cannot
-    /// finish, so finish/rank would keep our slot. Hearing its relay byte must still cancel —
-    /// that is the flag wiring through commit → `perhaps_cancel_dupe`.
+    /// finish, so finish/rank would keep our slot. A **strong** copy from it (non-zero next_hop)
+    /// must still cancel — that is the flag wiring through commit → `perhaps_cancel_dupe`.
     #[test]
     fn named_backup_cancels_on_designated_hop_when_finish_unknown() {
         const DESIG: u32 = 0x9900_0099;
@@ -7612,7 +7622,27 @@ mod tests {
             "without designation flags a non-finisher does not cancel"
         );
 
-        let copy = unicast_wire(6, 7, 0, 0x99, 0x509);
+        // Weak flood from designated: backup stays.
+        let weak = unicast_wire(6, 7, 0, 0x99, 0x509);
+        let weak_dupe = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &weak,
+                },
+                50,
+            )
+            .unwrap();
+        assert!(weak_dupe.duplicate);
+        assert!(
+            router.relay_tx_after(UNI_SOURCE, 0x509, 0).is_some(),
+            "weak flood from designated hop must not cancel the named backup"
+        );
+
+        // Strong onward stamp from designated: cancel even without finish proof.
+        let copy = unicast_wire(6, 7, (UNI_RELAYER & 0xFF) as u8, 0x99, 0x509);
         let dupe = router
             .process_inbound(
                 &InboundPacket {
@@ -7627,7 +7657,7 @@ mod tests {
         assert!(dupe.duplicate);
         assert!(
             router.relay_tx_after(UNI_SOURCE, 0x509, 0).is_none(),
-            "designated hop copy must cancel even when it cannot finish"
+            "strong designated hop copy must cancel even when it cannot finish"
         );
         assert!(router.poll_ready_relay(tx_after + 1).is_none());
         let mut logs = heapless::Vec::new();

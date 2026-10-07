@@ -2216,9 +2216,11 @@ impl NeighborGraph {
 
     /// The next hop to stamp on a relayed unicast, and whether that hop is safe to designate.
     /// Dijkstra's confirmed search reports `true`. A downstream chain that egresses via a
-    /// neighbour we hear is also stampable: dest need not hear that neighbour, and need not be
-    /// its RF neighbour. Every other source — a better-positioned neighbour, inbound-gateway
-    /// fallback, best-effort self relay, direct delivery — is a guess and reports `false`.
+    /// neighbour we hear is also stampable (`calculate_route` may return that hop with
+    /// `verified=false`, or the chain walk below when Dijkstra is empty): dest need not hear
+    /// that neighbour. Inbound-gateway fallback is stampable only when it coincides with that
+    /// chain egress; otherwise it is a guess. Originators must not fall back to a stale NodeDB
+    /// byte when this flag is false (field: Dura named MB59).
     pub fn get_next_hop_verified(
         &mut self,
         destination: u32,
@@ -2243,6 +2245,7 @@ impl NeighborGraph {
 
         let mut route = self.get_route(destination, now_ms);
         let chain_egress = self.downstream_chain_egress(destination, now_ms);
+        // Chain compose and confirmed Dijkstra are stampable; bare inbound-gateway is not.
         let stampable =
             |hop: u32, route_verified: bool| route_verified || chain_egress == Some(hop);
         // Suspect first hop: prefer a stampable alternate; never lose the only path.
