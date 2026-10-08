@@ -1397,6 +1397,10 @@ impl NeighborGraph {
                 .and_then(|n| n.find_edge(neighbor.node_id))
                 .is_some();
             if neighbor.node_id != self.my_node || sender_is_direct {
+                // Refresh sender activity and edge ages: with `update_timestamp` false, a hub's
+                // `last_full_update_ms` and Mirrored edge ages never moved, so after
+                // `NEIGHBOR_TTL_MS` `age_edges` deleted the hub and `clear_for_relay` wiped every
+                // list-downstream row parked behind it (Mesh Lab: Czar 84→1 at ~3.7 h).
                 self.edges.update_edge(
                     self.my_node,
                     sender,
@@ -1404,7 +1408,7 @@ impl NeighborGraph {
                     etx,
                     now_ms,
                     EdgeSource::Mirrored,
-                    false,
+                    true,
                     heard_on,
                 );
                 self.edges
@@ -5069,6 +5073,88 @@ mod tests {
         assert!(
             graph.is_our_direct_neighbor(STOCK),
             "a node that promises no cadence tells us nothing by going quiet"
+        );
+    }
+
+    #[test]
+    fn topology_merge_refreshes_sender_last_full_update() {
+        const ME: u32 = 0xAA00_00AA;
+        const HUB: u32 = 0x6300_008C;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(HUB, -70, 8, 1_000, 0);
+        let us = PackedNeighbor {
+            node_id: ME,
+            rssi: -70,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let far = PackedNeighbor {
+            node_id: 0xCC00_00CC,
+            rssi: -80,
+            snr: 4,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        assert!(matches!(
+            graph.merge_topology(HUB, &topo_header(1), &[us, far], true, 1_000, 0),
+            TopologyMergeResult::Applied { .. }
+        ));
+        let mid = 1_000 + NEIGHBOR_TTL_MS / 2;
+        assert!(matches!(
+            graph.merge_topology(HUB, &topo_header(2), &[us, far], true, mid, 0),
+            TopologyMergeResult::Applied { .. }
+        ));
+        assert_eq!(
+            graph
+                .edges()
+                .find_node(HUB)
+                .map(|n| n.last_full_update_ms),
+            Some(mid),
+            "a topology list must refresh the sender against NEIGHBOR_TTL aging"
+        );
+    }
+
+    #[test]
+    fn list_downstream_behind_a_hub_we_still_hear_survives_neighbor_ttl() {
+        // Field (MR3a): after ~NEIGHBOR_TTL, age_edges deleted Czar (stale last_full_update
+        // despite ongoing RX) and clear_for_relay wiped ~80 parked unicast routes.
+        const ME: u32 = 0xAA00_00AA;
+        const HUB: u32 = 0x6300_008C;
+        const QUIET: u32 = 0x8400_003E;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_CLIENT);
+        graph.observe_direct_neighbor(HUB, -70, 8, 1_000, 0);
+        graph.observe_direct_neighbor(QUIET, -80, 5, 1_000, 0);
+        graph.capability_mut().track_topology(HUB, true, 1_000);
+        graph.capability_mut().track_topology(QUIET, true, 1_000);
+        let now = 1_000 + NEIGHBOR_TTL_MS + 1;
+        for i in 0..20u32 {
+            graph.downstream_mut().update_listed(
+                ME,
+                0x1000_0000 + i,
+                HUB,
+                3.0,
+                now.saturating_sub(1_000),
+                false,
+                0,
+            );
+        }
+        graph.observe_direct_neighbor(HUB, -72, 7, now, 0);
+        graph.run_maintenance(now);
+        assert!(
+            graph.is_our_direct_neighbor(HUB),
+            "a hub we still hear must stay a direct neighbour"
+        );
+        assert_eq!(
+            graph.downstream_count_for_relay(HUB, now),
+            20,
+            "list-downstream parked behind that hub must not be cleared_for_relay"
         );
     }
 

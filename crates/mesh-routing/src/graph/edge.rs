@@ -1099,56 +1099,81 @@ impl EdgeStore {
         mut downstream: Option<&mut super::DownstreamTable>,
     ) -> bool {
         let mut changed = false;
-        let mut n = 0u8;
-        while (n as usize) < self.node_count as usize {
-            if self.nodes[n as usize].node_id == my_node {
-                n += 1;
-                continue;
-            }
-            let node_id = self.nodes[n as usize].node_id;
+        // Pass 1: drop expired directed edges on every node, including our own Reported
+        // links. Skipping `my_node` here left stale L1 claims forever and forced removal to
+        // ignore `we_hear_them`. Do not remove nodes in this pass — demotion needs a stable
+        // parent snapshot.
+        for i in 0..self.node_count as usize {
             let mut write = 0u8;
-            let edge_count = self.nodes[n as usize].edge_count;
-            for i in 0..edge_count as usize {
-                let edge = self.nodes[n as usize].edges[i];
+            let edge_count = self.nodes[i].edge_count;
+            for e in 0..edge_count as usize {
+                let edge = self.nodes[i].edges[e];
                 if now_ms.wrapping_sub(edge.last_update_ms) <= ttl_ms {
-                    if write as usize != i {
-                        self.nodes[n as usize].edges[write as usize] = edge;
+                    if write as usize != e {
+                        self.nodes[i].edges[write as usize] = edge;
                     }
                     write += 1;
                 } else {
                     changed = true;
                 }
             }
-            self.nodes[n as usize].edge_count = write;
+            self.nodes[i].edge_count = write;
+        }
 
-            // Mute L1s we still hear keep an empty slot. Horizon L2/L3 publishers are the same
-            // shape: admission puts them in the ball while measurements live on the parent.
-            // Purging every empty slot each tick collapsed the L3 ball between hub topology
-            // dumps. Keep classed ball members until last_full_update_ms expires; only Unknown
-            // soft-creates are dropped immediately when empty.
+        // Pass 2: collect nodes that should leave the ball. Mute L1s we still hear keep an
+        // empty slot; horizon L2/L3 publishers are the same shape. Never remove a node we
+        // still Report-hear — `prune_silent_publishers` owns that retract, and deleting a
+        // live hub here used to `clear_for_relay` and wipe every list-downstream row parked
+        // behind it.
+        let mut victims = [0u32; super::MAX_GRAPH_NODES];
+        let mut victim_n = 0usize;
+        for i in 0..self.node_count as usize {
+            let node_id = self.nodes[i].node_id;
+            if node_id == my_node {
+                continue;
+            }
             let we_hear_them = self
                 .find_node(my_node)
                 .and_then(|me| me.find_edge(node_id))
                 .is_some_and(|e| e.source == EdgeSource::Reported);
-            let classed_ball = Self::class_within_depth(self.nodes[n as usize].class);
-            let stale =
-                now_ms.wrapping_sub(self.nodes[n as usize].last_full_update_ms) > ttl_ms;
-            let empty_unknown =
-                self.nodes[n as usize].edge_count == 0 && !we_hear_them && !classed_ball;
-            if stale || empty_unknown {
-                if let Some(ref mut ds) = downstream {
-                    ds.clear_for_relay(node_id);
-                }
-                self.remove_node_edges_to(node_id);
-                if (n as usize) < self.node_count as usize - 1 {
-                    self.nodes[n as usize] = self.nodes[self.node_count as usize - 1];
-                }
-                self.node_count -= 1;
-                changed = true;
+            if we_hear_them {
                 continue;
             }
-            n += 1;
+            let classed_ball = Self::class_within_depth(self.nodes[i].class);
+            let stale = now_ms.wrapping_sub(self.nodes[i].last_full_update_ms) > ttl_ms;
+            let empty_unknown =
+                self.nodes[i].edge_count == 0 && !classed_ball;
+            if (stale || empty_unknown) && victim_n < super::MAX_GRAPH_NODES {
+                victims[victim_n] = node_id;
+                victim_n += 1;
+            }
         }
+
+        // Pass 3: demote into list-downstream when an L1 parent remains (same as
+        // `prune_unreachable_from_root`); only hard-clear when there is no parent.
+        for &victim in victims[..victim_n].iter() {
+            if let Some(ref mut ds) = downstream {
+                if let Some((parent, cost_fixed)) = self.pick_l1_parent(victim, my_node) {
+                    self.apply_demotion(
+                        my_node,
+                        PendingDemotion {
+                            victim,
+                            parent,
+                            cost_fixed,
+                        },
+                        now_ms,
+                        ds,
+                    );
+                } else {
+                    ds.clear_for_relay(victim);
+                    ds.clear_for_destination(victim);
+                }
+            }
+            if self.remove_node(victim) {
+                changed = true;
+            }
+        }
+
         if changed {
             if let Some(ds) = downstream {
                 if self.prune_unreachable_from_root(my_node, now_ms, ds) {
@@ -1489,9 +1514,30 @@ mod tests {
         downstream.update(0xAA, 0xDD, 0xBB, 2.0, 1_000, false, 0);
         assert_eq!(downstream.count(), 1);
 
+        // Our Reported edge ages off with the TTL, then BB is no longer heard and may leave.
         let now = 1_000 + 7_200_001;
         assert!(edges.age_edges(0xAA, now, 7_200_000, Some(&mut downstream)));
         assert_eq!(downstream.count(), 0);
+    }
+
+    #[test]
+    fn age_keeps_a_hub_we_still_hear_and_its_list_downstream() {
+        // Stale last_full_update alone must not delete a Reported neighbour: that used to
+        // clear_for_relay and wipe every unicast route parked behind the hub.
+        const ME: u32 = 0xAA;
+        const HUB: u32 = 0xBB;
+        const DEST: u32 = 0xDD;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 1_000);
+        edges.update_edge(ME, ME, HUB, 2.0, 1_000, EdgeSource::Reported, true, 0);
+        let mut downstream = DownstreamTable::new();
+        let now = 1_000 + 7_200_001;
+        // Hub node activity is stale, but our hearing of it was just refreshed.
+        edges.update_edge(ME, ME, HUB, 2.0, now, EdgeSource::Reported, true, 0);
+        downstream.update_listed(ME, DEST, HUB, 3.0, now, false, 0);
+        assert!(!edges.age_edges(ME, now, 7_200_000, Some(&mut downstream)));
+        assert!(edges.find_node(HUB).is_some());
+        assert_eq!(downstream.count(), 1);
     }
 
     #[test]
