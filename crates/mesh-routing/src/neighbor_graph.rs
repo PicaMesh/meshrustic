@@ -1903,8 +1903,13 @@ impl NeighborGraph {
         }
         // A former direct neighbour heard only through this relayer is retracted immediately —
         // waiting for publisher silence left travelling unicasts aimed at a dead last hop.
+        // Exception: we already took this same packet id direct — the relayed copy is a desk
+        // duplicate (Czar rebroadcast), not evidence they left. Retracting then flapped directs.
         let was_direct_neighbor = self.edges.has_direct_reported_edge_to(self.my_node, from);
-        if was_direct_neighbor && self.retract_direct_link(from) {
+        let already_heard_direct =
+            packet_id != 0 && self.has_node_transmitted(from, packet_id, now_ms);
+        let travelling = was_direct_neighbor && !already_heard_direct;
+        if travelling && self.retract_direct_link(from) {
             self.remove_direct_signal(from);
             self.topology_dirty = true;
         }
@@ -2008,7 +2013,7 @@ impl NeighborGraph {
         // Multi-hop, non-publisher: stock nodes never advertise topology.
         // Multi-hop publisher that was never our neighbour: skip — Dijkstra on their (and their
         // peers') lists is the multi-hop TX path; a forwarded copy is not.
-        let infer_downstream = was_direct_neighbor || single_hop || !source_publishes;
+        let infer_downstream = travelling || single_hop || !source_publishes;
         let dest_in_ball = self.edges.find_node(from).is_some();
         let list_parked = self
             .downstream
@@ -2016,9 +2021,9 @@ impl NeighborGraph {
             .is_some_and(|(m, _)| self.edges.find_node(m).is_some());
         // Ball / list-downstream stay; a travelling former neighbour still parks behind the
         // hop we heard so unicasts do not keep the dead last hop.
-        let steal_ok = was_direct_neighbor || (!dest_in_ball && !list_parked);
+        let steal_ok = travelling || (!dest_in_ball && !list_parked);
         if active_routing && can_infer_downstream && infer_downstream && steal_ok {
-            if was_direct_neighbor {
+            if travelling {
                 // Write even when the relayer already published an edge to them: they still
                 // have to sit behind the hop we heard, not as our last hop.
                 self.downstream.update_exclusive(
@@ -4887,6 +4892,41 @@ mod tests {
         graph.edges_mut().set_edge_hears_us(ME, TRAVELLER, true);
         assert!(graph.get_downstream_relay(TRAVELLER, 3_000).is_none());
         assert_eq!(graph.get_route(TRAVELLER, 3_000).next_hop, TRAVELLER);
+    }
+
+    #[test]
+    fn relayed_duplicate_of_direct_packet_does_not_retract() {
+        // Desk: hear the originator direct, then the same id via a neighbour's rebroadcast.
+        // That is not a travelling neighbour — retracting flapped L1 count beside Czar.
+        const ME: u32 = 0x0A0B_0C0D;
+        const PEER: u32 = 0x1111_1111;
+        const RELAY: u32 = 0x2222_2222;
+        const PACKET: u32 = 0xc73a_8812;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(RELAY, -70, 8, 1_000, 0);
+        graph.edges_mut().set_edge_hears_us(ME, RELAY, true);
+        graph.capability_mut().track_topology(PEER, true, 1_000);
+        graph.capability_mut().track_topology(RELAY, true, 1_000);
+        for (from, to) in [(RELAY, PEER), (PEER, RELAY)] {
+            graph
+                .edges_mut()
+                .update_edge(ME, from, to, 1.2, 1_000, EdgeSource::Mirrored, true, 0);
+        }
+        graph.edges_mut().set_edge_hears_us(RELAY, PEER, true);
+
+        graph.observe_packet(PEER, 3, 3, 0x11, -7, 12, 2_000, 0, None, PACKET);
+        assert!(graph.is_our_direct_neighbor(PEER));
+        assert!(graph.has_node_transmitted(PEER, PACKET, 2_000));
+
+        graph.observe_packet(PEER, 3, 2, 0x22, -70, 8, 2_500, 0, Some(RELAY), PACKET);
+        assert!(
+            graph.is_our_direct_neighbor(PEER),
+            "same packet id via a relay must not retract a direct we already took"
+        );
+        assert!(graph.get_downstream_relay(PEER, 2_500).is_none());
+        assert_eq!(graph.get_route(PEER, 2_500).next_hop, PEER);
     }
 
     #[test]

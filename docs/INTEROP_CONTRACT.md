@@ -899,11 +899,16 @@ is actually waiting for.
   is retracted (`retract_direct_link`). They are written as downstream of that relayer only when
   the relayer hears us and, if they publish topology, they list it. Relayed copies
   do not refresh our measurement of the sender, so without this a node that moved behind a hop
-  kept drawing unicasts onto a dead last hop until `PUBLISHER_SILENCE_MS`. Their later topology
-  must not reinstall `sender → us` unless we hear them again — Dijkstra would treat us as that
-  last hop from a stale list. A later *direct* frame from them (`observe_direct_neighbor` +
+  kept drawing unicasts onto a dead last hop until `PUBLISHER_SILENCE_MS`. **Same packet id
+  exception:** if we already recorded this `packet_id` from the sender (`has_node_transmitted`,
+  set on the direct observe path), a later relayed copy is a duplicate rebroadcast, not travel —
+  do not retract or park them downstream. Desk field: angl heard MR3a direct then Czar’s matched
+  copy ~0.5 s later and flapped directs to 1. Their later topology must not reinstall
+  `sender → us` unless we hear them again — Dijkstra would treat us as that last hop from a
+  stale list. A later *direct* frame from them (`observe_direct_neighbor` +
   `clear_for_destination`) restores the neighbour and drops every downstream row for them.
-  Tests: `a_relayed_former_neighbour_becomes_downstream`.
+  Tests: `a_relayed_former_neighbour_becomes_downstream`,
+  `relayed_duplicate_of_direct_packet_does_not_retract`.
 
 ## 6. Inbound policing
 
