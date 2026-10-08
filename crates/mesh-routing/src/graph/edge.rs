@@ -260,6 +260,22 @@ impl EdgeStore {
         self.find_node(node_id).map(|n| n.class)
     }
 
+    /// Counts of L1 / L2 / L3 ball members. Unknown (placeholders, unclassified) are omitted.
+    pub fn count_horizon_classes(&self) -> (u8, u8, u8) {
+        let mut l1 = 0u8;
+        let mut l2 = 0u8;
+        let mut l3 = 0u8;
+        for i in 0..self.node_count as usize {
+            match self.nodes[i].class {
+                NodeClass::L1 => l1 = l1.saturating_add(1),
+                NodeClass::L2 => l2 = l2.saturating_add(1),
+                NodeClass::L3 => l3 = l3.saturating_add(1),
+                NodeClass::Unknown => {}
+            }
+        }
+        (l1, l2, l3)
+    }
+
     pub fn set_node_class(&mut self, node_id: u32, class: NodeClass, parent_hint: u32) {
         if let Some(node) = self.find_node_mut(node_id) {
             // Never demote an L1 to a deeper class while it still holds the slot.

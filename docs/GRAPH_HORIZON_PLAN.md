@@ -52,6 +52,8 @@ We need an explicit **horizon**: price a shallow ball of published links, park e
 
 **Hop labels are admission / eviction metadata only.** Dijkstra does not branch on “L1 vs L2”; it only sees edges.
 
+**Topology dump:** the periodic Network Topology log tags each ball node `[L1]` / `[L2]` / `[L3]` / `[L?]` and prints a header census `(L1=a L2=b L3=c)`. List-downstream and orphan rows stay `[downstream]` — they are not ball class.
+
 ### 4.1 Evidence preference (critical)
 
 For a link between ball node A and ball node B:

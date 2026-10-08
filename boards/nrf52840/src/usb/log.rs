@@ -953,14 +953,26 @@ pub mod sr {
         TopologyLogSink,
     };
 
+    fn horizon_class_tag(class: mesh_routing::NodeClass) -> &'static [u8] {
+        match class {
+            mesh_routing::NodeClass::L1 => b"[L1] ",
+            mesh_routing::NodeClass::L2 => b"[L2] ",
+            mesh_routing::NodeClass::L3 => b"[L3] ",
+            mesh_routing::NodeClass::Unknown => b"[L?] ",
+        }
+    }
+
     fn emit_topology_event(event: SrLogEvent) {
         match event {
             SrLogEvent::NetworkTopologyHeader {
                 direct_neighbors,
                 graph_nodes,
+                l1,
+                l2,
+                l3,
                 downstream_routes,
             } => {
-                let mut line = [0u8; 128];
+                let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Network Topology: ";
                 put(&mut line, &mut pos, prefix);
@@ -968,8 +980,17 @@ pub mod sr {
                 let mid = b" direct, ";
                 put(&mut line, &mut pos, mid);
                 put_u32(&mut line, &mut pos, graph_nodes as u32);
-                let mid2 = b" graph nodes, ";
+                let mid2 = b" graph nodes (L1=";
                 put(&mut line, &mut pos, mid2);
+                put_u32(&mut line, &mut pos, l1 as u32);
+                let mid3 = b" L2=";
+                put(&mut line, &mut pos, mid3);
+                put_u32(&mut line, &mut pos, l2 as u32);
+                let mid4 = b" L3=";
+                put(&mut line, &mut pos, mid4);
+                put_u32(&mut line, &mut pos, l3 as u32);
+                let mid5 = b"), ";
+                put(&mut line, &mut pos, mid5);
                 put_u32(&mut line, &mut pos, downstream_routes as u32);
                 let tail = b" downstream routes";
                 put(&mut line, &mut pos, tail);
@@ -998,15 +1019,18 @@ pub mod sr {
                 snr,
                 hears_us,
                 last,
+                class,
             } => {
                 let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
                 let branch = if last {
-                    b"[SR]   \\- !"
+                    b"[SR]   \\- "
                 } else {
-                    b"[SR]   +- !"
+                    b"[SR]   +- "
                 };
                 put(&mut line, &mut pos, branch);
+                put(&mut line, &mut pos, horizon_class_tag(class));
+                put(&mut line, &mut pos, b"!");
                 put_hex8(&mut line, &mut pos, node_id);
                 let mid = b": RSSI=";
                 put(&mut line, &mut pos, mid);
@@ -1027,6 +1051,7 @@ pub mod sr {
                 last_mirrored,
                 etx_fixed,
                 measured,
+                class,
             } => {
                 let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
@@ -1036,8 +1061,10 @@ pub mod sr {
                     b"[SR]       "
                 };
                 put(&mut line, &mut pos, indent);
-                let branch = if last_mirrored { b"\\- !" } else { b"+- !" };
+                let branch = if last_mirrored { b"\\- " } else { b"+- " };
                 put(&mut line, &mut pos, branch);
+                put(&mut line, &mut pos, horizon_class_tag(class));
+                put(&mut line, &mut pos, b"!");
                 put_hex8(&mut line, &mut pos, node_id);
                 let mid: &[u8] = if measured {
                     b" via topo etx="

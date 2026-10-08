@@ -3011,16 +3011,21 @@ impl NeighborGraph {
         node_num: u32,
         sink: &mut S,
     ) {
+        use crate::graph::NodeClass;
         use crate::sr_log::SrLogEvent;
 
         let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
         let direct = self.fill_neighbor_entries(&mut entries);
         let graph_nodes = self.graph_node_count();
+        let (l1, l2, l3) = self.edges.count_horizon_classes();
         let downstream_routes = self.downstream.count();
         if direct == 0 {
             sink.emit(SrLogEvent::NetworkTopologyHeader {
                 direct_neighbors: 0,
                 graph_nodes,
+                l1,
+                l2,
+                l3,
                 downstream_routes,
             });
             sink.emit(SrLogEvent::NetworkTopologyUs { node_id: node_num });
@@ -3033,6 +3038,9 @@ impl NeighborGraph {
         sink.emit(SrLogEvent::NetworkTopologyHeader {
             direct_neighbors: direct,
             graph_nodes,
+            l1,
+            l2,
+            l3,
             downstream_routes,
         });
         sink.emit(SrLogEvent::NetworkTopologyUs { node_id: node_num });
@@ -3049,6 +3057,10 @@ impl NeighborGraph {
                 snr: entry.snr,
                 hears_us: entry.hears_us,
                 last: i + 1 == direct as usize,
+                class: self
+                    .edges
+                    .node_class(entry.node_id)
+                    .unwrap_or(NodeClass::L1),
             });
 
             let continue_pipe = i + 1 != direct as usize;
@@ -3083,6 +3095,10 @@ impl NeighborGraph {
                         last_mirrored: seen == mirrored,
                         etx_fixed: edge.etx_fixed,
                         measured: edge.source.is_measured(),
+                        class: self
+                            .edges
+                            .node_class(edge.to)
+                            .unwrap_or(NodeClass::Unknown),
                     });
                 }
             }

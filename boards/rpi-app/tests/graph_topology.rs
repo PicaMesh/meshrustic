@@ -242,6 +242,7 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
             direct_neighbors: 0,
             graph_nodes,
             downstream_routes: 0,
+            ..
         } if *graph_nodes >= 1
     )));
 }
@@ -279,6 +280,25 @@ fn emit_topology_log_lists_mirrored_l2_not_list_downstream() {
         SrLogEvent::NetworkTopologyMirrored {
             node_id: 0xCC,
             hears_us: true,
+            class: mesh_routing::NodeClass::L2,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SrLogEvent::NetworkTopologyNeighbor {
+            node_id: 0xBB,
+            class: mesh_routing::NodeClass::L1,
+            ..
+        }
+    )));
+    // Us + the direct peer are L1; listed hearsUs peer is L2 in the ball.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SrLogEvent::NetworkTopologyHeader {
+            l1: 2,
+            l2: 1,
+            l3: 0,
             ..
         }
     )));

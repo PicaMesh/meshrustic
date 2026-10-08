@@ -154,6 +154,10 @@ pub enum SrLogEvent {
     NetworkTopologyHeader {
         direct_neighbors: u8,
         graph_nodes: u8,
+        /// Ball members tagged L1 / L2 / L3 (Unknown omitted from these counts).
+        l1: u8,
+        l2: u8,
+        l3: u8,
         downstream_routes: u16,
     },
     NetworkTopologyUs {
@@ -166,6 +170,7 @@ pub enum SrLogEvent {
         snr: i8,
         hears_us: bool,
         last: bool,
+        class: crate::graph::NodeClass,
     },
     NetworkTopologyMirrored {
         continue_pipe: bool,
@@ -176,6 +181,7 @@ pub enum SrLogEvent {
         /// can see which links they disagree about, and whether a guess is behind it.
         etx_fixed: u16,
         measured: bool,
+        class: crate::graph::NodeClass,
     },
     NetworkTopologyDownstreamHeader {
         count: u16,
