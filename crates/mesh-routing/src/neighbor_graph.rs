@@ -1298,13 +1298,13 @@ impl NeighborGraph {
         // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
         // last hop to them from a stale list after they moved behind a relay.
         let sender_is_direct = self.edges.has_direct_reported_edge_to(self.my_node, sender);
-        // Horizon: accept topology when the sender is an RF neighbour, we heard this frame
-        // directly from them, they already sit in the ball, their list names an L1, or a ball
-        // node already points at them (§6.2). Relayed frames need one of the non-direct gates.
+        // Horizon §6.2: RF neighbour, heard this frame from them, already in the ball, an L1
+        // lists them with hearsUs, or their list names an L1/L2 we hold. Asymmetric edge
+        // targets (hearsUs=0) must not unlock ingest.
         let sender_horizon_ok = sender_is_direct
             || is_direct_from_sender
             || self.edges.find_node(sender).is_some()
-            || self.edges.reachable_via_neighbor(sender)
+            || self.edges.reachable_via_hears_us(sender)
             || self.edges.node_class(sender).is_some_and(|c| {
                 matches!(c, NodeClass::L2 | NodeClass::L3)
             })
@@ -1316,48 +1316,62 @@ impl NeighborGraph {
                 topo_v: received,
             };
         }
-        // When admitting a non-direct sender, prefer L3 if they already classify that deep.
+        // Admit a non-direct sender only when already in the ball or their list names L1/L2
+        // (same gate as the MT+SR fork). Classify from ball evidence first; Unknown fallback
+        // is L3 only when the list names an L2 and does not name an L1.
         if !sender_is_direct && sender_horizon_ok {
-            let parent = self
-                .edges
-                .find_node(sender)
-                .map(|n| n.parent_hint)
-                .filter(|&p| p != 0)
-                .or_else(|| {
-                    neighbors.iter().find_map(|n| {
-                        self.edges.node_class(n.node_id).and_then(|c| match c {
-                            NodeClass::L2 if GRAPH_MAX_DEPTH >= 3 => Some(n.node_id),
-                            NodeClass::L1 => Some(n.node_id),
-                            _ => None,
+            let names_l1 = neighbors.iter().any(|n| {
+                self.edges
+                    .has_direct_reported_edge_to(self.my_node, n.node_id)
+            });
+            let names_l2 = neighbors.iter().any(|n| {
+                self.edges
+                    .node_class(n.node_id)
+                    .is_some_and(|c| c == NodeClass::L2)
+            });
+            let already_in_ball = self.edges.find_node(sender).is_some();
+            if already_in_ball || names_l1 || names_l2 {
+                let parent = self
+                    .edges
+                    .find_node(sender)
+                    .map(|n| n.parent_hint)
+                    .filter(|&p| p != 0)
+                    .or_else(|| {
+                        neighbors.iter().find_map(|n| {
+                            if self
+                                .edges
+                                .has_direct_reported_edge_to(self.my_node, n.node_id)
+                            {
+                                return Some(n.node_id);
+                            }
+                            self.edges.node_class(n.node_id).and_then(|c| match c {
+                                NodeClass::L2 if GRAPH_MAX_DEPTH >= 3 => Some(n.node_id),
+                                NodeClass::L1 => Some(n.node_id),
+                                _ => None,
+                            })
                         })
                     })
-                })
-                .unwrap_or(0);
-            let class = self.edges.classify_candidate(sender, self.my_node);
-            let class = if class == NodeClass::Unknown {
-                if GRAPH_MAX_DEPTH >= 3
-                    && neighbors.iter().any(|n| {
-                        self.edges
-                            .node_class(n.node_id)
-                            .is_some_and(|c| c == NodeClass::L2)
-                    })
-                {
-                    NodeClass::L3
+                    .unwrap_or(0);
+                let class = self.edges.classify_candidate(sender, self.my_node);
+                let class = if class == NodeClass::Unknown {
+                    if GRAPH_MAX_DEPTH >= 3 && names_l2 && !names_l1 {
+                        NodeClass::L3
+                    } else {
+                        NodeClass::L2
+                    }
                 } else {
-                    NodeClass::L2
+                    class
+                };
+                if EdgeStore::class_within_depth(class) && class != NodeClass::Unknown {
+                    let _ = self.edges.ensure_publisher(
+                        sender,
+                        class,
+                        parent,
+                        now_ms,
+                        self.my_node,
+                        &mut self.downstream,
+                    );
                 }
-            } else {
-                class
-            };
-            if EdgeStore::class_within_depth(class) && class != NodeClass::Unknown {
-                let _ = self.edges.ensure_publisher(
-                    sender,
-                    class,
-                    parent,
-                    now_ms,
-                    self.my_node,
-                    &mut self.downstream,
-                );
             }
         }
         let passive_local = !self.is_active_routing_role();
@@ -5261,6 +5275,105 @@ mod tests {
             Some(crate::graph::NodeClass::L3)
         );
         assert!(graph.get_downstream_relay(L3, 300).is_none());
+    }
+
+    /// First ingest of a far sender that names both an L1 and an L2 must class as L2 (they hear
+    /// an L1), not L3. Edges are not installed yet when classify runs, so the Unknown fallback
+    /// must require namesL2 && !namesL1 — matching the MT+SR fork.
+    #[test]
+    fn merge_topology_far_sender_naming_l1_and_l2_is_l2_not_l3() {
+        const ME: u32 = 0xAA00_00AA;
+        const L1: u32 = 0xBB00_00BB;
+        const L2: u32 = 0xCC00_00CC;
+        const FAR: u32 = 0xF100_00F1;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(L1, -70, 8, 100, 0);
+        let nb = |id: u32| PackedNeighbor {
+            node_id: id,
+            rssi: -75,
+            snr: 7,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L1, &h1, &[nb(L2)], true, 200, 0);
+        assert_eq!(
+            graph.edges().node_class(L2),
+            Some(crate::graph::NodeClass::L2)
+        );
+
+        write_packed_header(&mut packed, 2, true);
+        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(FAR, &h2, &[nb(L1), nb(L2)], false, 300, 0);
+        assert_eq!(
+            graph.edges().node_class(FAR),
+            Some(crate::graph::NodeClass::L2),
+            "naming an L1 makes the sender L2 even when the list also names an L2"
+        );
+    }
+
+    /// Asymmetric L1→FAR (hearsUs=0) must not unlock FAR's topology when FAR does not name an
+    /// L1/L2 we hold (§6.2).
+    #[test]
+    fn asymmetric_listing_does_not_unlock_far_topology() {
+        const ME: u32 = 0xAA00_00AA;
+        const L1: u32 = 0xBB00_00BB;
+        const FAR: u32 = 0xF100_00F1;
+        const Y: u32 = 0xEE00_00EE;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(L1, -70, 8, 100, 0);
+        let asym = PackedNeighbor {
+            node_id: FAR,
+            rssi: -80,
+            snr: 5,
+            signal_routing_active: true,
+            hears_us: false,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L1, &h1, &[asym], true, 200, 0);
+        assert!(
+            graph.edges().find_node(FAR).is_none(),
+            "asymmetric listing must not admit FAR as a publisher"
+        );
+        assert!(
+            graph
+                .edges()
+                .find_node(L1)
+                .and_then(|n| n.find_edge(FAR))
+                .is_some(),
+            "asymmetric Mirrored edge is still stored on L1"
+        );
+
+        let y = PackedNeighbor {
+            node_id: Y,
+            rssi: -85,
+            snr: 4,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        write_packed_header(&mut packed, 2, true);
+        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let result = graph.merge_topology(FAR, &h2, &[y], false, 300, 0);
+        assert!(matches!(
+            result,
+            TopologyMergeResult::Applied {
+                neighbors: 0,
+                ..
+            }
+        ));
+        assert!(graph.edges().find_node(FAR).is_none());
+        assert!(graph.get_downstream_relay(Y, 300).is_none());
     }
 
     #[test]

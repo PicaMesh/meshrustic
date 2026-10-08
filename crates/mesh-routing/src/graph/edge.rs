@@ -634,6 +634,9 @@ impl EdgeStore {
 
     /// When `from` is only known as an edge target of a ball node, infer the shallowest class
     /// that horizon depth allows (L1→target ⇒ L2; L2→target ⇒ L3 if depth≥3).
+    /// Edge presence (not hearsUs) is enough here: reverse Mirrored rows for Dijkstra must soft-
+    /// create the far endpoint. Horizon *ingest* still requires hearsUs via
+    /// [`Self::reachable_via_hears_us`].
     fn bootstrap_class_from_reachability(&self, node_id: u32, my_node: u32) -> NodeClass {
         if let Some(me) = self.find_node(my_node) {
             for i in 0..me.edge_count as usize {
@@ -783,10 +786,25 @@ impl EdgeStore {
             .unwrap_or(false)
     }
 
+    /// True when any ball publisher lists `node_id` (any directed edge target).
     pub fn reachable_via_neighbor(&self, node_id: u32) -> bool {
         for i in 0..self.node_count as usize {
             for e in 0..self.nodes[i].edge_count as usize {
                 if self.nodes[i].edges[e].to == node_id {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Plan §6.2 / §4.2: a ball publisher claims `node_id` hears them (`hearsUs=1`).
+    /// Asymmetric listings must not unlock horizon ingest or soft-create.
+    pub fn reachable_via_hears_us(&self, node_id: u32) -> bool {
+        for i in 0..self.node_count as usize {
+            for e in 0..self.nodes[i].edge_count as usize {
+                let edge = &self.nodes[i].edges[e];
+                if edge.to == node_id && edge.hears_us {
                     return true;
                 }
             }

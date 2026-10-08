@@ -26,7 +26,8 @@ pub use route::{
     UNVERIFIED_HOP_COST_FACTOR,
 };
 
-pub const MAX_GRAPH_NODES: usize = 40;
+/// Match the MT+SR fork (`NEIGHBOR_GRAPH_MAX_NEIGHBORS`): lockstep eviction under a full ball.
+pub const MAX_GRAPH_NODES: usize = 32;
 
 /// How deep the priced edge ball grows: 2 = L0+L1+L2; 3 also admits L3 publishers.
 /// See `docs/GRAPH_HORIZON_PLAN.md` §8.5 / Phase 6.

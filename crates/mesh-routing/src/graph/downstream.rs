@@ -2,7 +2,8 @@
 
 use mesh_radio::RadioId;
 
-pub const MAX_DOWNSTREAM: usize = 1100;
+/// Match the MT+SR fork (`NEIGHBOR_GRAPH_MAX_DOWNSTREAM`).
+pub const MAX_DOWNSTREAM: usize = 900;
 /// Walk dest → relay → … at most this many hops before treating the chain as a cycle.
 pub const MAX_DOWNSTREAM_CHAIN: usize = 16;
 
