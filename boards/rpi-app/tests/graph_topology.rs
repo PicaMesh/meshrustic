@@ -154,13 +154,18 @@ fn relayed_packet_creates_placeholder_edge_to_transmitter() {
 }
 
 #[test]
-fn relayed_topology_adds_sender_edges_and_downstream_without_destination_node() {
-    use mesh_routing::DEVICE_ROLE_CLIENT;
+fn relayed_topology_from_unqualified_far_publisher_is_ignored() {
+    use mesh_routing::{placeholder_node_id, DEVICE_ROLE_CLIENT};
 
+    // Horizon: a far originator heard only via an unresolved relay byte is not a ball
+    // publisher. Its topology version may be tracked, but listed neighbours are not ingested
+    // and are not parked as list-downstream of that sender.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
     graph.observe_packet(0x108a_ef6c, 2, 1, 0x8f, -75, 11, 1_000, 0, None, 0);
+    assert!(graph.has_graph_node(placeholder_node_id(0x8f)));
+    assert!(!graph.has_graph_node(0x108a_ef6c));
 
     let neighbor = PackedNeighbor {
         node_id: 0xd6c2_3e3e,
@@ -174,10 +179,16 @@ fn relayed_topology_adds_sender_edges_and_downstream_without_destination_node() 
     write_packed_header(&mut packed, 197, true);
     let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
     let result = graph.merge_topology(0x108a_ef6c, &header, &[neighbor], false, 2_000, 0);
-    assert!(matches!(result, TopologyMergeResult::Applied { .. }));
-    assert!(graph.has_graph_node(0x108a_ef6c));
+    assert!(matches!(
+        result,
+        TopologyMergeResult::Applied {
+            neighbors: 0,
+            topo_v: 197
+        }
+    ));
+    assert!(!graph.has_graph_node(0x108a_ef6c));
     assert!(!graph.has_graph_node(0xd6c2_3e3e));
-    assert!(graph.get_downstream_relay(0xd6c2_3e3e, 2_000).is_some());
+    assert!(graph.get_downstream_relay(0xd6c2_3e3e, 2_000).is_none());
 }
 
 #[test]
@@ -223,20 +234,22 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
     let mut events = heapless::Vec::<SrLogEvent, { mesh_routing::MAX_SR_LOG }>::new();
     log.take(&mut events);
 
-    // The overheard relay is not a downstream row: the placeholder has not heard us, and the
-    // originator has not listed it. The one row is the neighbour the sender listed with hears_us.
+    // Unqualified far list is not ingested: only us + placeholder stay in the graph, and no
+    // list-downstream rows are created from that publisher.
     assert!(events.iter().any(|event| matches!(
         event,
         SrLogEvent::NetworkTopologyHeader {
             direct_neighbors: 0,
             graph_nodes,
-            downstream_routes: 1,
+            downstream_routes: 0,
         } if *graph_nodes >= 1
     )));
 }
 
 #[test]
-fn emit_topology_log_lists_mirrored_and_downstream_nodes() {
+fn emit_topology_log_lists_mirrored_l2_not_list_downstream() {
+    // Horizon depth≥2: an L1 listing a hearsUs peer promotes that peer into the ball as L2
+    // (mirrored), not as list-downstream of the L1.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.observe_direct_neighbor(0xBB, -70, 8, 100, 0);
@@ -253,6 +266,8 @@ fn emit_topology_log_lists_mirrored_and_downstream_nodes() {
     write_packed_header(&mut packed, 1, true);
     let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
     graph.merge_topology(0xBB, &header, &[neighbor], true, 200, 0);
+    assert!(graph.has_graph_node(0xCC));
+    assert!(graph.get_downstream_relay(0xCC, 200).is_none());
 
     let mut log = SrLog::new();
     graph.emit_topology_log(0xAA, &mut log);
@@ -267,10 +282,9 @@ fn emit_topology_log_lists_mirrored_and_downstream_nodes() {
             ..
         }
     )));
-    assert!(events.iter().any(|event| matches!(
+    assert!(!events.iter().any(|event| matches!(
         event,
         SrLogEvent::NetworkTopologyDownstreamGroup {
-            relay: 0xBB,
             destinations,
             len,
             ..
