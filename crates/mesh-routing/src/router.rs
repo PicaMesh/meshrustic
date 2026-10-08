@@ -3561,12 +3561,20 @@ impl Router {
         half_airtime: u32,
         airtime_ms: u32,
     ) -> u32 {
+        // Slot 0 keys at the largest floor that applies (stock contention floor or dest-ACK).
+        // Later slots must wait until that leader copy would have left the air on every preset:
+        // peer_relay_wait is measured from t=0 (turnaround + contention + airtime), but when the
+        // floor is larger (LONG_MODERATE and slower; also LONG_FAST at low CW) the leader keys
+        // later — clear time is then floor+airtime. Taking only peer_relay_wait undercut the
+        // floor and let slot 1 fire before slot 0.
+        let earliest =
+            crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).max(dest_ack_floor);
         if slot == 0 {
-            crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).max(dest_ack_floor)
+            earliest
         } else {
-            self.sr_peer_relay_wait_ms(airtime_ms)
-                .max(dest_ack_floor)
-                .saturating_add((slot as u32 - 1).saturating_mul(half_airtime))
+            let peer = self.sr_peer_relay_wait_ms(airtime_ms);
+            let leader_clear = peer.max(earliest.saturating_add(airtime_ms));
+            leader_clear.saturating_add((slot as u32 - 1).saturating_mul(half_airtime))
         }
     }
 
@@ -8723,6 +8731,52 @@ mod tests {
         assert!(
             router.poll_ready_relay(floor + jitter_max).is_some(),
             "slot 0 ready at the floor plus its tie-break"
+        );
+    }
+
+    /// On LONG_MODERATE (and slower) the contention floor exceeds peer_relay_wait for typical
+    /// airtimes, so a slot-1 delay of only peer_relay_wait undercuts slot 0. Slot 1 must wait
+    /// until the leader copy would have left the air (max(peer_wait, floor+airtime)).
+    #[test]
+    fn undesignated_unicast_later_slot_waits_for_leader_clear_when_floor_dominates() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(UNI_ME));
+        router.set_modem_preset(
+            "",
+            mesh_radio::MODEM_LONG_MODERATE,
+            true,
+            CryptoKey::from_bytes(&DEFAULT_PSK),
+        );
+        setup_unicast_graph(router);
+        let airtime = 100u32;
+        let wire = unicast_wire(3, 3, 0, 0xDD, 0x703);
+        let result = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &wire,
+                },
+                0,
+            )
+            .unwrap();
+        let _ = router.evaluate_tx_plan(&result, 0.0, airtime, 0);
+        let tx_after = router
+            .relay_tx_after(UNI_SOURCE, 0x703, 0)
+            .expect("we hold a later slot behind RELAYER");
+        let floor = coordinated_relay::relay_floor_ms(coordinated_relay::slot_time_for_preset(
+            mesh_radio::MODEM_LONG_MODERATE,
+        ));
+        let peer = router.sr_peer_relay_wait_ms(airtime);
+        assert!(
+            floor > peer,
+            "precondition: floor {floor} must exceed peer wait {peer}"
+        );
+        let leader_clear = peer.max(floor.saturating_add(airtime));
+        assert!(
+            tx_after >= leader_clear,
+            "slot 1 undercut leader clear: {tx_after} < {leader_clear} (floor={floor}, peer={peer})"
         );
     }
 

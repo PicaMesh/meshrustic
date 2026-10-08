@@ -336,10 +336,14 @@ is actually waiting for.
   cancels only when we cannot finish ourselves (the designated or stock hop we were waiting for).
   Named backups add a graph-independent cancel (below). Slot 0 waits the largest floor that applies
   to it — stock's own contention floor (`coordinated_relay::relay_floor_ms`), or the destination's
-  ACK wait where that is longer; later slots take the larger of that floor and the leader's peer
-  relay window, then space by half an airtime. There is no delay clamp that bunches late rungs.
+  ACK wait where that is longer. Later slots wait until that leader copy would have left the air —
+  the larger of the peer-relay wait from t=0 (`channel_access::peer_relay_wait_ms`: turnaround +
+  contention + one airtime) and slot-0 floor + one airtime — then space by half an airtime. Taking
+  only the peer-relay wait undercut the floor on LONG_MODERATE (and slower), so slot 1 keyed before
+  slot 0. There is no delay clamp that bunches late rungs.
   Tests: `undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination`,
   `undesignated_unicast_slot_zero_waits_stocks_contention_floor`,
+  `undesignated_unicast_later_slot_waits_for_leader_clear_when_floor_dominates`,
   `undesignated_flood_without_route_stays_silent_when_already_covered`,
   `dupe_cancels_when_the_relayer_can_finish`,
   `dupe_kept_when_we_can_finish_and_they_cannot`,
