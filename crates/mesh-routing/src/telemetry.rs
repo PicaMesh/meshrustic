@@ -6,7 +6,7 @@ use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
 use crate::topology::{
-    encode_data_payload_opts, DataBitfield, DataEncodeOpts, SR_BROADCAST_MAX_HOPS,
+    encode_data_payload_opts, DataBitfield, DataEncodeOpts,
 };
 
 pub const TELEMETRY_APP: u32 = 67;
@@ -126,14 +126,13 @@ pub fn build_device_telemetry_wire_frame(
         &mut cipher[..plaintext.len()],
     );
 
-    let hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
     let header = PacketHeader::from_fields(
         NODENUM_BROADCAST,
         node_num,
         packet_id,
         channel_hash,
-        hop,
-        hop,
+        hop_limit,
+        hop_limit,
         false,
         false,
         0,

@@ -18,7 +18,9 @@ pub const PACKED_HEADER_FLAG_MORE_CHUNKS: u8 = 0x02;
 pub const PACKED_HEADER_FLAG_CONTINUATION: u8 = 0x04;
 /// Max neighbors per topology protobuf chunk (11 on wire; 28 entries fit in the 229-byte limit).
 pub const MAX_NEIGHBORS_PER_PACKET: usize = 28;
-pub const SR_BROADCAST_MAX_HOPS: u8 = 5;
+/// Cap on `hop_limit` / `hop_start` for SR topology broadcasts (port 88).
+/// Other originated frames use the node's configured LoRa `hop_limit` as-is.
+pub const SR_BROADCAST_MAX_HOPS: u8 = 4;
 pub const SIGNAL_ROUTING_APP: u32 = 88;
 
 /// `Data.bitfield` (field 9). Stock stamps it on every frame it originates, and a receiver
@@ -285,15 +287,13 @@ pub fn build_app_wire_frame(
     cipher[..plaintext.len()].copy_from_slice(&plaintext);
     encrypt_packet(key, from, packet_id as u64, &mut cipher[..plaintext.len()]);
 
-    let hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
-    let start = hop_start.min(SR_BROADCAST_MAX_HOPS);
     let header = PacketHeader::from_fields(
         to,
         from,
         packet_id,
         channel_hash,
-        hop,
-        start,
+        hop_limit,
+        hop_start,
         want_ack,
         false,
         next_hop,

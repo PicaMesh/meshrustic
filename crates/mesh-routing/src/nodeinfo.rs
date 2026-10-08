@@ -6,7 +6,7 @@ use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
 use crate::topology::{
-    encode_data_payload_opts, DataBitfield, DataEncodeOpts, SR_BROADCAST_MAX_HOPS,
+    encode_data_payload_opts, DataBitfield, DataEncodeOpts,
 };
 
 pub const NODEINFO_APP: u32 = 4;
@@ -493,14 +493,13 @@ fn build_nodeinfo_frame(
     cipher[..plaintext.len()].copy_from_slice(&plaintext);
     encrypt_packet(key, from, packet_id as u64, &mut cipher[..plaintext.len()]);
 
-    let hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
     let header = PacketHeader::from_fields(
         to,
         from,
         packet_id,
         channel_hash,
-        hop,
-        hop,
+        hop_limit,
+        hop_limit,
         false,
         false,
         0,

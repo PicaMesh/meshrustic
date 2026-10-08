@@ -1675,8 +1675,8 @@ impl Router {
                 self.node_num,
                 packet_id,
                 0, // PKI frames use channel 0 on the air header
-                hop_limit.min(SR_BROADCAST_MAX_HOPS),
-                hop_limit.min(SR_BROADCAST_MAX_HOPS),
+                hop_limit,
+                hop_limit,
                 want_ack,
                 false,
                 next_hop,
@@ -3190,7 +3190,7 @@ impl Router {
         airtime_ms: u32,
     ) -> Option<RelayPlan> {
         let packet_id = self.alloc_tx_id(now_ms);
-        let mut hop = hop_limit.min(SR_BROADCAST_MAX_HOPS);
+        let mut hop = hop_limit;
         let mut next_hop = 0u8;
         if to != NODENUM_BROADCAST && self.graph.caps_last_hop(to) {
             hop = hop.min(LAST_HOP_BUDGET);
