@@ -7,7 +7,7 @@ use mesh_routing::{
 
 #[test]
 fn downstream_table_supports_full_capacity() {
-    assert_eq!(MAX_DOWNSTREAM, 1100);
+    assert_eq!(MAX_DOWNSTREAM, 900);
 }
 
 #[test]

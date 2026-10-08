@@ -130,6 +130,9 @@ fn rate_limited_packet_does_not_merge_topology() {
         .process_inbound(&inbound(&wire), 1_000)
         .expect("topology rx");
     assert!(result.rate_limited);
+    // Dropped before merge: listed peer must not enter the ball (Horizon promotes L1-listed
+    // hearsUs peers to L2; pre-Horizon this was a list-downstream row).
+    assert!(!router.graph_mut().has_graph_node(listed));
     assert_eq!(router.graph_mut().get_downstream_relay(listed, 1_000), None);
 
     let mut control = Router::with_modem_preset(our_node, "", MODEM_SHORT_SLOW, true, key, 3);
@@ -141,9 +144,9 @@ fn rate_limited_packet_does_not_merge_topology() {
         .process_inbound(&inbound(&control_wire), 1_000)
         .expect("unlimited topology rx");
     assert!(!control_result.rate_limited);
-    assert_eq!(
-        control.graph_mut().get_downstream_relay(listed, 1_000),
-        Some(attacker)
+    assert!(
+        control.graph_mut().has_graph_node(listed),
+        "unlimited topology must promote the listed hearsUs peer into the ball"
     );
 }
 
