@@ -1066,40 +1066,7 @@ impl Router {
             });
         }
 
-        if let Some((node_id, rssi, snr, is_new, hears_us)) = self.graph.observe_packet(
-            parsed.from,
-            parsed.hop_start,
-            parsed.hop_limit,
-            parsed.relay_node,
-            packet.rssi,
-            packet.snr,
-            now_ms,
-            packet.radio_id,
-            known_relay,
-            parsed.id,
-        ) {
-            if hears_us {
-                self.sr_log
-                    .push(SrLogEvent::RelayConfirmedHearsUs { node_id });
-            }
-            if is_new {
-                self.sr_log.push(SrLogEvent::DirectNeighbor {
-                    node_id,
-                    rssi,
-                    snr,
-                    is_new: true,
-                });
-                self.sr_log.push(SrLogEvent::TopologyChangedNewNeighbor {
-                    node_id,
-                    total: self.graph.neighbor_count(),
-                });
-                // The graph marked the topology dirty; the list goes out on the dirty schedule
-                // (once TOPOLOGY_DIRTY_MIN_MS has passed since our last broadcast, jittered).
-                // Sending a list the instant each neighbour appeared made peers treat every
-                // partial boot-time list as authoritative and clear hears_us on their edge to
-                // us; the empty boot broadcast already asks them for theirs.
-            }
-        }
+        self.observe_inbound_graph(&parsed, packet, now_ms, known_relay);
 
         if self.graph.is_active_routing_role() || direct {
             self.graph.update_node_activity(parsed.from, now_ms);
@@ -4459,6 +4426,57 @@ impl Router {
         );
     }
 
+    /// Graph / downstream learning shared by the first copy and later duplicates.
+    ///
+    /// A later copy may resolve a `hearsUs` neighbour that the first-heard relay byte could
+    /// not (placeholder / non-neighbour). Skipping observe on the dupe path left designated
+    /// unicasts with `NO_ROUTE` even after a usable copy arrived.
+    fn observe_inbound_graph(
+        &mut self,
+        parsed: &ParsedPacket,
+        packet: &InboundPacket<'_>,
+        now_ms: u32,
+        known_relay: Option<u32>,
+    ) {
+        if parsed.via_mqtt {
+            return;
+        }
+        if let Some((node_id, rssi, snr, is_new, hears_us)) = self.graph.observe_packet(
+            parsed.from,
+            parsed.hop_start,
+            parsed.hop_limit,
+            parsed.relay_node,
+            packet.rssi,
+            packet.snr,
+            now_ms,
+            packet.radio_id,
+            known_relay,
+            parsed.id,
+        ) {
+            if hears_us {
+                self.sr_log
+                    .push(SrLogEvent::RelayConfirmedHearsUs { node_id });
+            }
+            if is_new {
+                self.sr_log.push(SrLogEvent::DirectNeighbor {
+                    node_id,
+                    rssi,
+                    snr,
+                    is_new: true,
+                });
+                self.sr_log.push(SrLogEvent::TopologyChangedNewNeighbor {
+                    node_id,
+                    total: self.graph.neighbor_count(),
+                });
+                // The graph marked the topology dirty; the list goes out on the dirty schedule
+                // (once TOPOLOGY_DIRTY_MIN_MS has passed since our last broadcast, jittered).
+                // Sending a list the instant each neighbour appeared made peers treat every
+                // partial boot-time list as authoritative and clear hears_us on their edge to
+                // us; the empty boot broadcast already asks them for theirs.
+            }
+        }
+    }
+
     fn handle_duplicate_rx(
         &mut self,
         parsed: &ParsedPacket,
@@ -4470,6 +4488,27 @@ impl Router {
         if let Some(data) = decoded_data {
             self.maybe_cancel_relay_for_foreign_ack(parsed, data);
         }
+
+        // Still learn the graph: a later copy may name a hearsUs neighbour the first copy did
+        // not resolve (field: first RX via 0xf0 placeholder, later via FCM6).
+        let direct = is_direct_packet(
+            parsed.from,
+            parsed.hop_start,
+            parsed.hop_limit,
+            parsed.relay_node,
+        );
+        let known_relay = if !direct && parsed.relay_node != 0 {
+            Some(self.resolve_heard_from_node(
+                parsed.relay_node,
+                parsed.from,
+                packet.rssi,
+                packet.snr,
+                now_ms,
+            ))
+        } else {
+            None
+        };
+        self.observe_inbound_graph(parsed, packet, now_ms, known_relay);
 
         // A nominated follow-up ends only when that hop carries the packet. Upstream,
         // originator, and other peers leave it armed — coverage rank does not cancel it.
@@ -5517,6 +5556,92 @@ mod tests {
             .relay
             .is_none());
         assert!(router.poll_ready_relay(100).is_none());
+    }
+
+    #[test]
+    fn duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor() {
+        // First-heard via an unresolved relay byte parks nothing; a later duplicate via a
+        // hearsUs neighbour must still run observe and park a stock originator (Czar/Z005/
+        // FCM6 race: first RX often 0xf0, later 0x6c).
+        const ME: u32 = 0x63DC_8F8C;
+        const STOCK: u32 = 0x4F51_78DC;
+        const GATEWAY: u32 = 0x108A_EF6C;
+        const PACKET_ID: u32 = 0x91DB_7D3C;
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(ME));
+        router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
+        router
+            .graph_mut()
+            .observe_direct_neighbor(GATEWAY, -96, 7, 0, 0);
+        router
+            .graph_mut()
+            .edges_mut()
+            .set_edge_hears_us(ME, GATEWAY, true);
+
+        let first = encode_wire(
+            PacketHeader::from_fields(
+                NODENUM_BROADCAST,
+                STOCK,
+                PACKET_ID,
+                0,
+                5,
+                7,
+                false,
+                false,
+                0,
+                0xF0,
+            ),
+            &[1, 2, 3],
+        );
+        let _ = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -70,
+                    snr: 8,
+                    bytes: &first,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            router.graph_mut().get_downstream_relay(STOCK, 150),
+            None,
+            "unresolved relay must not invent a path"
+        );
+
+        let second = encode_wire(
+            PacketHeader::from_fields(
+                NODENUM_BROADCAST,
+                STOCK,
+                PACKET_ID,
+                0,
+                5,
+                7,
+                false,
+                false,
+                0,
+                (GATEWAY & 0xFF) as u8,
+            ),
+            &[1, 2, 3],
+        );
+        let dup = router
+            .process_inbound(
+                &InboundPacket {
+                    radio_id: 0,
+                    rssi: -96,
+                    snr: 7,
+                    bytes: &second,
+                },
+                200,
+            )
+            .unwrap();
+        assert!(dup.duplicate);
+        assert_eq!(
+            router.graph_mut().get_downstream_relay(STOCK, 250),
+            Some(GATEWAY),
+            "dupe via hearsUs neighbour must park the stock originator"
+        );
     }
 
     #[test]

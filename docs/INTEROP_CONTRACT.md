@@ -885,7 +885,10 @@ is actually waiting for.
   downstream parent without that list claim
   (`relayed_hearing_does_not_steal_an_existing_downstream_parent`). Hearing the originator via
   the relay is
-  the other direction, and a path we cannot send to is not a path. A copy of a packet **we**
+  the other direction, and a path we cannot send to is not a path. A **duplicate** copy still
+  runs the same observe: the first-heard relay byte may be an unresolved placeholder, while a
+  later copy names a real `hearsUs` neighbour (`duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor`).
+  A copy of a packet **we**
   transmitted
   teaches nothing: the peer relaying it got it from us, so recording the source as downstream of
   that peer invents a path back through ourselves, and the two nodes then name each other as next

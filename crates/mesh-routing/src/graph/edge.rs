@@ -367,13 +367,12 @@ impl EdgeStore {
             }
             return true;
         }
-        if (self.node_count as usize) >= super::MAX_GRAPH_NODES {
-            if self
+        if (self.node_count as usize) >= super::MAX_GRAPH_NODES
+            && self
                 .evict_for_capacity(now_ms, my_node, Some(downstream))
                 .is_none()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         let idx = self.node_count as usize;
         self.nodes[idx] = NodeEdges {
@@ -678,8 +677,8 @@ impl EdgeStore {
         let mut sp = 0usize;
         let mut id_at = [0u32; super::MAX_GRAPH_NODES];
         let ncount = self.node_count as usize;
-        for i in 0..ncount {
-            id_at[i] = self.nodes[i].node_id;
+        for (slot, node) in id_at.iter_mut().zip(self.nodes.iter()).take(ncount) {
+            *slot = node.node_id;
         }
         let idx_of = |id: u32, id_at: &[u32], ncount: usize| -> Option<usize> {
             (0..ncount).find(|&i| id_at[i] == id)
@@ -731,8 +730,7 @@ impl EdgeStore {
                 doomed_n += 1;
             }
         }
-        for d in 0..doomed_n {
-            let victim = doomed[d];
+        for &victim in doomed[..doomed_n].iter() {
             if let Some((parent, cost_fixed)) = self.pick_l1_parent(victim, my_node) {
                 self.apply_demotion(
                     my_node,
@@ -1122,7 +1120,7 @@ impl EdgeStore {
             let empty_unknown =
                 self.nodes[n as usize].edge_count == 0 && !we_hear_them && !classed_ball;
             if stale || empty_unknown {
-                if let Some(ds) = downstream.as_deref_mut() {
+                if let Some(ref mut ds) = downstream {
                     ds.clear_for_relay(node_id);
                 }
                 self.remove_node_edges_to(node_id);
@@ -1136,7 +1134,7 @@ impl EdgeStore {
             n += 1;
         }
         if changed {
-            if let Some(ds) = downstream.as_deref_mut() {
+            if let Some(ds) = downstream {
                 if self.prune_unreachable_from_root(my_node, now_ms, ds) {
                     changed = true;
                 }
