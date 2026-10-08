@@ -1023,11 +1023,7 @@ pub mod sr {
             } => {
                 let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
-                let branch = if last {
-                    b"[SR]   \\- "
-                } else {
-                    b"[SR]   +- "
-                };
+                let branch = if last { b"[SR]   \\- " } else { b"[SR]   +- " };
                 put(&mut line, &mut pos, branch);
                 put(&mut line, &mut pos, horizon_class_tag(class));
                 put(&mut line, &mut pos, b"!");
