@@ -10,8 +10,8 @@ pub use downstream::{
     ChainEgress, DownstreamEntry, DownstreamTable, MAX_DOWNSTREAM, MAX_DOWNSTREAM_CHAIN,
 };
 pub use edge::{
-    Edge, EdgeSource, EdgeStore, NodeEdges, EDGE_NEW, EDGE_NO_CHANGE, EDGE_SIGNIFICANT_CHANGE,
-    MAX_EDGES_PER_NODE,
+    Edge, EdgeSource, EdgeStore, NodeClass, NodeEdges, PendingDemotion, EDGE_NEW, EDGE_NO_CHANGE,
+    EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
 pub use etx::{calculate_etx, etx_to_fixed, etx_to_signal, fixed_to_etx, EtxFixed};
 pub use placeholder::{
@@ -21,9 +21,13 @@ pub use route::{
     acknowledgement_price_fixed, calculate_route, can_deliver, coverage_owner, covers,
     delivery_hop_cost_fixed, find_better_positioned_neighbor, has_strong_delivery_hop,
     has_strong_hop_to, hop_cost_fixed, is_node_routable, is_silent_publisher, known_to_hear,
-    publishes_topology, verified_connectivity, RoutableFilter, Route, RouteCache,
+    publishes_topology, verified_connectivity, RoutableFilter, Route, RouteCache, RouteMode,
     COVERAGE_ETX_CEILING_FIXED, MAX_CACHED_ROUTES, OWNER_COST_BUCKET_FIXED, ROUTE_CACHE_TIMEOUT_MS,
     UNVERIFIED_HOP_COST_FACTOR,
 };
 
 pub const MAX_GRAPH_NODES: usize = 40;
+
+/// How deep the priced edge ball grows: 2 = L0+L1+L2; 3 also admits L3 publishers.
+/// See `docs/GRAPH_HORIZON_PLAN.md` §8.5 / Phase 6.
+pub const GRAPH_MAX_DEPTH: u8 = 3;

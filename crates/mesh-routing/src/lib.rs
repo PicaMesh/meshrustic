@@ -73,9 +73,10 @@ pub use graph::{
     calculate_etx, calculate_route, can_deliver, covers, delivery_hop_cost_fixed, etx_to_fixed,
     etx_to_signal, find_better_positioned_neighbor, fixed_to_etx, get_placeholder_for_relay,
     hop_cost_fixed, is_node_routable, is_placeholder_node, known_to_hear, placeholder_node_id,
-    publishes_topology, verified_connectivity, DownstreamTable, EdgeSource, RoutableFilter, Route,
-    RouteCache, COVERAGE_ETX_CEILING_FIXED, MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE,
-    PLACEHOLDER_NODE_PREFIX, UNVERIFIED_HOP_COST_FACTOR,
+    publishes_topology, verified_connectivity, DownstreamTable, EdgeSource, NodeClass,
+    RoutableFilter, Route, RouteCache, RouteMode, COVERAGE_ETX_CEILING_FIXED, GRAPH_MAX_DEPTH,
+    MAX_CACHED_ROUTES, MAX_DOWNSTREAM, MAX_EDGES_PER_NODE, PLACEHOLDER_NODE_PREFIX,
+    UNVERIFIED_HOP_COST_FACTOR,
 };
 pub use hop_health::{
     HopHealth, HopHealthEvent, HOP_HEALTH_SUSPECT_MISSES, HOP_HEALTH_SUSPECT_TTL_MS,

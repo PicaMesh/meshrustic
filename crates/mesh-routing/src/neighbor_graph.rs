@@ -8,8 +8,8 @@ use crate::coordinated_relay::slot_tie_break_ms;
 use crate::graph::{
     calculate_etx, calculate_route, find_better_positioned_neighbor, is_node_routable,
     is_placeholder_node, placeholder_node_id, verified_connectivity, DownstreamTable, EdgeSource,
-    EdgeStore, RoutableFilter, Route, RouteCache, EDGE_NEW, EDGE_SIGNIFICANT_CHANGE,
-    MAX_EDGES_PER_NODE,
+    EdgeStore, NodeClass, RoutableFilter, Route, RouteCache, EDGE_NEW, EDGE_SIGNIFICANT_CHANGE,
+    GRAPH_MAX_DEPTH, MAX_EDGES_PER_NODE,
 };
 use crate::hop_health::{HopHealth, HopHealthEvent};
 use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE};
@@ -1110,25 +1110,25 @@ impl NeighborGraph {
                 let swap = {
                     let a = out[i];
                     let b = out[j];
-                    let a_edge = self
-                        .edges
-                        .find_node(self.my_node)
-                        .and_then(|node| node.find_edge(a.node_id));
-                    let b_edge = self
-                        .edges
-                        .find_node(self.my_node)
-                        .and_then(|node| node.find_edge(b.node_id));
-                    let a_reported = a_edge
-                        .map(|e| e.source == EdgeSource::Reported)
-                        .unwrap_or(false);
-                    let b_reported = b_edge
-                        .map(|e| e.source == EdgeSource::Reported)
-                        .unwrap_or(false);
-                    if a_reported != b_reported {
-                        b_reported
+                    // Pack order: hearsUs, then SR-active, then lower ETX. Hubs with dense RF
+                    // neighbourhoods otherwise drop SR parents that still hear them (FCM6/Czar).
+                    if a.hears_us != b.hears_us {
+                        b.hears_us
+                    } else if a.signal_routing_active != b.signal_routing_active {
+                        b.signal_routing_active
                     } else {
-                        let a_etx = a_edge.map(|e| e.etx()).unwrap_or(f32::MAX);
-                        let b_etx = b_edge.map(|e| e.etx()).unwrap_or(f32::MAX);
+                        let a_etx = self
+                            .edges
+                            .find_node(self.my_node)
+                            .and_then(|node| node.find_edge(a.node_id))
+                            .map(|e| e.etx())
+                            .unwrap_or(f32::MAX);
+                        let b_etx = self
+                            .edges
+                            .find_node(self.my_node)
+                            .and_then(|node| node.find_edge(b.node_id))
+                            .map(|e| e.etx())
+                            .unwrap_or(f32::MAX);
                         b_etx < a_etx
                     }
                 };
@@ -1298,6 +1298,68 @@ impl NeighborGraph {
         // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
         // last hop to them from a stale list after they moved behind a relay.
         let sender_is_direct = self.edges.has_direct_reported_edge_to(self.my_node, sender);
+        // Horizon: accept topology when the sender is an RF neighbour, we heard this frame
+        // directly from them, they already sit in the ball, their list names an L1, or a ball
+        // node already points at them (§6.2). Relayed frames need one of the non-direct gates.
+        let sender_horizon_ok = sender_is_direct
+            || is_direct_from_sender
+            || self.edges.find_node(sender).is_some()
+            || self.edges.reachable_via_neighbor(sender)
+            || self.edges.node_class(sender).is_some_and(|c| {
+                matches!(c, NodeClass::L2 | NodeClass::L3)
+            })
+            || self.list_names_horizon_anchor(neighbors);
+        if !sender_horizon_ok && self.is_active_routing_role() {
+            // Still track capability, but do not grow edges from an unqualified far publisher.
+            return TopologyMergeResult::Applied {
+                neighbors: 0,
+                topo_v: received,
+            };
+        }
+        // When admitting a non-direct sender, prefer L3 if they already classify that deep.
+        if !sender_is_direct && sender_horizon_ok {
+            let parent = self
+                .edges
+                .find_node(sender)
+                .map(|n| n.parent_hint)
+                .filter(|&p| p != 0)
+                .or_else(|| {
+                    neighbors.iter().find_map(|n| {
+                        self.edges.node_class(n.node_id).and_then(|c| match c {
+                            NodeClass::L2 if GRAPH_MAX_DEPTH >= 3 => Some(n.node_id),
+                            NodeClass::L1 => Some(n.node_id),
+                            _ => None,
+                        })
+                    })
+                })
+                .unwrap_or(0);
+            let class = self.edges.classify_candidate(sender, self.my_node);
+            let class = if class == NodeClass::Unknown {
+                if GRAPH_MAX_DEPTH >= 3
+                    && neighbors.iter().any(|n| {
+                        self.edges
+                            .node_class(n.node_id)
+                            .is_some_and(|c| c == NodeClass::L2)
+                    })
+                {
+                    NodeClass::L3
+                } else {
+                    NodeClass::L2
+                }
+            } else {
+                class
+            };
+            if EdgeStore::class_within_depth(class) && class != NodeClass::Unknown {
+                let _ = self.edges.ensure_publisher(
+                    sender,
+                    class,
+                    parent,
+                    now_ms,
+                    self.my_node,
+                    &mut self.downstream,
+                );
+            }
+        }
         let passive_local = !self.is_active_routing_role();
         for neighbor in neighbors {
             if neighbor.node_id == 0 || (neighbor.node_id & 0xFF00_0000) == 0xFF00_0000 {
@@ -1364,20 +1426,35 @@ impl NeighborGraph {
                     self.downstream.clear_for_destination(neighbor.node_id);
                 }
             } else if neighbor.hears_us {
-                let via_radio = self.edges.relay_heard_on(self.my_node, sender);
-                self.downstream.update(
-                    self.my_node,
-                    neighbor.node_id,
+                // Prefer admitting into the edge ball when depth allows (L1 lists L2 with
+                // hearsUs, or L2 lists L3). Otherwise park as list-downstream of the sender.
+                let admitted = self.try_admit_listed_publisher(
                     sender,
-                    etx,
+                    neighbor.node_id,
+                    sender_is_direct,
                     now_ms,
-                    relay_has_edge,
-                    via_radio,
                 );
+                if admitted {
+                    self.downstream.clear_for_destination(neighbor.node_id);
+                } else {
+                    let via_radio = self.edges.relay_heard_on(self.my_node, sender);
+                    self.downstream.update_listed(
+                        self.my_node,
+                        neighbor.node_id,
+                        sender,
+                        etx,
+                        now_ms,
+                        relay_has_edge,
+                        via_radio,
+                    );
+                }
             } else if neighbor.node_id != self.my_node {
                 self.record_merge_asymmetric_skip(sender, neighbor.node_id);
             }
         }
+
+        self.edges
+            .flush_pending_demotion(self.my_node, now_ms, &mut self.downstream);
 
         // The sender is authoritative about who it hears: a neighbour it does not list has its
         // hears_us towards the sender cleared. That needs the complete list, so chunks of a
@@ -1417,6 +1494,11 @@ impl NeighborGraph {
                     // still counted 22 minutes later, and only on one of two colocated nodes).
                     if self.edges.retain_listed_edges(sender, &listed[..count]) {
                         self.route_cache.clear();
+                        let _ = self.edges.prune_unreachable_from_root(
+                            self.my_node,
+                            now_ms,
+                            &mut self.downstream,
+                        );
                     }
                 }
                 self.pending_listed[slot].valid = false;
@@ -1439,6 +1521,67 @@ impl NeighborGraph {
         }
         self.merge_asymmetric_skips[count] = (sender, destination);
         self.merge_asymmetric_skip_count += 1;
+    }
+
+    /// True when this topology list names an L1 we hear, or an L2 already in the ball
+    /// (enough to qualify an L3 sender under §6.2).
+    fn list_names_horizon_anchor(&self, neighbors: &[PackedNeighbor]) -> bool {
+        for n in neighbors {
+            if self
+                .edges
+                .has_direct_reported_edge_to(self.my_node, n.node_id)
+            {
+                return true;
+            }
+            if self
+                .edges
+                .node_class(n.node_id)
+                .is_some_and(|c| matches!(c, NodeClass::L1 | NodeClass::L2))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Admit a listed non-neighbour into the edge ball when horizon depth allows.
+    /// L1 listing X with hearsUs → L2; L2 listing X with hearsUs → L3 if depth≥3.
+    fn try_admit_listed_publisher(
+        &mut self,
+        sender: u32,
+        listed: u32,
+        sender_is_direct: bool,
+        now_ms: u32,
+    ) -> bool {
+        if listed == 0 || listed == self.my_node {
+            return false;
+        }
+        if self.edges.has_direct_reported_edge_to(self.my_node, listed) {
+            return true;
+        }
+        let (class, parent) = if sender_is_direct {
+            (NodeClass::L2, sender)
+        } else if self
+            .edges
+            .node_class(sender)
+            .is_some_and(|c| c == NodeClass::L2)
+            && GRAPH_MAX_DEPTH >= 3
+        {
+            (NodeClass::L3, sender)
+        } else {
+            return false;
+        };
+        if !EdgeStore::class_within_depth(class) {
+            return false;
+        }
+        self.edges.ensure_publisher(
+            listed,
+            class,
+            parent,
+            now_ms,
+            self.my_node,
+            &mut self.downstream,
+        )
     }
 
     pub fn drain_merge_asymmetric_skips(&mut self) -> impl Iterator<Item = (u32, u32)> + '_ {
@@ -1852,7 +1995,15 @@ impl NeighborGraph {
         // Multi-hop publisher that was never our neighbour: skip — Dijkstra on their (and their
         // peers') lists is the multi-hop TX path; a forwarded copy is not.
         let infer_downstream = was_direct_neighbor || single_hop || !source_publishes;
-        if active_routing && can_infer_downstream && infer_downstream {
+        let dest_in_ball = self.edges.find_node(from).is_some();
+        let list_parked = self
+            .downstream
+            .list_downstream(from, now_ms, NEIGHBOR_TTL_MS)
+            .is_some_and(|(m, _)| self.edges.find_node(m).is_some());
+        // Ball / list-downstream stay; a travelling former neighbour still parks behind the
+        // hop we heard so unicasts do not keep the dead last hop.
+        let steal_ok = was_direct_neighbor || (!dest_in_ball && !list_parked);
+        if active_routing && can_infer_downstream && infer_downstream && steal_ok {
             if was_direct_neighbor {
                 // Write even when the relayer already published an edge to them: they still
                 // have to sit behind the hop we heard, not as our last hop.
@@ -2036,12 +2187,26 @@ impl NeighborGraph {
     /// only through a relayer, so Dijkstra stops treating them as a last hop. Returns true if
     /// our edge to them existed.
     fn retract_direct_link(&mut self, neighbor: u32) -> bool {
+        self.retract_direct_link_inner(neighbor, true)
+    }
+
+    /// Drop our measured link to `neighbor` and their edge back to us. When `cascade` is true,
+    /// also prune ball publishers that became unreachable (single retract). Batch silence
+    /// retracts set `cascade` false and prune once after the whole batch.
+    fn retract_direct_link_inner(&mut self, neighbor: u32, cascade: bool) -> bool {
         if neighbor == 0 || neighbor == self.my_node {
             return false;
         }
         let removed = self.edges.remove_edge(self.my_node, neighbor);
         self.edges.remove_edge(neighbor, self.my_node);
         if removed {
+            if cascade {
+                let _ = self.edges.prune_unreachable_from_root(
+                    self.my_node,
+                    0,
+                    &mut self.downstream,
+                );
+            }
             self.route_cache.clear();
         }
         removed
@@ -2734,7 +2899,10 @@ impl NeighborGraph {
         for &node_id in &gone[..count] {
             // Only our own claim of a direct link goes. The node itself stays: a peer that still
             // hears it keeps it reachable, and a unicast for it must still find that route.
-            self.retract_direct_link(node_id);
+            // Do not run the reachability cascade here — retracting every silent L1 in one pass
+            // would orphan the peer-connected component (GW↔PUB) and erase publishers the
+            // silence rule deliberately keeps.
+            self.retract_direct_link_inner(node_id, false);
             self.downstream.clear_for_destination(node_id);
         }
         count > 0
@@ -5028,7 +5196,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_topology_still_learns_downstream_for_nodes_we_do_not_hear() {
+    fn merge_topology_admits_l2_for_listed_nodes_we_do_not_hear() {
         const ME: u32 = 0xAA00_00AA;
         const PEER: u32 = 0xBB00_00BB;
         const REMOTE: u32 = 0xDD00_00DD;
@@ -5050,7 +5218,218 @@ mod tests {
         let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
         let result = graph.merge_topology(PEER, &header, &[listed], true, 200, 0);
         assert!(matches!(result, TopologyMergeResult::Applied { .. }));
-        assert_eq!(graph.get_downstream_relay(REMOTE, 200), Some(PEER));
+        // Horizon: L1 listing REMOTE with hearsUs admits REMOTE as an L2 publisher.
+        assert!(graph.edges().find_node(REMOTE).is_some());
+        assert_eq!(
+            graph.edges().node_class(REMOTE),
+            Some(crate::graph::NodeClass::L2)
+        );
+        assert!(graph.get_downstream_relay(REMOTE, 200).is_none());
+    }
+
+    #[test]
+    fn merge_topology_admits_l3_from_l2_list() {
+        const ME: u32 = 0xAA00_00AA;
+        const L1: u32 = 0xBB00_00BB;
+        const L2: u32 = 0xCC00_00CC;
+        const L3: u32 = 0xDD00_00DD;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(L1, -70, 8, 100, 0);
+        let nb = |id: u32| PackedNeighbor {
+            node_id: id,
+            rssi: -75,
+            snr: 7,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L1, &h1, &[nb(L2)], true, 200, 0);
+        assert_eq!(
+            graph.edges().node_class(L2),
+            Some(crate::graph::NodeClass::L2)
+        );
+        write_packed_header(&mut packed, 2, true);
+        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L2, &h2, &[nb(L1), nb(L3)], false, 300, 0);
+        assert_eq!(
+            graph.edges().node_class(L3),
+            Some(crate::graph::NodeClass::L3)
+        );
+        assert!(graph.get_downstream_relay(L3, 300).is_none());
+    }
+
+    #[test]
+    fn topology_pack_prefers_hears_us_and_sr_over_better_etx() {
+        const ME: u32 = 0xAA00_00AA;
+        const STRONG_MUTE: u32 = 0xB100_0001; // strong ETX, no hearsUs, not SR
+        const MID_HEARS: u32 = 0xB200_0002; // mid ETX, hearsUs, not SR
+        const WEAK_SR: u32 = 0xB300_0003; // weak ETX, hearsUs, SR-active (the parent we must keep)
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(STRONG_MUTE, -50, 12, 100, 0);
+        graph.observe_direct_neighbor(MID_HEARS, -70, 8, 100, 0);
+        graph.observe_direct_neighbor(WEAK_SR, -90, 2, 100, 0);
+        graph.confirm_direct_neighbor_hears_us(MID_HEARS);
+        graph.confirm_direct_neighbor_hears_us(WEAK_SR);
+        graph
+            .capability_mut()
+            .track_topology(WEAK_SR, true, 100);
+        // STRONG_MUTE and MID_HEARS stay Unknown/Legacy (not SR-active).
+
+        let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
+        let n = graph.topology_neighbors_for_pack(&mut entries);
+        assert_eq!(n, 3);
+        assert_eq!(
+            entries[0].node_id, WEAK_SR,
+            "hearsUs+SR must pack before stronger non-SR links"
+        );
+        assert_eq!(entries[1].node_id, MID_HEARS);
+        assert_eq!(entries[2].node_id, STRONG_MUTE);
+    }
+
+    #[test]
+    fn merge_topology_parks_past_depth_as_list_downstream() {
+        const ME: u32 = 0xAA00_00AA;
+        const L1: u32 = 0xBB00_00BB;
+        const L2: u32 = 0xCC00_00CC;
+        const L3: u32 = 0xDD00_00DD;
+        const Y: u32 = 0xEE00_00EE;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(L1, -70, 8, 100, 0);
+        let nb = |id: u32| PackedNeighbor {
+            node_id: id,
+            rssi: -75,
+            snr: 7,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L1, &header, &[nb(L2)], true, 200, 0);
+        assert_eq!(
+            graph.edges().node_class(L2),
+            Some(crate::graph::NodeClass::L2)
+        );
+        write_packed_header(&mut packed, 2, true);
+        let (header2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L2, &header2, &[nb(L1), nb(L3)], false, 300, 0);
+        assert_eq!(
+            graph.edges().node_class(L3),
+            Some(crate::graph::NodeClass::L3)
+        );
+        // L3 lists Y with hearsUs: depth=3 ⇒ list-downstream of L3, not a publisher.
+        write_packed_header(&mut packed, 3, true);
+        let (header3, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L3, &header3, &[nb(L2), nb(Y)], false, 400, 0);
+        assert!(graph.edges().find_node(Y).is_none());
+        assert_eq!(graph.get_downstream_relay(Y, 400), Some(L3));
+    }
+
+    #[test]
+    fn route_to_list_downstream_behind_l3_sums_ball_path() {
+        const ME: u32 = 0xAA00_00AA;
+        const L1: u32 = 0xBB00_00BB;
+        const L2: u32 = 0xCC00_00CC;
+        const L3: u32 = 0xDD00_00DD;
+        const Y: u32 = 0xEE00_00EE;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(L1, -50, 10, 100, 0);
+        let nb = |id: u32, rssi: i8| PackedNeighbor {
+            node_id: id,
+            rssi,
+            snr: 8,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        // L1 must list us so retain_listed keeps L1→ME and strict Dijkstra can leave L1 toward us.
+        write_packed_header(&mut packed, 1, true);
+        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L1, &h1, &[nb(ME, -50), nb(L2, -60)], true, 200, 0);
+        write_packed_header(&mut packed, 2, true);
+        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L2, &h2, &[nb(L1, -55), nb(L3, -65)], false, 300, 0);
+        write_packed_header(&mut packed, 3, true);
+        let (h3, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L3, &h3, &[nb(L2, -60), nb(Y, -80)], false, 400, 0);
+
+        assert_eq!(graph.get_downstream_relay(Y, 500), Some(L3));
+        let route = graph.get_route(Y, 500);
+        assert_eq!(route.next_hop, L1);
+        assert!(route.verified);
+        assert_eq!(route.mode, crate::graph::RouteMode::ListDownstream);
+        assert!(route.hops >= 2, "at least L1…L3 plus last hop");
+    }
+
+    #[test]
+    fn relayed_originator_is_orphan_gateway_not_verified_list() {
+        const ME: u32 = 0xAA00_00AA;
+        const GW: u32 = 0xBB00_00BB;
+        const FAR: u32 = 0xCC00_00CC;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(GW, -70, 8, 100, 0);
+        graph.confirm_direct_neighbor_hears_us(GW);
+        graph.observe_packet(FAR, 1, 0, (GW & 0xFF) as u8, -70, 8, 200, 0, Some(GW), 9);
+        assert!(graph.edges().find_node(FAR).is_none());
+        assert_eq!(graph.get_downstream_relay(FAR, 200), Some(GW));
+        let route = graph.get_route(FAR, 200);
+        assert_eq!(route.next_hop, GW);
+        assert!(!route.verified);
+        assert_eq!(route.mode, crate::graph::RouteMode::OrphanGateway);
+    }
+
+    #[test]
+    fn relayed_copy_does_not_steal_list_downstream() {
+        const ME: u32 = 0xAA00_00AA;
+        const L1: u32 = 0xBB00_00BB;
+        const L2: u32 = 0xCC00_00CC;
+        const L3: u32 = 0xDD00_00DD;
+        const Y: u32 = 0xEE00_00EE;
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(ME);
+        graph.set_device_role(DEVICE_ROLE_ROUTER);
+        graph.observe_direct_neighbor(L1, -70, 8, 100, 0);
+        graph.confirm_direct_neighbor_hears_us(L1);
+        let nb = |id: u32| PackedNeighbor {
+            node_id: id,
+            rssi: -75,
+            snr: 7,
+            signal_routing_active: true,
+            hears_us: true,
+            etx_variance: 0,
+        };
+        let mut packed = [0u8; 16];
+        write_packed_header(&mut packed, 1, true);
+        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L1, &h1, &[nb(L2)], true, 200, 0);
+        write_packed_header(&mut packed, 2, true);
+        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L2, &h2, &[nb(L1), nb(L3)], false, 300, 0);
+        write_packed_header(&mut packed, 3, true);
+        let (h3, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        graph.merge_topology(L3, &h3, &[nb(L2), nb(Y)], false, 400, 0);
+        assert_eq!(graph.get_downstream_relay(Y, 400), Some(L3));
+        graph.observe_packet(Y, 1, 0, (L1 & 0xFF) as u8, -70, 8, 500, 0, Some(L1), 11);
+        assert_eq!(
+            graph.get_downstream_relay(Y, 500),
+            Some(L3),
+            "a relayed copy must not orphan-steal a list-downstream dest"
+        );
     }
 
     const COV_ME: u32 = 0x1000_0001;
@@ -5435,3 +5814,4 @@ mod tests {
         assert_eq!(graph.neighbor_count(), 1);
     }
 }
+

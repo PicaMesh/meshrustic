@@ -41,6 +41,17 @@ pub fn is_node_routable(filter: &RoutableFilter<'_>, node_id: u32) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RouteMode {
+    /// Destination priced inside the edge ball (Dijkstra).
+    #[default]
+    Ball = 0,
+    /// Destination is list-downstream of a ball publisher M: Dijkstra to M + M→Y cost.
+    ListDownstream = 1,
+    /// Destination only known via a relayed gateway; hand off, no Dijkstra to dest.
+    OrphanGateway = 2,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Route {
     pub destination: u32,
     pub next_hop: u32,
@@ -52,9 +63,11 @@ pub struct Route {
     pub hops: u8,
     /// Every hop is priced from the receiver's own measurement. False for the inbound-gateway
     /// fallback (a hop into a publisher that has not published a measurement of the sender, taken
-    /// at `UNVERIFIED_HOP_COST_FACTOR` times the sender's reverse cost) and for downstream-table
-    /// routes.
+    /// at `UNVERIFIED_HOP_COST_FACTOR` times the sender's reverse cost) and for orphan-gateway
+    /// routes. True for strict ball paths and for list-downstream when the path to M is strict
+    /// and M→Y was learned with `hears_us`.
     pub verified: bool,
+    pub mode: RouteMode,
 }
 
 /// Cost factor of an unconfirmed hop in the fallback search: the receiver never listed the
@@ -96,6 +109,7 @@ impl RouteCache {
                     timestamp_ms: 0,
                     hops: 0,
                     verified: true,
+                    mode: RouteMode::Ball,
                 },
             }; MAX_CACHED_ROUTES],
             count: 0,
@@ -437,6 +451,11 @@ pub fn coverage_owner(
         if candidate == target || is_placeholder_node(candidate) {
             continue;
         }
+        // Ownership is who on *this* RF copy can carry the neighbour. L2/L3 publishers
+        // in the edge ball are not candidates: they did not hear this transmission.
+        if candidate != me && !edges.has_direct_reported_edge_to(me, candidate) {
+            continue;
+        }
         // Only what it measured itself: an edge to the target is the evidence that it hears it,
         // and for a stock node the only way that edge exists is us watching it carry the traffic.
         let Some(edge) = edges
@@ -707,12 +726,49 @@ fn backward_search(
 /// and a confirmed hop is priced at its receiver.
 /// Intermediate hops must pass `is_node_routable`; the destination and we ourselves need not.
 ///
-/// When no path priced from receiver measurements exists, the downstream table is walked from
-/// dest until a neighbour we hear (any depth; dest need not be that parent's RF neighbour), then
-/// the inbound-gateway fallback: the same search with reverse-only hops into a publisher allowed
-/// at a penalty, so the node that hears the far side still carries the frame out (a one-way edge
-/// is usually a marginal link or a truncated list, not silence). Such a route is marked
-/// unverified.
+/// Dijkstra to ball parent `m`, then add `hop_cost` for the last hop M→dest.
+/// Used for DownstreamTable rows and for `parent_hint` when Ball cannot price the dest.
+fn try_compose_via_parent(
+    edges: &EdgeStore,
+    my_node: u32,
+    parent: u32,
+    hop_cost: u16,
+    now_ms: u32,
+    routable: Option<&RoutableFilter<'_>>,
+    verified: bool,
+    result: &mut Route,
+) -> bool {
+    if edges.find_node(parent).is_none() {
+        return false;
+    }
+    let Some((cost_to_m, next_hop, hops)) =
+        backward_search(edges, my_node, parent, now_ms, routable, false)
+    else {
+        return false;
+    };
+    if next_hop == 0 || cost_to_m >= 0xFFF0 {
+        return false;
+    }
+    result.next_hop = next_hop;
+    result.cost_fixed = cost_to_m.saturating_add(hop_cost);
+    result.hops = hops.saturating_add(1);
+    result.verified = verified;
+    result.mode = RouteMode::ListDownstream;
+    result.egress_radio = edges
+        .find_node(my_node)
+        .and_then(|n| n.find_edge(next_hop))
+        .map(|e| e.heard_on)
+        .unwrap_or(0);
+    true
+}
+
+/// When no path priced from receiver measurements exists, list-downstream behind a ball parent
+/// is composed (Dijkstra to M + M→Y), then the same compose via a ball publisher's `parent_hint`
+/// when the dest sits in the edge ball but no longer lists that parent (hub packed-list churn),
+/// then orphan gateway handoff (no Dijkstra to the dest), then the inbound-gateway fallback: the
+/// same search with reverse-only hops into a publisher allowed at a penalty, so the node that
+/// hears the far side still carries the frame out (a one-way edge is usually a marginal link or a
+/// truncated list, not silence). Such a route is marked unverified.
 pub fn calculate_route(
     edges: &EdgeStore,
     downstream: &DownstreamTable,
@@ -731,18 +787,32 @@ pub fn calculate_route(
         // Nothing is a confirmed path until the strict search says so: an empty route must not
         // claim verification, or a caller reading this flag believes a guess.
         verified: false,
+        mode: RouteMode::Ball,
     };
     if my_node == 0 || destination == 0 || destination == my_node {
         return result;
     }
 
-    if let Some((cost, next_hop, hops)) =
-        backward_search(edges, my_node, destination, now_ms, routable, false)
-    {
-        result.cost_fixed = cost;
-        result.next_hop = next_hop;
-        result.hops = hops;
-        result.verified = true;
+    let dest_in_ball = edges.find_node(destination).is_some();
+    let list_ds = downstream.list_downstream(destination, now_ms, u32::MAX);
+    let ds_relay = downstream.get_relay(destination, now_ms, u32::MAX);
+    let skip_dijkstra_to_dest = list_ds
+        .map(|(m, _)| m)
+        .or(ds_relay)
+        .is_some_and(|m| edges.find_node(m).is_some());
+
+    // Mode 1: destination is a ball publisher — or a leaf we can still price on ball edges when
+    // it is not parked behind a ball parent (list-downstream and orphans skip Dijkstra to dest).
+    if dest_in_ball || !skip_dijkstra_to_dest {
+        if let Some((cost, next_hop, hops)) =
+            backward_search(edges, my_node, destination, now_ms, routable, false)
+        {
+            result.cost_fixed = cost;
+            result.next_hop = next_hop;
+            result.hops = hops;
+            result.verified = true;
+            result.mode = RouteMode::Ball;
+        }
     }
 
     if result.next_hop != 0 {
@@ -751,8 +821,55 @@ pub fn calculate_route(
             .and_then(|n| n.find_edge(result.next_hop))
             .map(|e| e.heard_on)
             .unwrap_or(0);
+        return result;
     }
 
+    // Mode 2: list-downstream of ball node M (topology + hearsUs) — Dijkstra to M, add M→Y cost.
+    if let Some((m, hop_cost)) = list_ds {
+        if try_compose_via_parent(
+            edges,
+            my_node,
+            m,
+            hop_cost,
+            now_ms,
+            routable,
+            true,
+            &mut result,
+        ) {
+            return result;
+        }
+    }
+
+    // Mode 2b: ball dest whose packed list no longer names its admit parent — compose via
+    // parent_hint and the parent's measured edge to the dest (same math as list-downstream).
+    if result.next_hop == 0 {
+        let parent_hint = edges
+            .find_node(destination)
+            .map(|n| n.parent_hint)
+            .unwrap_or(0);
+        if parent_hint != 0 && parent_hint != destination && parent_hint != my_node {
+            if let Some(edge) = edges
+                .find_node(parent_hint)
+                .and_then(|n| n.find_edge(destination))
+                .filter(|e| e.source.is_measured())
+            {
+                if try_compose_via_parent(
+                    edges,
+                    my_node,
+                    parent_hint,
+                    edge.etx_fixed,
+                    now_ms,
+                    routable,
+                    edge.hears_us,
+                    &mut result,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
+
+    // Mode 3: orphan gateway handoff — no Dijkstra toward the destination.
     if result.next_hop == 0 {
         let my_edges = edges.find_node(my_node);
         let is_egress = |n: u32| {
@@ -770,10 +887,13 @@ pub fn calculate_route(
                 result.next_hop = chain.node;
                 result.cost_fixed = cost_to_egress.saturating_add(chain.cost_fixed);
                 result.verified = false;
+                result.mode = RouteMode::OrphanGateway;
+                result.hops = chain.hops;
                 result.egress_radio = my_edges
                     .and_then(|n| n.find_edge(chain.node))
                     .map(|e| e.heard_on)
                     .unwrap_or(0);
+                return result;
             }
         }
     }
@@ -786,6 +906,7 @@ pub fn calculate_route(
             result.next_hop = next_hop;
             result.hops = hops;
             result.verified = false;
+            result.mode = RouteMode::Ball;
             result.egress_radio = edges
                 .find_node(my_node)
                 .and_then(|n| n.find_edge(next_hop))
@@ -891,7 +1012,7 @@ pub fn find_better_positioned_neighbor(
 mod tests {
     use super::*;
     use crate::capability::CapabilityCache;
-    use crate::graph::{DownstreamTable, EdgeSource, EdgeStore};
+    use crate::graph::{DownstreamTable, EdgeSource, EdgeStore, NodeClass};
     use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE};
 
     #[test]
@@ -996,6 +1117,89 @@ mod tests {
         assert_eq!(
             calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
             DEST
+        );
+    }
+
+    /// Asymmetric L1: we hear A but A does not hear us. A hears B (L2); we reach B through C (L1).
+    /// The ball stores that picture; the route to A is via C→B→A at receiver prices — not our
+    /// one-way RX of A.
+    #[test]
+    fn asymmetric_l1_routes_via_l2_hearer_not_our_rx() {
+        const ME: u32 = 0xAA00_00AA;
+        const A: u32 = 0xA100_00A1;
+        const B: u32 = 0xB200_00B2;
+        const C: u32 = 0xC300_00C3;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        // We hear A (L1); A never confirms us.
+        edges.update_edge(ME, ME, A, 1.5, 0, EdgeSource::Reported, true, 0);
+        assert!(
+            !edges
+                .find_node(ME)
+                .and_then(|n| n.find_edge(A))
+                .is_some_and(|e| e.hears_us),
+            "premise: A does not hear us"
+        );
+        // Path to B via C: we hear C; C lists B with hearsUs → B is L2.
+        edges.update_edge(ME, ME, C, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_edge_hears_us(ME, C, true);
+        edges.update_edge(ME, C, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, C, B, 1.5, 0, EdgeSource::Mirrored, true, 0);
+        edges.set_edge_hears_us(C, B, true);
+        assert!(edges.ensure_publisher(
+            B,
+            NodeClass::L2,
+            C,
+            0,
+            ME,
+            &mut DownstreamTable::new(),
+        ));
+        // B's measurement of C prices C→B; A's measurement of B prices B→A.
+        edges.update_edge(ME, B, C, 1.2, 0, EdgeSource::Mirrored, true, 0);
+        edges.update_edge(ME, A, B, 2.0, 0, EdgeSource::Mirrored, true, 0);
+
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(A, true, 0);
+        capability.track_topology(B, true, 0);
+        capability.track_topology(C, true, 0);
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: DEVICE_ROLE_CLIENT,
+            excluded: &[],
+        };
+        let downstream = DownstreamTable::new();
+
+        assert!(
+            edges.find_node(ME).and_then(|n| n.find_edge(A)).is_some(),
+            "graph stores our RX of A"
+        );
+        assert!(
+            edges.find_node(A).and_then(|n| n.find_edge(B)).is_some(),
+            "graph stores A hearing B"
+        );
+        assert_eq!(
+            edges.node_class(B),
+            Some(NodeClass::L2),
+            "B sits in the L2 ball via C"
+        );
+        assert!(
+            !can_deliver(&edges, Some(&capability), ME, A),
+            "one-way RX is not a delivery hop into a publishing A"
+        );
+        assert!(can_deliver(&edges, Some(&capability), B, A));
+        assert!(can_deliver(&edges, Some(&capability), C, B));
+
+        let route = calculate_route(&edges, &downstream, ME, A, 0, Some(&filter));
+        assert_eq!(route.next_hop, C, "leave toward C, not A");
+        assert!(route.verified, "receiver-priced path C→B→A is verified");
+        assert_eq!(route.hops, 3);
+        // ME→C at C's 1.0 of ME + C→B at B's 1.2 of C + B→A at A's 2.0 of B.
+        assert_eq!(route.cost_fixed, 100 + 120 + 200);
+        assert_ne!(
+            route.cost_fixed,
+            150 * UNVERIFIED_HOP_COST_FACTOR,
+            "must not be the inbound-gateway guess from our RX of A"
         );
     }
 
@@ -1462,14 +1666,105 @@ mod tests {
         edges.ensure_local_node(HUB, 0);
         edges.update_edge(HUB, HUB, PARENT, 1.4, 0, EdgeSource::Reported, true, 0);
         let mut downstream = DownstreamTable::new();
-        downstream.update(ME, DEST, PARENT, 2.0, 0, false, 0);
+        downstream.update_listed(ME, DEST, PARENT, 2.0, 0, false, 0);
         downstream.update(ME, PARENT, HUB, 2.0, 0, false, 0);
-        downstream.update(HUB, DEST, PARENT, 2.0, 0, false, 0);
+        downstream.update_listed(HUB, DEST, PARENT, 2.0, 0, false, 0);
         let route = calculate_route(&edges, &downstream, ME, DEST, 0, None);
         assert_eq!(route.next_hop, HUB);
-        assert!(!route.verified);
+        // List-downstream of a ball parent: strict path to PARENT + hearsUs-gated row ⇒ verified.
+        assert!(route.verified);
+        assert_eq!(route.mode, RouteMode::ListDownstream);
         let hub = calculate_route(&edges, &downstream, HUB, DEST, 0, None);
         assert_eq!(hub.next_hop, PARENT);
+    }
+
+    #[test]
+    fn orphan_via_l1_is_unverified_gateway_handoff() {
+        const ME: u32 = 0xAA;
+        const GW: u32 = 0xBB;
+        const FAR: u32 = 0xCC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, GW, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_l1(GW);
+        let mut downstream = DownstreamTable::new();
+        downstream.update(ME, FAR, GW, 2.0, 0, false, 0);
+        assert!(edges.find_node(FAR).is_none());
+        let route = calculate_route(&edges, &downstream, ME, FAR, 0, None);
+        assert_eq!(route.next_hop, GW);
+        assert!(!route.verified);
+        assert_eq!(route.mode, RouteMode::OrphanGateway);
+    }
+
+    #[test]
+    fn l2_publisher_does_not_own_a_local_silent_neighbour() {
+        const ME: u32 = 0xAA;
+        const L1: u32 = 0xBB;
+        const L2: u32 = 0xCC;
+        const SILENT: u32 = 0xDD;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, L1, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, ME, SILENT, 3.0, 0, EdgeSource::Reported, true, 0);
+        edges.update_edge(ME, L1, L2, 1.5, 0, EdgeSource::Mirrored, true, 0);
+        edges.set_edge_hears_us(L1, L2, true);
+        let mut ds = DownstreamTable::new();
+        edges.ensure_publisher(L2, NodeClass::L2, L1, 0, ME, &mut ds);
+        edges.update_edge(ME, L2, SILENT, 1.0, 0, EdgeSource::Mirrored, true, 0);
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(L1, true, 0);
+        capability.track_topology(L2, true, 0);
+        assert_eq!(
+            coverage_owner(&edges, &capability, ME, true, SILENT),
+            ME,
+            "an L2 list must not own a silent neighbour of ours"
+        );
+    }
+
+    /// Hub packed-list churn: L2 is in the ball with parent_hint but no longer lists the parent.
+    /// Ball cannot price the last hop; compose via parent_hint + parent's measured edge.
+    #[test]
+    fn parent_hint_composes_when_dest_omits_parent_from_its_list() {
+        const ME: u32 = 0xAA00_00AA;
+        const PARENT: u32 = 0xBB00_00BB;
+        const DEST: u32 = 0xCC00_00CC;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, PARENT, 1.0, 0, EdgeSource::Reported, true, 0);
+        edges.set_l1(PARENT);
+        // Parent listed DEST with hearsUs when we admitted DEST as L2.
+        edges.update_edge(ME, PARENT, DEST, 1.5, 0, EdgeSource::Mirrored, true, 0);
+        edges.set_edge_hears_us(PARENT, DEST, true);
+        assert!(edges.ensure_publisher(
+            DEST,
+            NodeClass::L2,
+            PARENT,
+            0,
+            ME,
+            &mut DownstreamTable::new(),
+        ));
+        // DEST publishes topology but does not list PARENT (packed-list omission).
+        edges.update_edge(ME, DEST, 0xDD00_00DD, 1.2, 0, EdgeSource::Mirrored, true, 0);
+        // PARENT lists ME so strict Dijkstra can leave PARENT toward us.
+        edges.update_edge(ME, PARENT, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
+
+        let mut capability = CapabilityCache::new();
+        capability.track_topology(DEST, true, 0);
+        capability.track_topology(PARENT, true, 0);
+        let filter = RoutableFilter {
+            capability: &capability,
+            my_node: ME,
+            device_role: 0,
+            excluded: &[],
+        };
+        let downstream = DownstreamTable::new();
+        assert!(downstream.get_relay(DEST, 0, u32::MAX).is_none());
+        let route = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter));
+        assert_eq!(route.next_hop, PARENT);
+        assert!(route.verified);
+        assert_eq!(route.mode, RouteMode::ListDownstream);
+        assert_eq!(route.hops, 2);
+        assert_eq!(route.cost_fixed, 250);
     }
 
     #[test]

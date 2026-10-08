@@ -21,6 +21,9 @@ pub struct DownstreamEntry {
     pub via_radio: RadioId,
     pub cost_fixed: u16,
     pub last_update_ms: u32,
+    /// Set when the row came from a publisher's topology with `hearsUs` (or a
+    /// capacity demotion that kept that evidence). Relayed orphans stay false.
+    pub list_learned: bool,
 }
 
 pub struct DownstreamTable {
@@ -43,6 +46,7 @@ impl DownstreamTable {
                 via_radio: 0,
                 cost_fixed: 0,
                 last_update_ms: 0,
+                list_learned: false,
             }; MAX_DOWNSTREAM],
             count: 0,
         }
@@ -69,12 +73,37 @@ impl DownstreamTable {
             .map(|(relay, _)| relay)
     }
 
-    fn relay_and_cost(&self, destination: u32, now_ms: u32, ttl_ms: u32) -> Option<(u32, u16)> {
+    pub fn relay_and_cost(&self, destination: u32, now_ms: u32, ttl_ms: u32) -> Option<(u32, u16)> {
         let mut best_relay = None;
         let mut best_cost = u16::MAX;
         for i in 0..self.count as usize {
             let entry = &self.entries[i];
             if entry.destination != destination {
+                continue;
+            }
+            if now_ms.wrapping_sub(entry.last_update_ms) >= ttl_ms {
+                continue;
+            }
+            if entry.cost_fixed < best_cost {
+                best_cost = entry.cost_fixed;
+                best_relay = Some(entry.relay);
+            }
+        }
+        best_relay.map(|relay| (relay, best_cost))
+    }
+
+    /// Parent and last-hop cost when `destination` was parked from a topology list with `hearsUs`.
+    pub fn list_downstream(
+        &self,
+        destination: u32,
+        now_ms: u32,
+        ttl_ms: u32,
+    ) -> Option<(u32, u16)> {
+        let mut best_relay = None;
+        let mut best_cost = u16::MAX;
+        for i in 0..self.count as usize {
+            let entry = &self.entries[i];
+            if entry.destination != destination || !entry.list_learned {
                 continue;
             }
             if now_ms.wrapping_sub(entry.last_update_ms) >= ttl_ms {
@@ -188,7 +217,15 @@ impl DownstreamTable {
             let destination = self.entries[i].destination;
             let cost_fixed = self.entries[i].cost_fixed;
             let via_radio = self.entries[i].via_radio;
-            self.upsert_entry(destination, new_relay, cost_fixed, via_radio, now_ms);
+            let list_learned = self.entries[i].list_learned;
+            self.upsert_entry(
+                destination,
+                new_relay,
+                cost_fixed,
+                via_radio,
+                now_ms,
+                list_learned,
+            );
             moved += 1;
         }
         self.clear_for_relay(old_relay);
@@ -202,6 +239,7 @@ impl DownstreamTable {
         cost_fixed: u16,
         via_radio: RadioId,
         now_ms: u32,
+        list_learned: bool,
     ) {
         for i in 0..self.count as usize {
             if self.entries[i].destination == destination && self.entries[i].relay == relay {
@@ -209,6 +247,9 @@ impl DownstreamTable {
                 self.entries[i].last_update_ms = now_ms;
                 if via_radio != 0 {
                     self.entries[i].via_radio = via_radio;
+                }
+                if list_learned {
+                    self.entries[i].list_learned = true;
                 }
                 return;
             }
@@ -221,6 +262,7 @@ impl DownstreamTable {
                 via_radio,
                 cost_fixed,
                 last_update_ms: now_ms,
+                list_learned,
             };
             self.count += 1;
             return;
@@ -239,6 +281,7 @@ impl DownstreamTable {
             via_radio,
             cost_fixed,
             last_update_ms: now_ms,
+            list_learned,
         };
     }
 
@@ -252,6 +295,52 @@ impl DownstreamTable {
         relay_has_direct_edge: bool,
         via_radio: RadioId,
     ) {
+        self.update_inner(
+            my_node,
+            destination,
+            relay,
+            total_cost,
+            now_ms,
+            relay_has_direct_edge,
+            via_radio,
+            false,
+        );
+    }
+
+    /// Topology list with `hearsUs`: last hop is priced from the publisher, not a relayed guess.
+    pub fn update_listed(
+        &mut self,
+        my_node: u32,
+        destination: u32,
+        relay: u32,
+        total_cost: f32,
+        now_ms: u32,
+        relay_has_direct_edge: bool,
+        via_radio: RadioId,
+    ) {
+        self.update_inner(
+            my_node,
+            destination,
+            relay,
+            total_cost,
+            now_ms,
+            relay_has_direct_edge,
+            via_radio,
+            true,
+        );
+    }
+
+    fn update_inner(
+        &mut self,
+        my_node: u32,
+        destination: u32,
+        relay: u32,
+        total_cost: f32,
+        now_ms: u32,
+        relay_has_direct_edge: bool,
+        via_radio: RadioId,
+        list_learned: bool,
+    ) {
         if destination == 0 || relay == 0 || destination == relay || destination == my_node {
             return;
         }
@@ -259,46 +348,14 @@ impl DownstreamTable {
             return;
         }
         let cost_fixed = (total_cost * 100.0).min(65535.0) as u16;
-
-        for i in 0..self.count as usize {
-            if self.entries[i].destination == destination && self.entries[i].relay == relay {
-                self.entries[i].cost_fixed = cost_fixed;
-                self.entries[i].last_update_ms = now_ms;
-                if via_radio != 0 {
-                    self.entries[i].via_radio = via_radio;
-                }
-                return;
-            }
-        }
-
-        if (self.count as usize) < MAX_DOWNSTREAM {
-            let idx = self.count as usize;
-            self.entries[idx] = DownstreamEntry {
-                destination,
-                relay,
-                via_radio,
-                cost_fixed,
-                last_update_ms: now_ms,
-            };
-            self.count += 1;
-            return;
-        }
-
-        let mut oldest_idx = 0usize;
-        let mut oldest = self.entries[0].last_update_ms;
-        for i in 1..self.count as usize {
-            if self.entries[i].last_update_ms < oldest {
-                oldest = self.entries[i].last_update_ms;
-                oldest_idx = i;
-            }
-        }
-        self.entries[oldest_idx] = DownstreamEntry {
+        self.upsert_entry(
             destination,
             relay,
-            via_radio,
             cost_fixed,
-            last_update_ms: now_ms,
-        };
+            via_radio,
+            now_ms,
+            list_learned,
+        );
     }
 
     pub fn update_exclusive(
@@ -408,6 +465,16 @@ mod tests {
         table.update(0xAA, 0xDD, 0xCC, 5.0, 1_000, false, 0);
         assert_eq!(table.get_relay(0xDD, 10_000, 5_000), Some(0xBB));
         assert_eq!(table.get_relay(0xDD, 20_000, 5_000), None);
+    }
+
+    #[test]
+    fn list_downstream_ignores_orphan_rows() {
+        let mut table = DownstreamTable::new();
+        table.update(0xAA, 0xDD, 0xBB, 2.0, 1_000, false, 0);
+        assert!(table.list_downstream(0xDD, 1_500, 10_000).is_none());
+        table.update_listed(0xAA, 0xDD, 0xCC, 3.0, 1_000, false, 0);
+        assert_eq!(table.list_downstream(0xDD, 1_500, 10_000), Some((0xCC, 300)));
+        assert_eq!(table.get_relay(0xDD, 1_500, 10_000), Some(0xBB));
     }
 
     #[test]
