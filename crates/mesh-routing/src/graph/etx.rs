@@ -58,6 +58,22 @@ const RSSI_FACTOR: [f32; 2] = [0.90, 1.00];
 /// exactly backwards.
 const NON_FINITE_SNR_FALLBACK_DB: f32 = -100.0;
 
+/// SX126x `RssiPkt` register 0 means 0 dBm (clip at the strong end). Meshtastic also uses RSSI `0`
+/// as "no reading". Remap the clip to a strong-but-valid dBm so a desk-adjacent link is not stored
+/// or published as the unset sentinel (field 2026-10-09: MR3a↔MB1d L1 stuck at RSSI=0/ETX=1.05).
+pub const SATURATED_RX_RSSI_DBM: i16 = -30;
+
+/// Drop unset readings (`rssi == 0 && snr == 0`); remap a clipped RSSI of `0` when SNR shows RF.
+pub fn normalize_rx_signal(rssi: i16, snr: i8) -> Option<(i16, i8)> {
+    if rssi == 0 && snr == 0 {
+        None
+    } else if rssi == 0 {
+        Some((SATURATED_RX_RSSI_DBM, snr))
+    } else {
+        Some((rssi, snr))
+    }
+}
+
 /// Delivery probability contributed by decode margin: a six-point piecewise-linear map, total over
 /// any `f32` margin including non-finite ones after the caller's non-finite guard has run.
 fn margin_delivery_probability(margin_db: f32) -> f32 {
@@ -156,6 +172,17 @@ mod tests {
     fn strong_signal_low_etx() {
         let etx = calculate_etx(-60, 10.0, MODEM_SHORT_SLOW);
         assert!(etx < 2.0);
+    }
+
+    #[test]
+    fn normalize_rx_signal_remaps_clipped_rssi() {
+        assert_eq!(normalize_rx_signal(0, 0), None);
+        assert_eq!(
+            normalize_rx_signal(0, 14),
+            Some((SATURATED_RX_RSSI_DBM, 14))
+        );
+        assert_eq!(normalize_rx_signal(-70, 8), Some((-70, 8)));
+        assert_eq!(normalize_rx_signal(-70, 0), Some((-70, 0)));
     }
 
     #[test]

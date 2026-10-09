@@ -13,7 +13,10 @@ pub use edge::{
     Edge, EdgeSource, EdgeStore, NodeClass, NodeEdges, PendingDemotion, EDGE_NEW, EDGE_NO_CHANGE,
     EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
-pub use etx::{calculate_etx, etx_to_fixed, etx_to_signal, fixed_to_etx, EtxFixed};
+pub use etx::{
+    calculate_etx, etx_to_fixed, etx_to_signal, fixed_to_etx, normalize_rx_signal,
+    EtxFixed, SATURATED_RX_RSSI_DBM,
+};
 pub use placeholder::{
     get_placeholder_for_relay, is_placeholder_node, placeholder_node_id, PLACEHOLDER_NODE_PREFIX,
 };

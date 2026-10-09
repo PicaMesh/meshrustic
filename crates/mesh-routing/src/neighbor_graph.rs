@@ -1794,6 +1794,9 @@ impl NeighborGraph {
         if node_id == 0 || node_id == self.my_node {
             return false;
         }
+        let Some((rssi, snr)) = crate::graph::normalize_rx_signal(rssi, snr) else {
+            return false;
+        };
         let result = self.refresh_reported_direct_neighbor(node_id, rssi, snr, now_ms, heard_on);
         if result == EDGE_NEW || result == EDGE_SIGNIFICANT_CHANGE {
             self.topology_dirty = true;
@@ -1886,9 +1889,12 @@ impl NeighborGraph {
         if !self.is_active_routing_role() && !self.can_send_topology() {
             return None;
         }
-        if from == 0 || (rssi == 0 && snr == 0) {
+        if from == 0 {
             return None;
         }
+        let Some((rssi, snr)) = crate::graph::normalize_rx_signal(rssi, snr) else {
+            return None;
+        };
         let from_low = (from & 0xFF) as u8;
         if relay_node == 0 || relay_node == from_low {
             return None;
@@ -3690,6 +3696,21 @@ mod tests {
         graph.fill_neighbor_entries(&mut entries);
         assert_eq!(entries[0].rssi, -75);
         assert_eq!(entries[0].snr, 11);
+    }
+
+    #[test]
+    fn clipped_rssi_zero_with_snr_stores_saturated_sentinel() {
+        // SX126x register clip / Meshtastic unset collision: rssi=0 with real SNR must not
+        // publish the unset sentinel on the wire (MR3a↔MB1d, 2026-10-09).
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(0xAA);
+        assert!(graph.observe_direct_neighbor(0x1234_5678, 0, 14, 1_000, 0));
+        let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
+        graph.fill_neighbor_entries(&mut entries);
+        assert_eq!(entries[0].rssi, crate::graph::SATURATED_RX_RSSI_DBM);
+        assert_eq!(entries[0].snr, 14);
+        assert!(!graph.observe_direct_neighbor(0xABCD_EF01, 0, 0, 2_000, 0));
+        assert_eq!(graph.neighbor_count(), 1);
     }
 
     #[test]

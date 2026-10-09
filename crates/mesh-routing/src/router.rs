@@ -1036,7 +1036,8 @@ impl Router {
             // we relay *behind* and becomes one we relay *for* — the limiter would manufacture the
             // traffic it exists to suppress. The edge and its downstream invalidation are all we
             // take: no relay planning, no topology merge, no activity or capability tracking.
-            if direct && !parsed.via_mqtt && !(packet.rssi == 0 && packet.snr == 0) {
+            // observe_direct_neighbor remaps clipped RSSI=0 (with SNR) and refuses unset 0/0.
+            if direct && !parsed.via_mqtt {
                 self.graph.observe_direct_neighbor(
                     parsed.from,
                     packet.rssi,
