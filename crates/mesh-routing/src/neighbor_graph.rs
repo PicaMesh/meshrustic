@@ -1892,9 +1892,7 @@ impl NeighborGraph {
         if from == 0 {
             return None;
         }
-        let Some((rssi, snr)) = crate::graph::normalize_rx_signal(rssi, snr) else {
-            return None;
-        };
+        let (rssi, snr) = crate::graph::normalize_rx_signal(rssi, snr)?;
         let from_low = (from & 0xFF) as u8;
         if relay_node == 0 || relay_node == from_low {
             return None;
