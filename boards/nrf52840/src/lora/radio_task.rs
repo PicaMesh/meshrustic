@@ -441,7 +441,7 @@ fn handle_rx_frame(
 
         if let Some(ann) = router.take_young_announce() {
             if router.young_announce_broadcast() {
-                let mut body = [0u8; 48];
+                let mut body = [0u8; 80];
                 let n = mesh_routing::format_young_announce(&ann, &mut body);
                 let airtime_ms = packet_time_ms(slot.config(), PACKET_HEADER_LEN + n, true).max(1);
                 if let Some(plan) = router.send_local(

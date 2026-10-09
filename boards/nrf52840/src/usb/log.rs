@@ -1446,11 +1446,11 @@ pub mod sr {
                 finish_line(&mut line, pos);
             }
             SrLogEvent::RateLimitYoungAnnounce { ids, count } => {
-                let mut line = [0u8; 128];
+                let mut line = [0u8; 160];
                 let mut pos = line_prefix(&mut line);
-                put(&mut line, &mut pos, b"[RateLimit] young ");
+                put(&mut line, &mut pos, b"[RateLimit] ");
                 let ann = mesh_routing::YoungAnnounce { ids, count };
-                let mut body = [0u8; 48];
+                let mut body = [0u8; 80];
                 let n = mesh_routing::format_young_announce(&ann, &mut body);
                 put(&mut line, &mut pos, &body[..n]);
                 finish_line(&mut line, pos);

@@ -4,7 +4,9 @@
 //! buckets. RELAY path: rebroadcast candidates charge the last hop — 8 resolved NodeID slots
 //! plus one shared bucket for unresolved `relay_node` bytes — using an airtime budget tightened
 //! by local channel utilization. Young path: one shared packet-count bucket for originators first
-//! heard less than 30 minutes ago, so a flood of minted identities buys one slot, not one each.
+//! heard less than 30 minutes ago *after* warm-up, so a flood of minted identities buys one slot,
+//! not one each. Sightings during the post-boot warm-up go straight to alumni (established).
+//! Alumni never evicts: once established, an id is never re-inserted as young.
 //!
 //! Uniform hysteresis: trip / clear / fixed window; while limited, drop matching traffic. Every
 //! bucket clears the same way: at the window roll, when the count for that window is below the
@@ -28,6 +30,10 @@ use mesh_protocol::{rate_limit_bucket, RateLimitBucket, NODENUM_BROADCAST};
 const MAX_ORIGINATORS: usize = 16;
 const MAX_RELAYS: usize = 8;
 const MAX_YOUNG: usize = 32;
+/// Established ids after graduation or warm-up. Sized for a busy city mesh so
+/// aged rows rarely need to park in young[] (parking plus fail-closed would
+/// charge ordinary traffic). Never FIFO-evicts.
+const MAX_ALUMNI: usize = 128;
 const WINDOW_MS: u32 = 90_000;
 /// First-sighting records live only while the originator is younger than this.
 const YOUNG_AGE_MS: u32 = 30 * 60 * 1000;
@@ -187,8 +193,10 @@ pub struct YoungAnnounce {
     pub count: u8,
 }
 
-/// Fixed-width young IDs. The bytes are attacker-chosen and do not belong in free text.
+/// Human-readable prefix plus fixed-width young IDs. The id bytes are attacker-chosen
+/// and stay hex-only; they do not belong in free text.
 pub fn format_young_announce(ann: &YoungAnnounce, out: &mut [u8]) -> usize {
+    const PREFIX: &[u8] = b"Young nodes Rate Limit";
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut pos = 0usize;
     let push = |out: &mut [u8], pos: &mut usize, b: u8| {
@@ -197,7 +205,9 @@ pub fn format_young_announce(ann: &YoungAnnounce, out: &mut [u8]) -> usize {
             *pos += 1;
         }
     };
-    push(out, &mut pos, b'Y');
+    for &b in PREFIX {
+        push(out, &mut pos, b);
+    }
     for i in 0..ann.count as usize {
         push(out, &mut pos, b' ');
         push(out, &mut pos, b'!');
@@ -291,7 +301,7 @@ pub struct NodeRateLimiter {
     unresolved_relay: BucketState,
     young: [YoungSighting; MAX_YOUNG],
     young_count: u8,
-    alumni: [u32; MAX_YOUNG],
+    alumni: [u32; MAX_ALUMNI],
     alumni_count: u8,
     young_bucket: BucketState,
     dests: [DestEntry; MAX_DESTS],
@@ -369,7 +379,7 @@ impl NodeRateLimiter {
                 first_seen_ms: 0,
             }; MAX_YOUNG],
             young_count: 0,
-            alumni: [0; MAX_YOUNG],
+            alumni: [0; MAX_ALUMNI],
             alumni_count: 0,
             young_bucket: BucketState {
                 window_start_ms: 0,
@@ -438,23 +448,29 @@ impl NodeRateLimiter {
         self.young_bucket.limited
     }
 
-    pub fn young_table_full(&self) -> bool {
-        self.young_count as usize >= MAX_YOUNG
+    /// True when every young slot holds an *age-active* first-sighting.
+    /// Aged-parked rows do not count: they must not fail-closed a busy mesh.
+    pub fn young_table_full(&self, now_ms: u32) -> bool {
+        self.active_young_count(now_ms) >= MAX_YOUNG
     }
 
     /// Coverage asks this, not `should_drop`: a node whose traffic is being dropped
     /// is not a coverage target.
     pub fn coverage_gate(&self, now_ms: u32) -> YoungCoverageGate {
         let mut ids = [0u32; MAX_YOUNG];
-        let n = self.young_count as usize;
-        for (i, slot) in ids.iter_mut().enumerate().take(n) {
-            *slot = self.young[i].node_id;
+        let mut id_count = 0u8;
+        for i in 0..self.young_count as usize {
+            if !Self::young_age_active(self.young[i].first_seen_ms, now_ms) {
+                continue;
+            }
+            ids[id_count as usize] = self.young[i].node_id;
+            id_count += 1;
         }
         YoungCoverageGate {
             active: self.warmed_up(now_ms) && self.young_bucket.limited,
-            table_full: self.young_table_full(),
+            table_full: self.young_table_full(now_ms),
             ids,
-            id_count: self.young_count,
+            id_count,
         }
     }
 
@@ -757,17 +773,18 @@ impl NodeRateLimiter {
         self.alumni[..self.alumni_count as usize].contains(&node_id)
     }
 
-    fn add_alumni(&mut self, node_id: u32) {
+    fn add_alumni(&mut self, node_id: u32) -> bool {
         if self.in_alumni(node_id) {
-            return;
+            return true;
         }
-        if (self.alumni_count as usize) < MAX_YOUNG {
-            self.alumni[self.alumni_count as usize] = node_id;
-            self.alumni_count += 1;
-            return;
+        if (self.alumni_count as usize) >= MAX_ALUMNI {
+            // Never FIFO-evict: forgetting an established id lets note_originator
+            // re-insert it as young. Prefer holding aged entries in young[] instead.
+            return false;
         }
-        self.alumni.copy_within(1..MAX_YOUNG, 0);
-        self.alumni[MAX_YOUNG - 1] = node_id;
+        self.alumni[self.alumni_count as usize] = node_id;
+        self.alumni_count += 1;
+        true
     }
 
     fn remove_young_at(&mut self, idx: usize) {
@@ -782,15 +799,51 @@ impl NodeRateLimiter {
         self.young_count -= 1;
     }
 
+    fn young_age_active(first_seen_ms: u32, now_ms: u32) -> bool {
+        let age = now_ms.wrapping_sub(first_seen_ms);
+        !(YOUNG_AGE_MS..0x8000_0000).contains(&age)
+    }
+
+    fn active_young_count(&self, now_ms: u32) -> usize {
+        let mut n = 0usize;
+        for i in 0..self.young_count as usize {
+            if Self::young_age_active(self.young[i].first_seen_ms, now_ms) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn find_aged_young(&self, now_ms: u32) -> Option<usize> {
+        self.young[..self.young_count as usize]
+            .iter()
+            .position(|e| !Self::young_age_active(e.first_seen_ms, now_ms))
+    }
+
     fn expire_if_old(&mut self, node_id: u32, now_ms: u32) {
         let Some(idx) = self.find_young(node_id) else {
             return;
         };
-        let age = now_ms.wrapping_sub(self.young[idx].first_seen_ms);
-        if (YOUNG_AGE_MS..0x8000_0000).contains(&age) {
-            self.add_alumni(node_id);
+        if Self::young_age_active(self.young[idx].first_seen_ms, now_ms) {
+            return;
+        }
+        // Graduated: remember as alumni when there is room; otherwise leave the
+        // row in young[] so is_young stays false by age and we never re-youth.
+        if self.add_alumni(node_id) {
             self.remove_young_at(idx);
         }
+    }
+
+    fn insert_young(&mut self, node_id: u32, now_ms: u32) {
+        if (self.young_count as usize) >= MAX_YOUNG {
+            return;
+        }
+        let i = self.young_count as usize;
+        self.young[i] = YoungSighting {
+            node_id,
+            first_seen_ms: now_ms,
+        };
+        self.young_count += 1;
     }
 
     fn note_originator(&mut self, node_id: u32, now_ms: u32) {
@@ -798,26 +851,39 @@ impl NodeRateLimiter {
         if self.find_young(node_id).is_some() || self.in_alumni(node_id) {
             return;
         }
-        if (self.young_count as usize) < MAX_YOUNG {
-            let i = self.young_count as usize;
-            self.young[i] = YoungSighting {
-                node_id,
-                first_seen_ms: now_ms,
-            };
-            self.young_count += 1;
+        // Warm-up mesh is established, not young: everyone looks new after boot.
+        if !self.warmed_up(now_ms) {
+            let _ = self.add_alumni(node_id);
+            return;
         }
+        if (self.young_count as usize) < MAX_YOUNG {
+            self.insert_young(node_id, now_ms);
+            return;
+        }
+        // Physical full: reclaim an aged-parked slot so a real new identity still
+        // enters young[] and charges the bucket. Prefer alumni; if alumni is also
+        // full, drop the parked row (rare overflow — may re-youth later) rather
+        // than fail-closed-charging the rest of a busy mesh.
+        let Some(idx) = self.find_aged_young(now_ms) else {
+            return;
+        };
+        let old = self.young[idx].node_id;
+        let _ = self.add_alumni(old);
+        self.remove_young_at(idx);
+        self.insert_young(node_id, now_ms);
     }
 
-    /// No record + room → established (fail open). No record + full → young (fail closed).
+    /// No record + not active-full → established (fail open). No record + 32
+    /// simultaneous age-active young → young (fail closed). Aged-parked rows do
+    /// not make the table "full" for this purpose.
     fn is_young(&self, node_id: u32, now_ms: u32) -> bool {
         if let Some(idx) = self.find_young(node_id) {
-            let age = now_ms.wrapping_sub(self.young[idx].first_seen_ms);
-            return !(YOUNG_AGE_MS..0x8000_0000).contains(&age);
+            return Self::young_age_active(self.young[idx].first_seen_ms, now_ms);
         }
         if self.in_alumni(node_id) {
             return false;
         }
-        self.young_count as usize >= MAX_YOUNG
+        self.active_young_count(now_ms) >= MAX_YOUNG
     }
 
     fn relay_any_limited(&self) -> bool {
@@ -843,9 +909,14 @@ impl NodeRateLimiter {
             ids: [0; ANNOUNCE_MAX_IDS],
             count: 0,
         };
-        let n = (self.young_count as usize).min(ANNOUNCE_MAX_IDS);
-        for i in 0..n {
-            ann.ids[i] = self.young[i].node_id;
+        for i in 0..self.young_count as usize {
+            if ann.count as usize >= ANNOUNCE_MAX_IDS {
+                break;
+            }
+            if !Self::young_age_active(self.young[i].first_seen_ms, now_ms) {
+                continue;
+            }
+            ann.ids[ann.count as usize] = self.young[i].node_id;
             ann.count += 1;
         }
         self.last_announce_ms = now_ms;
@@ -1337,6 +1408,14 @@ mod tests {
             self.find_young(from).is_some()
         }
 
+        fn debug_in_alumni(&self, from: u32) -> bool {
+            self.in_alumni(from)
+        }
+
+        fn debug_alumni_count(&self) -> usize {
+            self.alumni_count as usize
+        }
+
         fn debug_young_count(&self) -> usize {
             self.young_count as usize
         }
@@ -1349,8 +1428,20 @@ mod tests {
             self.young_bucket.count
         }
 
+        /// Insert directly into young[] (bypasses warm-up→alumni).
         fn debug_seed_young(&mut self, from: u32, first_seen_ms: u32) {
-            self.note_originator(from, first_seen_ms);
+            if self.find_young(from).is_some() || self.in_alumni(from) {
+                return;
+            }
+            if (self.young_count as usize) >= MAX_YOUNG {
+                return;
+            }
+            let i = self.young_count as usize;
+            self.young[i] = YoungSighting {
+                node_id: from,
+                first_seen_ms,
+            };
+            self.young_count += 1;
         }
     }
 
@@ -2172,12 +2263,56 @@ mod tests {
         for i in 0..MAX_YOUNG as u32 {
             limiter.debug_seed_young(0xB200_0000 + i, now);
         }
-        assert!(limiter.young_table_full());
+        assert!(limiter.young_table_full(now));
         assert!(
             limiter.debug_is_young(0xB300_0001, now),
-            "no record and a full table means young"
+            "no record and 32 active young means fail-closed young"
         );
         assert!(!limiter.debug_tracks_young(0xB300_0001));
+    }
+
+    #[test]
+    fn parked_rows_do_not_fail_closed_a_busy_mesh() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let t0 = WARMUP_MS;
+        // Fill alumni so graduates must park in young[].
+        let mut next = 0xE100_0000u32;
+        while limiter.debug_alumni_count() < MAX_ALUMNI {
+            let wave = next;
+            let room = MAX_YOUNG - limiter.debug_young_count();
+            for j in 0..room as u32 {
+                limiter.debug_seed_young(wave + j, t0);
+            }
+            next = wave + room as u32;
+            for j in 0..room as u32 {
+                let _ = drop_other(&mut limiter, wave + j, t0 + YOUNG_AGE_MS);
+            }
+        }
+        // Park a full young table of aged rows.
+        for i in 0..MAX_YOUNG as u32 {
+            limiter.debug_seed_young(0xE200_0000 + i, t0);
+        }
+        let parked_now = t0 + YOUNG_AGE_MS + 1;
+        for i in 0..MAX_YOUNG as u32 {
+            let _ = drop_other(&mut limiter, 0xE200_0000 + i, parked_now);
+            assert!(limiter.debug_tracks_young(0xE200_0000 + i));
+            assert!(!limiter.debug_is_young(0xE200_0000 + i, parked_now));
+        }
+        assert_eq!(limiter.debug_young_count(), MAX_YOUNG);
+        assert!(
+            !limiter.young_table_full(parked_now),
+            "aged-parked must not count as active-full"
+        );
+        assert!(
+            !limiter.debug_is_young(0xE300_0001, parked_now),
+            "busy-mesh overflow must fail open, not charge ordinary traffic"
+        );
+        // A real new identity still gets a slot by reclaiming a parked row.
+        assert!(!drop_text(&mut limiter, 0xE300_0001, parked_now));
+        assert!(limiter.debug_tracks_young(0xE300_0001));
+        assert!(limiter.debug_is_young(0xE300_0001, parked_now));
+        assert_eq!(limiter.debug_young_count(), MAX_YOUNG);
     }
 
     #[test]
@@ -2191,6 +2326,83 @@ mod tests {
         }
         assert!(!limiter.young_limited());
         assert!(!limiter.warmed_up(YOUNG_TRIP + 4));
+        assert_eq!(
+            limiter.debug_young_count(),
+            0,
+            "warm-up sightings must not enter the young table"
+        );
+        assert!(
+            limiter.debug_alumni_count() > 0,
+            "warm-up sightings are established (alumni)"
+        );
+        assert!(limiter.debug_in_alumni(0xC100_0000));
+    }
+
+    #[test]
+    fn warmup_nodes_stay_established_after_warmup() {
+        let mut limiter = NodeRateLimiter::new();
+        let from = 0xC200_0001;
+        assert!(!drop_text(&mut limiter, from, 1_000));
+        assert!(limiter.debug_in_alumni(from));
+        assert!(!limiter.debug_tracks_young(from));
+        let t = WARMUP_MS + 1;
+        for i in 0..YOUNG_TRIP {
+            assert!(
+                !limiter.debug_is_young(from, t + i),
+                "boot-neighbour must not become young after warm-up"
+            );
+            assert_eq!(limiter.debug_young_count_value(), 0);
+            let _ = drop_text(&mut limiter, from, t + i);
+        }
+        assert!(!limiter.young_limited());
+    }
+
+    #[test]
+    fn alumni_never_reyouths_when_table_turns_over() {
+        let mut limiter = NodeRateLimiter::new();
+        warmed(&mut limiter);
+        let t0 = WARMUP_MS;
+        // Fill alumni to capacity via graduation (may take several young waves).
+        let mut next_id = 0xD100_0000u32;
+        while limiter.debug_alumni_count() < MAX_ALUMNI {
+            let wave_start = next_id;
+            let room = MAX_YOUNG - limiter.debug_young_count();
+            for j in 0..room as u32 {
+                limiter.debug_seed_young(wave_start + j, t0);
+            }
+            next_id = wave_start + room as u32;
+            for j in 0..room as u32 {
+                let id = wave_start + j;
+                assert!(
+                    !drop_other(&mut limiter, id, t0 + YOUNG_AGE_MS),
+                    "graduate into alumni"
+                );
+            }
+        }
+        assert_eq!(limiter.debug_alumni_count(), MAX_ALUMNI);
+        let early = 0xD100_0000;
+        assert!(limiter.debug_in_alumni(early));
+        // More graduates with alumni full stay parked in young[] (aged), not forgotten.
+        let parked = 0xD200_0001;
+        limiter.debug_seed_young(parked, t0);
+        assert!(!drop_other(
+            &mut limiter,
+            parked,
+            t0 + YOUNG_AGE_MS + 1
+        ));
+        assert!(
+            limiter.debug_tracks_young(parked),
+            "aged entry stays parked when alumni is full"
+        );
+        assert!(!limiter.debug_is_young(parked, t0 + YOUNG_AGE_MS + 1));
+        // An early alumnus must never be re-inserted as young.
+        for i in 0..YOUNG_TRIP {
+            assert!(!limiter.debug_is_young(early, t0 + YOUNG_AGE_MS + 2 + i));
+            let _ = drop_text(&mut limiter, early, t0 + YOUNG_AGE_MS + 2 + i);
+        }
+        assert!(!limiter.debug_tracks_young(early));
+        assert!(limiter.debug_in_alumni(early));
+        assert!(!limiter.young_limited());
     }
 
     #[test]
@@ -2316,9 +2528,12 @@ mod tests {
             ids: [0xAABB_CCDD, 0x0102_0304, 0, 0],
             count: 2,
         };
-        let mut buf = [0u8; 48];
+        let mut buf = [0u8; 80];
         let n = format_young_announce(&ann, &mut buf);
-        assert_eq!(&buf[..n], b"Y !aabbccdd !01020304");
+        assert_eq!(
+            &buf[..n],
+            b"Young nodes Rate Limit !aabbccdd !01020304"
+        );
     }
 
     #[test]
