@@ -24,12 +24,12 @@ pub const MAX_NEIGHBORS: usize = MAX_EDGES_PER_NODE;
 pub const MAX_RELAY_STATES: usize = 32;
 pub const MAX_HEARD_TRANSMITTERS: usize = 6;
 pub const MAX_TOPOLOGY_VERSION_ENTRIES: usize = MAX_NEIGHBORS;
-pub const TOPOLOGY_BROADCAST_MS: u32 = 600_000;
-pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 300_000;
+pub const TOPOLOGY_BROADCAST_MS: u32 = 900_000;
+pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 600_000;
 /// No accepted report from a peer for this long: accept whatever version it sends next. Covers a
 /// peer whose reboot broadcast we missed, a peer that came back with a moved-on counter, and a
-/// receiver that was itself away. Twice the periodic interval.
-pub const TOPOLOGY_RESYNC_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS;
+/// receiver that was itself away. Twice the periodic interval plus a 20-second margin.
+pub const TOPOLOGY_RESYNC_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS + 20_000;
 /// Delayed copies of the previous one or two broadcasts sit a few counts behind `last`. Farther
 /// behind is a restarted counter (a flash: last=26, received=1), not an older in-flight list.
 pub const TOPOLOGY_DELAYED_BEHIND_MAX: u8 = 7;
@@ -37,12 +37,13 @@ pub const TOPOLOGY_DELAYED_BEHIND_MAX: u8 = 7;
 pub const INFERRED_LINK_RSSI: i32 = -70;
 pub const INFERRED_LINK_SNR: f32 = 5.0;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
-pub const NEIGHBOR_TTL_MS: u32 = 7_200_000;
+pub const NEIGHBOR_TTL_MS: u32 = 10_800_000;
 /// A node that publishes topology promises a list every [`TOPOLOGY_BROADCAST_MS`]. Miss two of
-/// them with nothing else heard from it and it is gone: [`NEIGHBOR_TTL_MS`] is how long a graph is
-/// worth remembering, not how long we owe a neighbour airtime. Stock and legacy neighbours keep
+/// them plus a 20-second margin with nothing else heard from it and it is gone:
+/// [`NEIGHBOR_TTL_MS`] is how long a graph is worth remembering, not how long we owe a neighbour
+/// airtime. Stock and legacy neighbours keep
 /// the full TTL, because they promise no cadence and their silence says nothing.
-pub const PUBLISHER_SILENCE_MS: u32 = TOPOLOGY_RESYNC_MS;
+pub const PUBLISHER_SILENCE_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS + 20_000;
 
 /// Legacy SHORT_SLOW contention window; live retention uses `transmission_record_window_ms`.
 pub const NODE_TX_RECORD_MS: u32 = 2_000;
@@ -1263,7 +1264,7 @@ impl NeighborGraph {
         let (last, last_accept_ms) = self.topo_version_entry(sender);
         // Ways in: the forward window; a header-only version-0 boot broadcast (counter restarted);
         // a jump far behind `last` (the sender restarted and we missed the empty boot — Inno 26→1);
-        // nothing accepted for two periodic intervals; rejected versions climbing 1..=7 after a
+        // nothing accepted for two periodic intervals plus margin; rejected versions climbing 1..=7 after a
         // lost boot (a missed list is 1 then 3, not only exact +1); or a complete list heard from
         // the originator whose counter looks backwards (the air is newer than what we stored).
         // A header-only version 0 is a restart notice, active or passive, direct or relayed.
@@ -4363,7 +4364,7 @@ mod tests {
         ));
     }
 
-    /// The boot broadcast was missed: after two quiet intervals any version is accepted.
+    /// The boot broadcast was missed: after two quiet intervals plus margin any version is accepted.
     #[test]
     fn passive_peer_boot_broadcast_resets_its_topology_version_too() {
         const PEER: u32 = 0xB000_000B;
@@ -4390,7 +4391,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_topology_resyncs_after_two_silent_intervals() {
+    fn peer_topology_resyncs_after_two_silent_intervals_plus_margin() {
         const ME: u32 = 0xAA00_00AA;
         const PEER: u32 = 0xBB00_00BB;
         let mut graph = NeighborGraph::new();
@@ -4399,6 +4400,10 @@ mod tests {
         assert!(matches!(
             peer_report(&mut graph, PEER, 8, 1_000),
             TopologyMergeResult::Applied { .. }
+        ));
+        assert!(matches!(
+            peer_report_via(&mut graph, PEER, 7, 1_000 + 2 * TOPOLOGY_BROADCAST_MS, false),
+            TopologyMergeResult::Stale { .. }
         ));
         assert!(matches!(
             peer_report_via(&mut graph, PEER, 7, 1_000 + TOPOLOGY_RESYNC_MS - 1, false),

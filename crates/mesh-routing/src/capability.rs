@@ -9,8 +9,8 @@ use crate::nodeinfo::{
 use crate::sr_role::role_is_mute;
 
 pub const MAX_CAPABILITY_RECORDS: usize = 64;
-/// Three topology broadcast intervals plus margin (1810 s).
-pub const CAPABILITY_TTL_MS: u32 = 1_810_000;
+/// Three topology broadcast intervals plus a 20-second margin (2720 s).
+pub const CAPABILITY_TTL_MS: u32 = 3 * crate::neighbor_graph::TOPOLOGY_BROADCAST_MS + 20_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CapabilityStatus {

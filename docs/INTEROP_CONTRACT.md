@@ -240,7 +240,7 @@ is actually waiting for.
   `last_heard` on its own `Reported` RX edges (direct originator or on-air relay gateway only;
   zero means never heard: no live surcharge). Age since that stamp adds a silence component with
   `T` the topology period (`TOPOLOGY_BROADCAST_MS` / `TOPOLOGY_BROADCAST_SECS` =
-  `SIGNAL_ROUTING_BROADCAST_SECS` = 600 s): `< T/2` none, `T/2…T` slight, `T…2T` much more,
+  `SIGNAL_ROUTING_BROADCAST_SECS` = 900 s): `< T/2` none, `T/2…T` slight, `T…2T` much more,
   `≥ 2T` saturate. Dijkstra and `delivery_hop_cost_fixed` / `deliveryHopCost` add
   `stored_variance×5` on peers' lists and `effective_variance×10` on our RX edges. An unverified
   reverse hop saturates `etx×UNVERIFIED_HOP_COST_FACTOR` first, then adds that variance term.
@@ -692,9 +692,9 @@ is actually waiting for.
 
 ## 5. Topology reports
 
-- **Cadence.** Periodic every `TOPOLOGY_BROADCAST_MS` (600 s; fork `SIGNAL_ROUTING_BROADCAST_SECS`
+- **Cadence.** Periodic every `TOPOLOGY_BROADCAST_MS` (900 s; fork `SIGNAL_ROUTING_BROADCAST_SECS`
   / `NeighborGraph::TOPOLOGY_BROADCAST_SECS`); a dirty broadcast no sooner than
-  `TOPOLOGY_DIRTY_MIN_MS` after the last one; a header-only version-0 broadcast at boot; direct
+  `TOPOLOGY_DIRTY_MIN_MS` (600 s) after the last one; a header-only version-0 broadcast at boot; direct
   SR neighbours answer a boot broadcast once per `BOOTSTRAP_REPLY_MIN_MS` (120 s). Originated packets do
   not reset the timer.
 - **A bootstrap request is answered by any list, not only by its own reply.** The request is
@@ -711,6 +711,7 @@ is actually waiting for.
   relayed, resets the tracked version, active or passive sender; a received version more than
   `TOPOLOGY_DELAYED_BEHIND_MAX` (7) behind `last` (and still in the backward half of the u8
   circle) is a restarted counter and rebases on the first list; after `TOPOLOGY_RESYNC_MS`
+  (two broadcast intervals plus 20 seconds)
   without an accepted report, any version is taken as the new base; when the boot broadcast was
   lost and the new counter is still near `last`, rejected versions climbing by 1..=7 re-base us
   (a missed list is 1 then 3); and a complete, non-empty list heard from the originator whose
@@ -720,7 +721,7 @@ is actually waiting for.
   `a_near_behind_direct_list_resyncs_and_a_relayed_copy_does_not`,
   `peer_boot_broadcast_resets_its_topology_version`,
   `passive_peer_boot_broadcast_resets_its_topology_version_too`,
-  `peer_topology_resyncs_after_two_silent_intervals`,
+  `peer_topology_resyncs_after_two_silent_intervals_plus_margin`,
   `relayed_boot_broadcast_resets_the_topology_version_too`,
   `peer_restart_is_accepted_after_climbing_stale_reports`.
 - **An empty list clears nothing.** The "an unlisted neighbour does not hear the sender" rule
@@ -846,8 +847,8 @@ is actually waiting for.
   until `NEIGHBOR_TTL_MS`.
 - **A publisher that goes quiet loses our direct link.** A node whose lists we accept promises
   one every `TOPOLOGY_BROADCAST_MS`; heard nothing at all from it for `PUBLISHER_SILENCE_MS` (two
-  intervals, the same silence horizon as `TOPOLOGY_RESYNC_MS`) and we retract our own two edges to
-  it (`NeighborGraph::prune_silent_publishers`). `NEIGHBOR_TTL_MS` is how long a topology is worth
+  intervals plus a 20-second margin) and we retract our own two edges to
+  it (`NeighborGraph::prune_silent_publishers`). `NEIGHBOR_TTL_MS` (3 hours) is how long a topology is worth
   remembering, not how long we owe a neighbour airtime: until the edge goes, every coverage
   decision still counts that neighbour as ours to carry, so a node that has left the air draws a
   relay out of us for every frame whose sender we cannot show reached it. Only our own claim is

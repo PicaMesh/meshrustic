@@ -155,7 +155,7 @@ fn three_node_topology_versions_converge() {
 }
 
 #[test]
-fn capability_expires_at_1810s() {
+fn capability_expires_after_three_topology_intervals_plus_margin() {
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.track_node_role(0xBB, DEVICE_ROLE_REPEATER, 0);

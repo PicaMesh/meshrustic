@@ -8,7 +8,7 @@ use crate::graph::{
 use crate::rate_limit::YoungCoverageGate;
 
 const BIDI_ETX_CEILING: f32 = 20.0;
-const DOWNSTREAM_TTL_MS: u32 = 7_200_000;
+const DOWNSTREAM_TTL_MS: u32 = crate::neighbor_graph::NEIGHBOR_TTL_MS;
 const MAX_COVERED: usize = MAX_EDGES_PER_NODE + 8;
 const MAX_CANDIDATES: usize = MAX_EDGES_PER_NODE + 4;
 
