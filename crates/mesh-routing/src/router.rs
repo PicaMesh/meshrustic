@@ -2859,29 +2859,6 @@ impl Router {
         )
     }
 
-    fn delivering_relayer_is_sr(
-        &self,
-        parsed: &ParsedPacket,
-        hop_start_known: bool,
-        now_ms: u32,
-    ) -> bool {
-        let node = if hops_away(parsed.hop_start, parsed.hop_limit, hop_start_known) == Some(0) {
-            parsed.from
-        } else if parsed.relay_node == 0 {
-            return false;
-        } else {
-            self.graph
-                .match_relay_byte_on_outgoing_edges(parsed.relay_node)
-                .unwrap_or(0)
-        };
-        if node == 0 {
-            return false;
-        }
-        self.graph
-            .capability_status_at(node, now_ms)
-            .is_signal_routing()
-    }
-
     fn response_header(&self, parsed: &ParsedPacket, hop_start_known: bool) -> (u8, u8) {
         let base = hop_limit_for_response(parsed, hop_start_known, self.hop_limit);
         let arrived_direct = is_direct_packet(
@@ -3601,8 +3578,6 @@ impl Router {
                     {
                         self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
                     }
-                } else if self.delivering_relayer_is_sr(parsed, data.has_bitfield, now_ms) {
-                    self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
                 }
             }
         } else if parsed.from != self.node_num
@@ -4288,15 +4263,6 @@ impl Router {
                         }
                     }
                 }
-                self.schedule_dupe_want_ack(parsed, parsed.channel, now_ms);
-            } else if !parsed.want_ack
-                && repeated
-                && self.delivering_relayer_is_sr(
-                    parsed,
-                    decoded_data.is_some_and(|d| d.has_bitfield),
-                    now_ms,
-                )
-            {
                 self.schedule_dupe_want_ack(parsed, parsed.channel, now_ms);
             }
         }
@@ -7022,26 +6988,27 @@ mod tests {
                 0,
             )
             .expect("frame");
-            let _ = router
-                .process_inbound(
-                    &InboundPacket {
-                        radio_id: 0,
-                        rssi: -70,
-                        snr: 8,
-                        bytes: &frame[..len as usize],
-                    },
-                    id,
-                )
-                .unwrap();
-            let ack = router.poll_ack_tx(id).expect("ack");
+            let inbound = InboundPacket {
+                radio_id: 0,
+                rssi: -70,
+                snr: 8,
+                bytes: &frame[..len as usize],
+            };
+            let _ = router.process_inbound(&inbound, id).unwrap();
+            if !want_ack {
+                assert!(router.poll_ack_tx(id).is_none(), "unsolicited delivery has no ack");
+                let duplicate = router
+                    .process_inbound(&inbound, id.wrapping_add(1))
+                    .unwrap();
+                assert!(duplicate.duplicate);
+                assert!(router.poll_ack_tx(id).is_none(), "duplicate has no implicit ack");
+                continue;
+            }
+            let ack = router.poll_ack_tx(id).expect("requested ack");
             let hdr = PacketHeader::decode(&ack.bytes[..PACKET_HEADER_LEN])
                 .unwrap()
                 .parse();
-            if want_ack {
-                assert!(hdr.hop_limit > 0, "a requested ack keeps its hop budget");
-            } else {
-                assert_eq!(hdr.hop_limit, 0, "an unrequested ack stays local");
-            }
+            assert!(hdr.hop_limit > 0, "a requested ack keeps its hop budget");
             assert_eq!(hdr.to, UNI_SOURCE);
             assert_eq!(hdr.from, UNI_ME);
         }

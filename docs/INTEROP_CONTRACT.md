@@ -172,12 +172,10 @@ is actually waiting for.
   acknowledged as before (`Router::process_reliable_rx`): a request uses `response_header` /
   `hop_limit_for_response` (hops used plus margin, zero for a zero-hop request, the configured
   limit when the hop count is unknown), and a response gets a hop-0 ACK only when it arrived
-  with zero hops or a designated next hop. A unicast that did not ask is acknowledged at hop
-  limit 0 only when the delivering transmitter is SR (`Router::delivering_relayer_is_sr`): hops
-  away 0 means the originator, otherwise the resolved relay byte. Stock last hops are not
-  waiting. A duplicate of a `want_ack` unicast, or of an SR-delivered unsolicited unicast, is
-  acknowledged again the same way. A module reply still replaces the ACK. Routing ACKs
-  themselves are not acknowledged. Test:
+  with zero hops or a designated next hop. A unicast without `want_ack` does not receive an
+  implicit delivery ACK, including when it arrives through an SR relay. A duplicate of a
+  `want_ack` unicast is acknowledged again the same way. A module reply still replaces the ACK.
+  Routing ACKs themselves are not acknowledged. Test:
   `unicast_to_us_is_acked_and_a_request_keeps_its_hop_budget`.
 - **Routing ACKs that retrace a local link are not relayed** (`SrSkipReason::ReplyRetracesLink`).
   Heard straight from the ACK originator, whose topology lists the ACK destination on a
