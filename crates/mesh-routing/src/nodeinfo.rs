@@ -1,23 +1,17 @@
-//! NODEINFO_APP (port 4) wire encode for discovery broadcasts and unicast replies.
-
+use crate::protobuf::{read_varint, skip_field};
 use mesh_crypto::{encrypt_packet, CryptoKey};
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
-use crate::topology::{
-    encode_data_payload_opts, DataBitfield, DataEncodeOpts,
-};
+use crate::topology::{encode_data_payload_opts, DataBitfield, DataEncodeOpts};
 
 pub const NODEINFO_APP: u32 = 4;
-/// `Config.DeviceConfig.Role.CLIENT` on the wire.
 pub const DEVICE_ROLE_CLIENT: u32 = 0;
 pub const DEVICE_ROLE_CLIENT_MUTE: u32 = 1;
-/// `Config.DeviceConfig.Role.ROUTER` on the wire.
 pub const DEVICE_ROLE_ROUTER: u32 = 2;
 pub const DEVICE_ROLE_ROUTER_CLIENT: u32 = 3;
 pub const DEVICE_ROLE_REPEATER: u32 = 4;
-/// `Config.DeviceConfig.Role.TRACKER` — SR mute (no rebroadcast).
 pub const DEVICE_ROLE_TRACKER: u32 = 5;
 pub const DEVICE_ROLE_SENSOR: u32 = 6;
 pub const DEVICE_ROLE_TAK: u32 = 7;
@@ -26,10 +20,7 @@ pub const DEVICE_ROLE_LOST_AND_FOUND: u32 = 9;
 pub const DEVICE_ROLE_TAK_TRACKER: u32 = 10;
 pub const DEVICE_ROLE_ROUTER_LATE: u32 = 11;
 pub const DEVICE_ROLE_CLIENT_BASE: u32 = 12;
-/// Wire name of a device role, for logs. Unknown values render as `role=<n>` by the caller.
-///
-/// The role a node advertises decides which band it takes and whether it is reserved for, so a
-/// capture that does not record our own role cannot be checked against the ladder it produced.
+/// Role information is needed to explain relay reservations in a field capture.
 pub fn device_role_name(role: u32) -> Option<&'static str> {
     Some(match role {
         DEVICE_ROLE_CLIENT => "CLIENT",
@@ -49,12 +40,10 @@ pub fn device_role_name(role: u32) -> Option<&'static str> {
     })
 }
 
-/// True for a role value the wire enum defines (0..=12).
 pub fn is_known_device_role(role: u32) -> bool {
     device_role_name(role).is_some()
 }
 
-/// Map an unknown or corrupt role byte to CLIENT so ranking never sees a nameless value.
 pub fn sanitize_device_role(role: u32) -> u32 {
     if is_known_device_role(role) {
         role
@@ -63,26 +52,18 @@ pub fn sanitize_device_role(role: u32) -> u32 {
     }
 }
 
-/// Pro Micro DIY + TCXO board (`NRF52_PROMICRO_DIY` in mesh.proto).
 pub const HW_MODEL_NRF52_PROMICRO_DIY: u32 = 63;
-/// Generic private / DIY hardware model id on the wire.
 pub const HW_MODEL_PRIVATE: u32 = 255;
-/// Periodic nodeinfo broadcast interval (15 min).
 pub const NODEINFO_BROADCAST_MS: u32 = 900_000;
-/// Minimum gap between unicast nodeinfo replies to the same requester.
 pub const NODEINFO_REPLY_COOLDOWN_MS: u32 = 5_000;
-/// Max cached peer nodeinfo entries.
 pub const MAX_NODEINFO_PEERS: usize = 16;
 
-/// Max `User.long_name` length on the wire.
 pub const NODEINFO_LONG_NAME_MAX: usize = 40;
-/// Max `User.short_name` length on the wire.
 pub const NODEINFO_SHORT_NAME_MAX: usize = 5;
 
 const OWNER_LONG_BASE: &str = "MeshRustic";
 const OWNER_SHORT_BASE: &str = "MR";
 
-/// Human-readable fields advertised in the `User` protobuf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeInfoAdvert {
     pub long_name: [u8; NODEINFO_LONG_NAME_MAX],
@@ -101,7 +82,6 @@ impl Default for NodeInfoAdvert {
 }
 
 impl NodeInfoAdvert {
-    /// Nameless advert with the board defaults (const, so a `Router` can live in a const static).
     pub const fn empty() -> Self {
         Self {
             long_name: [0; NODEINFO_LONG_NAME_MAX],
@@ -116,7 +96,6 @@ impl NodeInfoAdvert {
 }
 
 impl NodeInfoAdvert {
-    /// Fill owner names from node id (MT-style: long gets low 16 bits, short gets low byte).
     pub fn populate_owner_names(node_num: u32, advert: &mut Self) {
         advert.hw_model = HW_MODEL_NRF52_PROMICRO_DIY;
         advert.role = DEVICE_ROLE_CLIENT;
@@ -150,7 +129,6 @@ impl NodeInfoAdvert {
     }
 }
 
-/// Full on-air node identity (User protobuf + Curve25519 public key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeInfoIdentity {
     pub advert: NodeInfoAdvert,
@@ -172,7 +150,6 @@ impl NodeInfoIdentity {
         Self::for_node(0, public_key)
     }
 
-    /// Placeholder identity until `Router::load_node_config` / `set_node_identity` runs.
     pub const fn unconfigured() -> Self {
         Self {
             advert: NodeInfoAdvert::empty(),
@@ -181,16 +158,19 @@ impl NodeInfoIdentity {
     }
 }
 
-/// Format mesh node id as `!xxxxxxxx` (9 bytes, no NUL).
 pub fn format_node_id(out: &mut [u8; 9], node_num: u32) -> usize {
     out[0] = b'!';
     push_hex_u32(&mut out[1..], node_num);
     9
 }
 
-/// Hand-rolled `User` protobuf (id, names, hw_model, is_licensed, role, public_key).
 pub fn encode_user(node_num: u32, identity: &NodeInfoIdentity) -> heapless::Vec<u8, 240> {
     let advert = &identity.advert;
+    if advert.long_name_len as usize > advert.long_name.len()
+        || advert.short_name_len as usize > advert.short_name.len()
+    {
+        return heapless::Vec::new();
+    }
     let mut id = [0u8; 9];
     let id_len = format_node_id(&mut id, node_num);
     let mut out = heapless::Vec::new();
@@ -218,7 +198,6 @@ pub fn encode_user(node_num: u32, identity: &NodeInfoIdentity) -> heapless::Vec<
     out
 }
 
-/// Decode a hand-encoded `User` protobuf payload from NODEINFO_APP.
 pub fn decode_user(payload: &[u8]) -> Option<NodeInfoIdentity> {
     let mut advert = NodeInfoAdvert::default();
     let mut public_key = [0u8; 32];
@@ -227,11 +206,14 @@ pub fn decode_user(payload: &[u8]) -> Option<NodeInfoIdentity> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (2, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -243,7 +225,7 @@ pub fn decode_user(payload: &[u8]) -> Option<NodeInfoIdentity> {
             }
             (3, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -271,7 +253,7 @@ pub fn decode_user(payload: &[u8]) -> Option<NodeInfoIdentity> {
             }
             (8, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -292,7 +274,6 @@ pub fn decode_user(payload: &[u8]) -> Option<NodeInfoIdentity> {
     Some(NodeInfoIdentity { advert, public_key })
 }
 
-/// Cached peer nodeinfo from on-air NODEINFO_APP packets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeInfoPeerEntry {
     pub node_num: u32,
@@ -366,10 +347,10 @@ impl NodeInfoCache {
             return true;
         }
         let mut oldest_idx = 0usize;
-        let mut oldest = self.entries[0].last_seen_ms;
+        let mut oldest = now_ms.wrapping_sub(self.entries[0].last_seen_ms);
         for i in 1..self.count as usize {
-            if self.entries[i].last_seen_ms < oldest {
-                oldest = self.entries[i].last_seen_ms;
+            if now_ms.wrapping_sub(self.entries[i].last_seen_ms) > oldest {
+                oldest = now_ms.wrapping_sub(self.entries[i].last_seen_ms);
                 oldest_idx = i;
             }
         }
@@ -382,45 +363,6 @@ impl NodeInfoCache {
     }
 }
 
-fn read_varint(data: &[u8], mut idx: usize) -> Option<(u32, usize)> {
-    let mut result = 0u32;
-    let mut shift = 0u32;
-    for _ in 0..5 {
-        if idx >= data.len() {
-            return None;
-        }
-        let byte = data[idx];
-        idx += 1;
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, idx));
-        }
-        shift += 7;
-    }
-    None
-}
-
-fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
-    match wire {
-        0 => {
-            let (_, i) = read_varint(data, idx)?;
-            Some(i)
-        }
-        2 => {
-            let (len, mut i) = read_varint(data, idx)?;
-            i += len as usize;
-            if i > data.len() {
-                None
-            } else {
-                Some(i)
-            }
-        }
-        1 | 5 => Some(idx + if wire == 1 { 8 } else { 4 }),
-        _ => None,
-    }
-}
-
-/// Broadcast nodeinfo to `NODENUM_BROADCAST` (periodic discovery).
 pub fn build_nodeinfo_wire_frame(
     node_num: u32,
     packet_id: u32,
@@ -445,7 +387,6 @@ pub fn build_nodeinfo_wire_frame(
     )
 }
 
-/// Unicast nodeinfo reply to a requester (`reply_id` links to the request packet id).
 pub fn build_nodeinfo_reply_frame(
     to: u32,
     from: u32,
@@ -485,8 +426,11 @@ fn build_nodeinfo_frame(
     data_opts: DataEncodeOpts,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     let user = encode_user(from, identity);
+    if user.is_empty() {
+        return None;
+    }
     let plaintext = encode_data_payload_opts(NODEINFO_APP, &user, data_opts);
-    if plaintext.len() > MAX_PACKET_PAYLOAD {
+    if plaintext.is_empty() || plaintext.len() > MAX_PACKET_PAYLOAD {
         return None;
     }
     let mut cipher = [0u8; MAX_PACKET_PAYLOAD];

@@ -5,7 +5,6 @@ use crate::hash::sha256_in_place;
 use crate::key::CryptoKey;
 use crate::nonce::init_nonce;
 
-/// Mutable crypto state for channel and PKI paths.
 pub struct CryptoEngine {
     pub key: CryptoKey,
     pub nonce: [u8; 16],
@@ -37,13 +36,12 @@ impl CryptoEngine {
         self.private_key = *private_key;
     }
 
-    pub fn hash(&mut self, bytes: &mut [u8]) {
-        sha256_in_place(bytes, bytes.len());
+    pub fn hash(&mut self, bytes: &mut [u8]) -> bool {
+        sha256_in_place(bytes, bytes.len())
     }
 
-    /// X25519 DH with remote public key; `false` on weak/all-zero result.
     pub fn set_dh_public_key(&mut self, pub_key: &[u8; 32]) -> bool {
-        if pub_key.iter().all(|&b| b == 0) {
+        if self.private_key.iter().all(|&b| b == 0) || pub_key.iter().all(|&b| b == 0) {
             self.shared_key.fill(0);
             return false;
         }
@@ -139,6 +137,7 @@ impl CryptoEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec::Vec;
 
     fn hex_to_bytes<const N: usize>(hex: &str) -> [u8; N] {
         let decoded = hex::decode(hex).unwrap();
@@ -207,5 +206,11 @@ mod tests {
             &decrypted[..10],
             hex::decode("08011204746573744800").unwrap()
         );
+    }
+    #[test]
+    fn unset_private_key_cannot_establish_a_shared_secret() {
+        let mut crypto = CryptoEngine::new();
+        assert!(!crypto.set_dh_public_key(&[9; 32]));
+        assert_eq!(crypto.shared_key, [0; 32]);
     }
 }

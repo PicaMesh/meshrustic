@@ -1,5 +1,3 @@
-//! Public mesh air-interface constants.
-
 pub const PACKET_HEADER_LEN: usize = 16;
 pub const MAX_LORA_PAYLOAD_LEN: usize = 255;
 pub const MAX_LORA_FRAME_LEN: usize = MAX_LORA_PAYLOAD_LEN;

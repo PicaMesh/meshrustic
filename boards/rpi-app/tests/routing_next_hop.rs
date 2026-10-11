@@ -1,5 +1,3 @@
-//! getNextHop Dijkstra routing tests.
-
 use mesh_protocol::PacketHeader;
 use mesh_routing::{
     decode_packed_neighbors, relay_header_with_next_hop, write_packed_header, NeighborGraph,
@@ -17,7 +15,7 @@ fn merge_remote(graph: &mut NeighborGraph, reporter: u32, neighbor: u32, now_ms:
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 1, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     let result = graph.merge_topology(reporter, &header, &[remote], true, now_ms, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
 }

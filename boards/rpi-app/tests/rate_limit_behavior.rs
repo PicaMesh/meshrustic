@@ -1,7 +1,3 @@
-//! Rate limiter ordering on the RX path — rate-limit runs before graph/topology observe;
-//! dropped frames leave no neighbor or module side effects. Port handlers and reliable-RX
-//! side effects are skipped on drop.
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_radio::MODEM_SHORT_SLOW;
@@ -91,7 +87,7 @@ fn build_topology_wire(
     packed[5..9].copy_from_slice(&listed_neighbor.to_le_bytes());
     packed[9] = 0xB6;
     packed[10] = 8;
-    packed[11] = 0x02; // hears_us
+    packed[11] = 0x02;
     let packed_len = PACKED_NEIGHBOR_HEADER_SIZE + 8;
     let (len, frame) = build_topology_wire_frame(
         from,
@@ -130,8 +126,6 @@ fn rate_limited_packet_does_not_merge_topology() {
         .process_inbound(&inbound(&wire), 1_000)
         .expect("topology rx");
     assert!(result.rate_limited);
-    // Dropped before merge: listed peer must not enter the ball (Horizon promotes L1-listed
-    // hearsUs peers to L2; pre-Horizon this was a list-downstream row).
     assert!(!router.graph_mut().has_graph_node(listed));
     assert_eq!(router.graph_mut().get_downstream_relay(listed, 1_000), None);
 
@@ -152,9 +146,6 @@ fn rate_limited_packet_does_not_merge_topology() {
 
 #[test]
 fn nodeinfo_request_to_us_is_answered_even_from_a_limited_node() {
-    // Packets addressed to us bypass the per-source limiter: they are never relayed and the
-    // reply path has its own per-requester cooldown, so a flooded OTHER bucket must not
-    // silence a direct NodeInfo request.
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our_node = 0x1111_1111;
     let requester = 0x2222_2222;
@@ -255,7 +246,6 @@ fn dedup_still_runs_when_rate_limited() {
 
 #[test]
 fn multi_from_one_resolved_relay_is_contained() {
-    // AC19: rotating originators through one resolved last hop trip RELAY; drop skips topology.
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our_node = 0x0101_0101;
     let relay = 0x0A0A_0A0A;
@@ -269,7 +259,6 @@ fn multi_from_one_resolved_relay_is_contained() {
     let channel = router.channel_hash();
     let relay_byte = (relay & 0xFF) as u8;
     router.remember_relay_identity(relay, relay_byte, 0);
-    // Seed relay as a direct peer and free the pool slot.
     {
         let (len, frame) = build_app_wire_frame(
             NODENUM_BROADCAST,
@@ -332,7 +321,6 @@ fn multi_from_one_resolved_relay_is_contained() {
     let wire = build_topology_wire(0xB000_00AA, 0x9101, channel, &key, listed);
     let mut wired = wire;
     if wired.len() > 15 {
-        // Multi-hop topology via the same banned relay (hop_start=5, hop_limit=3).
         wired[12] = mesh_protocol::PacketHeader::encode_flags(3, 5, false, false);
         wired[15] = relay_byte;
     }

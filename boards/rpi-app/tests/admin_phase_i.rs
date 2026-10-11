@@ -1,5 +1,3 @@
-//! Phase I: get_channel, settings-load burst, Security identity keys, DEVICE stub.
-
 use mesh_crypto::CryptoEngine;
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_routing::{
@@ -37,6 +35,7 @@ fn build_pki_admin_frame_opts(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_pki_admin_frame_full(
     to: u32,
     from: u32,
@@ -152,13 +151,15 @@ fn get_channel_primary_psk_and_disabled() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE001_0001u32;
     let peer = 0xF001_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x01; 16]), 1);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x02; 16]), 2);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x03; 16]), 3);
+    let (node_priv, node_pub) = generate_keypair([0x01; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x02; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x03; 32]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetChannelRequest(1);
+    let get = AdminMessage {
+        payload: AdminPayload::GetChannelRequest(1),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -181,8 +182,10 @@ fn get_channel_primary_psk_and_disabled() {
         other => panic!("{:?}", other),
     }
 
-    let mut get2 = AdminMessage::default();
-    get2.payload = AdminPayload::GetChannelRequest(2);
+    let get2 = AdminMessage {
+        payload: AdminPayload::GetChannelRequest(2),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -207,13 +210,15 @@ fn field_log_channel_then_lora_both_admin_replies() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE002_0001u32;
     let peer = 0xF002_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x11; 16]), 11);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x12; 16]), 12);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x13; 16]), 13);
+    let (node_priv, node_pub) = generate_keypair([0x11; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x12; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x13; 32]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
-    let mut ch = AdminMessage::default();
-    ch.payload = AdminPayload::GetChannelRequest(1);
+    let ch = AdminMessage {
+        payload: AdminPayload::GetChannelRequest(1),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -224,8 +229,10 @@ fn field_log_channel_then_lora_both_admin_replies() {
     );
     inbound(router, &frame, 2_000);
 
-    let mut lora = AdminMessage::default();
-    lora.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let lora = AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -242,7 +249,6 @@ fn field_log_channel_then_lora_both_admin_replies() {
         decrypt_pki_admin(&tx1, &b1_priv, &node_pub).1.payload,
         decrypt_pki_admin(&tx2, &b1_priv, &node_pub).1.payload,
     ];
-    // Order is FIFO by next_tx_ms; accept either order.
     let mut saw_channel = false;
     let mut saw_lora = false;
     for p in &payloads {
@@ -264,10 +270,10 @@ fn security_get_set_persist_and_identity_immutable() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE003_0001u32;
     let peer = 0xF003_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x21; 16]), 21);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x22; 16]), 22);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x23; 16]), 23);
-    let (flash_priv, flash_pub) = generate_keypair(Some(&[0x24; 16]), 24);
+    let (node_priv, node_pub) = generate_keypair([0x21; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x22; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32]);
+    let (flash_priv, flash_pub) = generate_keypair([0x24; 32]);
     let _ = flash_priv;
 
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
@@ -278,10 +284,10 @@ fn security_get_set_persist_and_identity_immutable() {
     router.set_node_identity(NodeInfoIdentity::for_node(our, node_pub));
     router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
     router.set_device_role(DEVICE_ROLE_ROUTER);
-
-    // Seed session.
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
+    let get = AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -303,20 +309,20 @@ fn security_get_set_persist_and_identity_immutable() {
         other => panic!("{:?}", other),
     }
     let passkey = sec_msg.session_passkey;
-
-    // Set flash admin key + attempt identity rotation (must be ignored).
-    let mut sec = WireSecurityConfig::default();
-    sec.has_public_key = true;
-    sec.public_key = [0xDE; 32];
-    sec.has_private_key = true;
-    sec.private_key = [0xAD; 32];
+    let mut sec = WireSecurityConfig {
+        has_public_key: true,
+        public_key: [0xDE; 32],
+        has_private_key: true,
+        private_key: [0xAD; 32],
+        ..Default::default()
+    };
     sec.admin_keys[0] = flash_pub;
     sec.admin_key_count = 1;
-    let mut set = AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Security(sec));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
-    // Field log 23:32: client set omitted want_response; still must get Routing NONE.
+    let set = AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Security(sec)),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = build_pki_admin_frame_full(
         our,
         peer,
@@ -349,7 +355,6 @@ fn security_get_set_persist_and_identity_immutable() {
         ROUTING_ERROR_NONE,
         "mutating admin set completes with ROUTING_APP Error_NONE even without want_response"
     );
-    // Client WantAck retry: hop_limit=0 re-ACK only — no second admin completion.
     inbound(router, &frame, 3_150);
     assert!(
         router.poll_admin_tx(3_150).is_none(),
@@ -397,12 +402,11 @@ fn security_get_set_persist_and_identity_immutable() {
     assert_eq!(reloaded.public_key, node_pub);
     assert_eq!(reloaded.private_key, node_priv);
     assert_eq!(reloaded.admin_public_keys[0], flash_pub);
-
-    // Clear flash keys.
-    let mut clear = AdminMessage::default();
-    clear.payload = AdminPayload::SetConfig(ConfigPayload::Security(WireSecurityConfig::default()));
-    clear.has_session_passkey = true;
-    clear.session_passkey = router.admin_state().session_passkey;
+    let clear = AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Security(WireSecurityConfig::default())),
+        has_session_passkey: true,
+        session_passkey: router.admin_state().session_passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -421,13 +425,15 @@ fn get_device_role_and_module_config_stub() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE004_0001u32;
     let peer = 0xF004_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x31; 16]), 31);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x32; 16]), 32);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x33; 16]), 33);
+    let (node_priv, node_pub) = generate_keypair([0x31; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x32; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE);
+    let get = AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -445,8 +451,10 @@ fn get_device_role_and_module_config_stub() {
         other => panic!("{:?}", other),
     }
 
-    let mut modreq = AdminMessage::default();
-    modreq.payload = AdminPayload::GetModuleConfigRequest(0);
+    let modreq = AdminMessage {
+        payload: AdminPayload::GetModuleConfigRequest(0),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -468,9 +476,9 @@ fn rapid_multi_get_queue_and_rate_limit() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE005_0001u32;
     let peer = 0xF005_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x41; 16]), 41);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x42; 16]), 42);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x43; 16]), 43);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let requests = [
@@ -482,8 +490,10 @@ fn rapid_multi_get_queue_and_rate_limit() {
 
     let now = 5_000u32;
     for (id, payload) in requests {
-        let mut msg = AdminMessage::default();
-        msg.payload = payload;
+        let msg = AdminMessage {
+            payload,
+            ..Default::default()
+        };
         let frame = build_pki_admin_frame(
             our,
             peer,
@@ -511,19 +521,19 @@ fn rapid_multi_get_queue_and_rate_limit() {
 
 #[test]
 fn pki_want_ack_ack_is_pki_and_admin_sets_request_id() {
-    // Field log 2026-08-10 21:20: PKI admin WantAck got channel-PSK ACKs → app retransmits;
-    // admin replies must set Data.request_id and (when WantAck) serve as the sole ACK.
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE006_0001u32;
     let peer = 0xF006_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x51; 16]), 51);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x52; 16]), 52);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x53; 16]), 53);
+    let (node_priv, node_pub) = generate_keypair([0x51; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x52; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x53; 32]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let req_id = 0x8f8b_7001u32;
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
+    let get = AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame_opts(
         our,
         peer,
@@ -554,7 +564,6 @@ fn pki_want_ack_ack_is_pki_and_admin_sets_request_id() {
         meta.reply_id, 0,
         "admin reply must not set Data.reply_id (setReplyTo)"
     );
-    // Reply must be PKI (Ch=0) so pure-PKI clients accept it as the WantAck stop.
     assert_eq!(hdr.channel, 0);
     match msg.payload {
         AdminPayload::GetConfigResponse(ConfigPayload::Security(sec)) => {
@@ -570,14 +579,16 @@ fn pki_want_ack_dupe_resends_idempotent_admin_get() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE006_0003u32;
     let peer = 0xF006_0004u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x61; 16]), 61);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x62; 16]), 62);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x63; 16]), 63);
+    let (node_priv, node_pub) = generate_keypair([0x61; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x62; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x63; 32]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let req_id = 0x8f8b_7002u32;
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let get = AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame_opts(
         our,
         peer,

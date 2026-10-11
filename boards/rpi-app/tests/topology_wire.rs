@@ -1,5 +1,3 @@
-//! Topology wire-format tests (V3 packed_neighbors).
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::PacketHeader;
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
@@ -26,9 +24,6 @@ fn multi_packet_chunk_size_golden() {
     for i in 0..MAX_NEIGHBORS as u32 {
         graph.observe_direct_neighbor(0x1000 + i, -70, 8, 0, 0);
     }
-    // Our neighbour set is our own measured edges, so all MAX_NEIGHBORS of them count and are
-    // published — the graph node cap applies to nodes we hold edge lists for, not to our own
-    // edges. Topology pack includes only reported edges with a cached direct signal.
     assert_eq!(graph.neighbor_count() as usize, MAX_NEIGHBORS);
     let mut packed_neighbors = [NeighborEntry::default(); MAX_NEIGHBORS];
     let pack_count = graph.topology_neighbors_for_pack(&mut packed_neighbors);
@@ -36,8 +31,6 @@ fn multi_packet_chunk_size_golden() {
         pack_count as usize, MAX_NEIGHBORS,
         "one cached signal per observed direct edge"
     );
-
-    // 40 direct neighbours no longer fit one 28-entry packet: the list goes out as two chunks.
     let per_packet = MAX_NEIGHBORS_PER_PACKET;
     let expected_packets = MAX_NEIGHBORS.div_ceil(per_packet);
     assert_eq!(expected_packets, 2);
@@ -103,7 +96,7 @@ fn maintenance_does_not_rebroadcast_topology_after_one_minute() {
         .poll_topology_tx(100)
         .expect("boot topology must be ready");
     let header = PacketHeader::decode(&topo.bytes[..topo.len as usize]).unwrap();
-    router.record_tx_on_air(header.parse().id, 100);
+    router.record_tx_on_air(header.parse().from, header.parse().id, 100);
     assert!(router.poll_topology_tx(100).is_none());
 
     let report = router.run_maintenance(60_100, 50);

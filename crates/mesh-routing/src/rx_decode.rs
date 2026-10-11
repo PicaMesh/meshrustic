@@ -1,5 +1,4 @@
-//! Decrypted payload summaries for RX logging.
-
+use crate::protobuf::{read_varint, skip_field};
 use mesh_protocol::portnum::num;
 
 use crate::telemetry::{decode_device_metrics, extract_device_metrics, TELEMETRY_APP};
@@ -170,6 +169,9 @@ fn decode_position(payload: &[u8]) -> Option<RxPayloadSummary> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 5) if i + 4 <= payload.len() => {
@@ -210,11 +212,14 @@ fn decode_nodeinfo(payload: &[u8]) -> Option<RxPayloadSummary> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (3, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -254,8 +259,6 @@ fn decode_traceroute(payload: &[u8]) -> Option<RxPayloadSummary> {
 fn decode_device_telemetry(payload: &[u8]) -> Option<RxPayloadSummary> {
     let nested = extract_device_metrics(payload)?;
     let dm = decode_device_metrics(nested)?;
-    // Battery fields are optional on the wire (a sender with no usable pack reading
-    // omits them), so summarize whatever arrived instead of dropping the packet.
     if dm.voltage_v.is_none() && dm.battery_level.is_none() && dm.uptime_seconds.is_none() {
         return None;
     }
@@ -271,6 +274,9 @@ fn decode_routing(payload: &[u8]) -> Option<RxPayloadSummary> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         if field == 1 && wire == 0 {
             let (v, ni) = read_varint(payload, i)?;
@@ -284,44 +290,6 @@ fn decode_routing(payload: &[u8]) -> Option<RxPayloadSummary> {
     Some(RxPayloadSummary::Routing {
         error_reason: error_reason?,
     })
-}
-
-fn read_varint(data: &[u8], mut idx: usize) -> Option<(u32, usize)> {
-    let mut result = 0u32;
-    let mut shift = 0u32;
-    for _ in 0..5 {
-        if idx >= data.len() {
-            return None;
-        }
-        let byte = data[idx];
-        idx += 1;
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, idx));
-        }
-        shift += 7;
-    }
-    None
-}
-
-fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
-    match wire {
-        0 => {
-            let (_, i) = read_varint(data, idx)?;
-            Some(i)
-        }
-        2 => {
-            let (len, mut i) = read_varint(data, idx)?;
-            i += len as usize;
-            if i > data.len() {
-                None
-            } else {
-                Some(i)
-            }
-        }
-        1 | 5 => Some(idx + if wire == 1 { 8 } else { 4 }),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -352,7 +320,7 @@ mod tests {
     fn routing_error_reason() {
         let mut payload = heapless::Vec::<u8, 8>::new();
         payload.push(1 << 3).unwrap();
-        payload.push(3).unwrap(); // NONE or similar enum value
+        payload.push(3).unwrap();
         match summarize_decrypted(num::ROUTING_APP, &payload) {
             RxPayloadSummary::Routing { error_reason } => assert_eq!(error_reason, 3),
             _ => panic!("expected routing"),

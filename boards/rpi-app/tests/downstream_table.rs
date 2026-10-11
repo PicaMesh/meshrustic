@@ -1,5 +1,3 @@
-//! Downstream relay lookup: TTL, lowest cost, transfer helpers.
-
 use mesh_routing::{DownstreamTable, NeighborGraph, NEIGHBOR_TTL_MS};
 
 #[test]

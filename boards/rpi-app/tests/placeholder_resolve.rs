@@ -1,5 +1,3 @@
-//! Placeholder → real node resolution and gateway transfer.
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
@@ -152,8 +150,6 @@ fn relayed_packet_uses_known_direct_neighbor_as_gateway() {
 
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(!graph.has_graph_node(placeholder));
-    // The real node is the gateway, but the source has not listed it and it has not heard us,
-    // so the frame is not a downstream path.
     assert_eq!(graph.get_downstream_relay(SOURCE, 300), None);
 }
 
@@ -223,9 +219,6 @@ fn relayed_frame_does_not_resolve_placeholder() {
     router.process_inbound(&relayed, 100).expect("relayed rx");
     let placeholder = get_placeholder_for_relay(RELAY_BYTE);
     assert!(router.graph_mut().has_graph_node(placeholder));
-
-    // Hop budget consumed (hop_start > hop_limit): must not resolve even though
-    // relay byte matches REAL_RELAY's low byte.
     let header = PacketHeader::from_fields(
         NODENUM_BROADCAST,
         REAL_RELAY,

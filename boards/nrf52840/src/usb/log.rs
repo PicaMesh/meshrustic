@@ -1,12 +1,9 @@
-//! Static ring buffer for USB CDC log output.
-
 use core::cell::RefCell;
 
 use embassy_time::Instant;
 
 const RING_SIZE: usize = 16384;
 
-/// Max single USB log line: timestamp + RX metadata + full 255-byte hex payload.
 pub const MAX_LOG_LINE: usize = 640;
 
 struct LogRing {
@@ -28,9 +25,6 @@ impl LogRing {
         self.head.wrapping_sub(self.tail)
     }
 
-    /// Discard the oldest unread line, including its newline. A full ring used to drop
-    /// single bytes, which removed the middle of a line the host had already started and
-    /// glued the next line onto what remained.
     fn drop_oldest_line(&mut self) {
         let available = self.len();
         let mut dropped = 0usize;
@@ -57,9 +51,7 @@ impl LogRing {
         }
     }
 
-    /// Copy one complete line, including its newline. Returns 0 when the oldest
-    /// unread bytes are not yet a finished line. A line that cannot fit in `out`
-    /// is discarded so it cannot stall the drain.
+    /// An oversized line must not stall draining the ring.
     fn read_line(&mut self, out: &mut [u8]) -> usize {
         let available = self.len();
         if available == 0 || out.is_empty() {
@@ -113,7 +105,6 @@ fn push_u64(out: &mut [u8], mut n: u64) -> usize {
     len
 }
 
-/// Write `[T=12345ms] ` prefix; returns next write offset.
 fn line_prefix(line: &mut [u8]) -> usize {
     let prefix = b"[T=";
     line[..prefix.len()].copy_from_slice(prefix);
@@ -125,15 +116,11 @@ fn line_prefix(line: &mut [u8]) -> usize {
 }
 
 fn finish_line(line: &mut [u8], pos: usize) {
-    // Never index past the buffer: a truncated line beats a halted node.
     let pos = pos.min(line.len() - 1);
     line[pos] = b'\n';
     push_bytes(&line[..pos + 1]);
 }
 
-/// Bounded appends: text that would overflow the line buffer is truncated (keeping room for the
-/// newline) instead of panicking. The version-resync line once overran its 128-byte buffer by
-/// three bytes; with `panic_probe` that halted both nicenanos on the first resync.
 fn put(line: &mut [u8], pos: &mut usize, text: &[u8]) {
     let room = line.len().saturating_sub(*pos + 1);
     let n = text.len().min(room);
@@ -260,7 +247,6 @@ fn push_freq_mhz(out: &mut [u8], freq_mhz: f32) -> usize {
     pos
 }
 
-/// Boot and identity lines for USB CDC.
 pub mod mesh {
     use super::{finish_line, line_prefix, push_hex_u16_4, put, put_hex8, put_u32};
 
@@ -273,11 +259,6 @@ pub mod mesh {
         finish_line(&mut line, pos);
     }
 
-    /// `[meshrustic] role=CLIENT (0)` — our own configured device role at boot.
-    ///
-    /// The role decides which ladder positions we take and whether peers reserve for us, so a
-    /// capture without it cannot be checked against the ladder it produced. Neither tree logged
-    /// it before.
     pub fn device_role(role: u32) {
         let mut line = [0u8; 64];
         let mut pos = line_prefix(&mut line);
@@ -292,9 +273,6 @@ pub mod mesh {
         finish_line(&mut line, pos);
     }
 
-    /// Flash load result + configurable admin public-key count.
-    /// `[meshrustic] reset reason=0x0004 (SREQ)` — RESETREAS bits as read at boot; SREQ is what
-    /// the panic handler's `sys_reset` leaves behind, so a panic reboot is visible in the log.
     pub fn reset_reason(resetreas: u32) {
         let mut line = [0u8; 96];
         let mut pos = line_prefix(&mut line);
@@ -358,10 +336,6 @@ pub mod mesh {
         finish_line(&mut line, pos);
     }
 
-    /// `[meshrustic] host command rejected: <reason>` — Part C's line parser refused a line.
-    /// Named here, not silently dropped: the H1 controlled-node harness (see
-    /// tmp/controlled-node-harness-plan-20260911.md in the repo) needs to know which check
-    /// failed, not just that a line went nowhere.
     pub fn host_command_rejected(reason: &[u8]) {
         let mut line = [0u8; 96];
         let mut pos = line_prefix(&mut line);
@@ -370,10 +344,6 @@ pub mod mesh {
         finish_line(&mut line, pos);
     }
 
-    /// `[meshrustic] host command dropped: queue full` — a line parsed fine but the radio task
-    /// had not yet drained the previous command. The channel is deliberately tiny (capacity 2,
-    /// never unbounded); this is the same "say so" discipline as a rejected line, not a silent
-    /// loss.
     pub fn host_command_dropped() {
         let mut line = [0u8; 64];
         let mut pos = line_prefix(&mut line);
@@ -386,18 +356,12 @@ pub mod mesh {
     }
 }
 
-/// Mirror key `[Radio0]` defmt lines as plain text for USB CDC.
 pub mod radio {
     use super::{
         finish_line, line_prefix, push_freq_mhz, push_hex_u32_8, push_hex_u8_2, push_u32, put,
         put_hex2, put_hex4, put_hex8, put_i32, put_u32, MAX_LOG_LINE,
     };
 
-    /// `[Radio0] TX held: id=0x<id> behind=N hold=214ms busy=0 pending=1 gate=0` -- which frame
-    /// waited, which reception it sat behind, and which gate kept it off the air.
-    ///
-    /// Rate-limited by the caller — this fires on the edge, once per hold, so a long wait
-    /// does not fill the log.
     pub fn tx_held(
         id: u32,
         hold_ms: u32,
@@ -449,7 +413,6 @@ pub mod radio {
         finish_line(&mut line, pos);
     }
 
-    // One log line per modem parameter set; the argument list mirrors the printed fields.
     #[allow(clippy::too_many_arguments)]
     pub fn config_modem(
         sf: u8,
@@ -558,7 +521,6 @@ pub mod radio {
             append_slice(line, pos, b" hopStart=");
             append_u32(line, pos, parsed.hop_start as u32);
         }
-        // Unicasts always show the field: a cleared next hop is a decision, not an omission.
         if parsed.next_hop != 0 || parsed.to != 0xFFFF_FFFF {
             append_slice(line, pos, b" nextHop=0x");
             *pos += push_hex_u8_2(&mut line[*pos..], parsed.next_hop);
@@ -945,7 +907,6 @@ pub mod battery {
     }
 }
 
-/// Signal-routing decision logs (`[SR]` prefix).
 pub mod sr {
     use super::{finish_line, line_prefix, put, put_hex2, put_hex8, put_i32, put_u32};
     use mesh_routing::{
@@ -1089,7 +1050,6 @@ pub mod sr {
                 len,
                 last: _,
             } => {
-                // ~33 bytes of prefix plus 10 per destination: 12 ids need ~153 bytes.
                 let mut line = [0u8; 256];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR]   !";
@@ -1122,7 +1082,6 @@ pub mod sr {
         }
     }
 
-    /// Stream the full periodic topology dump directly to USB (bypasses SR log ring).
     pub fn emit_topology_dump(router: &Router) {
         let mut sink = UsbTopologySink;
         router.emit_topology_log(&mut sink);
@@ -1236,8 +1195,6 @@ pub mod sr {
                 absorbed,
                 absorbed_len,
             } => {
-                // 320 clipped the cand= tail once unc= was added, and the tail is the part two nodes
-                // are compared on; slots=, the R: markers and abs= added ~130 more.
                 let mut line = [0u8; 544];
                 let mut pos = line_prefix(&mut line);
                 let prefix = b"[SR] Slot scheduling for pkt 0x";
@@ -1264,9 +1221,6 @@ pub mod sr {
                 let tail2 = b", slot=";
                 put(&mut line, &mut pos, tail2);
                 put_u32(&mut line, &mut pos, slot_index as u32);
-                // Transmissions expected ahead of ours, and how many are stock reservations. This
-                // is what T1 arming turns on; without it a capture cannot say whether two nodes
-                // agreed about the insurance a packet earned.
                 put(&mut line, &mut pos, b", slots=");
                 put_u32(&mut line, &mut pos, slots_given as u32);
                 if reserved_slots > 0 {
@@ -1290,9 +1244,6 @@ pub mod sr {
                         if i > 0 {
                             put(&mut line, &mut pos, b">");
                         }
-                        // Leading entries are reservations for stock routers, not rungs we
-                        // assigned. Marked, because the two are compared across nodes and a flat
-                        // list cannot tell them apart.
                         if (i as u8) < reserved_ranked {
                             put(&mut line, &mut pos, b"R:");
                         }
@@ -1301,9 +1252,6 @@ pub mod sr {
                     }
                 }
                 if absorbed_len > 0 {
-                    // Who took coverage off the table before we were ranked, and how many nodes
-                    // each newly covered: !node+credit. A candidate with nothing unique left is
-                    // explained by these entries and by nothing else in the line.
                     put(&mut line, &mut pos, b", abs=");
                     for (i, (node, credit)) in
                         absorbed.iter().take(absorbed_len as usize).enumerate()
@@ -1318,8 +1266,6 @@ pub mod sr {
                     }
                 }
                 if evaluated_len > 0 {
-                    // Ranking inputs: !node(unique/total coverage,cost bucket); unicast costs carry
-                    // tier bits and no coverage.
                     let cand = b", cand=";
                     put(&mut line, &mut pos, cand);
                     for (i, (node, cov, total, cost)) in
@@ -2007,6 +1953,7 @@ pub mod sr {
             }
             SrLogEvent::T1Canceled { id, reason } => {
                 let reason_text: &[u8] = match reason {
+                    T1CancelReason::Policy => b"relay policy changed",
                     T1CancelReason::RelayHeard => b"relay heard",
                     T1CancelReason::OwnTransmission => b"we transmitted it ourselves",
                 };

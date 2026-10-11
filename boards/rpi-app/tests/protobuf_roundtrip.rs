@@ -28,7 +28,7 @@ fn mesh_packet_protobuf_round_trip() {
 
 #[test]
 fn signal_routing_info_round_trip() {
-    let mut packed = vec![1, 8, 3, 42, 1]; // V3 packed header: fmt=1, entry=8, routing=3, topo=42, SR=1
+    let packed = vec![1, 8, 3, 42, 1];
     let info = SignalRoutingInfo {
         packed_neighbors: packed.clone(),
     };

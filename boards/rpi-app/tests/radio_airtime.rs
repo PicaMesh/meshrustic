@@ -1,5 +1,3 @@
-//! AirTime duty-cycle and packet-time tests (host).
-
 use mesh_radio::{
     contention_window_ms, packet_time_ms, slot_time_ms, AirTime, RadioConfig, EU_868,
     MODEM_SHORT_SLOW, REGION_EU_868,
@@ -44,7 +42,7 @@ fn eu868_region_constants() {
 fn contention_window_matches_shortslow_airtime() {
     let cfg = RadioConfig::eu868_short_slow();
     let slot = slot_time_ms(&cfg);
-    assert!(slot >= 8 && slot <= 15);
+    assert!((8..=15).contains(&slot));
     assert_eq!(contention_window_ms(MODEM_SHORT_SLOW), 2000);
     let typical_airtime = packet_time_ms(&cfg, 64, false);
     assert!(typical_airtime > slot);

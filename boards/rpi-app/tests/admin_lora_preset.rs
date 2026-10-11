@@ -1,5 +1,3 @@
-//! LoRa modem preset get/set via admin and persistence across store reload.
-
 use mesh_crypto::{CryptoEngine, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_radio::{
@@ -89,9 +87,9 @@ fn set_lora_persists_and_reloads_channel_hash() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC001_0001u32;
     let peer = 0xD001_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x11; 16]), 1);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x12; 16]), 2);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x13; 16]), 3);
+    let (node_priv, node_pub) = generate_keypair([0x11; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x12; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x13; 32]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -106,8 +104,10 @@ fn set_lora_persists_and_reloads_channel_hash() {
         primary_channel_hash("", MODEM_DEFAULT_PRESET, true, &DEFAULT_PSK)
     );
 
-    let mut get = mesh_routing::AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let get = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -120,17 +120,18 @@ fn set_lora_persists_and_reloads_channel_hash() {
     let _ = router.poll_admin_tx(1_000);
     let passkey = router.admin_state().session_passkey;
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-        use_preset: true,
-        modem_preset: MODEM_SHORT_FAST as u32,
-        region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
-        config_ok_to_mqtt: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_SHORT_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+            config_ok_to_mqtt: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -151,14 +152,11 @@ fn set_lora_persists_and_reloads_channel_hash() {
     assert_eq!(router.modem_preset(), MODEM_SHORT_FAST);
     let expected_hash = primary_channel_hash("", MODEM_SHORT_FAST, true, &DEFAULT_PSK);
     assert_eq!(router.channel_hash(), expected_hash);
-    // Soft radio reinit — never schedule MCU reset (UF2 boards enter upload mode).
     assert!(
         router.take_pending_radio_reinit(),
         "LoRa preset change must request soft radio reinit"
     );
     assert!(router.take_pending_reboot_seconds().is_none());
-
-    // Board soft-reinit uses eu868_config_for_preset(router.modem_preset()).
     let radio = eu868_config_for_preset(router.modem_preset());
     assert_eq!(
         radio.spreading_factor, 7,
@@ -183,8 +181,6 @@ fn set_lora_persists_and_reloads_channel_hash() {
     assert_eq!(reloaded.lora.bandwidth_khz, 250.0);
     assert_eq!(reloaded.lora.coding_rate, 5);
     assert_eq!(reloaded.primary_channel_hash(), expected_hash);
-
-    // Boot path: main.rs applies eu868_config_for_preset(config.lora.modem_preset).
     let boot_radio = eu868_config_for_preset(reloaded.lora.modem_preset);
     assert_eq!(boot_radio.spreading_factor, reloaded.lora.spreading_factor);
     assert_eq!(boot_radio.bandwidth_khz, reloaded.lora.bandwidth_khz);
@@ -201,9 +197,9 @@ fn set_long_fast_persists_to_store() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC003_0001u32;
     let peer = 0xD003_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x21; 16]), 21);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x22; 16]), 22);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x23; 16]), 23);
+    let (node_priv, node_pub) = generate_keypair([0x21; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x22; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -213,8 +209,10 @@ fn set_long_fast_persists_to_store() {
     router.set_node_identity(NodeInfoIdentity::for_node(our, node_pub));
     router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
 
-    let mut get = mesh_routing::AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let get = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -227,17 +225,18 @@ fn set_long_fast_persists_to_store() {
     let _ = router.poll_admin_tx(1_000);
     let passkey = router.admin_state().session_passkey;
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-        use_preset: true,
-        modem_preset: MODEM_LONG_FAST as u32,
-        region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
-        config_ok_to_mqtt: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_LONG_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+            config_ok_to_mqtt: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -275,17 +274,19 @@ fn get_lora_reports_current_preset_after_set() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC002_0001u32;
     let peer = 0xD002_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x88; 16]), 8);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x89; 16]), 9);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x8A; 16]), 10);
+    let (node_priv, node_pub) = generate_keypair([0x88; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x89; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x8A; 32]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
     router.set_node_identity(NodeInfoIdentity::for_node(our, node_pub));
     router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
 
-    let mut get = mesh_routing::AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let get = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -299,17 +300,18 @@ fn get_lora_reports_current_preset_after_set() {
     assert_eq!(router.admin_state().modem_preset, MODEM_DEFAULT_PRESET);
     let passkey = router.admin_state().session_passkey;
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-        use_preset: true,
-        modem_preset: MODEM_SHORT_FAST as u32,
-        region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
-        config_ok_to_mqtt: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_SHORT_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+            config_ok_to_mqtt: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,

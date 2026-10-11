@@ -1,44 +1,26 @@
-//! POSITION_APP (port 3) fixed-position broadcasts.
-//!
-//! Cadence and coordinates come from remote admin, the same messages the phone
-//! sends a node it administers: `Config.PositionConfig` and `AdminMessage.set_fixed_position`.
-//! MeshRustic's USB link is a log plus text host commands, not the phone `ToRadio` API,
-//! so that local client path is not implemented.
-//!
-//! Only a stored lat/lon is broadcast, on `position_broadcast_secs`. Position requests
-//! are not answered. Smart broadcast, position flags, and GPS are not implemented.
+//! The USB debug link has no phone ToRadio endpoint to supply local position updates.
 
+use crate::protobuf::{read_varint, skip_field};
 use mesh_crypto::{encrypt_packet, CryptoKey};
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
 use crate::nodeinfo::{DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_LATE};
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
-use crate::topology::{
-    encode_data_payload_opts, DataBitfield, DataEncodeOpts,
-};
+use crate::topology::{encode_data_payload_opts, DataBitfield, DataEncodeOpts};
 
 pub const POSITION_APP: u32 = mesh_protocol::num::POSITION_APP;
 
-/// `Position.LocSource.LOC_MANUAL`.
 pub const LOC_MANUAL: u32 = 1;
 
-/// Full lat/lon precision. The MT+SR fork quantizes with the channel's
-/// `position_precision` (13 on a fresh primary channel); MeshRustic has no
-/// channel module settings, so the configured coordinates go out unchanged.
 pub const POSITION_PRECISION_BITS: u32 = 32;
 
-/// `Default.h` `default_broadcast_interval_secs` / `min_default_broadcast_interval_secs`
-/// for every role other than ROUTER and ROUTER_LATE.
 pub const POSITION_BROADCAST_SECS_CLIENT: u32 = 60 * 60;
 
-/// Same defaults for ROUTER and ROUTER_LATE (`ONE_DAY / 2`).
 pub const POSITION_BROADCAST_SECS_ROUTER: u32 = 12 * 60 * 60;
 
-/// `Default.h` `MAX_INTERVAL` (`INT32_MAX`): larger values overflow Apple clients.
 pub const POSITION_BROADCAST_SECS_MAX: u32 = i32::MAX as u32;
 
-/// Role-aware floor and default. Zero stays "unset" and resolves to this at send time.
 pub fn position_interval_floor_secs(role: u32) -> u32 {
     if role == DEVICE_ROLE_ROUTER || role == DEVICE_ROLE_ROUTER_LATE {
         POSITION_BROADCAST_SECS_ROUTER
@@ -47,7 +29,6 @@ pub fn position_interval_floor_secs(role: u32) -> u32 {
     }
 }
 
-/// Raise a configured interval to the default-channel floor. Zero is left as zero.
 pub fn coerce_position_broadcast_secs(configured: u32, role: u32) -> u32 {
     if configured == 0 {
         return 0;
@@ -61,17 +42,15 @@ pub fn coerce_position_broadcast_secs(configured: u32, role: u32) -> u32 {
     }
 }
 
-/// Effective broadcast period. Stored 0 uses the role default.
 pub fn position_broadcast_interval_ms(stored_secs: u32, role: u32) -> u32 {
     let secs = if stored_secs == 0 {
         position_interval_floor_secs(role)
     } else {
         coerce_position_broadcast_secs(stored_secs, role)
     };
-    secs.saturating_mul(1_000)
+    secs.saturating_mul(1_000).min(i32::MAX as u32)
 }
 
-/// Encode `Position` with lat/lon, `LOC_MANUAL`, and full precision. No time, altitude, or flags.
 pub fn encode_fixed_position(
     latitude_i: i32,
     longitude_i: i32,
@@ -83,8 +62,6 @@ pub fn encode_fixed_position(
         && push_varint_field(out, 23, POSITION_PRECISION_BITS)
 }
 
-/// Broadcast the fixed position on the primary channel. `want_response` stays clear:
-/// this node does not solicit position replies.
 pub fn build_fixed_position_wire_frame(
     node_num: u32,
     packet_id: u32,
@@ -95,7 +72,6 @@ pub fn build_fixed_position_wire_frame(
     longitude_i: i32,
     ok_to_mqtt: bool,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
-    // 0,0 is the unset sentinel. Do not put an undefined position on the air.
     if latitude_i == 0 && longitude_i == 0 {
         return None;
     }
@@ -111,7 +87,7 @@ pub fn build_fixed_position_wire_frame(
             ..Default::default()
         },
     );
-    if plaintext.len() > MAX_PACKET_PAYLOAD {
+    if plaintext.is_empty() || plaintext.len() > MAX_PACKET_PAYLOAD {
         return None;
     }
     let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
@@ -152,13 +128,15 @@ pub struct DecodedFixedPosition {
     pub precision_bits: u32,
 }
 
-/// Decode the fields we send. Other `Position` fields are skipped.
 pub fn decode_fixed_position(payload: &[u8]) -> Option<DecodedFixedPosition> {
     let mut out = DecodedFixedPosition::default();
     let mut idx = 0usize;
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 5) if i + 4 <= payload.len() => {
@@ -215,35 +193,6 @@ fn push_varint(out: &mut heapless::Vec<u8, 32>, mut v: u32) -> bool {
         if v == 0 {
             return true;
         }
-    }
-}
-
-fn read_varint(data: &[u8], mut idx: usize) -> Option<(u32, usize)> {
-    let mut result = 0u32;
-    let mut shift = 0;
-    while idx < data.len() && shift < 32 {
-        let byte = data[idx];
-        idx += 1;
-        result |= u32::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, idx));
-        }
-        shift += 7;
-    }
-    None
-}
-
-fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
-    match wire {
-        0 => read_varint(data, idx).map(|(_, i)| i),
-        1 => (idx + 8 <= data.len()).then_some(idx + 8),
-        2 => {
-            let (len, ni) = read_varint(data, idx)?;
-            let end = ni + len as usize;
-            (end <= data.len()).then_some(end)
-        }
-        5 => (idx + 4 <= data.len()).then_some(idx + 4),
-        _ => None,
     }
 }
 

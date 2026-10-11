@@ -1,5 +1,3 @@
-//! Reliable want_ack: originate, ACK reply, implicit cancel on rebroadcast dupe.
-
 use mesh_crypto::{encrypt_packet, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
@@ -49,7 +47,6 @@ fn send_local_schedules_reliable_retransmit() {
         .parse()
         .id;
     let fire_ms = router.reliable_retx_delay_ms(plan.len, router.node_num(), sent_id);
-    // Meshtastic-style backoff: never before the peer could have ACKed (two airtimes + margin).
     assert!(fire_ms >= mesh_routing::RETX_PROCESSING_TIME_MS);
     assert!(router
         .poll_reliable_retransmit(1_000 + fire_ms - 1)

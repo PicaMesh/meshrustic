@@ -1,5 +1,3 @@
-//! Transmit gate: only a completed reception arms the contention hold.
-
 use mesh_radio::{
     AirTime, RadioError, RadioId, RadioInterface, RadioSlot, RxFrame, TxFrame, EU_868,
 };
@@ -63,8 +61,6 @@ fn slot_with(busy: bool, inbox: Option<RxFrame>) -> RadioSlot<MockRadio> {
         },
     )
 }
-
-/// The board's arming rule: a completed reception this pass, nothing else.
 fn arm_hold(access: &mut ChannelAccess, receptions: u8, now_ms: u32, backoff_ms: u32) {
     if receptions > 0 {
         access.note_rx(now_ms, backoff_ms);

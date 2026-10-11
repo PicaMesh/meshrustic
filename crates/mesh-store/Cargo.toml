@@ -7,7 +7,7 @@ publish.workspace = true
 description = "MeshRustic NodeDB flash layout and defaults"
 
 [dependencies]
-mesh-crypto = { path = "../mesh-crypto", features = ["pki"] }
+mesh-crypto = { path = "../mesh-crypto", default-features = false }
 mesh-radio = { path = "../mesh-radio" }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
 

@@ -1,5 +1,3 @@
-//! Cross-preset bridge decisions (Phase 9).
-
 use mesh_protocol::{ParsedPacket, NODENUM_BROADCAST};
 use mesh_radio::{RadioId, MAX_BRIDGE_TARGETS, MAX_RADIOS};
 
@@ -19,7 +17,6 @@ struct BridgeDedupEntry {
     target_radio: RadioId,
 }
 
-/// Tracks recent `(from, id, target_radio)` bridge forwards (separate from RX dedup).
 #[derive(Clone, Copy, Default)]
 pub struct BridgeDedupCache {
     entries: [BridgeDedupEntry; BRIDGE_DEDUP_SIZE],
@@ -63,7 +60,6 @@ impl BridgeDedupCache {
     }
 }
 
-/// Cross-preset forward leg queued on a target radio's TX queue.
 #[derive(Clone, Copy)]
 pub struct BridgeLeg {
     pub target_radio: RadioId,
@@ -85,7 +81,6 @@ impl BridgeLeg {
     pub const MAX: usize = MAX_BRIDGE_TARGETS;
 }
 
-/// Inputs for bridge policy (read-only graph snapshot).
 pub struct BridgeEval<'a> {
     pub rx_radio: RadioId,
     pub parsed: &'a ParsedPacket,
@@ -97,7 +92,6 @@ pub struct BridgeEval<'a> {
     pub to_us: bool,
 }
 
-/// Whether a copy of `frame` should be forwarded on `dst_radio` instead of relaying on `rx_radio`.
 pub fn should_bridge_to(
     eval: &BridgeEval<'_>,
     dst_radio: RadioId,
@@ -144,9 +138,6 @@ fn routing_need(eval: &BridgeEval<'_>, dst_radio: RadioId, graph: &NeighborGraph
     eval.route.egress_radio != eval.rx_radio
 }
 
-/// Fill `plan.bridge` when another preset segment should carry this frame.
-///
-/// Returns `true` when a cross-preset bridge leg was queued (same-radio relay should be skipped).
 pub fn evaluate_bridge_targets(
     eval: &BridgeEval<'_>,
     relay: &RelayPlan,

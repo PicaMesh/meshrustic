@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Build release firmware and pack a UF2 for Adafruit UF2 bootloaders (nice!nano).
 set -euo pipefail
 
 BOARD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,13 +8,11 @@ cd "${BOARD_DIR}"
 TARGET=thumbv7em-none-eabihf
 PROFILE=release
 FEATURES=nicenano
-OUT="${REPO_ROOT}/target/${TARGET}/${PROFILE}"
+OUT="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/${TARGET}/${PROFILE}"
 ELF="${OUT}/nrf52840"
 BIN="${OUT}/mr-nrf52840-nicenano.bin"
 UF2="${OUT}/mr-nrf52840-nicenano.uf2"
 UF2CONV="${BOARD_DIR}/scripts/uf2/uf2conv.py"
-
-# Adafruit nRF52840 UF2 family; app base with SoftDevice S140 v6.x.
 UF2_BASE=0x26000
 UF2_FAMILY=0xADA52840
 

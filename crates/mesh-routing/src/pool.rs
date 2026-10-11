@@ -1,13 +1,14 @@
 use mesh_protocol::{PacketHeader, MAX_LORA_PAYLOAD_LEN, PACKET_HEADER_LEN};
 
-/// Max encrypted payload bytes after the 16-byte header.
-pub const MAX_PACKET_PAYLOAD: usize = MAX_LORA_PAYLOAD_LEN + 1 - PACKET_HEADER_LEN;
+pub const MAX_PACKET_PAYLOAD: usize = MAX_LORA_PAYLOAD_LEN - PACKET_HEADER_LEN;
 
-/// Number of in-flight packets (fixed pool size for MeshRustic).
 pub const POOL_SIZE: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PacketHandle(pub usize);
+pub struct PacketHandle {
+    index: usize,
+    generation: u32,
+}
 
 #[derive(Clone, Copy)]
 pub struct PacketSlot {
@@ -37,6 +38,7 @@ impl PacketSlot {
 pub struct PacketPool {
     slots: [PacketSlot; POOL_SIZE],
     used: [bool; POOL_SIZE],
+    generations: [u32; POOL_SIZE],
 }
 
 impl Default for PacketPool {
@@ -50,6 +52,7 @@ impl PacketPool {
         Self {
             slots: [PacketSlot::empty(); POOL_SIZE],
             used: [false; POOL_SIZE],
+            generations: [0; POOL_SIZE],
         }
     }
 
@@ -58,29 +61,39 @@ impl PacketPool {
             if !*used {
                 *used = true;
                 self.slots[index] = PacketSlot::empty();
-                return Some(PacketHandle(index));
+                self.generations[index] = self.generations[index].wrapping_add(1);
+                return Some(PacketHandle {
+                    index,
+                    generation: self.generations[index],
+                });
             }
         }
         None
     }
 
     pub fn release(&mut self, handle: PacketHandle) {
-        debug_assert!(handle.0 < POOL_SIZE);
-        debug_assert!(self.used[handle.0]);
-        self.used[handle.0] = false;
+        if self.get(handle).is_some() {
+            self.used[handle.index] = false;
+        }
     }
 
     pub fn get(&self, handle: PacketHandle) -> Option<&PacketSlot> {
-        if handle.0 < POOL_SIZE && self.used[handle.0] {
-            Some(&self.slots[handle.0])
+        if handle.index < POOL_SIZE
+            && self.used[handle.index]
+            && self.generations[handle.index] == handle.generation
+        {
+            Some(&self.slots[handle.index])
         } else {
             None
         }
     }
 
     pub fn get_mut(&mut self, handle: PacketHandle) -> Option<&mut PacketSlot> {
-        if handle.0 < POOL_SIZE && self.used[handle.0] {
-            Some(&mut self.slots[handle.0])
+        if handle.index < POOL_SIZE
+            && self.used[handle.index]
+            && self.generations[handle.index] == handle.generation
+        {
+            Some(&mut self.slots[handle.index])
         } else {
             None
         }
@@ -91,35 +104,26 @@ impl PacketPool {
     }
 }
 
-/// RAII release for a single pool slot (uses raw pointer so multiple guards can coexist).
-pub struct PacketGuard {
-    index: usize,
-    pool: *mut PacketPool,
+pub struct PacketGuard<'a> {
+    handle: PacketHandle,
+    pool: &'a mut PacketPool,
 }
 
-impl PacketGuard {
-    pub fn new(pool: &mut PacketPool, handle: PacketHandle) -> Self {
-        Self {
-            index: handle.0,
-            pool: pool as *mut PacketPool,
-        }
+impl<'a> PacketGuard<'a> {
+    pub fn new(pool: &'a mut PacketPool, handle: PacketHandle) -> Self {
+        assert!(pool.get(handle).is_some(), "packet slot must be allocated");
+        Self { handle, pool }
     }
-
     pub fn slot(&mut self) -> &mut PacketSlot {
-        // SAFETY: `index` was allocated and not released; caller must not release twice.
-        unsafe {
-            (*self.pool)
-                .get_mut(PacketHandle(self.index))
-                .unwrap_unchecked()
-        }
+        self.pool
+            .get_mut(self.handle)
+            .expect("guard owns an allocated slot")
     }
 }
 
-impl Drop for PacketGuard {
+impl Drop for PacketGuard<'_> {
     fn drop(&mut self) {
-        unsafe {
-            (*self.pool).release(PacketHandle(self.index));
-        }
+        self.pool.release(self.handle);
     }
 }
 
@@ -144,7 +148,10 @@ mod tests {
     fn pool_exhaustion() {
         static POOL: StaticCell<PacketPool> = StaticCell::new();
         let pool = POOL.init(PacketPool::new());
-        let mut handles = [PacketHandle(0); POOL_SIZE];
+        let mut handles = [PacketHandle {
+            index: 0,
+            generation: 0,
+        }; POOL_SIZE];
         for (i, slot) in handles.iter_mut().enumerate() {
             *slot = pool.alloc().unwrap_or_else(|| panic!("alloc {i}"));
         }
@@ -163,8 +170,21 @@ mod tests {
             let h = pool.alloc().unwrap();
             let mut guard = PacketGuard::new(pool, h);
             guard.slot().payload_len = 1;
-            assert_eq!(pool.free_count(), POOL_SIZE - 1);
+            assert_eq!(guard.pool.free_count(), POOL_SIZE - 1);
         }
         assert_eq!(pool.free_count(), POOL_SIZE);
+    }
+    #[test]
+    fn released_handle_cannot_read_or_free_a_reused_slot() {
+        let mut pool = PacketPool::new();
+        let stale = pool.alloc().unwrap();
+        pool.release(stale);
+        let live = pool.alloc().unwrap();
+        assert_ne!(stale, live);
+        assert!(pool.get(stale).is_none());
+        assert!(pool.get_mut(stale).is_none());
+        pool.release(stale);
+        assert!(pool.get(live).is_some());
+        assert_eq!(pool.free_count(), POOL_SIZE - 1);
     }
 }

@@ -1,5 +1,3 @@
-//! Rolling TX duty cycle and channel utilization tracking.
-
 use crate::config::RadioConfig;
 use crate::config::RegionInfo;
 use crate::packet_time::packet_time_ms;
@@ -15,7 +13,6 @@ pub enum AirtimeLog {
     RxAll,
 }
 
-/// Tracks hourly TX duty cycle and ~10 s channel utilization windows.
 #[derive(Clone, Debug)]
 pub struct AirTime {
     region: RegionInfo,
@@ -76,16 +73,19 @@ impl AirTime {
     }
 
     pub fn channel_utilization_percent(&self) -> f32 {
-        let sum: u32 = self.channel_utilization.iter().sum();
+        let sum: u64 = self
+            .channel_utilization
+            .iter()
+            .map(|&ms| u64::from(ms))
+            .sum();
         (sum as f32 / (CHANNEL_UTILIZATION_PERIODS as f32 * 10.0 * 1000.0)) * 100.0
     }
 
     pub fn utilization_tx_percent(&self) -> f32 {
-        let sum: u32 = self.utilization_tx.iter().sum();
+        let sum: u64 = self.utilization_tx.iter().map(|&ms| u64::from(ms)).sum();
         (sum as f32 / MS_IN_HOUR as f32) * 100.0
     }
 
-    /// Effective hourly TX cap (polite fraction of regulatory duty cycle).
     pub fn duty_cycle_limit_percent(&self) -> f32 {
         if self.region.duty_cycle_percent >= 100 {
             return 100.0;
@@ -93,7 +93,6 @@ impl AirTime {
         self.region.duty_cycle_percent as f32 * self.polite_duty_cycle_percent as f32 / 100.0
     }
 
-    /// Whether TX is allowed under EU_868 duty cycle (polite half of cap).
     pub fn is_tx_allowed_duty_cycle(&self) -> bool {
         if self.region.duty_cycle_percent >= 100 {
             return true;
@@ -128,7 +127,6 @@ mod tests {
     fn duty_cycle_blocks_after_hour_of_continuous_tx() {
         let mut air = AirTime::new(EU_868);
         let cfg = RadioConfig::eu868_short_slow();
-        let packet_ms = packet_time_ms(&cfg, 64, false);
 
         for _ in 0..3600 {
             air.tick_second();

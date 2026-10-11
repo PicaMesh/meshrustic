@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# RAM/flash usage and the largest stack frames of the release build. Run via `just size nrf52840`.
-# Two boot regressions came from numbers this prints: a Router built on the stack that no longer
-# fit above the statics, and statics growing past what the stack needed.
+# Static growth and large stack frames can prevent boot even when linking succeeds.
 set -euo pipefail
-ELF=/workspace/target/thumbv7em-none-eabihf/release/nrf52840
+ELF="${CARGO_TARGET_DIR:-/workspace/target}/thumbv7em-none-eabihf/release/nrf52840"
 cargo build --release >/dev/null
 echo "== sections (text data bss)"; rust-size "$ELF" | tail -1
 echo "== largest statics"; rust-nm -S --size-sort -C "$ELF" | tail -5

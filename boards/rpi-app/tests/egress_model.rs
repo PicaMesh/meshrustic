@@ -1,11 +1,7 @@
-//! Egress vs inbound model — coverage and relay candidacy use `hears_us` only.
-
 use mesh_routing::{
     decode_packed_neighbors, plan_broadcast_relay, write_packed_header, BroadcastRelayContext,
     NeighborGraph, PackedNeighbor, TopologyMergeResult, DEVICE_ROLE_ROUTER,
 };
-
-/// SHORT_SLOW slot time: the stock-router window is 15 of these.
 const SHORT_SLOW_SLOT_MS: u32 = 10;
 const ME: u32 = 0x1000_0001;
 const EGRESS: u32 = 0xA000_000A;
@@ -49,7 +45,7 @@ fn field_merge_asymmetric_downstream_is_observable() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 1, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     let result = graph.merge_topology(0xBB00_00BB, &header, &[remote], true, 200, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
     let skips: heapless::Vec<_, 4> = graph.drain_merge_asymmetric_skips().collect();

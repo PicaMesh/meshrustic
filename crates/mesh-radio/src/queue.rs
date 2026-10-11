@@ -1,5 +1,3 @@
-//! Bounded RX/TX queues between the radio driver and router.
-
 use crate::frame::{RxFrame, TxFrame};
 
 pub const DEFAULT_RX_QUEUE: usize = 4;
@@ -94,6 +92,10 @@ impl<const N: usize> TxQueue<N> {
         self.len
     }
 
+    pub fn is_full(&self) -> bool {
+        self.len == N
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -116,7 +118,6 @@ impl<const N: usize> TxQueue<N> {
         Ok(())
     }
 
-    /// Drop every queued frame for which `drop` returns true; returns how many were removed.
     pub fn remove_where(&mut self, mut drop: impl FnMut(&TxFrame) -> bool) -> usize {
         let mut kept: [TxFrame; N] = self.buf;
         let mut kept_len = 0usize;

@@ -1,24 +1,20 @@
-//! Dijkstra routing and route cache over the edge graph.
-
 use mesh_radio::RadioId;
 
 use super::edge::{effective_variance_byte, Edge, EdgeSource};
 use super::is_placeholder_node;
 use super::{DownstreamTable, EdgeStore, MAX_GRAPH_NODES};
-use crate::neighbor_graph::TOPOLOGY_BROADCAST_MS;
 use crate::capability::{CapabilityCache, CapabilityStatus};
+use crate::neighbor_graph::TOPOLOGY_BROADCAST_MS;
 use crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE;
 
 pub const MAX_CACHED_ROUTES: usize = 32;
 pub const ROUTE_CACHE_TIMEOUT_MS: u32 = 300_000;
 pub const ROUTE_COST_UNKNOWN: u16 = 0xFFFF;
 
-/// Inputs for Dijkstra hop filtering (`is_node_routable`).
 pub struct RoutableFilter<'a> {
     pub capability: &'a CapabilityCache,
     pub my_node: u32,
     pub device_role: u32,
-    /// Intermediate hops to skip (named follow-up redirect). Empty for ordinary lookups.
     pub excluded: &'a [u32],
 }
 
@@ -34,7 +30,6 @@ pub fn is_node_routable(filter: &RoutableFilter<'_>, node_id: u32) -> bool {
     }
     match filter.capability.status(node_id) {
         CapabilityStatus::Legacy => filter.capability.is_legacy_router(node_id),
-        // SR-passive nodes broadcast topology but never relay: routing through one is a dead end.
         CapabilityStatus::Passive => false,
         _ => true,
     }
@@ -42,12 +37,9 @@ pub fn is_node_routable(filter: &RoutableFilter<'_>, node_id: u32) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RouteMode {
-    /// Destination priced inside the edge ball (Dijkstra).
     #[default]
     Ball = 0,
-    /// Destination is list-downstream of a ball publisher M: Dijkstra to M + M→Y cost.
     ListDownstream = 1,
-    /// Destination only known via a relayed gateway; hand off, no Dijkstra to dest.
     OrphanGateway = 2,
 }
 
@@ -58,21 +50,11 @@ pub struct Route {
     pub egress_radio: RadioId,
     pub cost_fixed: u16,
     pub timestamp_ms: u32,
-    /// Hops on the path, 1 for a direct neighbour; 0 when the route came from the downstream
-    /// table (length unknown) or there is none.
     pub hops: u8,
-    /// Every hop is priced from the receiver's own measurement. False for the inbound-gateway
-    /// fallback (a hop into a publisher that has not published a measurement of the sender, taken
-    /// at `UNVERIFIED_HOP_COST_FACTOR` times the sender's reverse cost) and for orphan-gateway
-    /// routes. True for strict ball paths and for list-downstream when the path to M is strict
-    /// and M→Y was learned with `hears_us`.
     pub verified: bool,
     pub mode: RouteMode,
 }
 
-/// Cost factor of an unconfirmed hop in the fallback search: the receiver never listed the
-/// sender, so the link is marginal or one-way; a confirmed path of up to this many times the
-/// raw cost is preferred.
 pub const UNVERIFIED_HOP_COST_FACTOR: u16 = 4;
 
 impl Route {
@@ -149,7 +131,14 @@ impl RouteCache {
             self.count += 1;
             return;
         }
-        self.entries[0].route = route;
+        let oldest = self
+            .entries
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, entry)| route.timestamp_ms.wrapping_sub(entry.route.timestamp_ms))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.entries[oldest].route = route;
     }
 }
 
@@ -189,12 +178,7 @@ fn prev_of(nodes: &[DNode; MAX_GRAPH_NODES], node_count: usize, id: u32) -> u32 
         .map_or(0, |n| n.prev)
 }
 
-/// Can a frame transmitted by `from` be received by `to`?
-///
-/// Edges are one-directional evidence (`from` listing `to` means `from` hears `to`). Delivery
-/// needs the other direction: `hears_us` on that edge, or `to` listing `from`. If `to` publishes
-/// topology and confirms neither, it does not hear `from`; if it publishes none, silence cannot
-/// be treated as proof it does not hear.
+/// Silence proves a missing link only when the peer promises to publish its neighbours.
 pub fn can_deliver(
     edges: &EdgeStore,
     capability: Option<&CapabilityCache>,
@@ -207,12 +191,6 @@ pub fn can_deliver(
     !publishes_topology(capability, to)
 }
 
-/// Confirmed hearing only: `to` hears `from` via `hears_us` or by listing `from`.
-///
-/// This is the strict half of [`covers`], which is what broadcast coverage actually calls: a
-/// receiver that publishes topology must be known to hear the transmitter, while a silent one
-/// falls back to the transmitter's own edge, since that is all anyone can measure about it.
-/// Unlike [`can_deliver`], being unable to publish is not by itself evidence of hearing.
 pub fn known_to_hear(edges: &EdgeStore, from: u32, to: u32) -> bool {
     if edges
         .find_node(from)
@@ -227,7 +205,6 @@ pub fn known_to_hear(edges: &EdgeStore, from: u32, to: u32) -> bool {
         .is_some()
 }
 
-/// SR active/passive lists are authoritative: unlisted peers do not hear that node.
 pub fn publishes_topology(capability: Option<&CapabilityCache>, node: u32) -> bool {
     matches!(
         capability.map(|c| c.status(node)),
@@ -246,18 +223,7 @@ fn measured_edge(edges: &EdgeStore, node: u32, peer: u32) -> Option<&Edge> {
         .filter(|e| e.source.is_measured())
 }
 
-/// Cost of the hop `from → to`, priced at the receiver when it published a measurement of the
-/// sender, else at the sender's own measurement. `None` when neither has a *measured* edge.
-///
-/// An [`EdgeSource::Inferred`] edge is skipped: it was minted at a nominal price because a frame
-/// once crossed the link, which says a path exists and nothing about what it costs. A guess must
-/// not produce a price. The route search prices its own hops from the edges directly and keeps
-/// using inferred edges for reachability, which is what they exist for.
-///
-/// This is the raw number. Delivery ranking and [`covers`] go through
-/// [`delivery_direction_cost_fixed`], which penalises a publisher hop that only has the sender's
-/// measurement. [`acknowledgement_price_fixed`] stays on this raw price: an acknowledgement is the
-/// other direction, and the source's own measurement is the one that counts.
+/// An inferred crossing proves a path exists, but its nominal price is not a link measurement.
 pub fn hop_cost_fixed(edges: &EdgeStore, from: u32, to: u32) -> Option<u16> {
     if let Some(cost) = measured_etx(edges, to, from) {
         return Some(cost);
@@ -265,7 +231,6 @@ pub fn hop_cost_fixed(edges: &EdgeStore, from: u32, to: u32) -> Option<u16> {
     measured_etx(edges, from, to)
 }
 
-/// Route/delivery price for one directed hop taken from `list_owner`'s edge list.
 pub fn priced_hop_cost_fixed(
     edge: &Edge,
     list_owner: u32,
@@ -310,10 +275,6 @@ fn relax_priced(
     relax(nodes, node_count, m, via, u_cost, edge_cost);
 }
 
-/// Price of delivering `from → to`. The receiver's measurement when it published one. When the
-/// only measurement is the sender's, that number is the reverse direction: a publisher that has
-/// not priced the arrival leaves the hop at [`UNVERIFIED_HOP_COST_FACTOR`] times that reverse
-/// cost. A receiver that publishes nothing has no better number, so the sender's measurement stands.
 pub fn delivery_direction_cost_fixed(
     edges: &EdgeStore,
     capability: Option<&CapabilityCache>,
@@ -327,11 +288,11 @@ pub fn delivery_direction_cost_fixed(
     }
     let edge = measured_edge(edges, from, to)?;
     let unverified = publishes_topology(capability, to);
-    Some(priced_hop_cost_fixed(edge, from, my_node, now_ms, unverified))
+    Some(priced_hop_cost_fixed(
+        edge, from, my_node, now_ms, unverified,
+    ))
 }
 
-/// Hop cost for a deliverable `from → to` (see [`delivery_direction_cost_fixed`]). `None` if not
-/// deliverable, or deliverable only by stock assumption with no edge cost either way.
 pub fn delivery_hop_cost_fixed(
     edges: &EdgeStore,
     capability: Option<&CapabilityCache>,
@@ -346,7 +307,6 @@ pub fn delivery_hop_cost_fixed(
     delivery_direction_cost_fixed(edges, capability, from, to, now_ms, my_node)
 }
 
-/// Measured link at or under [`COVERAGE_ETX_CEILING_FIXED`] (the poor-link threshold).
 pub fn has_strong_hop_to(edges: &EdgeStore, from: u32, peer: u32) -> bool {
     if peer == 0 {
         return false;
@@ -354,7 +314,6 @@ pub fn has_strong_hop_to(edges: &EdgeStore, from: u32, peer: u32) -> bool {
     hop_cost_fixed(edges, from, peer).is_some_and(|c| c <= COVERAGE_ETX_CEILING_FIXED)
 }
 
-/// Priced last hop whose measured link is strong enough to stamp the destination as `next_hop`.
 pub fn has_strong_delivery_hop(
     edges: &EdgeStore,
     capability: Option<&CapabilityCache>,
@@ -367,36 +326,11 @@ pub fn has_strong_delivery_hop(
         && has_strong_hop_to(edges, from, dest)
 }
 
-/// Bucket width for comparing links when picking a coverage owner: two nodes price the same link
-/// a few hundredths apart, and an exact comparison would hand ownership to a different node on
-/// every graph, so only a real difference counts.
+/// Cost buckets prevent tiny differences in local measurements from assigning different owners on
+/// different nodes.
 pub const OWNER_COST_BUCKET_FIXED: u16 = 50;
 
-/// Who relays for `target` when no transmitter can be shown to reach it (`covers` is false for
-/// every candidate)? Exactly one node, or the whole branch relays the same frame for the same
-/// unconfirmed neighbour. `target` never reports (a stock mute node publishes no topology), so its
-/// receive path is all we can measure: the node hearing it best is the likeliest to be heard by it.
-///
-/// Order: a stock relay router we have seen carrying its traffic first (stock nodes rebroadcast
-/// regardless of SR and already take the earliest slots, so an SR node relaying for the same
-/// neighbour is pure duplication), then the best measured link in [`OWNER_COST_BUCKET_FIXED`]
-/// buckets, then the lowest node id. Mute and passive nodes never own: they do not relay.
-/// `me` is our own node and `me_relays` whether our role rebroadcasts: we are absent from our own
-/// capability cache, so our eligibility has to be passed in.
-/// What an acknowledgement from `candidate` is worth to `source`: the cost in the direction the
-/// source would have to hear it, or `None` when it would not be heard at all.
-///
-/// This is the price the acknowledgement pass ranks on, and it is the opposite direction from
-/// coverage. Coverage asks whether a relay reaches a target; an acknowledgement asks whether the
-/// *originator* hears the relay, because a copy the originator cannot hear tells it nothing and
-/// its retry ladder runs anyway.
-///
-/// The evidence demanded is positive and one-directional: the source's own list named the
-/// candidate, or we watched the source's traffic carried by it. Deliberately not the symmetric
-/// test — a direct observation writes both edge directions from one measurement, so that would be
-/// satisfied by our own assumption of symmetry, and symmetry is the one thing an acknowledgement
-/// may not assume. Priced from the source's own measurement where it published one and from the
-/// candidate's own edge otherwise, and refused past the coverage ceiling, where nothing arrives.
+/// Only a return link the originator can hear can stop its retry ladder.
 pub fn acknowledgement_price_fixed(edges: &EdgeStore, candidate: u32, source: u32) -> Option<u16> {
     if source == 0 || candidate == 0 || candidate == source {
         return None;
@@ -418,17 +352,7 @@ pub fn acknowledgement_price_fixed(edges: &EdgeStore, candidate: u32, source: u3
     Some(cost)
 }
 
-/// Which single node carries a neighbour that nobody can be *shown* to reach: the one hearing it
-/// best, compared in [`OWNER_COST_BUCKET_FIXED`] buckets, with stock rebroadcasters given way
-/// first (they relay regardless of SR and hold the earliest slots) and the lowest node id as the
-/// final tie-break. Mute and passive roles never own, because they never relay, and a link past
-/// [`COVERAGE_ETX_CEILING_FIXED`] owns nothing because it delivers nothing.
-///
-/// Only a *silent* neighbour has an owner. A neighbour that publishes topology and does not list
-/// a candidate has told us that candidate cannot reach it, and that silence is evidence: nobody
-/// owns it, and a relay spent on it would be spent against its own report. Contrast
-/// [`acknowledgement_price_fixed`], which prices an answer to an originator and therefore reads the other
-/// direction of the link.
+/// A peer’s explicit omission is evidence against reachability; ownership must not contradict it.
 pub fn coverage_owner(
     edges: &EdgeStore,
     capability: &CapabilityCache,
@@ -448,16 +372,17 @@ pub fn coverage_owner(
         let Some(candidate) = edges.node_id_at(i) else {
             continue;
         };
-        if candidate == target || is_placeholder_node(candidate) {
+        if candidate == target
+            || is_placeholder_node(candidate)
+            || capability
+                .role(candidate)
+                .is_some_and(crate::sr_role::role_is_mute)
+        {
             continue;
         }
-        // Ownership is who on *this* RF copy can carry the neighbour. L2/L3 publishers
-        // in the edge ball are not candidates: they did not hear this transmission.
         if candidate != me && !edges.has_direct_reported_edge_to(me, candidate) {
             continue;
         }
-        // Only what it measured itself: an edge to the target is the evidence that it hears it,
-        // and for a stock node the only way that edge exists is us watching it carry the traffic.
         let Some(edge) = edges
             .find_node(candidate)
             .and_then(|n| n.find_edge(target))
@@ -465,13 +390,7 @@ pub fn coverage_owner(
         else {
             continue;
         };
-        // Ownership decides *who* covers a neighbour nobody can be shown to reach; it must not
-        // decide *whether* the neighbour is reachable at all. A link past the coverage ceiling
-        // (the curve's own floor included) delivers nothing, so its holder owns
-        // nothing: the ranking would otherwise credit it with unique coverage and hand it the
-        // first slot, and the packet would wait a full defer window for a relay that cannot
-        // come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
-        // ceiling, and the branch's insurance fired 65 times in 109 min to cover them.
+        // Crediting an unusable link with coverage would defer delivery to a relay that cannot arrive.
         if edge.etx_fixed > COVERAGE_ETX_CEILING_FIXED {
             continue;
         }
@@ -497,25 +416,10 @@ pub fn coverage_owner(
     owner
 }
 
-/// Delivery cost above which a confirmed hop still does not count as coverage. `hears_us` is
-/// sticky: a peer that heard the sender once keeps the flag while its link decays, and a rooftop
-/// node kept it with its antenna 20 dB down. Coverage decides whether we may stay silent, so it
-/// has to mean "that frame very likely arrived", not "it arrived once". ETX 7 in fixed point.
 pub const COVERAGE_ETX_CEILING_FIXED: u16 = 700;
 
-/// Has a topology publisher gone quiet long enough that it is nobody's coverage target?
-///
-/// A publisher promises a list every broadcast interval, so silence past
-/// [`PUBLISHER_SILENCE_MS`](crate::neighbor_graph::PUBLISHER_SILENCE_MS) means it is gone.
-/// Maintenance retracts *our own* link to such a node, but a peer's published edge to it outlives
-/// that by up to a broadcast interval — so without this test every node credits its peers with
-/// covering a node that has gone, and each of those peers, having retracted it under the same
-/// rule, declines the slot it was handed. Field 2026-09-08: the branch gateway died and both desk
-/// nodes handed 95% of frames to a peer for a node none of them still reached, leaving the
-/// insurance to carry everything three seconds late.
-///
-/// Judged on when we last heard the node itself, which is what the graph records per node — a
-/// peer mentioning it in a list is not hearing it.
+/// A peer’s old published edge may outlive our silence timeout; it must not resurrect coverage for a
+/// vanished publisher.
 pub fn is_silent_publisher(
     edges: &EdgeStore,
     capability: Option<&CapabilityCache>,
@@ -532,14 +436,7 @@ pub fn is_silent_publisher(
     silent > crate::neighbor_graph::PUBLISHER_SILENCE_MS && silent < 0x8000_0000
 }
 
-/// Does a transmission by `from` reach `to` well enough to relieve a bystander of relaying?
-///
-/// What counts as evidence depends on whether the receiver ever reports. A node that publishes
-/// topology is held to it: it must be known to hear the sender (`known_to_hear`), because its
-/// silence about the sender is itself information. A node that publishes nothing — stock, mute, or
-/// not yet classified — can never confirm anything, so the sender's own edge to it is all the
-/// evidence there will ever be; demanding more made every neighbour of such a node relay for it on
-/// every frame. Either way the delivery-direction link must not be hopeless.
+/// A topology publisher’s silence about the sender is itself evidence that it does not hear that sender.
 pub fn covers(edges: &EdgeStore, capability: Option<&CapabilityCache>, from: u32, to: u32) -> bool {
     let evidenced = if publishes_topology(capability, to) {
         known_to_hear(edges, from, to)
@@ -550,13 +447,9 @@ pub fn covers(edges: &EdgeStore, capability: Option<&CapabilityCache>, from: u32
                 .and_then(|n| n.find_edge(to))
                 .is_some()
     };
-    // The ceiling is the raw measurement. A publisher hop priced only from the reverse SNR is
-    // already kept out of a verified route; multiplying it again here dropped neighbours whose
-    // ETX is fine and whose `hears_us` is real.
     evidenced && hop_cost_fixed(edges, from, to).is_some_and(|c| c <= COVERAGE_ETX_CEILING_FIXED)
 }
 
-/// Lower `cost[m]` to `cost + edge_cost` with `via` as the next hop toward the destination.
 fn relax(
     nodes: &mut [DNode; MAX_GRAPH_NODES],
     node_count: &mut usize,
@@ -578,10 +471,6 @@ fn relax(
     }
 }
 
-/// One backward Dijkstra pass (see `calculate_route`). With `allow_unverified`, a hop into a
-/// topology-publishing node that has not published a measurement of the sender is taken too, at
-/// `UNVERIFIED_HOP_COST_FACTOR` times the sender's measurement of the receiver. Returns
-/// `(cost, next_hop, hops)`.
 fn backward_search(
     edges: &EdgeStore,
     my_node: u32,
@@ -591,8 +480,6 @@ fn backward_search(
     allow_unverified: bool,
 ) -> Option<(u16, u32, u8)> {
     let capability = routable.map(|f| f.capability);
-    // `cost` is the cost of the path from a node to the destination; `prev` is the node after it
-    // on that path.
     let mut nodes = [DNode {
         id: 0,
         cost: ROUTE_COST_UNKNOWN,
@@ -623,7 +510,6 @@ fn backward_search(
         if n == my_node {
             break;
         }
-        // Every settled node other than the destination would relay on this path.
         if n != destination {
             if let Some(filter) = routable {
                 if !is_node_routable(filter, n) {
@@ -632,7 +518,6 @@ fn backward_search(
             }
         }
 
-        // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
         if let Some(n_edges) = edges.find_node(n) {
             for e in 0..n_edges.edge_count as usize {
                 let edge = n_edges.edges[e];
@@ -651,11 +536,6 @@ fn backward_search(
                 );
             }
         }
-        // Nodes that hear N but that N has not listed. The edge stores their measurement of N,
-        // which is the reverse of the hop M → N. `hears_us` on it says N once confirmed hearing M;
-        // it is not N's price. A publisher that has not published that price is taken only in the
-        // fallback pass, at a penalty. A node that publishes nothing has no list coming, so the
-        // sender's measurement is the only one and stands at face value.
         let n_publishes = publishes_topology(capability, n);
         for i in 0..edges.node_count() {
             let Some(m) = edges.node_id_at(i) else {
@@ -716,18 +596,6 @@ fn backward_search(
     Some((me.cost, me.prev, hops))
 }
 
-/// Route from `my_node` to `destination`: a Dijkstra search run backwards from the
-/// destination over "who hears whom". A settled node N is reached by the nodes that can deliver
-/// to it: the nodes N lists (N hears them, priced at the cost N measured on their signal) and,
-/// when N publishes no topology, anyone who hears N (assumed symmetric, since nothing better is
-/// known). `hears_us` on a sender's edge is confirmation that N once heard them, not N's price.
-/// Into a publisher that has not listed the sender, that reverse measurement is only the
-/// fallback pass, at [`UNVERIFIED_HOP_COST_FACTOR`]. An edge is never used against its direction,
-/// and a confirmed hop is priced at its receiver.
-/// Intermediate hops must pass `is_node_routable`; the destination and we ourselves need not.
-///
-/// Dijkstra to ball parent `m`, then add `hop_cost` for the last hop M→dest.
-/// Used for DownstreamTable rows and for `parent_hint` when Ball cannot price the dest.
 fn try_compose_via_parent(
     edges: &EdgeStore,
     my_node: u32,
@@ -762,13 +630,6 @@ fn try_compose_via_parent(
     true
 }
 
-/// When no path priced from receiver measurements exists, list-downstream behind a ball parent
-/// is composed (Dijkstra to M + M→Y), then the same compose via a ball publisher's `parent_hint`
-/// when the dest sits in the edge ball but no longer lists that parent (hub packed-list churn),
-/// then orphan gateway handoff (no Dijkstra to the dest), then the inbound-gateway fallback: the
-/// same search with reverse-only hops into a publisher allowed at a penalty, so the node that
-/// hears the far side still carries the frame out (a one-way edge is usually a marginal link or a
-/// truncated list, not silence). Such a route is marked unverified.
 pub fn calculate_route(
     edges: &EdgeStore,
     downstream: &DownstreamTable,
@@ -784,8 +645,6 @@ pub fn calculate_route(
         cost_fixed: ROUTE_COST_UNKNOWN,
         timestamp_ms: now_ms,
         hops: 0,
-        // Nothing is a confirmed path until the strict search says so: an empty route must not
-        // claim verification, or a caller reading this flag believes a guess.
         verified: false,
         mode: RouteMode::Ball,
     };
@@ -801,8 +660,6 @@ pub fn calculate_route(
         .or(ds_relay)
         .is_some_and(|m| edges.find_node(m).is_some());
 
-    // Mode 1: destination is a ball publisher — or a leaf we can still price on ball edges when
-    // it is not parked behind a ball parent (list-downstream and orphans skip Dijkstra to dest).
     if dest_in_ball || !skip_dijkstra_to_dest {
         if let Some((cost, next_hop, hops)) =
             backward_search(edges, my_node, destination, now_ms, routable, false)
@@ -824,7 +681,6 @@ pub fn calculate_route(
         return result;
     }
 
-    // Mode 2: list-downstream of ball node M (topology + hearsUs) — Dijkstra to M, add M→Y cost.
     if let Some((m, hop_cost)) = list_ds {
         if try_compose_via_parent(
             edges,
@@ -840,8 +696,6 @@ pub fn calculate_route(
         }
     }
 
-    // Mode 2b: ball dest whose packed list no longer names its admit parent — compose via
-    // parent_hint and the parent's measured edge to the dest (same math as list-downstream).
     if result.next_hop == 0 {
         let parent_hint = edges
             .find_node(destination)
@@ -869,7 +723,6 @@ pub fn calculate_route(
         }
     }
 
-    // Mode 3: orphan gateway handoff — no Dijkstra toward the destination.
     if result.next_hop == 0 {
         let my_edges = edges.find_node(my_node);
         let is_egress = |n: u32| {
@@ -918,7 +771,6 @@ pub fn calculate_route(
     result
 }
 
-/// Returns `(verified, unknown)` for whether `transmitter` can reach `receiver`.
 pub fn verified_connectivity(
     edges: &EdgeStore,
     capability: &CapabilityCache,
@@ -951,7 +803,6 @@ fn is_stock_for_connectivity(capability: &CapabilityCache, node: u32) -> bool {
         )
 }
 
-/// Opportunistic next hop: neighbor with a direct edge to `destination` significantly better than our route.
 pub fn find_better_positioned_neighbor(
     edges: &EdgeStore,
     capability: &CapabilityCache,
@@ -1037,9 +888,6 @@ mod tests {
         assert_eq!(route.hops, 1);
     }
 
-    /// 2026-09-06 17:31: MR22 hears FCM6 at -108 dBm and lists it without hearsUs; FCM6's own
-    /// list has no MR22. Both nicenanos still routed "to FCM6 via MR22". An edge says who hears
-    /// whom in one direction only; forwarding needs the other one.
     #[test]
     fn one_way_edge_is_not_a_route() {
         const ME: u32 = 0xAA;
@@ -1049,7 +897,6 @@ mod tests {
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, RELAY, 1.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, RELAY, true);
-        // The relay hears the destination; nothing says the destination hears the relay.
         edges.update_edge(ME, RELAY, DEST, 4.0, 0, EdgeSource::Mirrored, true, 0);
         let downstream = DownstreamTable::new();
         let mut capability = CapabilityCache::new();
@@ -1067,13 +914,10 @@ mod tests {
             "a publisher that has not measured the relay has no verified route"
         );
         assert_eq!(fallback.next_hop, RELAY, "the inbound gateway still tries");
-        // Both hops are the sender's measurement of a publisher: ours of the relay, and the
-        // relay's of the destination. Each is taken at the penalty.
         assert_eq!(
             fallback.cost_fixed,
             (100 + 400) * UNVERIFIED_HOP_COST_FACTOR
         );
-        // A destination that publishes no topology cannot be ruled out.
         let mut stock = CapabilityCache::new();
         stock.track_topology(RELAY, true, 0);
         let stock_filter = RoutableFilter {
@@ -1086,21 +930,15 @@ mod tests {
             calculate_route(&edges, &downstream, ME, DEST, 0, Some(&stock_filter)).next_hop,
             RELAY
         );
-        // hears_us is the relay's claim that the destination heard it, priced at the relay's SNR
-        // of the destination. That is still the reverse direction.
         edges.set_edge_hears_us(RELAY, DEST, true);
         let claimed = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter));
         assert_eq!((claimed.next_hop, claimed.verified), (RELAY, false));
         assert_eq!(claimed.cost_fixed, (100 + 400) * UNVERIFIED_HOP_COST_FACTOR);
-        // The destination's own measurement, and the relay's measurement of us, verify the path
-        // at those prices — not at the reverse SNR.
         edges.update_edge(ME, RELAY, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, DEST, RELAY, 2.5, 0, EdgeSource::Mirrored, true, 0);
         let verified = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter));
         assert_eq!((verified.next_hop, verified.verified), (RELAY, true));
         assert_eq!(verified.cost_fixed, 100 + 250);
-        // Our own edge to the destination, even with hears_us, is our SNR of them. The verified
-        // relay stays until the destination publishes a measurement of us.
         edges.update_edge(ME, ME, DEST, 1.0, 0, EdgeSource::Reported, true, 0);
         assert_eq!(
             calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter)).next_hop,
@@ -1120,9 +958,6 @@ mod tests {
         );
     }
 
-    /// Asymmetric L1: we hear A but A does not hear us. A hears B (L2); we reach B through C (L1).
-    /// The ball stores that picture; the route to A is via C→B→A at receiver prices — not our
-    /// one-way RX of A.
     #[test]
     fn asymmetric_l1_routes_via_l2_hearer_not_our_rx() {
         const ME: u32 = 0xAA00_00AA;
@@ -1131,7 +966,6 @@ mod tests {
         const C: u32 = 0xC300_00C3;
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(ME, 0);
-        // We hear A (L1); A never confirms us.
         edges.update_edge(ME, ME, A, 1.5, 0, EdgeSource::Reported, true, 0);
         assert!(
             !edges
@@ -1140,21 +974,12 @@ mod tests {
                 .is_some_and(|e| e.hears_us),
             "premise: A does not hear us"
         );
-        // Path to B via C: we hear C; C lists B with hearsUs → B is L2.
         edges.update_edge(ME, ME, C, 1.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, C, true);
         edges.update_edge(ME, C, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, C, B, 1.5, 0, EdgeSource::Mirrored, true, 0);
         edges.set_edge_hears_us(C, B, true);
-        assert!(edges.ensure_publisher(
-            B,
-            NodeClass::L2,
-            C,
-            0,
-            ME,
-            &mut DownstreamTable::new(),
-        ));
-        // B's measurement of C prices C→B; A's measurement of B prices B→A.
+        assert!(edges.ensure_publisher(B, NodeClass::L2, C, 0, ME, &mut DownstreamTable::new(),));
         edges.update_edge(ME, B, C, 1.2, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, A, B, 2.0, 0, EdgeSource::Mirrored, true, 0);
 
@@ -1194,7 +1019,6 @@ mod tests {
         assert_eq!(route.next_hop, C, "leave toward C, not A");
         assert!(route.verified, "receiver-priced path C→B→A is verified");
         assert_eq!(route.hops, 3);
-        // ME→C at C's 1.0 of ME + C→B at B's 1.2 of C + B→A at A's 2.0 of B.
         assert_eq!(route.cost_fixed, 100 + 120 + 200);
         assert_ne!(
             route.cost_fixed,
@@ -1203,9 +1027,6 @@ mod tests {
         );
     }
 
-    /// 2026-09-06: the branch's only contact with the hub was one node hearing it at -108 dBm,
-    /// unconfirmed. A confirmed path wins whenever one exists, however long; without one the
-    /// node that hears the far side carries the frame out, and passive nodes never do.
     #[test]
     fn inbound_gateway_is_the_fallback_only_without_a_confirmed_path() {
         const ME: u32 = 0xAA;
@@ -1218,7 +1039,6 @@ mod tests {
         edges.set_edge_hears_us(ME, GATEWAY, true);
         edges.update_edge(ME, ME, PASSIVE, 1.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, PASSIVE, true);
-        // Both hear the hub; the hub confirms neither.
         edges.update_edge(ME, GATEWAY, HUB, 2.0, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, PASSIVE, HUB, 1.0, 0, EdgeSource::Mirrored, true, 0);
         let mut capability = CapabilityCache::new();
@@ -1241,8 +1061,6 @@ mod tests {
         assert_eq!(route.cost_fixed, (100 + 200) * UNVERIFIED_HOP_COST_FACTOR);
         assert_eq!(route.hops, 2);
 
-        // A confirmed path three hops long beats the two-hop unconfirmed one. Each hop is the
-        // receiver's measurement; hears_us on the reverse edge is not that measurement.
         const FAR: u32 = 0xDD;
         edges.update_edge(ME, GATEWAY, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, GATEWAY, FAR, 3.0, 0, EdgeSource::Mirrored, true, 0);
@@ -1262,8 +1080,6 @@ mod tests {
         assert_eq!(route.cost_fixed, 100 + 300 + 300);
     }
 
-    /// Costs are what the receiver of each hop measured: R hears us at ETX 3 and the destination
-    /// hears R at ETX 2, however good R's signal looks to us.
     #[test]
     fn route_cost_is_measured_at_the_receiver() {
         const ME: u32 = 0xAA;
@@ -1293,9 +1109,6 @@ mod tests {
         assert_eq!(route.hops, 2);
     }
 
-    /// Two relays both hear us. One has a strong SNR of the destination and claims the destination
-    /// hears it; the destination has not published that hop. The other is the hop the destination
-    /// actually measured, at a worse number. The measured arrival wins the verified route.
     #[test]
     fn the_destinations_measurement_beats_a_cheaper_reverse_snr() {
         const ME: u32 = 0xAA;
@@ -1404,8 +1217,8 @@ mod tests {
         edges.update_edge(0xAA, 0xAA, 0xBB, 3.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(0xAA, 0xBB, 0xCC, 3.0, 0, EdgeSource::Mirrored, true, 0);
         let mut capability = CapabilityCache::new();
-        capability.track_topology(P, false, 0); // passive: sends topology, never relays
-        edges.set_edge_hears_us(0xAA, P, true); // its list names us: it hears us
+        capability.track_topology(P, false, 0);
+        edges.set_edge_hears_us(0xAA, P, true);
         let filter = RoutableFilter {
             capability: &capability,
             my_node: 0xAA,
@@ -1414,10 +1227,8 @@ mod tests {
         };
         assert!(!is_node_routable(&filter, P));
         let downstream = DownstreamTable::new();
-        // Cheaper path via the passive node must be rejected in favour of the relaying one.
         let route = calculate_route(&edges, &downstream, 0xAA, 0xCC, 0, Some(&filter));
         assert_eq!(route.next_hop, 0xBB);
-        // The passive node itself is still a valid destination.
         let to_p = calculate_route(&edges, &downstream, 0xAA, P, 0, Some(&filter));
         assert_eq!(to_p.next_hop, P);
     }
@@ -1494,8 +1305,6 @@ mod tests {
         );
     }
 
-    /// A hop confirmed once but priced hopeless is not coverage: the peer keeps `hears_us` while
-    /// its link decays, and staying silent on that evidence drops the frame.
     #[test]
     fn covers_requires_a_link_that_is_not_hopeless() {
         const TX: u32 = 0xAA;
@@ -1515,9 +1324,6 @@ mod tests {
         assert!(covers(&edges, Some(&capability), TX, RX));
     }
 
-    /// A node that publishes nothing can never confirm hearing anyone, so the sender's own edge to
-    /// it is the only evidence there will ever be. Holding it to the reporting standard made every
-    /// neighbour of such a node relay for it on every frame.
     #[test]
     fn covers_a_silent_node_on_the_senders_own_edge() {
         const TX: u32 = 0xAA;
@@ -1535,9 +1341,6 @@ mod tests {
         );
     }
 
-    /// A neighbour that publishes topology and omits a candidate has reported that the candidate
-    /// cannot reach it. That silence is evidence, so nobody owns it — otherwise the ranking
-    /// credits coverage against the node's own report and burns a slot on it.
     #[test]
     fn a_publisher_has_no_owner() {
         const ME: u32 = 0xAA;
@@ -1549,14 +1352,11 @@ mod tests {
         edges.update_edge(ME, ME, TARGET, 2.0, 0, EdgeSource::Reported, true, 0);
         let mut capability = CapabilityCache::new();
         capability.track_topology(PEER, true, 0);
-        // Silent so far: someone owns it.
         assert_eq!(coverage_owner(&edges, &capability, ME, true, TARGET), ME);
-        // It publishes its own list and does not name us: nobody owns it.
         capability.track_topology(TARGET, true, 0);
         assert_eq!(coverage_owner(&edges, &capability, ME, true, TARGET), 0);
     }
 
-    /// An unverified route must not be reported as confirmed, and an empty one must not either.
     #[test]
     fn only_the_confirmed_search_reports_a_verified_route() {
         const ME: u32 = 0xAA;
@@ -1568,10 +1368,6 @@ mod tests {
         assert!(!empty.verified, "no route at all is not a confirmed route");
     }
 
-    /// Ownership picks who carries a neighbour nobody can be shown to reach. It must not make
-    /// an unreachable neighbour look reachable: over a link past the coverage ceiling nobody
-    /// owns it, or the ranking credits unique coverage to a node that cannot deliver and hands
-    /// it the first slot. Field 2026-09-08: 74 of 183 slots went out over such links.
     #[test]
     fn a_hopeless_link_owns_nothing() {
         const ME: u32 = 0xAA;
@@ -1581,9 +1377,7 @@ mod tests {
         edges.ensure_local_node(ME, 0);
         let mut capability = CapabilityCache::new();
         capability.track_topology(PEER, true, 0);
-        // The peer is a neighbour of ours, so its reports about others are accepted.
         edges.update_edge(ME, ME, PEER, 1.0, 0, EdgeSource::Reported, true, 0);
-        // Both of us can be shown to hear SILENT, the peer over a sound link.
         edges.update_edge(ME, PEER, SILENT, 2.0, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, ME, SILENT, 40.0, 0, EdgeSource::Reported, true, 0);
         assert_eq!(
@@ -1591,7 +1385,6 @@ mod tests {
             PEER,
             "the sound link owns it"
         );
-        // The peer's link decays to the heard-once sentinel too: now nobody owns it.
         edges.update_edge(ME, PEER, SILENT, 40.0, 0, EdgeSource::Mirrored, true, 0);
         assert_eq!(
             coverage_owner(&edges, &capability, ME, true, SILENT),
@@ -1614,8 +1407,6 @@ mod tests {
     }
     #[test]
     fn coverage_is_not_priced_on_a_guess() {
-        // An edge minted because a frame crossed the link says a path exists and nothing about
-        // what it costs, so it cannot excuse us from relaying.
         const ME: u32 = 0xAA;
         const GW: u32 = 0xBB;
         const FAR: u32 = 0xCC;
@@ -1629,7 +1420,6 @@ mod tests {
         assert!(!covers(&edges, Some(&capability), GW, FAR));
         assert_eq!(coverage_owner(&edges, &capability, ME, true, FAR), 0);
 
-        // The same link, published by the gateway inside the ceiling, is coverage.
         edges.update_edge(ME, GW, FAR, 2.0, 0, EdgeSource::Mirrored, true, 0);
         assert_eq!(hop_cost_fixed(&edges, GW, FAR), Some(200));
         assert!(covers(&edges, Some(&capability), GW, FAR));
@@ -1637,8 +1427,6 @@ mod tests {
 
     #[test]
     fn a_route_still_travels_over_a_guess() {
-        // Reachability is what an inferred edge is for: the search prices hops from the edges
-        // themselves, so a guessed link still carries a unicast.
         const ME: u32 = 0xAA;
         const GW: u32 = 0xBB;
         const FAR: u32 = 0xCC;
@@ -1671,7 +1459,6 @@ mod tests {
         downstream.update_listed(HUB, DEST, PARENT, 2.0, 0, false, 0);
         let route = calculate_route(&edges, &downstream, ME, DEST, 0, None);
         assert_eq!(route.next_hop, HUB);
-        // List-downstream of a ball parent: strict path to PARENT + hearsUs-gated row ⇒ verified.
         assert!(route.verified);
         assert_eq!(route.mode, RouteMode::ListDownstream);
         let hub = calculate_route(&edges, &downstream, HUB, DEST, 0, None);
@@ -1721,8 +1508,6 @@ mod tests {
         );
     }
 
-    /// Hub packed-list churn: L2 is in the ball with parent_hint but no longer lists the parent.
-    /// Ball cannot price the last hop; compose via parent_hint + parent's measured edge.
     #[test]
     fn parent_hint_composes_when_dest_omits_parent_from_its_list() {
         const ME: u32 = 0xAA00_00AA;
@@ -1732,7 +1517,6 @@ mod tests {
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, PARENT, 1.0, 0, EdgeSource::Reported, true, 0);
         edges.set_l1(PARENT);
-        // Parent listed DEST with hearsUs when we admitted DEST as L2.
         edges.update_edge(ME, PARENT, DEST, 1.5, 0, EdgeSource::Mirrored, true, 0);
         edges.set_edge_hears_us(PARENT, DEST, true);
         assert!(edges.ensure_publisher(
@@ -1743,9 +1527,7 @@ mod tests {
             ME,
             &mut DownstreamTable::new(),
         ));
-        // DEST publishes topology but does not list PARENT (packed-list omission).
         edges.update_edge(ME, DEST, 0xDD00_00DD, 1.2, 0, EdgeSource::Mirrored, true, 0);
-        // PARENT lists ME so strict Dijkstra can leave PARENT toward us.
         edges.update_edge(ME, PARENT, ME, 1.0, 0, EdgeSource::Mirrored, true, 0);
 
         let mut capability = CapabilityCache::new();
@@ -1816,14 +1598,11 @@ mod tests {
             .find_edge_mut(PEER)
             .unwrap()
             .last_heard_ms = t0;
-        let inside =
-            delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + T / 4, ME).unwrap();
+        let inside = delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + T / 4, ME).unwrap();
         assert_eq!(inside, 200);
-        let loud =
-            delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + T + 1_000, ME).unwrap();
+        let loud = delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + T + 1_000, ME).unwrap();
         assert!(loud > inside);
-        let saturated =
-            delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + 2 * T, ME).unwrap();
+        let saturated = delivery_hop_cost_fixed(&edges, None, PEER, ME, t0 + 2 * T, ME).unwrap();
         assert!(saturated > loud);
     }
 
@@ -1836,8 +1615,7 @@ mod tests {
         graph.set_my_node(ME);
         let t0 = 1_000_000u32;
         graph.observe_direct_neighbor(PEER, -70, 8, t0, 0);
-        let fresh =
-            delivery_hop_cost_fixed(graph.edges(), None, PEER, ME, t0, ME).unwrap();
+        let fresh = delivery_hop_cost_fixed(graph.edges(), None, PEER, ME, t0, ME).unwrap();
         graph.observe_direct_neighbor(PEER, -70, 8, t0 + 2 * T + 1, 0);
         let after =
             delivery_hop_cost_fixed(graph.edges(), None, PEER, ME, t0 + 2 * T + 1, ME).unwrap();
@@ -1938,7 +1716,6 @@ mod tests {
         };
         let none = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter_none));
         assert_eq!(none.next_hop, 0);
-        // Destination itself is never filtered out even if listed.
         let excl_dest = [DEST];
         let filter_dest = RoutableFilter {
             capability: &capability,
@@ -1949,5 +1726,4 @@ mod tests {
         let still = calculate_route(&edges, &downstream, ME, DEST, 0, Some(&filter_dest));
         assert_eq!(still.next_hop, HOP_A);
     }
-
 }

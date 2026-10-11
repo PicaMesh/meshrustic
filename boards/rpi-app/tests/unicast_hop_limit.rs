@@ -1,6 +1,3 @@
-//! Last-hop unicasts: a priced hop names the destination as next hop and decrements
-//! `hop_limit` like any other relay. Originated last hops still use `LAST_HOP_BUDGET`.
-
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_routing::{
     coordinated_relay, hops_away, relay_header_with_next_hop_opts, EdgeSource, InboundPacket,

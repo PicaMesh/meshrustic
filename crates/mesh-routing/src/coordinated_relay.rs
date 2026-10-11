@@ -1,68 +1,24 @@
-//! SNR-weighted coordinated relay slot timing (ROUTER role).
-//!
-//! Higher SNR → larger contention window → longer delay, so edge/weak nodes relay first.
-
 pub const CW_MIN: u8 = 3;
 pub const CW_MAX: u8 = 8;
 pub const SNR_MIN: i32 = -20;
 pub const SNR_MAX: i32 = 10;
 
-/// Fallback slot time when preset airtime is unavailable (SHORT_SLOW CAD slot ≈10 ms).
 pub const DEFAULT_SLOT_MS: u32 = 20;
 
-/// Minimum spacing between two relay rungs, whatever the airtime says.
-///
-/// Absolute, in an otherwise preset-derived geometry, and it binds about half the time: at
-/// SHORT_SLOW it applies to every frame up to 54 bytes, which was 354 of 703 and 305 of 628 relays
-/// across two 12 h captures. Expressing it in slot times was tried and withdrawn — the jitter range
-/// below is derived from the *floored* half, so a slot-time floor would shrink two colocated nodes'
-/// rung-0 separation from a measured 6.55 ms mean to a modelled 4.3–5.7 ms, through the band at
-/// which they demonstrably stop hearing each other.
-///
-/// So it stays, with a stated purpose rather than an inherited number: 50 ms is the smallest
-/// separation at which two colocated nodes reliably hear one another. Revisiting it needs a
-/// measurement of the separation at which a cancel actually fires, not a substitution of one
-/// constant for another.
+/// An absolute spacing floor preserves enough separation for colocated relayers to hear and cancel each
+/// other.
 pub const MIN_RUNG_SPACING_MS: u32 = 50;
 
-/// Minimum de-correlation between two nodes that computed the same rung.
-///
-/// Absolute for the same reason, and coupled to [`MIN_RUNG_SPACING_MS`]: the range must stay
-/// strictly below the spacing or two adjacent rungs can swap order. See
-/// [`slot_tie_break_ms`].
 pub const MIN_TIE_BREAK_RANGE_MS: u32 = 20;
 
-/// Earliest a relay may key up: stock's own boundary between the router window and the contention
-/// window every other role draws from, `2 · CWmax · slot_time`.
-///
-/// This is stock's number, not one of ours. A stock node relaying a packet — unicast or broadcast,
-/// there is no separate path — takes `getTxDelayMsecWeighted`, which for any role but ROUTER is
-/// `2·CWmax·slot + random(0, 2^CWsize)·slot`. So this is the floor below which no stock non-router
-/// ever transmits, and the point past which no stock ROUTER can still key up.
-///
-/// Starting here puts an SR relay at the head of the window stock nodes contend in — behind the
-/// routers, ahead of every random client draw, and deterministic where stock is random. Below it we
-/// would be transmitting while a stock neighbour is still reading out the frame we are answering,
-/// which is the case stock's own transmit-delay comment warns about: it cannot then hear our copy,
-/// so it does not cancel its own and the duplicate we were avoiding happens anyway.
-///
-/// Preset-derived, so it scales with spreading factor and bandwidth: 128 ms at SHORT_TURBO, 160 at
-/// SHORT_SLOW, 448 at LONG_FAST.
 pub fn relay_floor_ms(slot_time_ms: u32) -> u32 {
     2 * CW_MAX as u32 * slot_time_ms
 }
 
-/// Broadcast relay slot spacing: half of packet airtime, floored at [`MIN_RUNG_SPACING_MS`].
-///
-/// The one place the floor is applied. Three sites used to re-apply it independently, one of them
-/// inside the relay-commit path where it feeds both the fallback spacing *and* the jitter — so
-/// changing the obvious one would have left the others disagreeing, and at the short presets that
-/// inverts rung order.
 pub fn half_airtime_ms(packet_airtime_ms: u32) -> u32 {
     (packet_airtime_ms / 2).max(MIN_RUNG_SPACING_MS)
 }
 
-/// LoRa CAD slot time for a modem preset (EU_868 narrow band).
 pub fn slot_time_for_preset(modem_preset: u8) -> u32 {
     mesh_radio::slot_time_ms(&mesh_radio::eu868_config_for_preset(modem_preset)).max(1)
 }
@@ -81,7 +37,6 @@ pub fn cw_size_from_snr(snr: i8) -> u8 {
     map_range(snr as i32, SNR_MIN, SNR_MAX, CW_MIN, CW_MAX)
 }
 
-/// Deterministic jitter in place of `random()` for no_std ROUTER rebroadcast delay.
 fn jitter_slots(from: u32, id: u32, node_num: u32, slot_span: u32) -> u32 {
     if slot_span == 0 {
         return 0;
@@ -89,39 +44,18 @@ fn jitter_slots(from: u32, id: u32, node_num: u32, slot_span: u32) -> u32 {
     (from ^ id ^ node_num) % slot_span
 }
 
-/// Range of the rung tie-break: a quarter of the rung spacing either side, floored.
-///
-/// Named so the invariant it must satisfy can be stated and tested in one place: strictly below the
-/// rung spacing, or two adjacent rungs can swap and the earlier-ranked node transmits second —
-/// which voids the coverage absorption the ranking performed on its behalf.
 pub fn tie_break_range_ms(half_airtime_ms: u32) -> u32 {
     (half_airtime_ms / 2).max(MIN_TIE_BREAK_RANGE_MS)
 }
 
-/// Tie-breaker added to an SR relay rung: deterministic per (packet, node), strictly positive and
-/// no larger than [`tie_break_range_ms`].
-///
-/// Strictly positive, so a rung can be pushed later than its position but never earlier. The offset
-/// used to be signed and centred on zero, which let rung 0 fire *before* the ladder's origin — at
-/// SHORT_SLOW as early as 148 ms against a router window whose last slot is 150, so the two
-/// overlapped and the bands they are meant to separate did not.
-///
-/// Deliberately not zero either. Across two 12 h captures all 38 broadcast double relays had both
-/// nodes at rung 0 with the same half-airtime, separated *only* by this offset — mean 6.55 ms,
-/// max 18, two pairs already at 0. Removing it would make all 38 simultaneous key-ups, where
-/// neither copy cancels the other and a third node may decode neither: worse than a duplicate.
-///
-/// The cost is a mean rung delay half the range higher than before — about 12 ms at SHORT_SLOW —
-/// which buys the band separation and the de-correlation together.
+/// A positive tie-break separates equal first-rung choices while keeping every send outside the reserved
+/// window.
 pub fn slot_tie_break_ms(half_airtime_ms: u32, id: u32, node_num: u32) -> u32 {
     let range = tie_break_range_ms(half_airtime_ms);
     ((node_num ^ id) % range) + 1
 }
 
-/// Meshtastic `getTxDelayMsec`: `random(0, 2^CWsize) * slotTime`, CWsize from channel
-/// utilization. Used for module replies (NodeInfo answers, dirty topology broadcasts) that
-/// several nodes may fire in response to the same packet. Deterministic per (seeds, node) so
-/// colocated nodes draw different slots without an RNG.
+/// Per-node seeds decorrelate replies without requiring an RNG in the routing core.
 pub fn tx_delay_ms_contention(
     channel_util_pct: f32,
     slot_ms: u32,
@@ -133,30 +67,31 @@ pub fn tx_delay_ms_contention(
     jitter_slots(seed_a, seed_b, node_num, 1u32 << cw) * slot_ms
 }
 
-/// Upper bound of [`tx_delay_ms_contention`] at the given channel utilization.
 pub fn tx_delay_ms_contention_max_at(channel_util_pct: f32, slot_ms: u32) -> u32 {
     (1u32 << crate::routing_ack::contention_window_size(channel_util_pct)) * slot_ms
 }
 
-/// Upper bound of [`tx_delay_ms_contention`] at any channel utilization.
 pub fn tx_delay_ms_contention_max(slot_ms: u32) -> u32 {
     (1u32 << crate::routing_ack::RETX_CW_MAX) * slot_ms
 }
 
-/// Worst-case ROUTER_LATE relay window at strong SNR (T1 insurance timer base).
 pub fn tx_delay_ms_worst(cw_slot_ms: u32) -> u32 {
     let cw_max = CW_MAX as u32;
     let pow2 = 1u32 << cw_max;
     (2 * cw_max * cw_slot_ms).saturating_add(pow2 * cw_slot_ms)
 }
 
-/// `has_node_transmitted` retention: contention window or worst-case T1 delay, whichever is longer.
 pub fn transmission_record_window_ms(modem_preset: u8) -> u32 {
     let preset_window = mesh_radio::contention_window_ms(modem_preset);
     let slot = slot_time_for_preset(modem_preset);
     let cfg = mesh_radio::eu868_config_for_preset(modem_preset);
     let max_airtime = mesh_radio::packet_time_ms(&cfg, mesh_radio::MAX_LORA_PAYLOAD, false);
-    let t1_window = tx_delay_ms_worst(slot).saturating_add(max_airtime);
+    let ladder =
+        half_airtime_ms(max_airtime).saturating_mul(crate::graph::MAX_EDGES_PER_NODE as u32);
+    let t1_window = tx_delay_ms_worst(slot)
+        .max(ladder)
+        .saturating_add(max_airtime)
+        .saturating_add(ladder);
     preset_window.max(t1_window)
 }
 
@@ -164,16 +99,8 @@ pub fn transmission_record_window_ms(modem_preset: u8) -> u32 {
 mod tests {
     use super::*;
 
-    /// The tie-break range must stay strictly below the rung spacing, at every preset and frame
-    /// size — not only at the three values the older test happened to try.
-    ///
-    /// If it ever reaches the spacing, two adjacent rungs can swap: the earlier-ranked node
-    /// transmits second. The two floors are what make this non-obvious — the range is derived
-    /// from the *floored* half, so changing either constant alone can break it, which is why
-    /// both are named and pinned here.
     #[test]
     fn tie_break_range_stays_below_rung_spacing_everywhere() {
-        // Every preset, and frame sizes from a bare header to the maximum payload.
         for preset in 0u8..=9 {
             let cfg = mesh_radio::eu868_config_for_preset(preset);
             for len in [16usize, 29, 48, 55, 106, 200, 237, 253] {
@@ -185,7 +112,6 @@ mod tests {
                     "preset {preset} len {len}: tie-break range {range} must stay under the rung \
                      spacing {half}, or adjacent rungs can swap"
                 );
-                // And the offset it produces must fit inside that range on both sides.
                 for id in [0x1u32, 0x1234_5678, 0xffff_ffff] {
                     for node in [0xbdac_ce55u32, 0x046b_553a] {
                         let j = slot_tie_break_ms(half, id, node);
@@ -193,9 +119,6 @@ mod tests {
                             j >= 1 && j <= range,
                             "preset {preset} len {len}: offset {j} outside 1..={range}"
                         );
-                        // Strictly positive, so a rung never precedes its own position — which is
-                        // what let rung 0 fall inside the router window before.
-                        // And the earlier rung, however late, still precedes the next.
                         assert!(half + 1 > range, "preset {preset} len {len}: rungs overlap");
                     }
                 }
@@ -210,11 +133,6 @@ mod tests {
         assert!(cw_size_from_snr(12) >= cw_size_from_snr(-10));
     }
 
-    /// The SNR feeding the contention window is clamped, so the two bands stay disjoint. Stock's
-    /// mapping is not clamped upstream, and an SNR past its top extrapolates the window one step
-    /// beyond CWmax: a router's draw stretches from 15 slots to 17 and reaches into the band the
-    /// non-router roles start in. Measured on this fleet, 1,163 of 88,485 receptions carry an SNR
-    /// at or above +16 (maximum 17.75), so out-of-range input is routine, not a corner case.
     #[test]
     fn the_router_band_stays_below_the_non_router_floor_at_every_snr() {
         for slot_ms in [8u32, 10, 17, 28, 48, 89] {
@@ -225,7 +143,6 @@ mod tests {
                     (CW_MIN..=CW_MAX).contains(&cw),
                     "snr {snr} mapped outside [{CW_MIN}, {CW_MAX}]: {cw}"
                 );
-                // Worst case of `random(0, 2 * CWsize) * slotTime`, the exclusive top of the draw.
                 let worst_early = (2 * cw as u32 - 1) * slot_ms;
                 assert!(
                     worst_early < floor,

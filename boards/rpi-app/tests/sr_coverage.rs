@@ -1,5 +1,3 @@
-//! Broadcast dupe coverage via accumulated transmitters + unique coverage.
-
 use mesh_routing::{
     decode_packed_neighbors, write_packed_header, NeighborGraph, PackedNeighbor,
     TopologyMergeResult, DEFAULT_SLOT_MS,
@@ -32,7 +30,7 @@ fn merge_remote_neighbor(graph: &mut NeighborGraph, reporter: u32, neighbor: u32
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 1, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     let result = graph.merge_topology(reporter, &header, &[remote], true, now_ms, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
 }

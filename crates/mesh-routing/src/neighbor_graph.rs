@@ -1,5 +1,3 @@
-//! Topology graph and per-radio relay commit state (Phase 6 SR).
-
 use mesh_protocol::{is_direct_packet, NODENUM_BROADCAST};
 use mesh_radio::{RadioId, MODEM_DEFAULT_PRESET};
 
@@ -26,26 +24,16 @@ pub const MAX_HEARD_TRANSMITTERS: usize = 6;
 pub const MAX_TOPOLOGY_VERSION_ENTRIES: usize = MAX_NEIGHBORS;
 pub const TOPOLOGY_BROADCAST_MS: u32 = 900_000;
 pub const TOPOLOGY_DIRTY_MIN_MS: u32 = 600_000;
-/// No accepted report from a peer for this long: accept whatever version it sends next. Covers a
-/// peer whose reboot broadcast we missed, a peer that came back with a moved-on counter, and a
-/// receiver that was itself away. Twice the periodic interval plus a 20-second margin.
 pub const TOPOLOGY_RESYNC_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS + 20_000;
-/// Delayed copies of the previous one or two broadcasts sit a few counts behind `last`. Farther
-/// behind is a restarted counter (a flash: last=26, received=1), not an older in-flight list.
 pub const TOPOLOGY_DELAYED_BEHIND_MAX: u8 = 7;
-/// Nominal link assumed for edges inferred from relayed packets.
 pub const INFERRED_LINK_RSSI: i32 = -70;
 pub const INFERRED_LINK_SNR: f32 = 5.0;
 pub const MAINTENANCE_LOG_MS: u32 = 60_000;
 pub const NEIGHBOR_TTL_MS: u32 = 10_800_000;
-/// A node that publishes topology promises a list every [`TOPOLOGY_BROADCAST_MS`]. Miss two of
-/// them plus a 20-second margin with nothing else heard from it and it is gone:
-/// [`NEIGHBOR_TTL_MS`] is how long a graph is worth remembering, not how long we owe a neighbour
-/// airtime. Stock and legacy neighbours keep
-/// the full TTL, because they promise no cadence and their silence says nothing.
+/// Non-publishing peers promise no cadence, so their silence alone does not justify the shorter
+/// publisher timeout.
 pub const PUBLISHER_SILENCE_MS: u32 = 2 * TOPOLOGY_BROADCAST_MS + 20_000;
 
-/// Legacy SHORT_SLOW contention window; live retention uses `transmission_record_window_ms`.
 pub const NODE_TX_RECORD_MS: u32 = 2_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,17 +72,11 @@ struct RelayCommit {
 struct TopologyVersionEntry {
     node_id: u32,
     version: u8,
-    /// When we last accepted a report from this node (0 = never).
     last_accept_ms: u32,
-    /// Version of the last report we rejected as stale, if any: a rebooted peer whose boot
-    /// broadcast we missed shows as rejected versions climbing one by one.
     stale_version: u8,
     stale_valid: bool,
 }
 
-/// Neighbour ids listed so far by a multi-chunk topology report. The "unlisted neighbour does not
-/// hear the sender" rule needs the whole list, so ids are gathered across chunks and the rule runs
-/// on the last one; a chunk whose first packet was missed leaves the flags untouched.
 #[derive(Clone, Copy, Debug)]
 struct PendingListed {
     sender: u32,
@@ -102,9 +84,9 @@ struct PendingListed {
     count: u8,
     valid: bool,
     ids: [u32; MAX_NEIGHBORS],
+    next_chunk: u8,
 }
 
-/// Multi-chunk reports gathered at once; hubs with more than 28 neighbours are few.
 const PENDING_LISTED_SLOTS: usize = 4;
 
 impl PendingListed {
@@ -114,12 +96,14 @@ impl PendingListed {
         count: 0,
         valid: false,
         ids: [0; MAX_NEIGHBORS],
+        next_chunk: 1,
     };
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct NodeTxRecord {
     node_id: u32,
+    originator: u32,
     packet_id: u32,
     at_ms: u32,
 }
@@ -143,9 +127,6 @@ pub enum TopologyMergeResult {
 const MAX_OUR_TX_RECORDS: usize = 16;
 const MAX_NODE_TX_RECORDS: usize = 32;
 
-/// Hop budget of a last-hop unicast (see `NeighborGraph::caps_last_hop`): one hop, so the
-/// destination reads it as direct (`hop_start == hop_limit`, or one hop used on a relay) and
-/// every receiver sees a populated `hop_start`; the named next hop keeps stock relays out.
 pub const LAST_HOP_BUDGET: u8 = 1;
 
 pub struct NeighborGraph {
@@ -156,17 +137,14 @@ pub struct NeighborGraph {
     downstream: DownstreamTable,
     relay_states: [RelayCommit; MAX_RELAY_STATES],
     topo_versions: [TopologyVersionEntry; MAX_TOPOLOGY_VERSION_ENTRIES],
-    /// Set when a report was accepted outside the forward version window (peer reboot or long
-    /// silence): (sender, received version, previously stored version). Taken by the router for the log.
     last_version_resync: Option<(u32, u8, u8)>,
-    /// Listed neighbour ids of multi-chunk reports still being received, one slot per sender
-    /// (see `merge_topology`). A single slot let any other node's report invalidate a hub's list.
     pending_listed: [PendingListed; PENDING_LISTED_SLOTS],
     topo_version_count: u8,
     topology_version: u8,
     topology_dirty: bool,
     last_topology_ms: u32,
-    last_topology_list_ms: u32,
+    has_sent_topology: bool,
+    last_topology_list_ms: Option<u32>,
     last_maintenance_ms: u32,
     signal_routing_active: bool,
     our_tx: [NodeTxRecord; MAX_OUR_TX_RECORDS],
@@ -222,17 +200,20 @@ impl NeighborGraph {
             topology_version: 0,
             topology_dirty: false,
             last_topology_ms: 0,
-            last_topology_list_ms: 0,
+            has_sent_topology: false,
+            last_topology_list_ms: None,
             last_maintenance_ms: 0,
             signal_routing_active: true,
             our_tx: [NodeTxRecord {
                 node_id: 0,
+                originator: 0,
                 packet_id: 0,
                 at_ms: 0,
             }; MAX_OUR_TX_RECORDS],
             our_tx_count: 0,
             node_tx: [NodeTxRecord {
                 node_id: 0,
+                originator: 0,
                 packet_id: 0,
                 at_ms: 0,
             }; MAX_NODE_TX_RECORDS],
@@ -278,12 +259,6 @@ impl NeighborGraph {
         self.edges.is_our_direct_neighbor(node_id, self.my_node)
     }
 
-    /// Is a unicast to `destination` a last hop: the destination is a direct neighbour that
-    /// hears us and stock neighbours are listening? Such a frame goes out with
-    /// [`LAST_HOP_BUDGET`] and the destination named as next hop, so stock neighbours (which
-    /// relay a unicast only when the next hop is unset or their own byte) leave it alone while
-    /// the destination still reads it as a direct, ACK-worthy frame. Among SR peers only, the
-    /// slot coordination suppresses relays by itself and the budget stays untouched.
     pub fn caps_last_hop(&self, destination: u32) -> bool {
         if destination == 0 || destination == NODENUM_BROADCAST {
             return false;
@@ -317,21 +292,16 @@ impl NeighborGraph {
         &mut self.downstream
     }
 
-    /// Outgoing edge whose destination low byte matches `relay_byte` (non-placeholder preferred).
-    /// Resolve a relay byte against our own measured neighbours, and only when it is unambiguous.
-    ///
-    /// A relayed frame names its relayer in one byte, so two neighbours sharing that byte are
-    /// indistinguishable in it. The resolved identity decides which node a measured, published
-    /// edge is written to, and a peer reads that edge as evidence the named node reaches us — so
-    /// naming the wrong one would have a peer credit coverage that does not exist and stop
-    /// relaying to us. With eight neighbours a shared low byte is not a remote case. No answer is
-    /// the safe answer: the caller falls back to a placeholder, which is never published.
+    /// A wrong resolved identity would credit nonexistent coverage and suppress necessary relays.
     pub fn match_relay_byte_on_outgoing_edges(&self, relay_byte: u8) -> Option<u32> {
         let node = self.edges.find_node(self.my_node)?;
         let mut found: Option<u32> = None;
         for i in 0..node.edge_count as usize {
             let to = node.edges[i].to;
-            if (to & 0xFF) as u8 != relay_byte || is_placeholder_node(to) {
+            if (to & 0xFF) as u8 != relay_byte
+                || is_placeholder_node(to)
+                || node.edges[i].source != EdgeSource::Reported
+            {
                 continue;
             }
             match found {
@@ -375,11 +345,8 @@ impl NeighborGraph {
         self.modem_preset
     }
 
-    /// Drop every neighbour, route and commit learned on the previous air parameters.
-    ///
-    /// Identity, role and the modem preset we are about to operate on stay. Topology version
-    /// returns to 0 so the next list is a boot announcement peers will re-base on, rather than a
-    /// silent restart they would reject as stale.
+    /// Rebasing topology after an RF change prevents peers from rejecting the restarted sequence as
+    /// stale.
     pub fn purge_for_preset_change(&mut self) {
         self.edges.clear();
         self.downstream.clear();
@@ -396,7 +363,7 @@ impl NeighborGraph {
         self.topology_version = 0;
         self.topology_dirty = false;
         self.last_topology_ms = 0;
-        self.last_topology_list_ms = 0;
+        self.last_topology_list_ms = None;
     }
 
     fn node_tx_record_window_ms(&self) -> u32 {
@@ -413,6 +380,7 @@ impl NeighborGraph {
 
     pub fn track_node_role(&mut self, node_id: u32, role: u32, now_ms: u32) {
         self.capability.track_role(node_id, role, now_ms);
+        self.route_cache.clear();
     }
 
     #[doc(hidden)]
@@ -449,12 +417,15 @@ impl NeighborGraph {
         }
     }
 
-    pub fn record_our_transmission(&mut self, packet_id: u32, now_ms: u32) {
+    pub fn record_our_transmission(&mut self, originator: u32, packet_id: u32, now_ms: u32) {
         if packet_id == 0 {
             return;
         }
         for i in 0..self.our_tx_count as usize {
-            if self.our_tx[i].node_id == self.my_node && self.our_tx[i].packet_id == packet_id {
+            if self.our_tx[i].node_id == self.my_node
+                && self.our_tx[i].packet_id == packet_id
+                && self.our_tx[i].originator == originator
+            {
                 self.our_tx[i].at_ms = now_ms;
                 return;
             }
@@ -464,6 +435,7 @@ impl NeighborGraph {
             self.our_tx[idx] = NodeTxRecord {
                 node_id: self.my_node,
                 packet_id,
+                originator,
                 at_ms: now_ms,
             };
             self.our_tx_count += 1;
@@ -475,25 +447,39 @@ impl NeighborGraph {
         self.our_tx[MAX_OUR_TX_RECORDS - 1] = NodeTxRecord {
             node_id: self.my_node,
             packet_id,
+            originator,
             at_ms: now_ms,
         };
     }
 
-    pub fn has_our_transmission(&self, packet_id: u32) -> bool {
+    pub fn has_our_transmission(&self, originator: u32, packet_id: u32, now_ms: u32) -> bool {
         for i in 0..self.our_tx_count as usize {
-            if self.our_tx[i].node_id == self.my_node && self.our_tx[i].packet_id == packet_id {
+            if self.our_tx[i].node_id == self.my_node
+                && self.our_tx[i].packet_id == packet_id
+                && self.our_tx[i].originator == originator
+                && now_ms.wrapping_sub(self.our_tx[i].at_ms) <= self.node_tx_record_window_ms()
+            {
                 return true;
             }
         }
         false
     }
 
-    pub fn record_node_transmission(&mut self, node_id: u32, packet_id: u32, now_ms: u32) {
+    pub fn record_node_transmission(
+        &mut self,
+        node_id: u32,
+        originator: u32,
+        packet_id: u32,
+        now_ms: u32,
+    ) {
         if node_id == 0 || packet_id == 0 {
             return;
         }
         for i in 0..self.node_tx_count as usize {
-            if self.node_tx[i].node_id == node_id && self.node_tx[i].packet_id == packet_id {
+            if self.node_tx[i].node_id == node_id
+                && self.node_tx[i].packet_id == packet_id
+                && self.node_tx[i].originator == originator
+            {
                 self.node_tx[i].at_ms = now_ms;
                 return;
             }
@@ -503,6 +489,7 @@ impl NeighborGraph {
             self.node_tx[idx] = NodeTxRecord {
                 node_id,
                 packet_id,
+                originator,
                 at_ms: now_ms,
             };
             self.node_tx_count += 1;
@@ -512,16 +499,24 @@ impl NeighborGraph {
         self.node_tx[oldest] = NodeTxRecord {
             node_id,
             packet_id,
+            originator,
             at_ms: now_ms,
         };
     }
 
-    pub fn has_node_transmitted(&self, node_id: u32, packet_id: u32, now_ms: u32) -> bool {
+    pub fn has_node_transmitted(
+        &self,
+        node_id: u32,
+        originator: u32,
+        packet_id: u32,
+        now_ms: u32,
+    ) -> bool {
         let window = self.node_tx_record_window_ms();
         for i in 0..self.node_tx_count as usize {
             let rec = self.node_tx[i];
             if rec.node_id == node_id
                 && rec.packet_id == packet_id
+                && rec.originator == originator
                 && now_ms.wrapping_sub(rec.at_ms) <= window
             {
                 return true;
@@ -530,9 +525,6 @@ impl NeighborGraph {
         false
     }
 
-    /// Remember that we heard the source and optional relayer on-air for `packet_id`.
-    ///
-    /// Skips zero ids, self, and placeholder nodes so slot planning tracks real transmitters.
     pub fn record_heard_transmissions(
         &mut self,
         source: u32,
@@ -544,12 +536,12 @@ impl NeighborGraph {
             return;
         }
         if source != 0 && source != self.my_node && !is_placeholder_node(source) {
-            self.record_node_transmission(source, packet_id, now_ms);
+            self.record_node_transmission(source, source, packet_id, now_ms);
         }
         if let Some(relay) = relayer {
             if relay != 0 && relay != self.my_node && relay != source && !is_placeholder_node(relay)
             {
-                self.record_node_transmission(relay, packet_id, now_ms);
+                self.record_node_transmission(relay, source, packet_id, now_ms);
             }
         }
     }
@@ -589,8 +581,6 @@ impl NeighborGraph {
         self.edges.find_node(node_id).is_some()
     }
 
-    /// Whether `node_id` appears in the observed graph (for rate-limit eviction).
-    /// Never uses frame hop fields; placeholders are not "in graph".
     pub fn rate_limit_node_in_graph(&self, node_id: u32) -> bool {
         if node_id == 0 || is_placeholder_node(node_id) {
             return false;
@@ -601,7 +591,6 @@ impl NeighborGraph {
         self.is_our_direct_neighbor(node_id)
     }
 
-    /// Graph hops away for rate-limit eviction ranking (0 = unknown / not in graph).
     pub fn rate_limit_graph_hops(&mut self, node_id: u32, now_ms: u32) -> u8 {
         if node_id == 0 || is_placeholder_node(node_id) || node_id == self.my_node {
             return 0;
@@ -623,7 +612,6 @@ impl NeighborGraph {
         self.edges.count_direct_neighbors(self.my_node)
     }
 
-    /// True when we have at least one direct neighbor that could participate in SR broadcast routing.
     pub fn topology_healthy_for_broadcast(&self) -> bool {
         if self.my_node == 0 {
             return false;
@@ -656,7 +644,6 @@ impl NeighborGraph {
         capable >= 1
     }
 
-    /// True when `destination` is reachable via the topology graph or a downstream relay chain.
     pub fn topology_healthy_for_unicast(&mut self, destination: u32, now_ms: u32) -> bool {
         if self.my_node == 0 || destination == 0 || destination == self.my_node {
             return false;
@@ -684,18 +671,17 @@ impl NeighborGraph {
         self.topology_dirty = true;
     }
 
-    pub fn notify_originated_packet_sent(&mut self, now_ms: u32) {
-        self.last_topology_ms = self
-            .last_topology_ms
-            .saturating_sub(TOPOLOGY_BROADCAST_MS / 2);
-        let _ = now_ms;
-    }
-
-    pub fn relay_slot_index(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> (u8, u8) {
+    pub fn relay_slot_index(
+        &self,
+        packet_id: u32,
+        source: u32,
+        heard_from: u32,
+        now_ms: u32,
+    ) -> (u8, u8) {
         let mut stock = [0u32; MAX_EDGES_PER_NODE];
-        let stock_n = self.fill_stock_relay_candidates(packet_id, heard_from, now_ms, &mut stock);
+        let stock_n = self.fill_stock_relay_candidates(heard_from, &mut stock);
         let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
-        let sr_n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
+        let sr_n = self.fill_sr_relay_candidates(packet_id, source, heard_from, now_ms, &mut sr);
         let sr_index = sr[..sr_n as usize]
             .iter()
             .position(|&n| n == self.my_node)
@@ -704,26 +690,30 @@ impl NeighborGraph {
         (stock_n.saturating_add(sr_index), total)
     }
 
-    /// Best broadcast relay candidate: stock routers first, then SR peers (sorted by node id).
-    pub fn find_best_relay_candidate(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> u32 {
+    pub fn find_best_relay_candidate(
+        &self,
+        packet_id: u32,
+        source: u32,
+        heard_from: u32,
+        now_ms: u32,
+    ) -> u32 {
         let mut stock = [0u32; MAX_EDGES_PER_NODE];
-        let stock_n = self.fill_stock_relay_candidates(packet_id, heard_from, now_ms, &mut stock);
+        let stock_n = self.fill_stock_relay_candidates(heard_from, &mut stock);
         for &candidate in &stock[..stock_n as usize] {
-            if !self.has_node_transmitted(candidate, packet_id, now_ms) {
+            if !self.has_node_transmitted(candidate, source, packet_id, now_ms) {
                 return candidate;
             }
         }
         let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
-        let sr_n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
+        let sr_n = self.fill_sr_relay_candidates(packet_id, source, heard_from, now_ms, &mut sr);
         for &candidate in &sr[..sr_n as usize] {
-            if !self.has_node_transmitted(candidate, packet_id, now_ms) {
+            if !self.has_node_transmitted(candidate, source, packet_id, now_ms) {
                 return candidate;
             }
         }
         0
     }
 
-    /// Phased broadcast relay schedule (stock early slots → ranked SR → downstream).
     pub fn plan_broadcast_relay(
         &self,
         packet_id: u32,
@@ -751,12 +741,11 @@ impl NeighborGraph {
             now_ms,
             half_airtime_ms,
             crate::coordinated_relay::slot_time_for_preset(self.modem_preset),
-            |node| self.has_node_transmitted(node, packet_id, now_ms),
+            |node| self.has_node_transmitted(node, source, packet_id, now_ms),
             ack_eligible,
         )
     }
 
-    /// Cost-ranked slot for a unicast we overheard (see `unicast_relay`).
     pub fn plan_unicast_relay(
         &self,
         packet_id: u32,
@@ -781,11 +770,10 @@ impl NeighborGraph {
             destination,
             my_next_hop,
             now_ms,
-            |node| self.has_node_transmitted(node, packet_id, now_ms),
+            |node| self.has_node_transmitted(node, source, packet_id, now_ms),
         )
     }
 
-    /// Whether a heard unicast copy should pull back our pending relay.
     pub fn unicast_dupe_cancels(
         &self,
         packet_id: u32,
@@ -821,9 +809,7 @@ impl NeighborGraph {
 
     fn fill_stock_relay_candidates(
         &self,
-        packet_id: u32,
         heard_from: u32,
-        now_ms: u32,
         out: &mut [u32; MAX_EDGES_PER_NODE],
     ) -> u8 {
         let mut count = 0u8;
@@ -847,7 +833,6 @@ impl NeighborGraph {
             if !can_hear {
                 continue;
             }
-            let _ = self.has_node_transmitted(neighbor, packet_id, now_ms);
             if (count as usize) < MAX_EDGES_PER_NODE {
                 out[count as usize] = neighbor;
                 count += 1;
@@ -859,12 +844,13 @@ impl NeighborGraph {
     fn fill_sr_relay_candidates(
         &self,
         packet_id: u32,
+        source: u32,
         heard_from: u32,
         now_ms: u32,
         out: &mut [u32; MAX_EDGES_PER_NODE + 1],
     ) -> u8 {
         let mut count = 0usize;
-        if !self.has_node_transmitted(self.my_node, packet_id, now_ms) {
+        if !self.has_node_transmitted(self.my_node, source, packet_id, now_ms) {
             out[count] = self.my_node;
             count += 1;
         }
@@ -874,7 +860,7 @@ impl NeighborGraph {
             if id == heard_from {
                 continue;
             }
-            if self.has_node_transmitted(id, packet_id, now_ms) {
+            if self.has_node_transmitted(id, source, packet_id, now_ms) {
                 continue;
             }
             if self.capability.is_immediate_relay_router(id) {
@@ -897,27 +883,17 @@ impl NeighborGraph {
         count as u8
     }
 
-    /// How late this packet's own relay ladder can still key up: the last rung's delay.
-    ///
-    /// The insurance timer waits for the latest transmission anyone might still make, and that is
-    /// the later of two independent things — the worst stock draw, which scales with the slot time,
-    /// and our own ladder, which scales with the airtime. They cross: at a slow preset with a
-    /// full-size frame the ladder passes the stock worst case after only a handful of candidates,
-    /// because a half-airtime there is measured in seconds while a slot time is measured in tens of
-    /// milliseconds. Past that point a timer based on the stock draw alone fires while the ladder
-    /// is still running, and insurance becomes a competitor to the relay it was meant to cover.
-    ///
-    /// Reserved positions are not counted: they sit inside the router window, which the stock worst
-    /// case already spans.
+    /// At slow presets, the ranked ladder can outlast the contention window; retention must cover both.
     pub fn relay_ladder_span_ms(
         &self,
         packet_id: u32,
+        source: u32,
         heard_from: u32,
         now_ms: u32,
         half_airtime_ms: u32,
     ) -> u32 {
         let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
-        let n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
+        let n = self.fill_sr_relay_candidates(packet_id, source, heard_from, now_ms, &mut sr);
         let rungs = u32::from(n.saturating_sub(1));
         let transition = crate::coordinated_relay::relay_floor_ms(
             crate::coordinated_relay::slot_time_for_preset(self.modem_preset),
@@ -925,24 +901,15 @@ impl NeighborGraph {
         transition.saturating_add(rungs.saturating_mul(half_airtime_ms))
     }
 
-    /// Our rung on the insurance ladder: how many insurers are ordered ahead of us.
-    ///
-    /// Derived from the ladder it insures, not from the relay slot index. Two things follow, and
-    /// both were wrong before:
-    ///
-    /// **Stock candidates do not count.** The old stagger was the relay slot index — stock count
-    /// plus our position — times a half-airtime, which priced every reserved position as a rung of
-    /// ours. Reserved positions are a slot time wide and sit inside the router window; insurance
-    /// fires after that whole window has passed, so adding a half-airtime per stock node delays
-    /// every insurer for a window that is already behind them.
-    ///
-    /// **The order is the ladder's own tie-break**, the packet-id parity the relay ranking uses, so
-    /// the insurance burden rotates across packets instead of always falling on the lowest node id.
-    /// Nodes that already transmitted are excluded, by the same candidate rule: one that has sent
-    /// is not going to insure, and counting it pushes everybody else's copy later for nothing.
-    pub fn insurance_rung_index(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> u8 {
+    pub fn insurance_rung_index(
+        &self,
+        packet_id: u32,
+        source: u32,
+        heard_from: u32,
+        now_ms: u32,
+    ) -> u8 {
         let mut sr = [0u32; MAX_EDGES_PER_NODE + 1];
-        let n = self.fill_sr_relay_candidates(packet_id, heard_from, now_ms, &mut sr);
+        let n = self.fill_sr_relay_candidates(packet_id, source, heard_from, now_ms, &mut sr);
         let prefer_high = (packet_id & 1) != 0;
         let mut ahead = 0u8;
         for &peer in &sr[..n as usize] {
@@ -961,8 +928,14 @@ impl NeighborGraph {
         ahead
     }
 
-    pub fn relay_candidate_count(&self, packet_id: u32, heard_from: u32, now_ms: u32) -> u8 {
-        self.relay_slot_index(packet_id, heard_from, now_ms)
+    pub fn relay_candidate_count(
+        &self,
+        packet_id: u32,
+        source: u32,
+        heard_from: u32,
+        now_ms: u32,
+    ) -> u8 {
+        self.relay_slot_index(packet_id, source, heard_from, now_ms)
             .1
             .max(1)
     }
@@ -994,11 +967,11 @@ impl NeighborGraph {
             idx
         } else {
             let mut oldest = 0usize;
-            let mut oldest_ms = self.direct_signals[0].last_rx_ms;
+            let mut oldest_ms = now_ms.wrapping_sub(self.direct_signals[0].last_rx_ms);
             for i in 1..MAX_NEIGHBORS {
-                if self.direct_signals[i].last_rx_ms < oldest_ms {
+                if now_ms.wrapping_sub(self.direct_signals[i].last_rx_ms) > oldest_ms {
                     oldest = i;
-                    oldest_ms = self.direct_signals[i].last_rx_ms;
+                    oldest_ms = now_ms.wrapping_sub(self.direct_signals[i].last_rx_ms);
                 }
             }
             oldest
@@ -1080,9 +1053,6 @@ impl NeighborGraph {
             let Some(signal) = self.lookup_direct_signal(edge.to) else {
                 continue;
             };
-            // Per-entry SR-active is that neighbour's capability (fork:
-            // getCapabilityStatus). The packed header already carries ours;
-            // copying it here advertised stock neighbours as SR-active.
             out[written] = NeighborEntry {
                 node_id: edge.to,
                 rssi: signal.rssi,
@@ -1111,8 +1081,7 @@ impl NeighborGraph {
                 let swap = {
                     let a = out[i];
                     let b = out[j];
-                    // Pack order: hearsUs, then SR-active, then lower ETX. Hubs with dense RF
-                    // neighbourhoods otherwise drop SR parents that still hear them (FCM6/Czar).
+                    // Dense neighbourhoods still need room for SR parents that report hearing us.
                     if a.hears_us != b.hears_us {
                         b.hears_us
                     } else if a.signal_routing_active != b.signal_routing_active {
@@ -1176,6 +1145,7 @@ impl NeighborGraph {
             start + count < total as usize,
             chunk_index != 0,
         );
+        out[4] |= chunk_index << 3;
         for i in 0..count {
             let entry = sorted[start + i];
             let base = PACKED_NEIGHBOR_HEADER_SIZE + i * PACKED_NEIGHBOR_ENTRY_SIZE;
@@ -1238,7 +1208,6 @@ impl NeighborGraph {
         (1..=TOPOLOGY_DELAYED_BEHIND_MAX).contains(&step)
     }
 
-    /// Merge a neighbor's SR topology broadcast. `heard_on` tags the receiving radio segment.
     pub fn merge_topology(
         &mut self,
         sender: u32,
@@ -1262,20 +1231,11 @@ impl NeighborGraph {
 
         let received = header.topology_version;
         let (last, last_accept_ms) = self.topo_version_entry(sender);
-        // Ways in: the forward window; a header-only version-0 boot broadcast (counter restarted);
-        // a jump far behind `last` (the sender restarted and we missed the empty boot — Inno 26→1);
-        // nothing accepted for two periodic intervals plus margin; rejected versions climbing 1..=7 after a
-        // lost boot (a missed list is 1 then 3, not only exact +1); or a complete list heard from
-        // the originator whose counter looks backwards (the air is newer than what we stored).
-        // A header-only version 0 is a restart notice, active or passive, direct or relayed.
-        // Empty lists with other versions are ordinary reports from a node without neighbours.
-        // Delayed copies of the previous one or two broadcasts sit a few counts behind `last` and
-        // stay stale unless they are a complete list from the originator.
-        let boot_reset = neighbors.is_empty() && received == 0;
+        let boot_reset = neighbors.is_empty() && received == 0 && header.is_complete_list();
         let silence = last_accept_ms != 0
             && now_ms.wrapping_sub(last_accept_ms) >= TOPOLOGY_RESYNC_MS
             && now_ms.wrapping_sub(last_accept_ms) < 0x8000_0000;
-        let in_window = Self::topology_version_accept(received, last);
+        let in_window = last_accept_ms == 0 || Self::topology_version_accept(received, last);
         let counter_reset = !in_window && Self::topology_version_large_behind(received, last);
         let climb = !in_window && self.topo_version_climbs_after_stale(sender, received);
         let direct_resync = !in_window
@@ -1296,30 +1256,24 @@ impl NeighborGraph {
         self.edges.ensure_local_node(self.my_node, now_ms);
         self.merge_asymmetric_skip_count = 0;
 
-        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
-        // last hop to them from a stale list after they moved behind a relay.
+        // A relayed publisher cannot prove a current direct link to us; retaining that edge would invent
+        // a last-hop route.
         let sender_is_direct = self.edges.has_direct_reported_edge_to(self.my_node, sender);
-        // Horizon §6.2: RF neighbour, heard this frame from them, already in the ball, an L1
-        // lists them with hearsUs, or their list names an L1/L2 we hold. Asymmetric edge
-        // targets (hearsUs=0) must not unlock ingest.
         let sender_horizon_ok = sender_is_direct
             || is_direct_from_sender
             || self.edges.find_node(sender).is_some()
             || self.edges.reachable_via_hears_us(sender)
-            || self.edges.node_class(sender).is_some_and(|c| {
-                matches!(c, NodeClass::L2 | NodeClass::L3)
-            })
+            || self
+                .edges
+                .node_class(sender)
+                .is_some_and(|c| matches!(c, NodeClass::L2 | NodeClass::L3))
             || self.list_names_horizon_anchor(neighbors);
         if !sender_horizon_ok && self.is_active_routing_role() {
-            // Still track capability, but do not grow edges from an unqualified far publisher.
             return TopologyMergeResult::Applied {
                 neighbors: 0,
                 topo_v: received,
             };
         }
-        // Admit a non-direct sender only when already in the ball or their list names L1/L2
-        // (same gate as the MT+SR fork). Classify from ball evidence first; Unknown fallback
-        // is L3 only when the list names an L2 and does not name an L1.
         if !sender_is_direct && sender_horizon_ok {
             let names_l1 = neighbors.iter().any(|n| {
                 self.edges
@@ -1375,6 +1329,7 @@ impl NeighborGraph {
                 }
             }
         }
+        self.route_cache.clear();
         let passive_local = !self.is_active_routing_role();
         for neighbor in neighbors {
             if neighbor.node_id == 0 || (neighbor.node_id & 0xFF00_0000) == 0xFF00_0000 {
@@ -1398,10 +1353,6 @@ impl NeighborGraph {
                 .and_then(|n| n.find_edge(neighbor.node_id))
                 .is_some();
             if neighbor.node_id != self.my_node || sender_is_direct {
-                // Refresh sender activity and edge ages: with `update_timestamp` false, a hub's
-                // `last_full_update_ms` and Mirrored edge ages never moved, so after
-                // `NEIGHBOR_TTL_MS` `age_edges` deleted the hub and `clear_for_relay` wiped every
-                // list-downstream row parked behind it (Mesh Lab: Czar 84→1 at ~3.7 h).
                 self.edges.update_edge(
                     self.my_node,
                     sender,
@@ -1414,27 +1365,15 @@ impl NeighborGraph {
                 );
                 self.edges
                     .set_edge_hears_us(sender, neighbor.node_id, neighbor.hears_us);
-                // The sender lists us as a neighbor it hears directly. That is positive
-                // evidence the sender hears us. SR-passive nodes broadcast topology but
-                // never relay, so this is their only way to earn `hears_us` (SR-mute nodes
-                // send no topology at all and are unaffected).
                 if neighbor.node_id == self.my_node {
                     self.edges.set_edge_hears_us(self.my_node, sender, true);
                 } else {
-                    // The same evidence proves the sender hears every other listed node: mark the
-                    // listed node's own edge to the sender (if it has reported one) as heard, so we
-                    // model our peers' coverage of the sender the way they model it themselves.
-                    // Without this, two nodes that both just learned a passive neighbour each saw
-                    // the other as not covering it and both took slot 0 for its packets.
+                    // Passive reports can establish shared coverage; ignoring them makes overlapping
+                    // relayers choose the same first slot.
                     self.edges.set_edge_hears_us(neighbor.node_id, sender, true);
                 }
             }
 
-            // Direct = our Reported observation of them (us→them). The reverse of an RF
-            // hearing is only Inferred, and a peer listing us is Mirrored — neither is
-            // evidence we hear them. Checking Reported them→us never fired after the
-            // Inferred-reverse change and wrongly parked neighbours we hear as
-            // downstream of the topology sender.
             let has_direct_connection = neighbor.node_id == self.my_node
                 || self
                     .edges
@@ -1445,8 +1384,6 @@ impl NeighborGraph {
                     self.downstream.clear_for_destination(neighbor.node_id);
                 }
             } else if neighbor.hears_us {
-                // Prefer admitting into the edge ball when depth allows (L1 lists L2 with
-                // hearsUs, or L2 lists L3). Otherwise park as list-downstream of the sender.
                 let admitted = self.try_admit_listed_publisher(
                     sender,
                     neighbor.node_id,
@@ -1475,21 +1412,40 @@ impl NeighborGraph {
         self.edges
             .flush_pending_demotion(self.my_node, now_ms, &mut self.downstream);
 
-        // The sender is authoritative about who it hears: a neighbour it does not list has its
-        // hears_us towards the sender cleared. That needs the complete list, so chunks of a
-        // multi-packet report are gathered first and the rule runs on the last one.
-        let slot = self.pending_listed_slot(sender);
+        let slot = if header.continuation {
+            let Some(slot) = self
+                .pending_listed
+                .iter()
+                .position(|p| p.valid && p.sender == sender)
+            else {
+                return TopologyMergeResult::Applied {
+                    neighbors: neighbors.len() as u8,
+                    topo_v: received,
+                };
+            };
+            slot
+        } else {
+            self.pending_listed_slot(sender)
+        };
         if !header.continuation {
             self.pending_listed[slot] = PendingListed {
                 sender,
                 version: received,
                 count: 0,
-                valid: true,
+                valid: header.chunk_index == 0,
                 ids: [0; MAX_NEIGHBORS],
+                next_chunk: 1,
             };
         }
         let pending = &mut self.pending_listed[slot];
-        if pending.valid && pending.sender == sender && pending.version == received {
+        if pending.valid
+            && pending.sender == sender
+            && pending.version == received
+            && (!header.continuation || header.chunk_index == pending.next_chunk)
+        {
+            if header.continuation {
+                pending.next_chunk += 1;
+            }
             for neighbor in neighbors {
                 if (pending.count as usize) < MAX_NEIGHBORS {
                     pending.ids[pending.count as usize] = neighbor.node_id;
@@ -1499,18 +1455,11 @@ impl NeighborGraph {
                 }
             }
             if !header.more_chunks {
-                // An empty list is no evidence: a node that has just booted has heard nobody yet,
-                // and a node hearing nobody has nothing to say about who hears it.
-                if pending.valid && pending.count > 0 {
+                if pending.valid && !boot_reset {
                     let count = pending.count as usize;
                     let listed = pending.ids;
                     self.edges
                         .clear_hears_us_to_unlisted(sender, &listed[..count]);
-                    // The list is authoritative about the sender's own edges too, not only about
-                    // who hears it: an entry that has gone is a link the sender no longer has.
-                    // Without this a neighbour it dropped survived to NEIGHBOR_TTL_MS and stayed
-                    // in its coverage set (field 2026-09-08: a rebooted peer's dropped entry
-                    // still counted 22 minutes later, and only on one of two colocated nodes).
                     if self.edges.retain_listed_edges(sender, &listed[..count]) {
                         self.route_cache.clear();
                         let _ = self.edges.prune_unreachable_from_root(
@@ -1523,7 +1472,6 @@ impl NeighborGraph {
                 self.pending_listed[slot].valid = false;
             }
         } else if header.continuation {
-            // First chunk missed: this list is incomplete, leave hears_us as it was.
             pending.valid = false;
         }
 
@@ -1542,8 +1490,6 @@ impl NeighborGraph {
         self.merge_asymmetric_skip_count += 1;
     }
 
-    /// True when this topology list names an L1 we hear, or an L2 already in the ball
-    /// (enough to qualify an L3 sender under §6.2).
     fn list_names_horizon_anchor(&self, neighbors: &[PackedNeighbor]) -> bool {
         for n in neighbors {
             if self
@@ -1563,8 +1509,6 @@ impl NeighborGraph {
         false
     }
 
-    /// Admit a listed non-neighbour into the edge ball when horizon depth allows.
-    /// L1 listing X with hearsUs → L2; L2 listing X with hearsUs → L3 if depth≥3.
     fn try_admit_listed_publisher(
         &mut self,
         sender: u32,
@@ -1625,9 +1569,6 @@ impl NeighborGraph {
         let now_ms = now_ms.max(1);
         for i in 0..self.topo_version_count as usize {
             if self.topo_versions[i].node_id == node_id {
-                // A repeat is the next chunk of this version, or a delayed copy still in the air.
-                // Clearing the stale note here disarms restart-climb: a rejected v=1, then this
-                // version's second chunk, then v=2 with nothing left to climb from.
                 let same_version = self.topo_versions[i].version == version;
                 self.topo_versions[i].version = version;
                 self.topo_versions[i].last_accept_ms = now_ms;
@@ -1637,23 +1578,27 @@ impl NeighborGraph {
                 return;
             }
         }
-        if (self.topo_version_count as usize) < MAX_TOPOLOGY_VERSION_ENTRIES {
+        let idx = if (self.topo_version_count as usize) < MAX_TOPOLOGY_VERSION_ENTRIES {
             let idx = self.topo_version_count as usize;
-            self.topo_versions[idx] = TopologyVersionEntry {
-                node_id,
-                version,
-                last_accept_ms: now_ms,
-                stale_version: 0,
-                stale_valid: false,
-            };
             self.topo_version_count += 1;
-        }
+            idx
+        } else {
+            self.topo_versions
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, e)| now_ms.wrapping_sub(e.last_accept_ms))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
+        self.topo_versions[idx] = TopologyVersionEntry {
+            node_id,
+            version,
+            last_accept_ms: now_ms,
+            stale_version: 0,
+            stale_valid: false,
+        };
     }
 
-    /// Is `received` 1..=7 past the version we last rejected from `node_id`?
-    ///
-    /// Exact +1 is the usual reboot after a missed boot broadcast; a few missed lists still
-    /// rebase (v=1 then v=3). Delayed old reports sit 1–2 behind `last` and never climb from there.
     fn topo_version_climbs_after_stale(&self, node_id: u32, received: u8) -> bool {
         self.topo_versions[..self.topo_version_count as usize]
             .iter()
@@ -1674,13 +1619,10 @@ impl NeighborGraph {
         }
     }
 
-    /// A report was accepted outside the forward version window (sender, received, stored).
     pub fn take_topology_version_resync(&mut self) -> Option<(u32, u8, u8)> {
         self.last_version_resync.take()
     }
 
-    /// Slot gathering `sender`'s chunks: its open one if any, else a free one, else slot 0
-    /// (whose owner then loses its half-gathered list, the only casualty of the cap).
     fn pending_listed_slot(&self, sender: u32) -> usize {
         self.pending_listed
             .iter()
@@ -1689,7 +1631,6 @@ impl NeighborGraph {
             .unwrap_or(0)
     }
 
-    /// Record a direct RF neighbor. `heard_on` is the receiving radio (`RadioId(0)` on v1 hardware).
     fn observe_relay_gateway_signal(
         &mut self,
         gateway: u32,
@@ -1711,7 +1652,6 @@ impl NeighborGraph {
         result == EDGE_NEW
     }
 
-    /// Record a direct RF neighbor. `heard_on` is the receiving radio (`RadioId(0)` on v1 hardware).
     fn refresh_reported_direct_neighbor(
         &mut self,
         node_id: u32,
@@ -1755,13 +1695,6 @@ impl NeighborGraph {
             heard_on,
             self.modem_preset,
         );
-        // The reverse direction is our assumption of symmetry, not something we can measure: we
-        // have no way to know how well the neighbour hears us. Recording it as `Reported` gave
-        // our own guess the top rank, so the neighbour's published measurement of us could never
-        // land and we priced the link from the guess while every peer priced it from our list
-        // (field 2026-09-08: each node's own coverage total was one-sidedly higher than any
-        // peer's view of it). It stays in the graph as evidence a link exists in both
-        // directions; it just no longer prices one.
         let _ = self.edges.update_edge_from_observation(
             self.my_node,
             node_id,
@@ -1807,10 +1740,6 @@ impl NeighborGraph {
         result == EDGE_NEW
     }
 
-    /// Update graph from a received packet header. `heard_on` tags which preset segment heard it.
-    ///
-    /// `known_relay`, when set to a resolved non-placeholder NodeNum, lets relayed-packet
-    /// learning use the real gateway instead of a synthetic placeholder.
     pub fn observe_packet(
         &mut self,
         from: u32,
@@ -1854,9 +1783,6 @@ impl NeighborGraph {
         _now_ms: u32,
     ) -> u32 {
         let placeholder = placeholder_node_id(relay_node);
-        // Placeholder → real NodeNum resolution only happens on directly-heard frames
-        // (hop_start == hop_limit, relay byte matches originator). While a placeholder
-        // remains in the graph, relayed observations keep using it as the gateway.
         if self.edges.find_node(placeholder).is_some() {
             return placeholder;
         }
@@ -1886,7 +1812,6 @@ impl NeighborGraph {
         known_relay: Option<u32>,
         packet_id: u32,
     ) -> Option<(u32, bool, bool)> {
-        // A node that publishes no topology has nobody to tell, so it records nothing.
         if !self.is_active_routing_role() && !self.can_send_topology() {
             return None;
         }
@@ -1902,43 +1827,20 @@ impl NeighborGraph {
         if gateway == from || gateway == self.my_node {
             return None;
         }
-        // Our own echo teaches us nothing about who is behind whom. A peer that relays a packet we
-        // just transmitted got it from us, so recording the source as downstream of that peer
-        // invents a path back through ourselves: the peer then routes that destination to us while
-        // we route it to the peer, and a unicast bounces between them (seen with the balcony node,
-        // 2026-09-07).
-        if self.has_our_transmission(packet_id) {
+        if self.has_our_transmission(from, packet_id, now_ms) {
             return None;
         }
-        // A former direct neighbour heard only through this relayer is retracted immediately —
-        // waiting for publisher silence left travelling unicasts aimed at a dead last hop.
-        // Exception: we already took this same packet id direct — the relayed copy is a desk
-        // duplicate (Czar rebroadcast), not evidence they left. Retracting then flapped directs.
         let was_direct_neighbor = self.edges.has_direct_reported_edge_to(self.my_node, from);
         let already_heard_direct =
-            packet_id != 0 && self.has_node_transmitted(from, packet_id, now_ms);
+            packet_id != 0 && self.has_node_transmitted(from, from, packet_id, now_ms);
         let travelling = was_direct_neighbor && !already_heard_direct;
         if travelling && self.retract_direct_link(from) {
             self.remove_direct_signal(from);
             self.topology_dirty = true;
         }
-        // Measuring a relayer we heard is first-hand observation, not inference: the RSSI and SNR
-        // come off the relayer's own frame, exactly as they do for a frame that arrived direct. So
-        // every node records it, whatever its role. Only the node that hears a relayer can supply
-        // the transmit-direction evidence coverage needs about it ("does that router reach me?"),
-        // and a node that never records it stays permanently uncovered, so each of its neighbours
-        // holds unique coverage of it and relays. What the active-routing class gates is the
-        // inference below — who sits behind the gateway — which only a node that ranks relays uses.
         let active_routing = self.is_active_routing_role();
         self.edges.ensure_local_node(self.my_node, now_ms);
-        // What we measured is the relay's link to us, not the relay's link to the source. An
-        // inferred edge/downstream gets a nominal cost per hop the packet has travelled; with the
-        // measured value a two-hop path through a node a metre away priced at 1.05 and two
-        // colocated nodes routed a far hub through each other.
         let hops_used = hop_start.saturating_sub(hop_limit).max(1);
-        // A downstream entry stands for a path, so it is priced per hop the packet travelled. An
-        // inferred edge stands for one hop — the gateway's link to the source — so it is priced
-        // as one, whatever route the packet took to reach us.
         let nominal_hop = calculate_etx(INFERRED_LINK_RSSI, INFERRED_LINK_SNR, self.modem_preset);
         let path_etx = nominal_hop * hops_used as f32;
 
@@ -1946,19 +1848,10 @@ impl NeighborGraph {
             self.observe_relay_gateway_signal(gateway, rssi, snr, now_ms, heard_on);
 
         let single_hop = hops_used == 1;
-        // Anyone who publishes a neighbour list (SR-active or passive/mute) is authority for who
-        // sits behind which hop. Only a source that never lists (!publishes_topology: Legacy or
-        // still-Unknown stock) may be parked from a relay observation alone.
         let source_publishes = self.capability.publishes_topology(from);
 
-        // The edge we would write is `gateway → from`, and the gateway is the only node that can
-        // publish it. Invent it only when the gateway never will: a stock node, or a placeholder
-        // we have not resolved yet. Keyed on the gateway, not on the source, because the source's
-        // own list carries the other direction and says nothing about this one.
-        // Deliberately not `!publishes_topology`: that asks whether a role may be compensated for,
-        // and answers "yes" for an unclassified node. Inventing an edge is a stronger claim — it
-        // must be one nobody will ever publish — and an unclassified node may yet publish one that
-        // this would have overwritten. Only a node known to publish nothing, or a placeholder.
+        // Only the gateway can publish evidence of its link towards the originator; the originator
+        // reports the opposite direction.
         let gateway_never_publishes = self.capability.status(gateway) == CapabilityStatus::Legacy
             || is_placeholder_node(gateway);
         if active_routing && gateway_never_publishes {
@@ -1977,7 +1870,6 @@ impl NeighborGraph {
             }
         }
 
-        // Also learn (us -> relay_gateway) so routing can egress via the relay.
         let result_us_to_relay = self.edges.update_edge_from_observation(
             self.my_node,
             self.my_node,
@@ -1994,16 +1886,8 @@ impl NeighborGraph {
             self.route_cache.clear();
         }
 
-        // Only now does the us -> gateway edge exist for a first-time placeholder relay
-        // (observe_relay_gateway_signal skips placeholders), so confirm hears_us here rather
-        // than before the edge update, where the flag was logged but never stored.
         let hears_us = self.maybe_confirm_hears_us_from_relay(gateway, from, packet_id);
 
-        // Hearing the originator *via* a relay is the other direction from delivering *to* them.
-        // Keep the row when we can send to the relay (it hears us). A topology publisher (active
-        // or passive) must also list that relay — their list is the TX-path authority, including
-        // multi-hop dests that only appear further down the published edge graph. A source that
-        // never lists anyone leaves the relay observation as the only signal.
         let relay_hears_us = self
             .edges
             .find_node(self.my_node)
@@ -2014,27 +1898,16 @@ impl NeighborGraph {
             .find_node(from)
             .and_then(|n| n.find_edge(gateway))
             .is_some();
-        let can_infer_downstream =
-            relay_hears_us && (destination_lists_relay || !source_publishes);
-        // Former direct neighbour heard only via this relay: still only when the two facts above
-        // hold — they moved, and the path has to be one we can use.
-        // Single-hop: sender went through the gateway to reach us.
-        // Multi-hop, non-publisher: stock nodes never advertise topology.
-        // Multi-hop publisher that was never our neighbour: skip — Dijkstra on their (and their
-        // peers') lists is the multi-hop TX path; a forwarded copy is not.
+        let can_infer_downstream = relay_hears_us && (destination_lists_relay || !source_publishes);
         let infer_downstream = travelling || single_hop || !source_publishes;
         let dest_in_ball = self.edges.find_node(from).is_some();
         let list_parked = self
             .downstream
             .list_downstream(from, now_ms, NEIGHBOR_TTL_MS)
             .is_some_and(|(m, _)| self.edges.find_node(m).is_some());
-        // Ball / list-downstream stay; a travelling former neighbour still parks behind the
-        // hop we heard so unicasts do not keep the dead last hop.
         let steal_ok = travelling || (!dest_in_ball && !list_parked);
         if active_routing && can_infer_downstream && infer_downstream && steal_ok {
             if travelling {
-                // Write even when the relayer already published an edge to them: they still
-                // have to sit behind the hop we heard, not as our last hop.
                 self.downstream.update_exclusive(
                     self.my_node,
                     from,
@@ -2046,13 +1919,10 @@ impl NeighborGraph {
                 );
                 self.route_cache.clear();
             } else if !self.is_downstream_relay_for(gateway, from, now_ms) {
-                // Sticky parent: a relayed hearing must not park the dest behind a new gateway
-                // while another live parent already holds it, unless this gateway is on the
-                // originator's published list (TX-path evidence). Otherwise a desk node that
-                // merely forwarded a far mute steals the branch gateway's claim.
+                // A forwarding bystander must not replace the actual downstream gateway.
                 let existing_parent = self.get_downstream_relay(from, now_ms);
-                let steals_without_list = existing_parent.is_some_and(|p| p != gateway)
-                    && !destination_lists_relay;
+                let steals_without_list =
+                    existing_parent.is_some_and(|p| p != gateway) && !destination_lists_relay;
                 if !steals_without_list {
                     self.downstream.update(
                         self.my_node,
@@ -2087,25 +1957,17 @@ impl NeighborGraph {
         node_num: u32,
         broadcast_plan: Option<&crate::broadcast_relay::BroadcastRelayPlan>,
     ) -> (u32, u8, u8) {
-        // Same floor as the ranking used, by name: this value feeds both the fallback
-        // spacing and the jitter, so a local literal here could disagree with the rung order.
         let half = half_airtime_ms.max(crate::coordinated_relay::MIN_RUNG_SPACING_MS);
         let (slot_index, candidates, spacing) = if let Some(plan) = broadcast_plan {
             (plan.slot_index, plan.candidate_count, plan.slot_delay_ms)
         } else {
-            let (idx, count) = self.relay_slot_index(id, heard_from, now_ms);
+            let (idx, count) = self.relay_slot_index(id, from, heard_from, now_ms);
             (
                 idx,
                 count,
                 crate::channel_access::slot_delay_ms(idx as u32, half, cw_slot_ms),
             )
         };
-        // The slot already encodes the coordinated order. Only a small deterministic tie-break
-        // is added; the router-style SNR contention delay (up to 2·CW slots, several times a
-        // half-airtime) used to be added here and randomised the order, which is how two
-        // colocated nodes in slots 1 and 4 ended up keying up 50 ms apart.
-        // The offset is strictly positive now, so a rung can only be pushed later than its
-        // position — the saturating floor the signed version needed is gone with it.
         let delay = spacing.saturating_add(slot_tie_break_ms(half, id, node_num));
         let tx_after_ms = now_ms.wrapping_add(delay);
         if let Some(idx) = self.find_relay(from, id, radio_id) {
@@ -2139,7 +2001,6 @@ impl NeighborGraph {
             .map(|idx| self.relay_states[idx].tx_after_ms)
     }
 
-    /// Drop every committed relay. Returns how many were active.
     pub fn clear_relays(&mut self) -> usize {
         let mut n = 0;
         for slot in &mut self.relay_states {
@@ -2182,7 +2043,6 @@ impl NeighborGraph {
             .get_relay(destination, now_ms, NEIGHBOR_TTL_MS)
     }
 
-    /// First neighbour we can hear on the downstream walk from `destination`.
     pub fn downstream_chain_egress(&self, destination: u32, now_ms: u32) -> Option<u32> {
         self.downstream
             .chain_egress(destination, now_ms, NEIGHBOR_TTL_MS, |n| {
@@ -2211,16 +2071,10 @@ impl NeighborGraph {
             .transfer_downstream(old_relay, new_relay, now_ms)
     }
 
-    /// Drop our measured link to `neighbor` and their edge back to us. Used when we hear them
-    /// only through a relayer, so Dijkstra stops treating them as a last hop. Returns true if
-    /// our edge to them existed.
     fn retract_direct_link(&mut self, neighbor: u32) -> bool {
         self.retract_direct_link_inner(neighbor, true)
     }
 
-    /// Drop our measured link to `neighbor` and their edge back to us. When `cascade` is true,
-    /// also prune ball publishers that became unreachable (single retract). Batch silence
-    /// retracts set `cascade` false and prune once after the whole batch.
     fn retract_direct_link_inner(&mut self, neighbor: u32, cascade: bool) -> bool {
         if neighbor == 0 || neighbor == self.my_node {
             return false;
@@ -2229,11 +2083,9 @@ impl NeighborGraph {
         self.edges.remove_edge(neighbor, self.my_node);
         if removed {
             if cascade {
-                let _ = self.edges.prune_unreachable_from_root(
-                    self.my_node,
-                    0,
-                    &mut self.downstream,
-                );
+                let _ =
+                    self.edges
+                        .prune_unreachable_from_root(self.my_node, 0, &mut self.downstream);
             }
             self.route_cache.clear();
         }
@@ -2249,11 +2101,6 @@ impl NeighborGraph {
         self.route_cache.clear();
     }
 
-    /// Replace a synthetic placeholder with a learned real node id.
-    ///
-    /// Call only after a **directly-heard** frame from `real_node_id` (see
-    /// [`mesh_protocol::is_direct_packet`]): originator and relay byte in sync,
-    /// hop budget not yet consumed.
     pub fn resolve_placeholder(
         &mut self,
         placeholder_id: u32,
@@ -2335,7 +2182,6 @@ impl NeighborGraph {
         route
     }
 
-    /// Route search with intermediate hops excluded. Never reads or writes the route cache.
     pub fn route_excluding(&self, destination: u32, now_ms: u32, excluded: &[u32]) -> Route {
         let filter = RoutableFilter {
             capability: &self.capability,
@@ -2373,7 +2219,6 @@ impl NeighborGraph {
             .map(|r| r.original_heard_from)
     }
 
-    /// Route lookup including which radio should egress the first hop (Phase 9).
     pub fn route_to(&mut self, destination: u32, now_ms: u32) -> Route {
         self.get_route(destination, now_ms)
     }
@@ -2407,13 +2252,7 @@ impl NeighborGraph {
             .0
     }
 
-    /// The next hop to stamp on a relayed unicast, and whether that hop is safe to designate.
-    /// Dijkstra's confirmed search reports `true`. A downstream chain that egresses via a
-    /// neighbour we hear is also stampable (`calculate_route` may return that hop with
-    /// `verified=false`, or the chain walk below when Dijkstra is empty): dest need not hear
-    /// that neighbour. Inbound-gateway fallback is stampable only when it coincides with that
-    /// chain egress; otherwise it is a guess. Originators must not fall back to a stale NodeDB
-    /// byte when this flag is false (field: Dura named MB59).
+    /// An observed inbound gateway alone does not prove the outgoing path.
     pub fn get_next_hop_verified(
         &mut self,
         destination: u32,
@@ -2438,10 +2277,8 @@ impl NeighborGraph {
 
         let mut route = self.get_route(destination, now_ms);
         let chain_egress = self.downstream_chain_egress(destination, now_ms);
-        // Chain compose and confirmed Dijkstra are stampable; bare inbound-gateway is not.
         let stampable =
             |hop: u32, route_verified: bool| route_verified || chain_egress == Some(hop);
-        // Suspect first hop: prefer a stampable alternate; never lose the only path.
         if route.next_hop != 0
             && self
                 .hop_health
@@ -2600,16 +2437,10 @@ impl NeighborGraph {
         false
     }
 
-    /// Do we still reach a neighbour that none of `covered_by` can deliver to? Ours are the
-    /// neighbours that confirmed hearing us, plus those nobody can be shown to reach that we
-    /// own — and in both cases only while a copy from us would actually arrive.
     pub fn has_unique_coverage(&self, covered_by: &[u32], now_ms: u32) -> bool {
         self.unique_coverage_neighbor(covered_by, now_ms).is_some()
     }
 
-    /// The neighbour that makes our relay worth its airtime: ours to cover and reached by none of
-    /// `covered_by`. Returned rather than reduced to a bool so the decision can be logged: "we
-    /// relayed for X" is the only way to tell a justified relay from a coverage bug in the field.
     pub fn unique_coverage_neighbor(&self, covered_by: &[u32], now_ms: u32) -> Option<u32> {
         let node = self.edges.find_node(self.my_node)?;
         for i in 0..node.edge_count as usize {
@@ -2618,10 +2449,8 @@ impl NeighborGraph {
             if is_placeholder_node(neighbor) {
                 continue;
             }
-            // A publisher we have stopped hearing is nobody's coverage target, so it cannot be
-            // ours either. Admission has applied this since the silence rule was introduced and
-            // this path did not, so a queued relay was kept for a node the ranking had already
-            // agreed nobody could carry — the two decisions read one rule now.
+            // A silent publisher is not a useful coverage target, even while another node retains an old
+            // edge to it.
             if crate::graph::is_silent_publisher(
                 &self.edges,
                 Some(&self.capability),
@@ -2633,8 +2462,6 @@ impl NeighborGraph {
             if self.dropped_coverage.blocks(neighbor) {
                 continue;
             }
-            // Ours to cover: it proved it hears us, or nobody can prove anything about it and we
-            // are its owner. Otherwise it is another node's responsibility, or nobody's.
             if !edge.hears_us
                 && crate::graph::coverage_owner(
                     &self.edges,
@@ -2646,15 +2473,8 @@ impl NeighborGraph {
             {
                 continue;
             }
-            // Confirmation or ownership says whose it is; `covers` says whether a copy from us
-            // would arrive at all. `hears_us` is sticky, so without this a neighbour behind a
-            // decayed link stayed "ours to cover" and kept a queued relay the ranking refuses
-            // (31 of 183 slots sat at the heard-once sentinel, field 2026-09-08).
-            //
-            // The ranking additionally drops our own non-`Reported` edges, because a peer cannot
-            // see what we only heard about and the two must agree on slot order. That filter is
-            // absent here on purpose: no production path leaves a Mirrored edge on a real
-            // neighbour of ours, which `no_production_path_leaves_a_mirrored_self_edge` pins.
+            // Peers must rank from mutually visible measurements; our unreported inferences cannot
+            // establish agreed coverage.
             if !crate::graph::covers(&self.edges, Some(&self.capability), self.my_node, neighbor) {
                 continue;
             }
@@ -2669,18 +2489,6 @@ impl NeighborGraph {
             }
         }
         None
-    }
-
-    /// Drop every committed relay for `packet_id`: the frame is on the air (or was pulled back).
-    pub fn cancel_relay_for_id(&mut self, packet_id: u32) -> bool {
-        let mut any = false;
-        for slot in &mut self.relay_states {
-            if slot.active && slot.id == packet_id {
-                slot.active = false;
-                any = true;
-            }
-        }
-        any
     }
 
     fn find_relay_commit(&self, from: u32, id: u32) -> Option<usize> {
@@ -2734,15 +2542,7 @@ impl NeighborGraph {
         count
     }
 
-    /// Broadcast dupe coverage: accumulate the relayer and return true only when no unique coverage remains.
-    /// Has the copy we just heard carried everything our own relay would have carried?
-    ///
-    /// A relayer we cannot name keeps the relay, deliberately. The resolver never yields zero — an
-    /// unknown relay byte becomes a placeholder — and a placeholder is excluded from coverage
-    /// everywhere, so it is credited with carrying nothing and our unique nodes stay uncovered.
-    /// That is the conservative direction and the one the priority order wants: we do not know what
-    /// an unidentifiable copy reached, so we do not stand down on the strength of it. Our own echo
-    /// is the same: it says nothing about who else received the frame.
+    /// An unresolved relayer cannot prove that our coverage obligation has been met.
     pub fn all_neighbors_covered(
         &mut self,
         from: u32,
@@ -2759,14 +2559,12 @@ impl NeighborGraph {
         !self.has_unique_coverage(&covered_by[..count as usize], now_ms)
     }
 
-    /// Distinct accumulated relayers for a committed broadcast relay (testing / diagnostics).
     pub fn relay_heard_transmitter_count(&self, from: u32, id: u32) -> u8 {
         self.find_relay_commit(from, id)
             .map(|idx| self.relay_states[idx].heard_transmitter_count)
             .unwrap_or(0)
     }
 
-    /// True when a `hears_us` neighbor on `radio` has not yet transmitted this packet id.
     pub fn segment_has_uncovered_hears_us_neighbors(
         &self,
         radio: RadioId,
@@ -2785,7 +2583,7 @@ impl NeighborGraph {
             if edge.to == heard_from {
                 continue;
             }
-            if !self.has_node_transmitted(edge.to, packet_id, now_ms) {
+            if !self.has_node_transmitted(edge.to, heard_from, packet_id, now_ms) {
                 return true;
             }
         }
@@ -2823,13 +2621,6 @@ impl NeighborGraph {
             .unwrap_or_default()
     }
 
-    pub fn is_committed_relay_for_id(&self, packet_id: u32) -> bool {
-        self.relay_states
-            .iter()
-            .any(|s| s.active && s.id == packet_id)
-    }
-
-    /// When a neighbor relays our packet (or one we committed to relay), mark `hears_us`.
     pub fn maybe_confirm_hears_us_from_relay(
         &mut self,
         gateway: u32,
@@ -2839,7 +2630,7 @@ impl NeighborGraph {
         if gateway == 0 || gateway == self.my_node {
             return false;
         }
-        if packet_from != self.my_node && !self.is_committed_relay_for_id(packet_id) {
+        if packet_from != self.my_node && !self.is_committed_relay(packet_from, packet_id) {
             return false;
         }
         self.confirm_direct_neighbor_hears_us(gateway)
@@ -2860,9 +2651,6 @@ impl NeighborGraph {
         !crate::sr_role::role_is_mute(self.device_role)
     }
 
-    /// Record that `neighbor` hears us, reporting whether that is new information. One
-    /// definition for every source of the evidence: a peer carrying our traffic, a peer listing
-    /// us, or a peer routing through us.
     pub fn confirm_direct_neighbor_hears_us(&mut self, neighbor: u32) -> bool {
         if neighbor == 0 || neighbor == self.my_node {
             return false;
@@ -2878,6 +2666,7 @@ impl NeighborGraph {
             return false;
         }
         self.edges.set_edge_hears_us(self.my_node, neighbor, true);
+        self.route_cache.clear();
         true
     }
 
@@ -2887,21 +2676,13 @@ impl NeighborGraph {
             if !slot.active {
                 continue;
             }
-            if now_ms.wrapping_sub(slot.tx_after_ms) > MAX_HOLD_MS {
+            let age = now_ms.wrapping_sub(slot.tx_after_ms);
+            if age < 0x8000_0000 && age > MAX_HOLD_MS {
                 slot.active = false;
             }
         }
     }
 
-    /// Drop the direct link to a publisher that has gone silent for [`PUBLISHER_SILENCE_MS`].
-    ///
-    /// Our own edges are never aged directly: they disappear only when the neighbour's own node
-    /// entry expires, which takes [`NEIGHBOR_TTL_MS`]. Until then every coverage decision still
-    /// counts that neighbour as ours to carry, so a node that left the air keeps drawing a relay
-    /// out of us for every frame whose sender we cannot show reached it (field 2026-09-08: a
-    /// neighbour off the air at 15:40 was still being relayed for 120 minutes later). Coverage
-    /// must rest on evidence the neighbour is there, and for a publisher, silence is that
-    /// evidence.
     fn prune_silent_publishers(&mut self, now_ms: u32) -> bool {
         let mut gone = [0u32; MAX_NEIGHBORS];
         let mut count = 0usize;
@@ -2925,11 +2706,8 @@ impl NeighborGraph {
             }
         }
         for &node_id in &gone[..count] {
-            // Only our own claim of a direct link goes. The node itself stays: a peer that still
-            // hears it keeps it reachable, and a unicast for it must still find that route.
-            // Do not run the reachability cascade here — retracting every silent L1 in one pass
-            // would orphan the peer-connected component (GW↔PUB) and erase publishers the
-            // silence rule deliberately keeps.
+            // A reachability cascade here would erase an entire connected component when several direct
+            // publishers go quiet together.
             self.retract_direct_link_inner(node_id, false);
             self.downstream.clear_for_destination(node_id);
         }
@@ -2959,7 +2737,7 @@ impl NeighborGraph {
         if before != after {
             self.topology_dirty = true;
             self.route_cache.clear();
-        } else if edges_aged || downstream_aged || publishers_pruned {
+        } else if edges_aged || downstream_aged || publishers_pruned || clear_hears_us_count > 0 {
             self.route_cache.clear();
         }
 
@@ -2983,7 +2761,7 @@ impl NeighborGraph {
         }
 
         let topo_gap = now_ms.wrapping_sub(self.last_topology_ms);
-        if self.last_topology_ms == 0 || topo_gap >= TOPOLOGY_BROADCAST_MS {
+        if !self.has_sent_topology || topo_gap >= TOPOLOGY_BROADCAST_MS {
             report.topology_due = true;
         } else if self.topology_dirty && topo_gap >= TOPOLOGY_DIRTY_MIN_MS {
             report.topology_due = true;
@@ -2993,26 +2771,26 @@ impl NeighborGraph {
         report
     }
 
+    pub fn has_sent_topology(&self) -> bool {
+        self.has_sent_topology
+    }
+
     pub fn last_topology_ms(&self) -> u32 {
         self.last_topology_ms
     }
 
-    /// Uptime of the last topology broadcast that carried neighbours (0 = never).
-    pub fn last_topology_list_ms(&self) -> u32 {
+    pub fn last_topology_list_ms(&self) -> Option<u32> {
         self.last_topology_list_ms
     }
 
-    pub fn commit_topology_broadcast(&mut self, now_ms: u32, dirty_send: bool) {
+    pub fn commit_topology_broadcast(&mut self, now_ms: u32, _dirty_send: bool) {
         self.last_topology_ms = now_ms;
-        // A list with no entries (the boot broadcast) tells a requester nothing about who we
-        // hear, so it does not count as having answered one.
+        self.has_sent_topology = true;
         if self.neighbor_count() > 0 {
-            self.last_topology_list_ms = now_ms.max(1);
+            self.last_topology_list_ms = Some(now_ms);
         }
         self.topology_version = self.topology_version.wrapping_add(1);
-        if dirty_send {
-            self.topology_dirty = false;
-        }
+        self.topology_dirty = false;
     }
 
     pub fn emit_topology_log<S: crate::sr_log::TopologyLogSink>(
@@ -3104,10 +2882,7 @@ impl NeighborGraph {
                         last_mirrored: seen == mirrored,
                         etx_fixed: edge.etx_fixed,
                         measured: edge.source.is_measured(),
-                        class: self
-                            .edges
-                            .node_class(edge.to)
-                            .unwrap_or(NodeClass::Unknown),
+                        class: self.edges.node_class(edge.to).unwrap_or(NodeClass::Unknown),
                     });
                 }
             }
@@ -3129,8 +2904,6 @@ impl NeighborGraph {
             return;
         }
         sink.emit(SrLogEvent::NetworkTopologyDownstreamHeader { count });
-        // Grouped by relay: one line per relay (continued when a branch exceeds a line) instead
-        // of one line per destination. Relays are emitted in order of first appearance.
         let mut done = heapless::Vec::<u32, 64>::new();
         let mut emitted = 0u16;
         for i in 0..count {
@@ -3217,16 +2990,16 @@ mod tests {
     fn recorded_transmission_expires_after_retention_window() {
         let mut graph = NeighborGraph::new();
         graph.set_modem_preset(MODEM_SHORT_SLOW);
-        graph.record_node_transmission(0xBB, 42, 0);
+        graph.record_node_transmission(0xBB, 0xBB, 42, 0);
         let window = transmission_record_window_ms(MODEM_SHORT_SLOW);
-        assert!(graph.has_node_transmitted(0xBB, 42, window));
-        assert!(!graph.has_node_transmitted(0xBB, 42, window + 1));
+        assert!(graph.has_node_transmitted(0xBB, 0xBB, 42, window));
+        assert!(!graph.has_node_transmitted(0xBB, 0xBB, 42, window + 1));
 
         graph.set_modem_preset(MODEM_SHORT_FAST);
-        graph.record_node_transmission(0xCC, 7, 10_000);
+        graph.record_node_transmission(0xCC, 0xCC, 7, 10_000);
         let fast_window = transmission_record_window_ms(MODEM_SHORT_FAST);
-        assert!(graph.has_node_transmitted(0xCC, 7, 10_000 + fast_window));
-        assert!(!graph.has_node_transmitted(0xCC, 7, 10_000 + fast_window + 1));
+        assert!(graph.has_node_transmitted(0xCC, 0xCC, 7, 10_000 + fast_window));
+        assert!(!graph.has_node_transmitted(0xCC, 0xCC, 7, 10_000 + fast_window + 1));
         assert!(fast_window > mesh_radio::contention_window_ms(MODEM_SHORT_FAST));
     }
 
@@ -3251,7 +3024,7 @@ mod tests {
         let airtime = mesh_radio::packet_time_ms(&cfg, 44, false);
         let t1_delay = tx_delay_ms_worst(slot).saturating_add(airtime);
         let at_t1 = t0.wrapping_add(t1_delay);
-        assert!(graph.has_node_transmitted(GATEWAY, PACKET_ID, at_t1));
+        assert!(graph.has_node_transmitted(GATEWAY, REMOTE, PACKET_ID, at_t1));
     }
 
     #[test]
@@ -3259,14 +3032,14 @@ mod tests {
         let mut graph = NeighborGraph::new();
         let base = 10_000u32;
         for i in 0..MAX_NODE_TX_RECORDS as u32 {
-            graph.record_node_transmission(0x1000 + i, i + 1, base + i);
+            graph.record_node_transmission(0x1000 + i, 0x1000 + i, i + 1, base + i);
         }
         let now = base + MAX_NODE_TX_RECORDS as u32;
-        assert!(graph.has_node_transmitted(0x1000, 1, now));
-        graph.record_node_transmission(0x9999, 99, now);
-        assert!(!graph.has_node_transmitted(0x1000, 1, now));
-        assert!(graph.has_node_transmitted(0x9999, 99, now));
-        assert!(graph.has_node_transmitted(0x1001, 2, now));
+        assert!(graph.has_node_transmitted(0x1000, 0x1000, 1, now));
+        graph.record_node_transmission(0x9999, 0x9999, 99, now);
+        assert!(!graph.has_node_transmitted(0x1000, 0x1000, 1, now));
+        assert!(graph.has_node_transmitted(0x9999, 0x9999, 99, now));
+        assert!(graph.has_node_transmitted(0x1001, 0x1001, 2, now));
     }
 
     #[test]
@@ -3277,15 +3050,12 @@ mod tests {
         graph.set_my_node(ME);
         let observed = graph.observe_packet(SOURCE, 3, 3, 0xBB, -70, 8, 100, 0, None, 42);
         assert!(observed.is_some());
-        assert!(graph.has_node_transmitted(SOURCE, 42, 100));
+        assert!(graph.has_node_transmitted(SOURCE, SOURCE, 42, 100));
     }
 
-    /// Header-path observation: `observe_packet` never sees a decoded payload, so a frame whose
-    /// body cannot decrypt is still a direct neighbour when the hop/relay header says so.
     #[test]
     fn a_direct_hearing_is_recorded_without_a_decoded_payload() {
         const ME: u32 = 0xAA00_00AA;
-        // Same shape as a foreign-channel broadcast: hop budget unused, relay byte = sender.
         const STRANGER: u32 = 0x46ce_027c;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
@@ -3305,8 +3075,8 @@ mod tests {
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, Some(RELAY), 42);
-        assert!(graph.has_node_transmitted(REMOTE, 42, 1_000));
-        assert!(graph.has_node_transmitted(RELAY, 42, 1_000));
+        assert!(graph.has_node_transmitted(REMOTE, REMOTE, 42, 1_000));
+        assert!(graph.has_node_transmitted(RELAY, REMOTE, 42, 1_000));
     }
 
     #[test]
@@ -3318,8 +3088,8 @@ mod tests {
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         let placeholder = placeholder_node_id(0xBB);
         graph.observe_packet(REMOTE, 3, 2, 0xBB, -70, 12, 1_000, 0, None, 42);
-        assert!(graph.has_node_transmitted(REMOTE, 42, 1_000));
-        assert!(!graph.has_node_transmitted(placeholder, 42, 1_000));
+        assert!(graph.has_node_transmitted(REMOTE, REMOTE, 42, 1_000));
+        assert!(!graph.has_node_transmitted(placeholder, placeholder, 42, 1_000));
     }
 
     #[test]
@@ -3329,16 +3099,10 @@ mod tests {
         graph.set_my_node(ME);
         let placeholder = placeholder_node_id(0xCD);
         graph.record_heard_transmissions(ME, 7, Some(placeholder), 0);
-        assert!(!graph.has_node_transmitted(ME, 7, 0));
-        assert!(!graph.has_node_transmitted(placeholder, 7, 0));
+        assert!(!graph.has_node_transmitted(ME, ME, 7, 0));
+        assert!(!graph.has_node_transmitted(placeholder, placeholder, 7, 0));
     }
 
-    /// The insurance timer waits for whichever last transmission is later, and the two cross.
-    ///
-    /// A slot time and a half-airtime scale with different things, so on a slow preset with a
-    /// full-size frame the ladder overtakes the worst stock draw after a handful of candidates —
-    /// measured: four at LONG_SLOW, seven at LONG_FAST, fourteen at SHORT_SLOW. Before this the
-    /// timer knew only the stock draw and fired while the ladder was still running.
     #[test]
     fn the_insurance_wait_covers_the_ladder_when_it_outlasts_the_stock_window() {
         const ME: u32 = 0x0A00_000A;
@@ -3353,14 +3117,13 @@ mod tests {
         }
         graph.observe_direct_neighbor(SRC, -70, 8, 0, 0);
 
-        // A full-size frame at LONG_SLOW: the half-airtime is seconds, the slot time milliseconds.
         let slot = crate::coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_LONG_SLOW);
         let half = crate::coordinated_relay::half_airtime_ms(mesh_radio::packet_time_ms(
             &mesh_radio::eu868_config_for_preset(mesh_radio::MODEM_LONG_SLOW),
             237,
             true,
         ));
-        let span = graph.relay_ladder_span_ms(0x20, SRC, 0, half);
+        let span = graph.relay_ladder_span_ms(0x20, SRC, SRC, 0, half);
         let stock_worst = crate::coordinated_relay::tx_delay_ms_worst(slot);
         assert!(
             span > stock_worst,
@@ -3368,7 +3131,6 @@ mod tests {
         );
     }
 
-    /// With few candidates the stock window still dominates, so the wait does not grow for nothing.
     #[test]
     fn a_short_ladder_does_not_extend_the_insurance_wait() {
         const ME: u32 = 0x0A00_000A;
@@ -3377,13 +3139,10 @@ mod tests {
         graph.set_my_node(ME);
         graph.observe_direct_neighbor(SRC, -70, 8, 0, 0);
         let slot = crate::coordinated_relay::slot_time_for_preset(mesh_radio::MODEM_SHORT_SLOW);
-        let span = graph.relay_ladder_span_ms(0x20, SRC, 0, 50);
+        let span = graph.relay_ladder_span_ms(0x20, SRC, SRC, 0, 50);
         assert!(span < crate::coordinated_relay::tx_delay_ms_worst(slot));
     }
 
-    /// The insurance stagger no longer charges a half-airtime per stock rebroadcaster. A reserved
-    /// position is a slot time inside the router window, and insurance fires only once that window
-    /// has passed, so counting them delayed every insurer for a window already behind it.
     #[test]
     fn stock_rebroadcasters_do_not_push_the_insurance_rung() {
         const ME: u32 = 0xBB00_00BB;
@@ -3398,16 +3157,11 @@ mod tests {
         for stock in [STOCK_A, STOCK_B] {
             graph.track_node_role(stock, DEVICE_ROLE_ROUTER, 0);
         }
-        // Two stock routers are reserved for, and neither is an insurer.
-        assert_eq!(graph.insurance_rung_index(0x20, SRC, 0), 0);
+        assert_eq!(graph.insurance_rung_index(0x20, SRC, SRC, 0), 0);
     }
 
-    /// Insurers are ordered by the packet-id tie-break the relay ladder uses, so the burden
-    /// rotates across packets instead of always falling on the lowest node id.
     #[test]
     fn the_insurance_order_follows_the_packet_id_tie_break() {
-        // We hold the lowest node id of the three insurers, so the two parities put us at opposite
-        // ends of the ladder: first when the low id leads, last when the high id does.
         const ME: u32 = 0x0A00_000A;
         const SRC: u32 = 0x1100_0011;
         const MID: u32 = 0xBB00_00BB;
@@ -3419,19 +3173,17 @@ mod tests {
             graph.capability_mut().track_topology(peer, true, 0);
         }
         assert_eq!(
-            graph.insurance_rung_index(0x20, SRC, 0),
+            graph.insurance_rung_index(0x20, SRC, SRC, 0),
             0,
             "even packet id orders the lowest id first, and that is us"
         );
         assert_eq!(
-            graph.insurance_rung_index(0x21, SRC, 0),
+            graph.insurance_rung_index(0x21, SRC, SRC, 0),
             2,
             "odd packet id flips it, so both peers insure ahead of us"
         );
     }
 
-    /// A peer that already transmitted is not going to insure, so counting it would push every
-    /// remaining insurer later for nothing.
     #[test]
     fn a_peer_that_already_transmitted_is_not_an_insurer() {
         const ME: u32 = 0xBB00_00BB;
@@ -3443,9 +3195,9 @@ mod tests {
             graph.observe_direct_neighbor(peer, -70, 8, 0, 0);
             graph.capability_mut().track_topology(peer, true, 0);
         }
-        assert_eq!(graph.insurance_rung_index(0x20, SRC, 100), 1);
-        graph.record_node_transmission(GONE, 0x20, 100);
-        assert_eq!(graph.insurance_rung_index(0x20, SRC, 100), 0);
+        assert_eq!(graph.insurance_rung_index(0x20, SRC, SRC, 100), 1);
+        graph.record_node_transmission(GONE, SRC, 0x20, 100);
+        assert_eq!(graph.insurance_rung_index(0x20, SRC, SRC, 100), 0);
     }
 
     #[test]
@@ -3483,9 +3235,6 @@ mod tests {
         assert_eq!(entries[0].snr, 12);
     }
 
-    /// A CLIENT_MUTE never relays but does publish topology, and it is the only node that can
-    /// say whether a relayer reaches it. Before this, it recorded nothing and so stayed
-    /// permanently uncovered, which is what made every neighbour hold unique coverage of it.
     #[test]
     fn a_relay_byte_naming_one_neighbour_resolves_to_it() {
         const ME: u32 = 0xAA00_00AA;
@@ -3496,9 +3245,6 @@ mod tests {
         assert_eq!(graph.match_relay_byte_on_outgoing_edges(0xBB), Some(PEER));
     }
 
-    /// Two neighbours sharing a low byte are indistinguishable in a relayed frame. Guessing would
-    /// write a measured, published edge to the wrong node, and a peer reading it would credit that
-    /// node with covering us and stop relaying to us.
     #[test]
     fn an_ambiguous_relay_byte_resolves_to_nobody() {
         const ME: u32 = 0xAA00_00AA;
@@ -3511,9 +3257,6 @@ mod tests {
         assert_eq!(graph.match_relay_byte_on_outgoing_edges(0xBB), None);
     }
 
-    /// Identity, not signal, is what a relayed frame cannot supply: it names its relayer in one
-    /// byte. So a relayer we have never identified stays a placeholder and is never published,
-    /// however many of its frames we measure.
     #[test]
     fn an_unidentified_relayer_is_measured_but_never_published() {
         const ME: u32 = 0xAA00_00AA;
@@ -3571,7 +3314,6 @@ mod tests {
         assert_eq!(entries[0].node_id, RELAY);
     }
 
-    /// LOST_AND_FOUND broadcasts no topology, so it has nobody to tell and records nothing.
     #[test]
     fn a_node_that_publishes_no_topology_records_no_relayer() {
         const ME: u32 = 0xAA00_00AA;
@@ -3586,9 +3328,6 @@ mod tests {
         assert_eq!(graph.neighbor_count(), 0);
     }
 
-    /// The measurement is first-hand; who sits behind the gateway is inference, and only a node
-    /// that ranks relays uses it. An unresolved gateway is the case where an active node does
-    /// invent that edge, so it is the one that shows the split.
     #[test]
     fn a_mute_node_records_the_relayer_without_inferring_a_path_behind_it() {
         const ME: u32 = 0xAA00_00AA;
@@ -3699,8 +3438,6 @@ mod tests {
 
     #[test]
     fn clipped_rssi_zero_with_snr_stores_saturated_sentinel() {
-        // SX126x register clip / Meshtastic unset collision: rssi=0 with real SNR must not
-        // publish the unset sentinel on the wire (MR3a↔MB1d, 2026-10-09).
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA);
         assert!(graph.observe_direct_neighbor(0x1234_5678, 0, 14, 1_000, 0));
@@ -3723,7 +3460,18 @@ mod tests {
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         graph.observe_direct_neighbor(PEER, -70, 8, 1_000, 0);
         graph.observe_direct_neighbor(HUB, -72, 7, 2_000, 0);
-        graph.observe_packet(ORIGIN, 3, 2, (HUB & 0xFF) as u8, -65, 9, 3_000, 0, Some(HUB), 1);
+        graph.observe_packet(
+            ORIGIN,
+            3,
+            2,
+            (HUB & 0xFF) as u8,
+            -65,
+            9,
+            3_000,
+            0,
+            Some(HUB),
+            1,
+        );
         let me = graph.edges().find_node(ME).unwrap();
         assert_eq!(me.find_edge(PEER).unwrap().last_heard_ms, 1_000);
         assert_eq!(me.find_edge(HUB).unwrap().last_heard_ms, 3_000);
@@ -3752,7 +3500,10 @@ mod tests {
             .and_then(|n| n.find_edge(PEER))
             .unwrap()
             .etx_variance;
-        assert_eq!(still, quiet, "an in-window copy must not fold silence into EWMA");
+        assert_eq!(
+            still, quiet,
+            "an in-window copy must not fold silence into EWMA"
+        );
         graph.observe_direct_neighbor(PEER, -90, -15, t0 + T / 4 + 1, 0);
         let jumped = graph
             .edges()
@@ -3797,10 +3548,6 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        // -80/10 and -70/12 both clear LONG_FAST's decode threshold by a wide margin and saturate
-        // to the same delivery probability under the margin-dominant curve, so they no longer pin
-        // a variance change (the point of this test) — -90/-15 sits well below the margin curve's
-        // saturation point, so moving to -70/12 is a real change under the new curve too.
         graph.observe_direct_neighbor(RELAY, -90, -15, 0, 0);
         let variance_before = graph
             .edges()
@@ -3853,7 +3600,7 @@ mod tests {
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE + 8];
         write_packed_header(&mut packed, 1, true);
         packed[5..9].copy_from_slice(&0xCCu32.to_le_bytes());
-        packed[9] = 0xB6; // rssi-ish
+        packed[9] = 0xB6;
         packed[10] = 8;
         let (header, neighbors) =
             crate::topology::decode_packed_neighbors(&packed, packed.len()).unwrap();
@@ -3870,8 +3617,8 @@ mod tests {
         graph.observe_direct_neighbor(PASSIVE, -70, 8, 100, 0);
         assert!(!graph.edge_hears_us(PASSIVE));
         let mut packed = [0u8; 16];
-        write_packed_header(&mut packed, 1, false); // passive SR sender
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        write_packed_header(&mut packed, 1, false);
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let us = PackedNeighbor {
             node_id: ME,
             rssi: -72,
@@ -3896,8 +3643,7 @@ mod tests {
         graph.observe_direct_neighbor(PASSIVE, -70, 8, 100, 0);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (active, _) = decode_packed_neighbors(&packed, 8).unwrap();
-        // The peer reports the passive node before the passive node has listed it.
+        let (active, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let listed = PackedNeighbor {
             node_id: PASSIVE,
             rssi: -60,
@@ -3914,16 +3660,14 @@ mod tests {
                 .map(|e| e.hears_us)
         };
         assert_eq!(peer_edge(&graph), Some(false));
-        // The passive node lists the peer: that proves it hears the peer.
         write_packed_header(&mut packed, 1, false);
-        let (passive, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (passive, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let lists_peer = PackedNeighbor {
             node_id: PEER,
             ..listed
         };
         graph.merge_topology(PASSIVE, &passive, &[lists_peer], true, 300, 0);
         assert_eq!(peer_edge(&graph), Some(true));
-        // A node the peer never reported gets no edge invented for it.
         assert!(graph
             .edges()
             .find_node(PASSIVE)
@@ -3931,10 +3675,6 @@ mod tests {
             .unwrap_or(true));
     }
 
-    /// Field case of 2026-09-03 19:43: the gateway hears the phone poorly, so the phone is the
-    /// one uncovered neighbour and both nicenanos compete to relay for it. They now both take a
-    /// slot (unique vs the transmitter); packet-parity orders them, and the later cancels when
-    /// it hears the earlier copy.
     #[test]
     fn peers_that_both_cover_a_passive_neighbour_agree_on_one_relayer() {
         const A: u32 = 0xbdac_ce55;
@@ -3961,8 +3701,7 @@ mod tests {
         graph.capability_mut().track_topology(PH, false, 100);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 6, true);
-        let (active, _) = decode_packed_neighbors(&packed, 8).unwrap();
-        // B's report: it hears the phone as well as we do, but has no proof the phone hears it.
+        let (active, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(
             B,
             &active,
@@ -3971,7 +3710,6 @@ mod tests {
             150,
             0,
         );
-        // The gateway hears both of us well and the phone barely (ETX far above 7).
         graph.merge_topology(
             GW,
             &active,
@@ -3984,9 +3722,8 @@ mod tests {
             160,
             0,
         );
-        // The phone's passive listing names both of us.
         write_packed_header(&mut packed, 3, false);
-        let (passive, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (passive, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(
             PH,
             &passive,
@@ -4008,7 +3745,10 @@ mod tests {
         );
         assert_eq!(even.slot_index, 1);
         let odd = graph.plan_broadcast_relay(0xcc21_2ebd, SRC, GW, 0xffff_ffff, 200, 91, false);
-        assert!(odd.should_relay, "odd packet id: higher node id ranks first");
+        assert!(
+            odd.should_relay,
+            "odd packet id: higher node id ranks first"
+        );
         assert_eq!(odd.slot_index, 0);
     }
 
@@ -4023,7 +3763,6 @@ mod tests {
         graph.observe_direct_neighbor(U, -70, 8, 100, 0);
         graph.confirm_direct_neighbor_hears_us(PEER);
         graph.confirm_direct_neighbor_hears_us(U);
-        // U confirmed hearing the peer, but at ETX 40 (heard once, barely): not coverage.
         graph
             .edges_mut()
             .update_edge(ME, PEER, U, 40.0, 100, EdgeSource::Mirrored, true, 0);
@@ -4048,9 +3787,7 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(HIGH_PEER);
         graph.capability_mut().track_topology(HIGH_PEER, true, 100);
         graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
-        // The mute node never earns hears_us, yet it is ours: the peer's copy does not reach it.
         assert!(graph.has_unique_coverage(&[HIGH_PEER], 0));
-        // Once the transmitter is confirmed to reach it, it is covered like any other neighbour.
         graph
             .edges_mut()
             .update_edge(ME, HIGH_PEER, MUTE, 1.5, 100, EdgeSource::Mirrored, true, 0);
@@ -4086,12 +3823,10 @@ mod tests {
         );
     }
 
-    /// Ownership of a neighbour nobody can confirm goes by the measured link, with the node id
-    /// only as a tie-break: the lowest id may be the node that hears it worst.
     #[test]
     fn mute_neighbour_owner_is_the_best_link_then_the_lowest_id() {
         const ME: u32 = 0xAA00_00AA;
-        const NEAR_PEER: u32 = 0xEE00_00EE; // 0xFF.... would read as a placeholder id
+        const NEAR_PEER: u32 = 0xEE00_00EE;
         const MUTE: u32 = 0xCC00_00CC;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
@@ -4101,7 +3836,6 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(NEAR_PEER);
         graph.capability_mut().track_topology(NEAR_PEER, true, 100);
         graph.track_node_role(MUTE, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
-        // A higher-id peer that hears the mute node a bucket better owns it, id notwithstanding.
         graph
             .edges_mut()
             .update_edge(ME, ME, MUTE, 3.0, 100, EdgeSource::Reported, true, 0);
@@ -4112,7 +3846,6 @@ mod tests {
             crate::graph::coverage_owner(graph.edges(), graph.capability(), ME, true, MUTE),
             NEAR_PEER
         );
-        // Same bucket: the lowest id decides, so it comes back to us.
         graph
             .edges_mut()
             .update_edge(ME, NEAR_PEER, MUTE, 3.0, 100, EdgeSource::Mirrored, true, 0);
@@ -4120,7 +3853,6 @@ mod tests {
             crate::graph::coverage_owner(graph.edges(), graph.capability(), ME, true, MUTE),
             ME
         );
-        // A mute node never owns anything: it does not relay.
         graph.track_node_role(NEAR_PEER, crate::nodeinfo::DEVICE_ROLE_CLIENT_MUTE, 100);
         graph
             .capability_mut()
@@ -4133,9 +3865,9 @@ mod tests {
     }
 
     fn topo_header(version: u8) -> crate::topology::PackedHeader {
-        let mut packed = [0u8; 16];
+        let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, version, true);
-        decode_packed_neighbors(&packed, 8).unwrap().0
+        decode_packed_neighbors(&packed[..5], 8).unwrap().0
     }
 
     fn peer_report(
@@ -4165,7 +3897,6 @@ mod tests {
         graph.merge_topology(peer, &topo_header(version), &[listed], is_direct, now_ms, 0)
     }
 
-    /// A counter that jumped far behind `last` is a restart (Inno 26→1), not a delayed old list.
     #[test]
     fn a_far_behind_version_is_a_counter_reset() {
         const ME: u32 = 0xAA00_00AA;
@@ -4188,8 +3919,6 @@ mod tests {
         ));
     }
 
-    /// A few counts behind `last` on a relayed copy is a delayed old list. The originator's own
-    /// complete list with the same jump rebases: the air is newer than the stored counter.
     #[test]
     fn a_near_behind_direct_list_resyncs_and_a_relayed_copy_does_not() {
         const ME: u32 = 0xAA00_00AA;
@@ -4216,7 +3945,6 @@ mod tests {
         assert_eq!(graph.take_topology_version_resync(), Some((PEER, 12, 13)));
     }
 
-    /// The peer's empty boot broadcast restarts its counter for us too.
     #[test]
     fn peer_boot_broadcast_resets_its_topology_version() {
         const ME: u32 = 0xAA00_00AA;
@@ -4228,14 +3956,12 @@ mod tests {
             peer_report(&mut graph, PEER, 98, 1_000),
             TopologyMergeResult::Applied { .. }
         ));
-        // Boot broadcast: zero neighbours, version 0, direct, SR-active.
         let boot = graph.merge_topology(PEER, &topo_header(0), &[], true, 2_000, 0);
         assert!(matches!(
             boot,
             TopologyMergeResult::Applied { neighbors: 0, .. }
         ));
         assert_eq!(graph.take_topology_version_resync(), Some((PEER, 0, 98)));
-        // Its first real list after the reboot is accepted.
         assert!(matches!(
             peer_report(&mut graph, PEER, 1, 3_000),
             TopologyMergeResult::Applied { .. }
@@ -4246,8 +3972,6 @@ mod tests {
         ));
     }
 
-    /// The boot broadcast was lost and the new counter is still near `last`, so CounterReset
-    /// does not fire. Relayed rejects climbing by 1..=7 rebase, including a missed list.
     #[test]
     fn peer_restart_is_accepted_after_climbing_stale_reports() {
         const ME: u32 = 0xAA00_00AA;
@@ -4281,9 +4005,6 @@ mod tests {
         ));
     }
 
-    /// A later chunk of the version we already hold must not wipe a rejected reboot. The fork
-    /// keeps the stale note on a same-version accept for this reason: the second chunk of v=8
-    /// lands between v=1 (rejected) and v=2 (the climb).
     #[test]
     fn a_continuation_chunk_keeps_the_restart_climb_armed() {
         const ME: u32 = 0xAA00_00AA;
@@ -4301,7 +4022,7 @@ mod tests {
         ));
         let mut packed = [0u8; 16];
         write_packed_header_chunk(&mut packed, 8, true, false, true);
-        let header = decode_packed_neighbors(&packed, 8).unwrap().0;
+        let header = decode_packed_neighbors(&packed[..5], 8).unwrap().0;
         let listed = PackedNeighbor {
             node_id: 0xCC00_00CC,
             rssi: -70,
@@ -4323,8 +4044,6 @@ mod tests {
         );
     }
 
-    /// 2026-09-06 19:16: Dura's boot broadcast cleared B's `hears_us` for it. An empty list
-    /// says nothing about who hears the sender.
     #[test]
     fn empty_list_does_not_clear_hears_us() {
         const ME: u32 = 0xAA00_00AA;
@@ -4342,8 +4061,6 @@ mod tests {
         );
     }
 
-    /// 2026-09-06 20:49: angl heard Czar's boot broadcast only as A's relayed copy and called
-    /// Czar's reports stale for twenty minutes. The restart notice is valid however it arrived.
     #[test]
     fn relayed_boot_broadcast_resets_the_topology_version_too() {
         const ME: u32 = 0xAA00_00AA;
@@ -4364,7 +4081,6 @@ mod tests {
         ));
     }
 
-    /// The boot broadcast was missed: after two quiet intervals plus margin any version is accepted.
     #[test]
     fn passive_peer_boot_broadcast_resets_its_topology_version_too() {
         const PEER: u32 = 0xB000_000B;
@@ -4376,7 +4092,7 @@ mod tests {
         ));
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 0, false);
-        let passive_boot = decode_packed_neighbors(&packed, 8).unwrap().0;
+        let passive_boot = decode_packed_neighbors(&packed[..5], 8).unwrap().0;
         assert!(matches!(
             graph.merge_topology(PEER, &passive_boot, &[], true, 2_000, 0),
             TopologyMergeResult::Applied { .. }
@@ -4402,7 +4118,13 @@ mod tests {
             TopologyMergeResult::Applied { .. }
         ));
         assert!(matches!(
-            peer_report_via(&mut graph, PEER, 7, 1_000 + 2 * TOPOLOGY_BROADCAST_MS, false),
+            peer_report_via(
+                &mut graph,
+                PEER,
+                7,
+                1_000 + 2 * TOPOLOGY_BROADCAST_MS,
+                false
+            ),
             TopologyMergeResult::Stale { .. }
         ));
         assert!(matches!(
@@ -4474,10 +4196,12 @@ mod tests {
         let header = |more: bool, cont: bool| {
             let mut p = [0u8; 16];
             write_packed_header_chunk(&mut p, 7, true, more, cont);
-            decode_packed_neighbors(&p, 8).unwrap().0
+            if cont {
+                p[4] |= 1 << 3;
+            }
+            decode_packed_neighbors(&p[..5], 8).unwrap().0
         };
 
-        // A continuation whose first chunk was missed must not clear anything.
         graph.merge_topology(
             SENDER,
             &header(false, true),
@@ -4489,7 +4213,6 @@ mod tests {
         assert!(hears(&graph, IN_CHUNK2));
         assert!(hears(&graph, UNLISTED));
 
-        // Chunk 0 lists a third node only; IN_CHUNK2 arrives in the second packet.
         graph.merge_topology(
             SENDER,
             &header(true, false),
@@ -4506,8 +4229,6 @@ mod tests {
             hears(&graph, UNLISTED),
             "not cleared while chunks are pending"
         );
-        // Another node's complete report lands between the two chunks: it must not disturb the
-        // gathering of SENDER's list (one slot per sender).
         const OTHER: u32 = 0xEE00_00EE;
         graph.merge_topology(
             OTHER,
@@ -4564,29 +4285,12 @@ mod tests {
         graph.observe_direct_neighbor(RELAYER, -16, 14, 1_000, 0);
         graph.edges_mut().set_edge_hears_us(ME, RELAYER, true);
         graph.capability_mut().track_topology(RELAYER, true, 1_000);
-        // FAR has to be reachable before its list can be stored. The relay's own edge says the
-        // relay hears FAR; FAR's edge is the arrival list the downstream row requires.
-        graph.edges_mut().update_edge(
-            ME,
-            RELAYER,
-            FAR,
-            1.5,
-            1_000,
-            EdgeSource::Mirrored,
-            true,
-            0,
-        );
-        graph.edges_mut().update_edge(
-            ME,
-            FAR,
-            RELAYER,
-            1.5,
-            1_000,
-            EdgeSource::Mirrored,
-            true,
-            0,
-        );
-        // FAR's packet arrives via RELAYER after two hops, at bench strength (-16 dBm).
+        graph
+            .edges_mut()
+            .update_edge(ME, RELAYER, FAR, 1.5, 1_000, EdgeSource::Mirrored, true, 0);
+        graph
+            .edges_mut()
+            .update_edge(ME, FAR, RELAYER, 1.5, 1_000, EdgeSource::Mirrored, true, 0);
         graph.observe_packet(FAR, 7, 5, 0xBB, -16, 14, 2_000, 0, Some(RELAYER), 0x77);
         let route = graph.get_route(FAR, 2_000);
         assert_eq!(route.next_hop, RELAYER);
@@ -4612,13 +4316,6 @@ mod tests {
         assert!(graph.relay_tx_after(1, 2, 0).is_none());
     }
 
-    /// A node that publishes its own neighbour list is never given stock-router preference, even
-    /// when its role is ROUTER.
-    ///
-    /// This test previously claimed to cover "prefers a stock router" while handing the node an SR
-    /// topology broadcast — which makes it a publisher, and so not stock at all. Role only ever
-    /// compensates for what a node cannot tell us; this one told us. The genuine stock case is
-    /// covered by `stock_router_gets_first_slot` in `broadcast_relay`.
     #[test]
     fn a_publishing_router_is_not_given_stock_preference() {
         const ME: u32 = 0xCC00_00CC;
@@ -4632,7 +4329,7 @@ mod tests {
         graph.track_node_role(PUBLISHER, DEVICE_ROLE_ROUTER, 0);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, false);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let neighbor = PackedNeighbor {
             node_id: SOURCE,
             rssi: -75,
@@ -4641,11 +4338,10 @@ mod tests {
             hears_us: false,
             etx_variance: 0,
         };
-        // signal_routing_active = false on its own broadcast: SR-passive, not stock.
         graph.merge_topology(PUBLISHER, &header, &[neighbor], true, 0, 0);
         assert!(!graph.capability().is_immediate_relay_router(PUBLISHER));
         assert_ne!(
-            graph.find_best_relay_candidate(99, SOURCE, 0),
+            graph.find_best_relay_candidate(99, SOURCE, SOURCE, 0),
             PUBLISHER,
             "a publisher is ranked on what it published, not preferred for its role"
         );
@@ -4658,7 +4354,7 @@ mod tests {
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 0, 0);
         assert_eq!(
-            graph.find_best_relay_candidate(99, 0xBB00_00BB, 0),
+            graph.find_best_relay_candidate(99, 0xBB00_00BB, 0xBB00_00BB, 0),
             0xCC00_00CC
         );
     }
@@ -4680,8 +4376,6 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        // Our own packet comes back relayed by a never-seen relay byte: the placeholder edge
-        // is created and confirmed in the same observation.
         let observed = graph.observe_packet(ME, 3, 2, 0xCD, -70, 8, 100, 0, None, 0x42);
         let placeholder = placeholder_node_id(0xCD);
         let (gateway, _, _, _, hears_us) = observed.expect("relayed observation");
@@ -4691,7 +4385,6 @@ mod tests {
             graph.edge_hears_us(placeholder),
             "flag must be stored on the new us->relay edge"
         );
-        // Resolving the placeholder to the real node keeps the confirmed flag.
         assert!(graph.resolve_placeholder(placeholder, 0xBEEF_00CD, 200));
         assert!(graph.edge_hears_us(0xBEEF_00CD));
     }
@@ -4786,8 +4479,6 @@ mod tests {
 
     #[test]
     fn passive_originator_must_list_the_relay_too() {
-        // CLIENT_MUTE / passive still publishes topology; a forwarded copy via a desk node must
-        // not invent a TX path the mute never claimed (field: Z005 via angl).
         const ME: u32 = 0xAA00_00AA;
         const MUTE: u32 = 0x4F51_78DC;
         const GATEWAY: u32 = 0x5879_FA8F;
@@ -4814,8 +4505,6 @@ mod tests {
 
     #[test]
     fn relayed_hearing_does_not_steal_an_existing_downstream_parent() {
-        // Branch gateway already holds the dest; a peer that merely forwarded the mute must not
-        // become a competing parent without appearing on the originator's list.
         const ME: u32 = 0xAA00_00AA;
         const DEST: u32 = 0x4F51_78DC;
         const BRANCH: u32 = 0x63DC_8F8C;
@@ -4877,8 +4566,6 @@ mod tests {
 
     #[test]
     fn a_relayed_former_neighbour_becomes_downstream() {
-        // A neighbour we used to hear, now heard only through a relay, must leave our direct set
-        // immediately and sit behind that relay — otherwise unicasts keep aiming at a dead last hop.
         const ME: u32 = 0x0A0B_0C0D;
         const TRAVELLER: u32 = 0x1111_1111;
         const RELAY: u32 = 0x2222_2222;
@@ -4902,7 +4589,6 @@ mod tests {
 
         assert_eq!(graph.get_route(TRAVELLER, 1_000).next_hop, TRAVELLER);
 
-        // Multi-hop and SR-aware: without the travelling retract this would skip downstream.
         graph.observe_packet(TRAVELLER, 3, 1, 0x22, -70, 8, 2_000, 0, Some(RELAY), 7);
 
         assert!(
@@ -4913,7 +4599,6 @@ mod tests {
         assert_eq!(graph.get_downstream_relay(TRAVELLER, 2_000), Some(RELAY));
         assert_eq!(graph.get_route(TRAVELLER, 2_000).next_hop, RELAY);
 
-        // Their later list must not reinstall sender→us: Dijkstra would treat us as that last hop.
         let lists_us = PackedNeighbor {
             node_id: ME,
             rssi: -72,
@@ -4924,7 +4609,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(TRAVELLER, &header, &[lists_us], false, 2_100, 0);
         assert!(
             !graph.test_has_edge(TRAVELLER, ME),
@@ -4940,8 +4625,6 @@ mod tests {
 
     #[test]
     fn relayed_duplicate_of_direct_packet_does_not_retract() {
-        // Desk: hear the originator direct, then the same id via a neighbour's rebroadcast.
-        // That is not a travelling neighbour — retracting flapped L1 count beside Czar.
         const ME: u32 = 0x0A0B_0C0D;
         const PEER: u32 = 0x1111_1111;
         const RELAY: u32 = 0x2222_2222;
@@ -4962,7 +4645,7 @@ mod tests {
 
         graph.observe_packet(PEER, 3, 3, 0x11, -7, 12, 2_000, 0, None, PACKET);
         assert!(graph.is_our_direct_neighbor(PEER));
-        assert!(graph.has_node_transmitted(PEER, PACKET, 2_000));
+        assert!(graph.has_node_transmitted(PEER, PEER, PACKET, 2_000));
 
         graph.observe_packet(PEER, 3, 2, 0x22, -70, 8, 2_500, 0, Some(RELAY), PACKET);
         assert!(
@@ -4975,8 +4658,6 @@ mod tests {
 
     #[test]
     fn a_neighbours_own_report_of_us_beats_our_symmetry_guess() {
-        // We cannot measure how well a neighbour hears us. Our assumption must not outrank the
-        // neighbour's own published measurement, and must not price the link either.
         const ME: u32 = 0xAA00_00AA;
         const PEER: u32 = 0xBB00_00BB;
         let mut graph = NeighborGraph::new();
@@ -4990,7 +4671,6 @@ mod tests {
             .and_then(|n| n.find_edge(ME))
             .expect("the reverse direction is still in the graph");
         assert_eq!(reverse.source, EdgeSource::Inferred);
-        // Priced from our own measurement, which is the number our peers hold from our list.
         let own = graph
             .edges()
             .find_node(ME)
@@ -5001,7 +4681,6 @@ mod tests {
             Some(own.etx_fixed)
         );
 
-        // The peer reports it hears us over a much worse link: its measurement lands.
         graph
             .edges_mut()
             .update_edge(ME, PEER, ME, 6.0, 2_000, EdgeSource::Mirrored, true, 0);
@@ -5055,7 +4734,6 @@ mod tests {
         graph.observe_direct_neighbor(PUB, -70, 8, 1_000, 0);
         graph.capability_mut().track_topology(PUB, true, 1_000);
         graph.capability_mut().track_topology(GW, true, 1_000);
-        // The gateway keeps reporting the link in both directions.
         for (from, to) in [(GW, PUB), (PUB, GW)] {
             graph
                 .edges_mut()
@@ -5134,10 +4812,7 @@ mod tests {
             TopologyMergeResult::Applied { .. }
         ));
         assert_eq!(
-            graph
-                .edges()
-                .find_node(HUB)
-                .map(|n| n.last_full_update_ms),
+            graph.edges().find_node(HUB).map(|n| n.last_full_update_ms),
             Some(mid),
             "a topology list must refresh the sender against NEIGHBOR_TTL aging"
         );
@@ -5145,8 +4820,6 @@ mod tests {
 
     #[test]
     fn list_downstream_behind_a_hub_we_still_hear_survives_neighbor_ttl() {
-        // Field (MR3a): after ~NEIGHBOR_TTL, age_edges deleted Czar (stale last_full_update
-        // despite ongoing RX) and clear_for_relay wiped ~80 parked unicast routes.
         const ME: u32 = 0xAA00_00AA;
         const HUB: u32 = 0x6300_008C;
         const QUIET: u32 = 0x8400_003E;
@@ -5190,7 +4863,6 @@ mod tests {
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         graph.capability_mut().track_topology(PUB, true, 1_000);
-        // Any direct frame refreshes the edge, not only a topology list.
         for t in 0..4 {
             let now = 1_000 + t * (PUBLISHER_SILENCE_MS / 2);
             graph.observe_direct_neighbor(PUB, -70, 8, now, 0);
@@ -5231,14 +4903,13 @@ mod tests {
 
         let placeholder = placeholder_node_id(0xCD);
         assert!(!graph.has_graph_node(placeholder));
-        // The edge `relay -> source` belongs to the relay to publish, so it is not invented here
-        // for a gateway that may yet publish one. Downstream needs the relay to hear us and the
-        // originator to list it; a single overheard frame has neither.
         assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 200), None);
         assert!(!graph.test_has_edge(relay, 0xBB00_00BB));
 
         graph.observe_direct_neighbor(0xBB00_00BB, -70, 8, 150, 0);
-        graph.edges_mut().set_edge_hears_us(0xAA00_00AA, relay, true);
+        graph
+            .edges_mut()
+            .set_edge_hears_us(0xAA00_00AA, relay, true);
         graph.edges_mut().update_edge(
             0xAA00_00AA,
             0xBB00_00BB,
@@ -5258,7 +4929,6 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(0xAA00_00AA);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        // Source low byte must differ from relay byte so a placeholder is created.
         graph.observe_packet(0xBEEF_00AB, 3, 2, 0xCD, -70, 8, 100, 0, None, 0);
         let placeholder = placeholder_node_id(0xCD);
         assert!(!graph.resolve_placeholder(placeholder, 0x1234_00AB, 200));
@@ -5275,7 +4945,6 @@ mod tests {
         let placeholder = placeholder_node_id(0xCD);
         assert!(graph.has_graph_node(placeholder));
 
-        // Relayed frame must not resolve even when the real relay is already known.
         graph.observe_packet(0xBB00_00BB, 3, 2, 0xCD, -70, 8, 200, 0, Some(relay), 0);
         assert!(graph.has_graph_node(placeholder));
         assert_eq!(graph.get_downstream_relay(0xBB00_00BB, 300), None);
@@ -5332,7 +5001,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let result = graph.merge_topology(0xBB, &header, &[remote], true, 200, 0);
         assert!(matches!(result, TopologyMergeResult::Applied { .. }));
         let skips: heapless::Vec<_, 4> = graph.drain_merge_asymmetric_skips().collect();
@@ -5349,7 +5018,6 @@ mod tests {
         graph.set_device_role(DEVICE_ROLE_ROUTER);
         graph.observe_direct_neighbor(PEER, -70, 8, 100, 0);
         graph.observe_direct_neighbor(HEARD, -75, 11, 100, 0);
-        // A stale row from before we heard them, or from the old them→us check.
         graph
             .downstream_mut()
             .update(ME, HEARD, PEER, 2.0, 100, false, 0);
@@ -5365,7 +5033,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let result = graph.merge_topology(PEER, &header, &[listed], true, 200, 0);
         assert!(matches!(result, TopologyMergeResult::Applied { .. }));
         assert_eq!(
@@ -5395,10 +5063,9 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let result = graph.merge_topology(PEER, &header, &[listed], true, 200, 0);
         assert!(matches!(result, TopologyMergeResult::Applied { .. }));
-        // Horizon: L1 listing REMOTE with hearsUs admits REMOTE as an L2 publisher.
         assert!(graph.edges().find_node(REMOTE).is_some());
         assert_eq!(
             graph.edges().node_class(REMOTE),
@@ -5427,14 +5094,14 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h1, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L1, &h1, &[nb(L2)], true, 200, 0);
         assert_eq!(
             graph.edges().node_class(L2),
             Some(crate::graph::NodeClass::L2)
         );
         write_packed_header(&mut packed, 2, true);
-        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h2, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L2, &h2, &[nb(L1), nb(L3)], false, 300, 0);
         assert_eq!(
             graph.edges().node_class(L3),
@@ -5443,9 +5110,6 @@ mod tests {
         assert!(graph.get_downstream_relay(L3, 300).is_none());
     }
 
-    /// First ingest of a far sender that names both an L1 and an L2 must class as L2 (they hear
-    /// an L1), not L3. Edges are not installed yet when classify runs, so the Unknown fallback
-    /// must require namesL2 && !namesL1 — matching the MT+SR fork.
     #[test]
     fn merge_topology_far_sender_naming_l1_and_l2_is_l2_not_l3() {
         const ME: u32 = 0xAA00_00AA;
@@ -5466,7 +5130,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h1, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L1, &h1, &[nb(L2)], true, 200, 0);
         assert_eq!(
             graph.edges().node_class(L2),
@@ -5474,7 +5138,7 @@ mod tests {
         );
 
         write_packed_header(&mut packed, 2, true);
-        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h2, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(FAR, &h2, &[nb(L1), nb(L2)], false, 300, 0);
         assert_eq!(
             graph.edges().node_class(FAR),
@@ -5483,8 +5147,6 @@ mod tests {
         );
     }
 
-    /// Asymmetric L1→FAR (hearsUs=0) must not unlock FAR's topology when FAR does not name an
-    /// L1/L2 we hold (§6.2).
     #[test]
     fn asymmetric_listing_does_not_unlock_far_topology() {
         const ME: u32 = 0xAA00_00AA;
@@ -5505,7 +5167,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h1, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L1, &h1, &[asym], true, 200, 0);
         assert!(
             graph.edges().find_node(FAR).is_none(),
@@ -5529,14 +5191,11 @@ mod tests {
             etx_variance: 0,
         };
         write_packed_header(&mut packed, 2, true);
-        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h2, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let result = graph.merge_topology(FAR, &h2, &[y], false, 300, 0);
         assert!(matches!(
             result,
-            TopologyMergeResult::Applied {
-                neighbors: 0,
-                ..
-            }
+            TopologyMergeResult::Applied { neighbors: 0, .. }
         ));
         assert!(graph.edges().find_node(FAR).is_none());
         assert!(graph.get_downstream_relay(Y, 300).is_none());
@@ -5545,9 +5204,9 @@ mod tests {
     #[test]
     fn topology_pack_prefers_hears_us_and_sr_over_better_etx() {
         const ME: u32 = 0xAA00_00AA;
-        const STRONG_MUTE: u32 = 0xB100_0001; // strong ETX, no hearsUs, not SR
-        const MID_HEARS: u32 = 0xB200_0002; // mid ETX, hearsUs, not SR
-        const WEAK_SR: u32 = 0xB300_0003; // weak ETX, hearsUs, SR-active (the parent we must keep)
+        const STRONG_MUTE: u32 = 0xB100_0001;
+        const MID_HEARS: u32 = 0xB200_0002;
+        const WEAK_SR: u32 = 0xB300_0003;
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
@@ -5556,10 +5215,7 @@ mod tests {
         graph.observe_direct_neighbor(WEAK_SR, -90, 2, 100, 0);
         graph.confirm_direct_neighbor_hears_us(MID_HEARS);
         graph.confirm_direct_neighbor_hears_us(WEAK_SR);
-        graph
-            .capability_mut()
-            .track_topology(WEAK_SR, true, 100);
-        // STRONG_MUTE and MID_HEARS stay Unknown/Legacy (not SR-active).
+        graph.capability_mut().track_topology(WEAK_SR, true, 100);
 
         let mut entries = [NeighborEntry::default(); MAX_NEIGHBORS];
         let n = graph.topology_neighbors_for_pack(&mut entries);
@@ -5593,22 +5249,21 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L1, &header, &[nb(L2)], true, 200, 0);
         assert_eq!(
             graph.edges().node_class(L2),
             Some(crate::graph::NodeClass::L2)
         );
         write_packed_header(&mut packed, 2, true);
-        let (header2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header2, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L2, &header2, &[nb(L1), nb(L3)], false, 300, 0);
         assert_eq!(
             graph.edges().node_class(L3),
             Some(crate::graph::NodeClass::L3)
         );
-        // L3 lists Y with hearsUs: depth=3 ⇒ list-downstream of L3, not a publisher.
         write_packed_header(&mut packed, 3, true);
-        let (header3, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header3, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L3, &header3, &[nb(L2), nb(Y)], false, 400, 0);
         assert!(graph.edges().find_node(Y).is_none());
         assert_eq!(graph.get_downstream_relay(Y, 400), Some(L3));
@@ -5634,15 +5289,14 @@ mod tests {
             etx_variance: 0,
         };
         let mut packed = [0u8; 16];
-        // L1 must list us so retain_listed keeps L1→ME and strict Dijkstra can leave L1 toward us.
         write_packed_header(&mut packed, 1, true);
-        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h1, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L1, &h1, &[nb(ME, -50), nb(L2, -60)], true, 200, 0);
         write_packed_header(&mut packed, 2, true);
-        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h2, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L2, &h2, &[nb(L1, -55), nb(L3, -65)], false, 300, 0);
         write_packed_header(&mut packed, 3, true);
-        let (h3, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h3, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L3, &h3, &[nb(L2, -60), nb(Y, -80)], false, 400, 0);
 
         assert_eq!(graph.get_downstream_relay(Y, 500), Some(L3));
@@ -5694,13 +5348,13 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (h1, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h1, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L1, &h1, &[nb(L2)], true, 200, 0);
         write_packed_header(&mut packed, 2, true);
-        let (h2, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h2, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L2, &h2, &[nb(L1), nb(L3)], false, 300, 0);
         write_packed_header(&mut packed, 3, true);
-        let (h3, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (h3, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(L3, &h3, &[nb(L2), nb(Y)], false, 400, 0);
         assert_eq!(graph.get_downstream_relay(Y, 400), Some(L3));
         graph.observe_packet(Y, 1, 0, (L1 & 0xFF) as u8, -70, 8, 500, 0, Some(L1), 11);
@@ -5715,13 +5369,6 @@ mod tests {
     const COV_A: u32 = 0xA000_000A;
     const COV_B: u32 = 0xB000_000B;
 
-    /// The cancel path applies the same silence rule as admission, so the two agree.
-    ///
-    /// Admission has excluded a publisher we stopped hearing since the silence rule was
-    /// introduced: nobody can be shown to reach it, so nobody is credited for it and nobody is
-    /// handed a slot for it. The cancel path did not, so it went on counting that node as ours to
-    /// carry and kept a queued relay alive for a target the ranking had already agreed was
-    /// nobody's. One rule, read the same way on both sides.
     #[test]
     fn cancel_path_applies_the_silence_rule() {
         const ME: u32 = 0xCC00_00CC;
@@ -5734,12 +5381,9 @@ mod tests {
         graph.observe_direct_neighbor(GONE, -70, 8, t0, 0);
         graph.confirm_direct_neighbor_hears_us(PEER);
         graph.confirm_direct_neighbor_hears_us(GONE);
-        // Both publish, so both are held to their own lists.
         graph.capability_mut().track_topology(PEER, true, t0);
         graph.capability_mut().track_topology(GONE, true, t0);
 
-        // While we still hear it, the silent-to-be node is ours to carry and the peer's copy does
-        // not cover it, so a queued relay survives the duplicate.
         let inside = t0 + crate::neighbor_graph::PUBLISHER_SILENCE_MS;
         assert_eq!(
             graph.unique_coverage_neighbor(&[PEER], inside),
@@ -5747,8 +5391,6 @@ mod tests {
             "still heard: ours to carry, so the relay is kept"
         );
 
-        // Past the silence horizon it is nobody's target, so nothing unique remains and the
-        // duplicate cancels our relay.
         let past = inside + 1;
         assert_eq!(
             graph.unique_coverage_neighbor(&[PEER], past),
@@ -5768,11 +5410,6 @@ mod tests {
         assert!(graph.has_unique_coverage(&[COV_A], 0));
     }
 
-    /// The ranking ignores our own non-`Reported` edges, because peers cannot see what we only
-    /// heard about; the cancel path does not filter them. That asymmetry is inert only while no
-    /// production path leaves a Mirrored edge on one of our own real neighbours — this pins that
-    /// invariant, so a future path that breaks it fails here instead of silently making the two
-    /// paths disagree about who we cover.
     #[test]
     fn no_production_path_leaves_a_mirrored_self_edge() {
         const ME: u32 = 0xAA00_00AA;
@@ -5781,8 +5418,6 @@ mod tests {
         let mut graph = NeighborGraph::new();
         graph.set_my_node(ME);
         graph.set_device_role(DEVICE_ROLE_ROUTER);
-        // A frame relayed by a real gateway: the relayed-packet path writes a Mirrored edge for
-        // the gateway's own reach, and our edge to it must still be a direct measurement.
         graph.observe_packet(SRC, 3, 2, 0xBB, -70, 12, 1_000, 0, Some(GATEWAY), 0x99);
         let self_edge = graph
             .edges()
@@ -5794,7 +5429,6 @@ mod tests {
             EdgeSource::Reported,
             "our own edge is what we measured, not what we were told"
         );
-        // The same through placeholder resolution: an unresolved relay byte becomes a real node.
         let placeholder = placeholder_node_id(0xDD);
         graph.observe_packet(SRC, 3, 2, 0xDD, -70, 12, 2_000, 0, None, 0x9A);
         assert!(graph.edges().find_node(placeholder).is_some());
@@ -5807,9 +5441,6 @@ mod tests {
         assert_eq!(resolved.source, EdgeSource::Reported);
     }
 
-    /// `hears_us` is sticky: a neighbour that confirmed hearing us once keeps the flag while its
-    /// link decays. Ours to cover is not the same as reachable, so the cancel path asks `covers`
-    /// too — otherwise a queued relay is kept for a node the ranking refuses to serve.
     #[test]
     fn a_sticky_confirmation_behind_a_decayed_link_is_not_ours_to_cover() {
         const ME: u32 = 0xAA00_00AA;
@@ -5825,8 +5456,6 @@ mod tests {
             Some(EDGE),
             "a sound confirmed link is ours"
         );
-        // The link decays to the heard-once sentinel in both directions, as a fresh observation
-        // of a barely-audible neighbour writes it; the confirmation stays.
         for (from, to) in [(ME, EDGE), (EDGE, ME)] {
             graph
                 .edges_mut()
@@ -5839,8 +5468,6 @@ mod tests {
         );
     }
 
-    /// An inbound-only neighbour (we hear it, it never confirms hearing us) is nobody's coverage
-    /// unless we own it: whoever hears it best carries its traffic, and the rest stay silent.
     #[test]
     fn inbound_only_neighbor_belongs_to_its_owner() {
         let mut graph = NeighborGraph::new();
@@ -5849,13 +5476,11 @@ mod tests {
         graph.observe_direct_neighbor(COV_B, -70, 8, 0, 0);
         graph.confirm_direct_neighbor_hears_us(COV_A);
         graph.capability_mut().track_topology(COV_A, true, 0);
-        // Only we hear COV_B, so covering it is ours.
         assert_eq!(
             graph.unique_coverage_neighbor(&[COV_A], 0),
             Some(COV_B),
             "sole neighbour of an inbound-only node covers it"
         );
-        // COV_A hears it better: it owns it and we have nothing left to cover.
         graph
             .edges_mut()
             .update_edge(COV_ME, COV_A, COV_B, 1.0, 0, EdgeSource::Reported, true, 0);
@@ -5880,7 +5505,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(COV_A, &header, &[remote], true, 100, 0);
         assert!(!graph.has_unique_coverage(&[COV_A], 0));
     }
@@ -5946,9 +5571,6 @@ mod tests {
         assert_eq!(neighbors[0].snr, 10);
     }
 
-    /// The packed per-neighbour SR bit is that neighbour's capability, not ours.
-    /// Header SR-active stays ours. A stock or passive listed node must go out
-    /// as SR-inactive even when we are SR-active.
     #[test]
     fn packed_neighbor_sr_flag_is_the_neighbours_capability() {
         const ME: u32 = 0xAA00_00AA;
@@ -5981,7 +5603,10 @@ mod tests {
                 .map(|n| n.signal_routing_active)
                 .expect("listed")
         };
-        assert!(flag(SR_PEER), "an SR publisher we heard is packed SR-active");
+        assert!(
+            flag(SR_PEER),
+            "an SR publisher we heard is packed SR-active"
+        );
         assert!(
             !flag(STOCK),
             "a neighbour that never published topology is not SR-active"
@@ -6021,7 +5646,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(0xBB, &header, &[neighbor], true, 200, 0);
         let edge_etx = graph
             .edges()
@@ -6048,7 +5673,7 @@ mod tests {
         };
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         graph.merge_topology(0xBB, &header, &[neighbor], true, 200, 0);
         let report = graph.run_maintenance(400_000);
         assert!(!report.topology_dirty_send);
@@ -6068,13 +5693,13 @@ mod tests {
         graph
             .downstream_mut()
             .update(ME, FAR, PEER, 2.0, 100, false, 0);
-        graph.record_node_transmission(PEER, 42, 100);
+        graph.record_node_transmission(PEER, PEER, 42, 100);
         let routed = graph.route_to(PEER, 100);
         assert_ne!(routed.next_hop, 0);
         graph.commit_topology_broadcast(100, false);
         assert!(graph.neighbor_count() > 0);
         assert!(graph.downstream().count() > 0);
-        assert!(graph.has_node_transmitted(PEER, 42, 100));
+        assert!(graph.has_node_transmitted(PEER, PEER, 42, 100));
         assert_eq!(graph.topology_version(), 1);
 
         graph.purge_for_preset_change();
@@ -6082,7 +5707,7 @@ mod tests {
         assert_eq!(graph.neighbor_count(), 0);
         assert_eq!(graph.graph_node_count(), 0);
         assert_eq!(graph.downstream().count(), 0);
-        assert!(!graph.has_node_transmitted(PEER, 42, 200));
+        assert!(!graph.has_node_transmitted(PEER, PEER, 42, 200));
         assert_eq!(graph.route_to(PEER, 200).next_hop, 0);
         assert_eq!(graph.route_to(FAR, 200).next_hop, 0);
         assert_eq!(graph.topology_version(), 0);
@@ -6092,5 +5717,80 @@ mod tests {
         graph.observe_direct_neighbor(PEER, -70, 8, 300, 0);
         assert_eq!(graph.neighbor_count(), 1);
     }
-}
 
+    #[test]
+    fn transmission_history_is_scoped_and_own_history_expires() {
+        let mut graph = NeighborGraph::new();
+        graph.record_our_transmission(1, 42, u32::MAX - 100);
+        assert!(graph.has_our_transmission(1, 42, 10));
+        assert!(!graph.has_our_transmission(2, 42, 10));
+        assert!(!graph.has_our_transmission(1, 42, graph.node_tx_record_window_ms() + 10));
+        graph.record_node_transmission(3, 1, 42, 10);
+        assert!(graph.has_node_transmitted(3, 1, 42, 11));
+        assert!(!graph.has_node_transmitted(3, 2, 42, 11));
+    }
+
+    #[test]
+    fn lost_middle_chunk_cannot_retract_unlisted_edges() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(1);
+        graph.observe_direct_neighbor(2, -70, 8, 10, 0);
+        graph.observe_direct_neighbor(3, -70, 8, 10, 0);
+        graph
+            .edges_mut()
+            .update_edge(1, 3, 2, 1.0, 10, EdgeSource::Reported, true, 0);
+        graph.edges_mut().set_edge_hears_us(3, 2, true);
+        let mut header = topo_header(1);
+        header.more_chunks = true;
+        graph.merge_topology(2, &header, &[], true, 11, 0);
+        header.more_chunks = false;
+        header.continuation = true;
+        header.chunk_index = 2;
+        graph.merge_topology(2, &header, &[], true, 12, 0);
+        assert!(
+            graph
+                .edges()
+                .find_node(3)
+                .unwrap()
+                .find_edge(2)
+                .unwrap()
+                .hears_us
+        );
+    }
+
+    #[test]
+    fn empty_non_boot_report_retracts_stale_edges() {
+        let mut graph = NeighborGraph::new();
+        graph.set_my_node(1);
+        graph.observe_direct_neighbor(2, -70, 8, 10, 0);
+        graph.observe_direct_neighbor(3, -70, 8, 10, 0);
+        graph
+            .edges_mut()
+            .update_edge(1, 3, 2, 1.0, 10, EdgeSource::Reported, true, 0);
+        graph.edges_mut().set_edge_hears_us(3, 2, true);
+        graph.merge_topology(2, &topo_header(200), &[], true, 11, 0);
+        assert!(
+            !graph
+                .edges()
+                .find_node(3)
+                .unwrap()
+                .find_edge(2)
+                .unwrap()
+                .hears_us
+        );
+    }
+    #[test]
+    fn future_relay_commits_survive_maintenance() {
+        let mut graph = NeighborGraph::new();
+        graph.relay_states[0].active = true;
+        graph.relay_states[0].tx_after_ms = 1_000;
+        graph.clear_expired_commits(100);
+        assert!(graph.relay_states[0].active);
+        graph.clear_expired_commits(31_001);
+        assert!(!graph.relay_states[0].active);
+        graph.relay_states[0].active = true;
+        graph.relay_states[0].tx_after_ms = 50;
+        graph.clear_expired_commits(u32::MAX - 100);
+        assert!(graph.relay_states[0].active);
+    }
+}

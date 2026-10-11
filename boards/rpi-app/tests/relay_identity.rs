@@ -1,5 +1,3 @@
-//! Heard-from / relay-byte resolution for coordinated flooding.
-
 use mesh_routing::{placeholder_node_id, Router, PLACEHOLDER_NODE_PREFIX};
 
 #[test]

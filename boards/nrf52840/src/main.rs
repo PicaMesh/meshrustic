@@ -24,19 +24,15 @@ use embassy_nrf::wdt;
 use lora::{create_radio, radio_task, LoRaPins, Sx1262ModuleProfile};
 use mesh_radio::{eu868_config_for_preset, RadioSlot};
 use mesh_routing::Router;
-use mesh_store::EMPTY_ADMIN_KEY;
+use mesh_store::{ConfigStore, EMPTY_ADMIN_KEY};
 use node::NodeIdentity;
 use static_cell::{ConstStaticCell, StaticCell};
 use store::{ConfigLoadSource, NvmcConfigStore};
 
-/// Reset instead of halting. `panic_probe` parks the core, which in the field is a dead node
-/// until someone power-cycles it: both nicenanos sat silent for two hours after a log line
-/// overran its buffer. Nobody reads the defmt message without a probe, so a restart loses
-/// nothing; the boot log shows `reset reason` SREQ so a panic reboot stays visible.
+/// Resetting after a fault restores service; the retained reset reason preserves diagnostic evidence.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // defmt-rtt panics when acquired re-entrantly, so a panic raised while a log line was being
-    // written would recurse through here into a stack overflow. Log once, then reset regardless.
+    // Re-entering defmt during a logging panic would recurse into another panic.
     static PANICKING: AtomicBool = AtomicBool::new(false);
     if !PANICKING.swap(true, Ordering::SeqCst) {
         defmt::error!("panic: {}", defmt::Display2Format(info));
@@ -44,8 +40,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     cortex_m::peripheral::SCB::sys_reset()
 }
 
-/// Faults (stack overflow, bus fault, unaligned access) do not reach the panic handler. The
-/// cortex-m-rt default HardFault handler spins forever, the same dead-node outcome, so reset.
+/// Faults bypass the Rust panic handler; resetting avoids leaving a permanently dead node.
 #[exception]
 unsafe fn HardFault(_frame: &ExceptionFrame) -> ! {
     cortex_m::peripheral::SCB::sys_reset()
@@ -62,55 +57,43 @@ bind_interrupts!(struct Irqs {
 const WATCHDOG_TIMEOUT_SECS: u32 = 30;
 
 static RADIO_SLOT: StaticCell<RadioSlot<lora::Sx1262Driver>> = StaticCell::new();
-// Const-initialised so the ~70 KB router is placed by the linker, never built on the stack
-// (see `Router::unconfigured`). `load_node_config` below gives it its node id and channel.
 static ROUTER: ConstStaticCell<Router> = ConstStaticCell::new(Router::unconfigured());
 static CONFIG_STORE: StaticCell<NvmcConfigStore> = StaticCell::new();
-// Part C (H1 controlled-node harness): a host-typed command from the USB task to the radio
-// task. Built the same way every other object shared between these two independently-spawned
-// tasks already is -- a `StaticCell`, initialised once here, threaded into both spawns as a
-// `'static` reference -- rather than inventing a second sharing pattern.
 static HOST_CMD_CHANNEL: StaticCell<usb_log::HostCommandChannel> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // The bootloader returns here after a DFU inactivity timeout. Drop a leftover
-    // OTA request so this boot, and a later soft reset, stay in the application.
     dfu::clear_stale_ota_request();
     let mut hw_config = embassy_nrf::config::Config::default();
-    // The nRF52840 USBD needs HFCLK from the external 32 MHz crystal: full-speed USB
-    // tolerates 0.25 % clock error and the internal RC is only good to ~1.5 %, so on the
-    // RC some units enumerate and others never show up on the host.
     hw_config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     let p = embassy_nrf::init(hw_config);
-    // Hardware watchdog: the panic and HardFault handlers cover crashes, this covers hangs (a task
-    // that never yields stalls the whole cooperative executor). The radio task pets it on every
-    // pass of its loop, which sleeps at most 100 ms; 30 s leaves room for a full-length TX and
-    // an NVMC page erase. It keeps counting in sleep and pauses under a debugger. A WDT reset
-    // shows up as `reset reason ... DOG` in the boot log.
     let mut wdt_config = wdt::Config::default();
     wdt_config.timeout_ticks = 32768 * WATCHDOG_TIMEOUT_SECS;
     wdt_config.action_during_sleep = wdt::SleepConfig::RUN;
     wdt_config.action_during_debug_halt = wdt::HaltConfig::PAUSE;
     let radio_wdt = match wdt::Watchdog::try_new::<1>(p.WDT, wdt_config) {
         Ok((_wdt, [handle])) => Some(handle),
-        // Already running with a different setup. Firmware flashed before ours can leave the WDT
-        // enabled, and the nRF52 keeps it running through the soft reset that ends a UF2 flash —
-        // only a power-on reset clears it. We cannot pet a configuration we did not create, so
-        // that timer keeps expiring and resetting the node until it is power-cycled. Run without
-        // one of our own and say so, naming the remedy: the boot log is the only place this is
-        // visible, and the symptom (a reset every minute or two) looks like a crash otherwise.
+        // An inherited watchdog configuration cannot be safely claimed by this firmware; recovery
+        // requires a power cycle.
         Err(_) => None,
     };
-    // Adafruit UF2 bootloader leaves RESETREAS set; clear so a later soft-reset
-    // is not mistaken for a pin double-reset into upload mode. Keep the value for the boot log:
-    // bit 0 RESETPIN, bit 1 DOG, bit 2 SREQ (panic handler / soft reset), bit 3 LOCKUP.
+    // Clearing stale reset reasons prevents an ordinary reset from being mistaken for the bootloader’s
+    // double-reset trigger.
     let reset_reason = clear_resetreas();
 
-    let hw = NodeIdentity::from_hardware();
+    let mut rng = rng::Rng::new(p.RNG, Irqs);
+    let mut identity_seed = [0; 32];
+    rng.blocking_fill_bytes(&mut identity_seed);
+    let hw = NodeIdentity::from_hardware(identity_seed);
     let defaults = hw.first_boot_config();
     let store = CONFIG_STORE.init(NvmcConfigStore::new(Nvmc::new(p.NVMC), defaults));
-    let (config, load_src) = store.load_with_source();
+    let (mut config, load_src) = store.load_with_source();
+    let upgraded_identity = hw.replace_predictable_key(&mut config);
+    if (load_src == ConfigLoadSource::Defaults || upgraded_identity) && store.save(&config).is_err()
+    {
+        defmt::error!("failed to persist secure identity");
+        usb_log::log::push_line("[store] secure identity save failed");
+    }
     let admin_keys = config
         .admin_public_keys
         .iter()
@@ -118,8 +101,6 @@ async fn main(spawner: Spawner) {
         .count() as u32;
 
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
-    // The node id and build stamp are emitted by the USB task on every connection instead: a line
-    // pushed here is evicted from the log ring before any host attaches.
     usb_log::log::mesh::reset_reason(reset_reason);
     usb_log::log::push_line(if radio_wdt.is_some() {
         "[meshrustic] watchdog armed: 30 s, pet by the radio task"
@@ -142,35 +123,31 @@ async fn main(spawner: Spawner) {
     let spim = spim::Spim::new(p.SPI3, Irqs, p.P1_11, p.P0_02, p.P1_15, spi_cfg);
 
     let cs = Output::new(p.P1_13, Level::High, OutputDrive::Standard);
-    // A second, read-only handle on DIO1 so the radio task can be woken by the edge instead of
-    // discovering it on its next poll. The sx126x crate keeps the first handle and busy-waits on it
-    // inside its blocking transmit, so the pin cannot simply be moved here. Both handles are inputs
-    // configured identically and neither drives the line; the only exclusive resource is the GPIOTE
-    // channel, which this handle alone allocates.
+    // SAFETY: both DIO1 handles are identical inputs and never drive the line; only the wake handle
+    // allocates a GPIOTE channel. The driver must retain its input for blocking transmission.
     let dio1_wake = Input::new(
         unsafe { embassy_nrf::Peripheral::clone_unchecked(&p.P0_10) },
         Pull::None,
     );
     let lora_pins = LoRaPins::power_on(p.P0_13, p.P0_09, p.P0_29, p.P0_10);
     let mut driver = create_radio(spim, cs, lora_pins, Sx1262ModuleProfile::default_board());
-    driver.set_radio_config(eu868_config_for_preset(config.lora.modem_preset));
+    let mut radio_config = eu868_config_for_preset(config.lora.modem_preset);
+    radio_config.hop_limit = config.lora.hop_limit;
+    radio_config.tx_power_dbm = config.lora.tx_power_dbm.min(22) as i8;
+    driver.set_radio_config(radio_config);
     let slot = RADIO_SLOT.init(RadioSlot::new(0, driver));
 
     let router = ROUTER.take();
-    // Packet ids must differ between boots and between nodes: seed them from the RNG peripheral
-    // before the config load queues the first frames (the boot broadcast and nodeinfo).
     let mut seed = [0u8; 4];
-    rng::Rng::new(p.RNG, Irqs).blocking_fill_bytes(&mut seed);
+    rng.blocking_fill_bytes(&mut seed);
     router.seed_tx_ids(u32::from_le_bytes(seed));
     router.load_node_config(&config);
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(
         config.node_num,
         config.public_key,
     ));
-    // Role was applied in load_node_config; set_node_identity preserves it.
-    // Role travels to the USB task so it can be re-stated on every connection: like the node id
-    // and the build stamp, a line pushed here is evicted from the log ring long before a host
-    // attaches, and a capture that cannot say a node's role cannot judge its relay decisions.
+    // Boot-time identity and role logs can be evicted before a host connects, so connection-time logs
+    // must carry them.
     let own_role = router.device_role();
     usb_log::publish_device_role(own_role);
     usb_log::log::mesh::device_role(own_role);
@@ -181,14 +158,11 @@ async fn main(spawner: Spawner) {
         .unwrap();
     let saadc_config = saadc::Config::default();
     let mut saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
-    // Internal 0.6 V reference with gain 1/6 -> 3.6 V full scale; keep it explicit so
-    // battery::AREF_VOLTAGE cannot drift away from the hardware setting.
+    // The software conversion reference must agree with the configured ADC gain and reference.
     saadc_channel.reference = saadc::Reference::INTERNAL;
     saadc_channel.gain = saadc::Gain::GAIN1_6;
-    // The 1M + 1M VBAT divider is a ~500 kOhm source; the nRF52840 needs 40 us of
-    // acquisition above 400 kOhm. At the 10 us default the sample-and-hold cap never
-    // charges and the reading droops below MIN_BATTERY_MV, which makes the node fall
-    // back to the "USB powered" (101) telemetry level.
+    // The high-impedance battery divider needs a longer acquisition time to charge the ADC sample
+    // capacitor accurately.
     saadc_channel.time = saadc::Time::_40US;
     let saadc = saadc::Saadc::new(p.SAADC, Irqs, saadc_config, [saadc_channel]);
     spawner.spawn(battery::battery_task(saadc)).unwrap();
@@ -207,7 +181,6 @@ async fn main(spawner: Spawner) {
     core::future::pending().await
 }
 
-/// Clear nRF52840 POWER.RESETREAS (write 1 to clear sticky bits) and return what it held.
 fn clear_resetreas() -> u32 {
     const NRF_POWER_RESETREAS: *mut u32 = 0x4000_0400 as *mut u32;
     unsafe {

@@ -1,5 +1,3 @@
-//! Recent-packet dedup (fixed-size ring, no heap).
-
 const HISTORY_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Default)]
@@ -13,11 +11,9 @@ struct HistoryEntry {
 pub enum ObserveResult {
     New,
     Duplicate,
-    /// Same `(from, id)` seen again with a higher `hop_limit` (upgrade path).
     Upgraded,
 }
 
-/// Tracks recently seen `(from, id)` pairs to suppress duplicate RX and relay.
 pub struct PacketHistory {
     entries: [HistoryEntry; HISTORY_SIZE],
     head: usize,
@@ -68,7 +64,6 @@ impl PacketHistory {
         self.head = (self.head + 1) % HISTORY_SIZE;
     }
 
-    /// Record or update a packet; returns whether this copy is new, a dupe, or an upgrade.
     pub fn observe(&mut self, from: u32, id: u32, hop_limit: u8) -> ObserveResult {
         if id == 0 {
             return ObserveResult::New;
@@ -88,12 +83,10 @@ impl PacketHistory {
         self.find(from, id).map(|e| e.max_hop_limit)
     }
 
-    /// Returns `true` if this packet was already recorded.
     pub fn is_duplicate(&self, from: u32, id: u32) -> bool {
         self.find(from, id).is_some()
     }
 
-    /// Record a packet id so duplicates are suppressed later.
     pub fn remember(&mut self, from: u32, id: u32) {
         self.store(from, id, 0);
     }

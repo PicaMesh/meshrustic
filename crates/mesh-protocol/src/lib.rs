@@ -1,4 +1,3 @@
-//! LoRa mesh wire-format types shared by firmware and host tests.
 #![cfg_attr(not(feature = "prost"), no_std)]
 
 pub mod constants;

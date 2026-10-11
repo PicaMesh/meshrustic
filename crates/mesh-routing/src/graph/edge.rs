@@ -1,12 +1,7 @@
-//! Per-node edge lists in the topology graph.
-
 use mesh_radio::RadioId;
 
 use super::etx::{calculate_etx, etx_to_fixed, fixed_to_etx, EtxFixed};
 
-/// Direct-edge slots per node. A city hub hears well over 24 nodes; with 24 slots it kept evicting
-/// weaker but real neighbours (FCM6 dropped Czar), so the cap is 40. Lists above
-/// `MAX_NEIGHBORS_PER_PACKET` go out as several chunks.
 pub const MAX_EDGES_PER_NODE: usize = 40;
 
 pub const EDGE_NO_CHANGE: i8 = 0;
@@ -18,16 +13,11 @@ pub enum EdgeSource {
     #[default]
     Mirrored = 0,
     Reported = 1,
-    /// No measurement at all: minted because a relayed frame crossed this link, priced at
-    /// [`INFERRED_LINK_RSSI`](crate::neighbor_graph::INFERRED_LINK_RSSI) per hop. Good enough to
-    /// say a path exists, never good enough to price coverage or to displace a measurement.
+    /// Inferred crossings prove connectivity but cannot supply a measured delivery price.
     Inferred = 2,
 }
 
 impl EdgeSource {
-    /// How much this class is worth as evidence: our own measurement beats a peer's published
-    /// measurement, which beats a guess. Deliberately not the discriminant, which is wire-free
-    /// and kept stable.
     pub const fn rank(self) -> u8 {
         match self {
             EdgeSource::Inferred => 0,
@@ -36,7 +26,6 @@ impl EdgeSource {
         }
     }
 
-    /// A guess: it carries no measurement, so it cannot price a delivery.
     pub const fn is_measured(self) -> bool {
         !matches!(self, EdgeSource::Inferred)
     }
@@ -50,10 +39,7 @@ pub struct Edge {
     pub etx_variance: u8,
     pub source: EdgeSource,
     pub hears_us: bool,
-    /// Preset segment this edge was learned on (Phase 9 multi-radio).
     pub heard_on: RadioId,
-    /// Last time we RF-heard this neighbour as the on-air transmitter (our `Reported` edge only).
-    /// Zero means never heard: no live silence surcharge.
     pub last_heard_ms: u32,
 }
 
@@ -78,9 +64,10 @@ impl Edge {
     }
 }
 
-/// Live silence surcharge in ETX×100 from age since [`Edge::last_heard_ms`]. `period_ms` is the
-/// topology broadcast interval (`T`).
 pub fn silence_etx_fixed_from_age(age_ms: u32, period_ms: u32) -> u16 {
+    if period_ms < 2 {
+        return 1275;
+    }
     let half = period_ms / 2;
     if age_ms < half {
         return 0;
@@ -90,8 +77,8 @@ pub fn silence_etx_fixed_from_age(age_ms: u32, period_ms: u32) -> u16 {
         let den = half as u64;
         return (num / den) as u16;
     }
-    let two = period_ms * 2;
-    if age_ms < two {
+    let two = u64::from(period_ms) * 2;
+    if u64::from(age_ms) < two {
         let num = (age_ms - period_ms) as u64 * 550;
         let den = period_ms as u64;
         return (50 + num / den) as u16;
@@ -99,7 +86,6 @@ pub fn silence_etx_fixed_from_age(age_ms: u32, period_ms: u32) -> u16 {
     1275
 }
 
-/// Silence component as stored variance units (ETX×20), capped at 255.
 pub fn silence_variance_byte_from_age(age_ms: u32, period_ms: u32) -> u8 {
     let fixed = silence_etx_fixed_from_age(age_ms, period_ms);
     ((fixed as u32 * 20 + 50) / 100).min(255) as u8
@@ -114,24 +100,17 @@ pub fn effective_variance_byte(edge: &Edge, now_ms: u32, period_ms: u32, our_rx:
     edge.etx_variance.saturating_add(silence)
 }
 
-/// Admission / eviction hop class for a graph publisher. Dijkstra ignores this; only create,
-/// capacity demotion, and TTL cascade use it. `Unknown` is farthest (evicted first).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum NodeClass {
-    /// Not yet classified (placeholder or opportunistic create).
     #[default]
     Unknown = 0,
-    /// Our RF neighbour (`Reported us → N`).
     L1 = 1,
-    /// Hears at least one L1; not itself L1.
     L2 = 2,
-    /// Hears at least one L2; not L1/L2. Only admitted when `GRAPH_MAX_DEPTH >= 3`.
     L3 = 3,
 }
 
 impl NodeClass {
-    /// Graph depth for the horizon cap (`GRAPH_MAX_DEPTH`). Unknown counts as deepest.
     pub const fn depth(self) -> u8 {
         match self {
             NodeClass::L1 => 1,
@@ -141,7 +120,6 @@ impl NodeClass {
         }
     }
 
-    /// Eviction priority: higher means preferred victim (farthest first).
     pub const fn eviction_rank(self) -> u8 {
         match self {
             NodeClass::Unknown => 3,
@@ -158,12 +136,10 @@ pub struct NodeEdges {
     pub edge_count: u8,
     pub last_full_update_ms: u32,
     pub class: NodeClass,
-    /// L1 through which this deeper publisher was (or is) reachable; 0 if none.
     pub parent_hint: u32,
     pub edges: [Edge; MAX_EDGES_PER_NODE],
 }
 
-// Arrays longer than 32 have no derived `Default`.
 impl Default for NodeEdges {
     fn default() -> Self {
         Self {
@@ -191,7 +167,6 @@ impl NodeEdges {
     }
 }
 
-/// Capacity eviction that demoted a publisher into downstream (`victim via parent`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingDemotion {
     pub victim: u32,
@@ -202,10 +177,7 @@ pub struct PendingDemotion {
 pub struct EdgeStore {
     nodes: [NodeEdges; super::MAX_GRAPH_NODES],
     node_count: u8,
-    /// Absolute ETX delta that registers an edge change as significant ("half a retransmission").
-    /// Per-edge EWMA variance is added so a noisy link raises its own bar.
     etx_change_threshold: f32,
-    /// Last capacity demotion not yet flushed into [`DownstreamTable`] by the caller.
     pending_demotion: Option<PendingDemotion>,
 }
 
@@ -236,7 +208,6 @@ impl EdgeStore {
                 }; MAX_EDGES_PER_NODE],
             }; super::MAX_GRAPH_NODES],
             node_count: 0,
-            // Absolute ETX delta ("half a retransmission"); per-edge variance raises the bar.
             etx_change_threshold: 0.5,
             pending_demotion: None,
         }
@@ -246,7 +217,6 @@ impl EdgeStore {
         self.node_count
     }
 
-    /// Drop every node slot. Does not touch the ETX-change threshold.
     pub fn clear(&mut self) {
         self.node_count = 0;
         self.pending_demotion = None;
@@ -260,7 +230,6 @@ impl EdgeStore {
         self.find_node(node_id).map(|n| n.class)
     }
 
-    /// Counts of L1 / L2 / L3 ball members. Unknown (placeholders, unclassified) are omitted.
     pub fn count_horizon_classes(&self) -> (u8, u8, u8) {
         let mut l1 = 0u8;
         let mut l2 = 0u8;
@@ -278,7 +247,6 @@ impl EdgeStore {
 
     pub fn set_node_class(&mut self, node_id: u32, class: NodeClass, parent_hint: u32) {
         if let Some(node) = self.find_node_mut(node_id) {
-            // Never demote an L1 to a deeper class while it still holds the slot.
             if node.class == NodeClass::L1 && class != NodeClass::L1 {
                 if parent_hint != 0 {
                     node.parent_hint = parent_hint;
@@ -292,7 +260,6 @@ impl EdgeStore {
         }
     }
 
-    /// Mark `node_id` as an L1 neighbour of `my_node`.
     pub fn set_l1(&mut self, node_id: u32) {
         if let Some(node) = self.find_node_mut(node_id) {
             node.class = NodeClass::L1;
@@ -300,7 +267,6 @@ impl EdgeStore {
         }
     }
 
-    /// True when `class` is within the configured horizon depth.
     pub fn class_within_depth(class: NodeClass) -> bool {
         class != NodeClass::Unknown && class.depth() <= super::GRAPH_MAX_DEPTH
     }
@@ -340,7 +306,7 @@ impl EdgeStore {
         }
         let idx = self.node_count as usize;
         let class = if node_id == my_node {
-            NodeClass::L1 // L0 uses the L1 slot class only for eviction immunity via my_node check
+            NodeClass::L1
         } else {
             NodeClass::Unknown
         };
@@ -356,9 +322,6 @@ impl EdgeStore {
         Some(&mut self.nodes[idx])
     }
 
-    /// Admit `node_id` as a publisher of the given class, demoting a victim into downstream when
-    /// the ball is full. Returns false when admission is refused (depth, or no L1 parent for the
-    /// victim / newcomer).
     pub fn ensure_publisher(
         &mut self,
         node_id: u32,
@@ -376,8 +339,6 @@ impl EdgeStore {
         }
         if self.find_node(node_id).is_some() {
             self.set_node_class(node_id, class, parent_hint);
-            // Re-admission refreshes activity: L2/L3 often have no outbound edges (prices live
-            // on the parent), so age_edges keys retention on last_full_update_ms alone.
             if let Some(existing) = self.find_node_mut(node_id) {
                 existing.last_full_update_ms = now_ms;
             }
@@ -403,9 +364,7 @@ impl EdgeStore {
         true
     }
 
-    /// Pick a capacity victim: never L0/L1 when admitting deeper publishers; farthest class
-    /// first; within class fewest edges, then oldest `last_full_update_ms`.
-    fn select_eviction_victim(&self, my_node: u32, protect_l1: bool) -> Option<usize> {
+    fn select_eviction_victim(&self, my_node: u32, protect_l1: bool, now_ms: u32) -> Option<usize> {
         let mut best: Option<(usize, u8, u8, u32)> = None;
         for i in 0..self.node_count as usize {
             let node = &self.nodes[i];
@@ -420,11 +379,11 @@ impl EdgeStore {
                 continue;
             }
             let edges = node.edge_count;
-            let age = node.last_full_update_ms;
+            let age = now_ms.wrapping_sub(node.last_full_update_ms);
             let better = match best {
                 None => true,
                 Some((_, br, be, ba)) => {
-                    rank > br || (rank == br && (edges < be || (edges == be && age < ba)))
+                    rank > br || (rank == br && (edges < be || (edges == be && age > ba)))
                 }
             };
             if better {
@@ -435,10 +394,7 @@ impl EdgeStore {
     }
 
     fn pick_l1_parent(&self, victim: u32, my_node: u32) -> Option<(u32, u16)> {
-        let hint = self
-            .find_node(victim)
-            .map(|n| n.parent_hint)
-            .unwrap_or(0);
+        let hint = self.find_node(victim).map(|n| n.parent_hint).unwrap_or(0);
         if hint != 0 && self.is_our_direct_neighbor(hint, my_node) {
             let cost = self
                 .find_node(my_node)
@@ -447,7 +403,6 @@ impl EdgeStore {
                 .unwrap_or(200);
             return Some((hint, cost));
         }
-        // Prefer an L1 that lists the victim (or that the victim lists with hears_us).
         let mut best: Option<(u32, u16)> = None;
         if let Some(me) = self.find_node(my_node) {
             for i in 0..me.edge_count as usize {
@@ -475,36 +430,13 @@ impl EdgeStore {
         best
     }
 
-    /// Evict one publisher for capacity. When `downstream` is provided, demote the victim to
-    /// `via` an L1 parent and reparent its list-downstream children. Returns `Some(())` if a
-    /// slot was freed.
     fn evict_for_capacity(
         &mut self,
         now_ms: u32,
         my_node: u32,
         downstream: Option<&mut super::DownstreamTable>,
     ) -> Option<()> {
-        let idx = self.select_eviction_victim(my_node, true).or_else(|| {
-            // No deeper victim: fall back to oldest non-L0 with the legacy 120 s quiet gate.
-            let mut evict_idx = None;
-            let mut oldest = u32::MAX;
-            for i in 0..self.node_count as usize {
-                if self.nodes[i].node_id == my_node {
-                    continue;
-                }
-                if self.nodes[i].class == NodeClass::L1 {
-                    continue;
-                }
-                if now_ms.wrapping_sub(self.nodes[i].last_full_update_ms) < 120_000 {
-                    continue;
-                }
-                if self.nodes[i].last_full_update_ms < oldest {
-                    oldest = self.nodes[i].last_full_update_ms;
-                    evict_idx = Some(i);
-                }
-            }
-            evict_idx
-        })?;
+        let idx = self.select_eviction_victim(my_node, true, now_ms)?;
         let victim = self.nodes[idx].node_id;
         let parent_cost = self.pick_l1_parent(victim, my_node);
         if let Some((parent, cost_fixed)) = parent_cost {
@@ -519,7 +451,6 @@ impl EdgeStore {
                 self.pending_demotion = Some(demotion);
             }
         } else if downstream.is_some() {
-            // Plan §8.2: refuse rather than invent a parent when demotion was requested.
             return None;
         }
         self.remove_node_at(idx);
@@ -559,12 +490,10 @@ impl EdgeStore {
                 0,
             );
         }
-        // Reparent children that used via victim → via parent.
         let _ = downstream.transfer_downstream(demotion.victim, demotion.parent, now_ms);
         self.pending_demotion = None;
     }
 
-    /// Flush a pending capacity demotion into `downstream` (after `update_edge` without a sink).
     pub fn flush_pending_demotion(
         &mut self,
         my_node: u32,
@@ -576,7 +505,6 @@ impl EdgeStore {
         }
     }
 
-    /// Public capacity demotion used by tests and NeighborGraph when admitting past full.
     pub fn demote_for_capacity(
         &mut self,
         now_ms: u32,
@@ -594,7 +522,6 @@ impl EdgeStore {
         self.node_count -= 1;
     }
 
-    /// Classify hop depth for a candidate publisher from current ball evidence.
     pub fn classify_candidate(&self, node_id: u32, my_node: u32) -> NodeClass {
         if node_id == my_node {
             return NodeClass::L1;
@@ -602,7 +529,6 @@ impl EdgeStore {
         if self.has_direct_reported_edge_to(my_node, node_id) {
             return NodeClass::L1;
         }
-        // L2: an L1 lists node with hears_us, or node (if present) lists an L1.
         if let Some(me) = self.find_node(my_node) {
             for i in 0..me.edge_count as usize {
                 let l1 = me.edges[i].to;
@@ -626,7 +552,6 @@ impl EdgeStore {
             }
         }
         if super::GRAPH_MAX_DEPTH >= 3 {
-            // L3: an L2 lists node with hears_us, or node lists an L2.
             for i in 0..self.node_count as usize {
                 let n = &self.nodes[i];
                 if n.class != NodeClass::L2 {
@@ -647,11 +572,6 @@ impl EdgeStore {
         NodeClass::Unknown
     }
 
-    /// When `from` is only known as an edge target of a ball node, infer the shallowest class
-    /// that horizon depth allows (L1→target ⇒ L2; L2→target ⇒ L3 if depth≥3).
-    /// Edge presence (not hearsUs) is enough here: reverse Mirrored rows for Dijkstra must soft-
-    /// create the far endpoint. Horizon *ingest* still requires hearsUs via
-    /// [`Self::reachable_via_hears_us`].
     fn bootstrap_class_from_reachability(&self, node_id: u32, my_node: u32) -> NodeClass {
         if let Some(me) = self.find_node(my_node) {
             for i in 0..me.edge_count as usize {
@@ -659,7 +579,11 @@ impl EdgeStore {
                 if l1 == 0 || me.edges[i].source != EdgeSource::Reported {
                     continue;
                 }
-                if self.find_node(l1).and_then(|n| n.find_edge(node_id)).is_some() {
+                if self
+                    .find_node(l1)
+                    .and_then(|n| n.find_edge(node_id))
+                    .is_some()
+                {
                     return NodeClass::L2;
                 }
             }
@@ -675,10 +599,6 @@ impl EdgeStore {
         NodeClass::Unknown
     }
 
-    /// After an edge is removed, drop ball publishers that are no longer reachable from us.
-    /// Walk is **undirected** among remaining ball edges so a hearer-priced `L2→L1` still
-    /// keeps L2 when the bootstrap `L1→L2` listing has expired (backward Dijkstra uses that
-    /// direction). Isolated publishers with no path to an L1 we still hold are demoted.
     pub fn prune_unreachable_from_root(
         &mut self,
         my_node: u32,
@@ -769,7 +689,6 @@ impl EdgeStore {
         changed
     }
 
-    /// Remove one directed edge, then prune publishers that lost their only path from us.
     pub fn remove_edge_and_prune(
         &mut self,
         from: u32,
@@ -800,7 +719,6 @@ impl EdgeStore {
             .unwrap_or(false)
     }
 
-    /// True when any ball publisher lists `node_id` (any directed edge target).
     pub fn reachable_via_neighbor(&self, node_id: u32) -> bool {
         for i in 0..self.node_count as usize {
             for e in 0..self.nodes[i].edge_count as usize {
@@ -812,8 +730,6 @@ impl EdgeStore {
         false
     }
 
-    /// Plan §6.2 / §4.2: a ball publisher claims `node_id` hears them (`hearsUs=1`).
-    /// Asymmetric listings must not unlock horizon ingest or soft-create.
     pub fn reachable_via_hears_us(&self, node_id: u32) -> bool {
         for i in 0..self.node_count as usize {
             for e in 0..self.nodes[i].edge_count as usize {
@@ -837,7 +753,7 @@ impl EdgeStore {
         update_timestamp: bool,
         heard_on: RadioId,
     ) -> i8 {
-        if to == 0 || from == 0 {
+        if to == 0 || from == 0 || from == to || !etx.is_finite() || etx <= 0.0 {
             return EDGE_NO_CHANGE;
         }
 
@@ -850,7 +766,6 @@ impl EdgeStore {
             {
                 return EDGE_NO_CHANGE;
             } else {
-                // Horizon gate: only admit publishers within GRAPH_MAX_DEPTH.
                 let mut class = self.classify_candidate(from, my_node);
                 if class == NodeClass::Unknown {
                     class = self.bootstrap_class_from_reachability(from, my_node);
@@ -877,10 +792,7 @@ impl EdgeStore {
                 class
             };
             if class != NodeClass::Unknown {
-                let parent = self
-                    .find_node(from)
-                    .map(|n| n.parent_hint)
-                    .unwrap_or(0);
+                let parent = self.find_node(from).map(|n| n.parent_hint).unwrap_or(0);
                 self.set_node_class(from, class, parent);
             }
         }
@@ -898,15 +810,11 @@ impl EdgeStore {
             .find(|&i| self.nodes[from_idx].edges[i].to == to)
         {
             let edge = &mut self.nodes[from_idx].edges[edge_idx];
-            // A weaker class never overwrites a stronger one, whichever arrived last: that is
-            // what makes two nodes holding the same reports agree on the same number.
             if source.rank() < edge.source.rank() {
                 return EDGE_NO_CHANGE;
             }
             let old_etx = edge.etx();
             let abs_change = (etx - old_etx).abs();
-            // Significance uses the variance already on the edge; this observation's change is
-            // folded in afterwards so a quiet link really does report at the 0.5 floor.
             let dynamic = self.etx_change_threshold + edge.etx_variance_f();
             let significant = abs_change > dynamic;
             edge.set_etx(etx);
@@ -917,11 +825,9 @@ impl EdgeStore {
                 edge.update_etx_variance(abs_change);
             }
             edge.source = source;
-            if heard_on != 0 && source == EdgeSource::Reported {
+            if source == EdgeSource::Reported {
                 edge.heard_on = heard_on;
             }
-            // Absolute ETX delta vs threshold + EWMA variance (both in ETX units). Symmetric:
-            // an improvement past the bar is as significant as a degradation past it.
             if significant {
                 EDGE_SIGNIFICANT_CHANGE
             } else {
@@ -942,16 +848,12 @@ impl EdgeStore {
             self.nodes[from_idx].edge_count += 1;
             EDGE_NEW
         } else {
-            // Edge list full: replace the worst edge if the new one is better
-            // (score = ETX + age/300 s, so stale links lose first). Dropping the new edge instead
-            // meant a hub never learned neighbours that appeared after its 40 slots filled.
             let node = &mut self.nodes[from_idx];
             let mut worst_idx = usize::MAX;
             let mut worst_score = f32::MIN;
             for (i, edge) in node.edges.iter().enumerate().take(node.edge_count as usize) {
-                // Only edges this write is at least as well evidenced as may be displaced: a
-                // guess at the nominal price outscores every real link and would otherwise
-                // evict the measurements the ranking depends on.
+                // A nominally cheap inference must not evict stronger measurements that coverage ranking
+                // depends on.
                 if source.rank() < edge.source.rank() {
                     continue;
                 }
@@ -971,7 +873,7 @@ impl EdgeStore {
                 last_update_ms: now_ms,
                 etx_variance: 0,
                 source,
-                hears_us: false, // must be re-proven for the new neighbour
+                hears_us: false,
                 heard_on,
                 last_heard_ms: 0,
             };
@@ -1010,10 +912,6 @@ impl EdgeStore {
         }
     }
 
-    /// Drop `sender`'s edges to nodes its complete list no longer names. Only the sender can
-    /// report its own links, so a complete list is the whole truth about them; our own
-    /// measurements (`Reported`) and anything about the local node are left alone, and so is a
-    /// placeholder, which is a routing artefact rather than a claim by the sender.
     pub fn retain_listed_edges(&mut self, sender: u32, listed_ids: &[u32]) -> bool {
         let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == sender)
         else {
@@ -1058,8 +956,6 @@ impl EdgeStore {
         }
     }
 
-    /// Nodes we measured a direct link to — the set we publish. Counting peers that hold a
-    /// `Reported` edge back to us instead made this depend on our own symmetry assumption.
     pub fn count_direct_neighbors(&self, my_node: u32) -> u8 {
         let mut count = 0u8;
         if let Some(node) = self.find_node(my_node) {
@@ -1099,10 +995,6 @@ impl EdgeStore {
         mut downstream: Option<&mut super::DownstreamTable>,
     ) -> bool {
         let mut changed = false;
-        // Pass 1: drop expired directed edges on every node, including our own Reported
-        // links. Skipping `my_node` here left stale L1 claims forever and forced removal to
-        // ignore `we_hear_them`. Do not remove nodes in this pass — demotion needs a stable
-        // parent snapshot.
         for i in 0..self.node_count as usize {
             let mut write = 0u8;
             let edge_count = self.nodes[i].edge_count;
@@ -1120,11 +1012,6 @@ impl EdgeStore {
             self.nodes[i].edge_count = write;
         }
 
-        // Pass 2: collect nodes that should leave the ball. Mute L1s we still hear keep an
-        // empty slot; horizon L2/L3 publishers are the same shape. Never remove a node we
-        // still Report-hear — `prune_silent_publishers` owns that retract, and deleting a
-        // live hub here used to `clear_for_relay` and wipe every list-downstream row parked
-        // behind it.
         let mut victims = [0u32; super::MAX_GRAPH_NODES];
         let mut victim_n = 0usize;
         for i in 0..self.node_count as usize {
@@ -1141,16 +1028,13 @@ impl EdgeStore {
             }
             let classed_ball = Self::class_within_depth(self.nodes[i].class);
             let stale = now_ms.wrapping_sub(self.nodes[i].last_full_update_ms) > ttl_ms;
-            let empty_unknown =
-                self.nodes[i].edge_count == 0 && !classed_ball;
+            let empty_unknown = self.nodes[i].edge_count == 0 && !classed_ball;
             if (stale || empty_unknown) && victim_n < super::MAX_GRAPH_NODES {
                 victims[victim_n] = node_id;
                 victim_n += 1;
             }
         }
 
-        // Pass 3: demote into list-downstream when an L1 parent remains (same as
-        // `prune_unreachable_from_root`); only hard-clear when there is no parent.
         for &victim in victims[..victim_n].iter() {
             if let Some(ref mut ds) = downstream {
                 if let Some((parent, cost_fixed)) = self.pick_l1_parent(victim, my_node) {
@@ -1205,7 +1089,6 @@ impl EdgeStore {
         self.remove_node_edges_to(target);
     }
 
-    /// Remove one directed edge, leaving both endpoints in the graph.
     pub fn remove_edge(&mut self, from: u32, to: u32) -> bool {
         let Some(idx) = (0..self.node_count as usize).find(|&i| self.nodes[i].node_id == from)
         else {
@@ -1251,15 +1134,10 @@ impl EdgeStore {
         }
     }
 
-    /// Refresh node activity timestamp (SignalRouting `updateNodeActivity`).
     pub fn update_node_activity(&mut self, node_id: u32, now_ms: u32, my_node: u32) -> bool {
         if node_id == 0 || node_id == my_node {
             return false;
         }
-        // Refresh only: creating an edgeless node here made every relayed source a graph entry
-        // that `age_edges` removed on the next tick, and `remove_node_edges_to` then deleted
-        // every peer's published edge to it (field 2026-09-08: ~100 aging passes in 45 min on a
-        // graph of 9 nodes, and a gateway's coverage set wandering packet to packet).
         let Some(node) = self.find_node_mut(node_id) else {
             return false;
         };
@@ -1284,8 +1162,6 @@ mod tests {
                 EDGE_NEW
             );
         }
-        // Refresh every edge but the first at t=600 s: the first is now the stale one
-        // (score 4 + 600/300 = 6, the others 4).
         for i in 1..MAX_EDGES_PER_NODE as u32 {
             edges.update_edge(
                 ME,
@@ -1298,13 +1174,11 @@ mod tests {
                 0,
             );
         }
-        // Worse than every slot: dropped, list unchanged.
         assert_eq!(
             edges.update_edge(ME, ME, 0x2000, 9.0, 600_000, EdgeSource::Reported, true, 0),
             EDGE_NO_CHANGE
         );
         assert!(edges.find_node(ME).unwrap().find_edge(0x1000).is_some());
-        // Better than the stale slot: takes it, with hears_us cleared for the newcomer.
         assert_eq!(
             edges.update_edge(ME, ME, 0x2001, 5.0, 600_000, EdgeSource::Reported, true, 0),
             EDGE_NEW
@@ -1318,7 +1192,6 @@ mod tests {
 
     #[test]
     fn a_guess_never_overwrites_a_published_measurement() {
-        // A gateway published a hopeless link; a relayed frame across it must not reprice it.
         const ME: u32 = 0xAA;
         const GW: u32 = 0xBB;
         const FAR: u32 = 0xCC;
@@ -1335,7 +1208,6 @@ mod tests {
         assert_eq!(edge.etx_fixed, etx_to_fixed(15.87));
         assert_eq!(edge.source, EdgeSource::Mirrored);
 
-        // The published measurement still wins when it arrives second.
         edges.update_edge(ME, GW, 0xDD, 1.57, 1_000, EdgeSource::Inferred, true, 0);
         edges.update_edge(ME, GW, 0xDD, 15.87, 2_000, EdgeSource::Mirrored, true, 0);
         let replaced = edges.find_node(GW).unwrap().find_edge(0xDD).unwrap();
@@ -1345,8 +1217,6 @@ mod tests {
 
     #[test]
     fn a_guess_never_evicts_a_measurement_from_a_full_list() {
-        // The nominal inferred price outscores every real link, so without a class test it
-        // would evict the measurements the ranking depends on.
         const ME: u32 = 0xAA;
         const GW: u32 = 0xBB;
         let mut edges = EdgeStore::new();
@@ -1374,7 +1244,6 @@ mod tests {
             EDGE_NO_CHANGE
         );
         assert!(edges.find_node(GW).unwrap().find_edge(0x9999).is_none());
-        // A published measurement still displaces a worse published one.
         assert_eq!(
             edges.update_edge(ME, GW, 0x9999, 1.57, 1_000, EdgeSource::Mirrored, true, 0),
             EDGE_NEW
@@ -1415,7 +1284,6 @@ mod tests {
             "CC is an edge target, not a graph node"
         );
 
-        // Every edge of BB is past the TTL, so BB itself goes with them.
         let mut downstream = DownstreamTable::new();
         let now = 1_000 + 7_200_001;
         assert!(edges.age_edges(0xAA, now, 7_200_000, Some(&mut downstream)));
@@ -1424,9 +1292,6 @@ mod tests {
 
     #[test]
     fn noting_activity_never_invents_a_node() {
-        // Hearing a relayed frame from a far node says it is alive, not that we know a link to
-        // it. Creating an edgeless node here made the next aging pass delete every peer's
-        // published edge to it.
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
         assert!(!edges.update_node_activity(0xBB, 1_000, 0xAA));
@@ -1435,8 +1300,6 @@ mod tests {
 
     #[test]
     fn a_peers_published_edge_to_a_leaf_survives_aging() {
-        // The leaf publishes nothing and has no outgoing edge, so it is not a graph node. The
-        // gateway's measurement of it must still be there after maintenance.
         const ME: u32 = 0xAA;
         const GW: u32 = 0xBB;
         const LEAF: u32 = 0xCC;
@@ -1461,7 +1324,6 @@ mod tests {
     fn age_keeps_node_with_mirrored_edges() {
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
-        // Mirrored edges from an unknown `from` are rejected; establish BB first.
         edges.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Reported, true, 0);
         edges.update_edge(0xAA, 0xBB, 0xCC, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
         assert!(edges.find_node(0xBB).is_some());
@@ -1474,8 +1336,6 @@ mod tests {
 
     #[test]
     fn age_keeps_empty_l3_publisher_until_admission_ttl() {
-        // Parent→L3 measurements live on the parent; the L3 slot itself is often edgeless.
-        // Field (angl): dropping those slots each maintenance tick collapsed the ball.
         const ME: u32 = 0xAA;
         const L1: u32 = 0xBB;
         const L2: u32 = 0xCC;
@@ -1514,7 +1374,6 @@ mod tests {
         downstream.update(0xAA, 0xDD, 0xBB, 2.0, 1_000, false, 0);
         assert_eq!(downstream.count(), 1);
 
-        // Our Reported edge ages off with the TTL, then BB is no longer heard and may leave.
         let now = 1_000 + 7_200_001;
         assert!(edges.age_edges(0xAA, now, 7_200_000, Some(&mut downstream)));
         assert_eq!(downstream.count(), 0);
@@ -1522,8 +1381,6 @@ mod tests {
 
     #[test]
     fn age_keeps_a_hub_we_still_hear_and_its_list_downstream() {
-        // Stale last_full_update alone must not delete a Reported neighbour: that used to
-        // clear_for_relay and wipe every unicast route parked behind the hub.
         const ME: u32 = 0xAA;
         const HUB: u32 = 0xBB;
         const DEST: u32 = 0xDD;
@@ -1532,7 +1389,6 @@ mod tests {
         edges.update_edge(ME, ME, HUB, 2.0, 1_000, EdgeSource::Reported, true, 0);
         let mut downstream = DownstreamTable::new();
         let now = 1_000 + 7_200_001;
-        // Hub node activity is stale, but our hearing of it was just refreshed.
         edges.update_edge(ME, ME, HUB, 2.0, now, EdgeSource::Reported, true, 0);
         downstream.update_listed(ME, DEST, HUB, 3.0, now, false, 0);
         assert!(!edges.age_edges(ME, now, 7_200_000, Some(&mut downstream)));
@@ -1542,8 +1398,6 @@ mod tests {
 
     #[test]
     fn direct_neighbor_count_counts_what_we_publish() {
-        // Our neighbour set is what we measured and publish. Counting peers that hold an edge
-        // back to us instead counted our own assumption of symmetry.
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(0xAA, 1_000);
         edges.update_edge(0xAA, 0xAA, 0xCC, 2.0, 1_000, EdgeSource::Reported, true, 0);
@@ -1554,7 +1408,6 @@ mod tests {
             1
         );
 
-        // A peer's edge to us, with none of our own, is not a neighbour of ours.
         let mut lopsided = EdgeStore::new();
         lopsided.ensure_local_node(0xAA, 1_000);
         lopsided.update_edge(0xAA, 0xAA, 0xBB, 2.0, 1_000, EdgeSource::Reported, true, 0);
@@ -1582,7 +1435,6 @@ mod tests {
             edges.update_edge(ME, ME, PEER, 3.0, 1_000, EdgeSource::Reported, true, 0),
             EDGE_NEW
         );
-        // Absolute drop of 1.0 ETX clears the 0.5 floor on a quiet edge.
         assert_eq!(
             edges.update_edge(ME, ME, PEER, 2.0, 2_000, EdgeSource::Reported, true, 0),
             EDGE_SIGNIFICANT_CHANGE
@@ -1606,8 +1458,6 @@ mod tests {
 
     #[test]
     fn a_change_just_above_half_is_significant_on_a_quiet_edge() {
-        // Pins that significance consults the variance already on the edge, not the value after
-        // folding this observation in: with post-update EWMA a 0.55 jump would fail (0.5+0.1375).
         const ME: u32 = 0xAA;
         const PEER: u32 = 0xBB;
         let mut edges = EdgeStore::new();
@@ -1643,18 +1493,15 @@ mod tests {
         edges.update_edge(ME, ME, QUIET, 2.0, 1_000, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, NOISY, 2.0, 1_000, EdgeSource::Reported, true, 0);
 
-        // Build EWMA variance with repeated large swings on the noisy edge only.
         let mut etx = 2.0_f32;
         for i in 0..8u32 {
             etx = if i % 2 == 0 { 7.0 } else { 2.0 };
             edges.update_edge(ME, ME, NOISY, etx, 2_000 + i, EdgeSource::Reported, true, 0);
         }
-        // Leave the noisy edge at 2.0 so the probe matches the quiet edge's starting point.
         if etx != 2.0 {
             edges.update_edge(ME, ME, NOISY, 2.0, 3_000, EdgeSource::Reported, true, 0);
         }
 
-        // Same absolute jump: significant on a quiet edge, damped on the noisy one.
         assert_eq!(
             edges.update_edge(ME, ME, QUIET, 3.0, 4_000, EdgeSource::Reported, true, 0),
             EDGE_SIGNIFICANT_CHANGE
@@ -1704,31 +1551,21 @@ mod tests {
         let mut edges = EdgeStore::new();
         let mut downstream = DownstreamTable::new();
         edges.ensure_local_node(ME, 0);
-        // Fill the ball: 1 local + (MAX-1) publishers. Prefer L2 victims over L1.
         let l1_count = 4u32;
         for i in 0..l1_count {
             let id = 0x1000 + i;
             edges.update_edge(ME, ME, id, 1.0, 1_000, EdgeSource::Reported, true, 0);
         }
-        // Remaining slots as L2 (via first L1).
         let l1 = 0x1000u32;
         let mut next = 0x2000u32;
         while edges.node_count() < super::super::MAX_GRAPH_NODES as u8 {
             edges.update_edge(ME, l1, next, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
-            edges.ensure_publisher(
-                next,
-                NodeClass::L2,
-                l1,
-                1_000,
-                ME,
-                &mut downstream,
-            );
+            edges.ensure_publisher(next, NodeClass::L2, l1, 1_000, ME, &mut downstream);
             edges.update_edge(ME, next, l1, 2.0, 1_000, EdgeSource::Mirrored, true, 0);
             next += 1;
         }
         assert_eq!(edges.node_count() as usize, super::super::MAX_GRAPH_NODES);
 
-        // Force an L3-class node into the table by tagging one L2 as L3, then admit another L2.
         let deep = 0x2000u32;
         edges.set_node_class(deep, NodeClass::L3, l1);
         let newcomer = next;
@@ -1747,14 +1584,7 @@ mod tests {
                 "L1 must survive capacity demotion"
             );
         }
-        assert!(edges.ensure_publisher(
-            newcomer,
-            NodeClass::L2,
-            l1,
-            2_000,
-            ME,
-            &mut downstream
-        ));
+        assert!(edges.ensure_publisher(newcomer, NodeClass::L2, l1, 2_000, ME, &mut downstream));
         let _ = newcomer;
     }
 
@@ -1812,7 +1642,6 @@ mod tests {
         const PUB: u32 = 0xBB00_00BB;
         let mut edges = EdgeStore::new();
         let mut downstream = DownstreamTable::new();
-        // Match observe_direct_neighbor: Reported us→N + Inferred N→us.
         edges.update_edge(ME, ME, GW, 1.0, 1_000, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, GW, ME, 1.0, 1_000, EdgeSource::Inferred, true, 0);
         edges.update_edge(ME, ME, PUB, 1.0, 1_000, EdgeSource::Reported, true, 0);

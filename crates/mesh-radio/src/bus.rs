@@ -1,6 +1,3 @@
-//! SPI bus abstraction for LoRa transceivers.
-
-/// Minimal SPI bus used by SX1262 drivers (CS managed externally).
 pub trait SpiLoRaBus {
     type Error;
 

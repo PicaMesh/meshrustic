@@ -4,15 +4,12 @@ use mesh_radio::{
     MODEM_SHORT_SLOW, SYNC_WORD,
 };
 
-/// 16-byte default public-channel PSK (factory primary channel).
 pub const DEFAULT_PSK: [u8; 16] = [
     0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59, 0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0x01,
 ];
 
-/// Number of configurable (flash) admin public-key slots.
 pub const ADMIN_KEY_SLOTS: usize = 3;
 
-/// Hardcoded LoRa settings for Phase 2 bring-up / persisted modem preset.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LoRaConfig {
     pub region: RegionInfo,
@@ -25,14 +22,10 @@ pub struct LoRaConfig {
     pub hop_limit: u8,
     pub tx_power_dbm: u8,
     pub use_preset: bool,
-    /// Stock's `config_ok_to_mqtt`: gateways may uplink our frames, and every Data we originate
-    /// carries the bit. On by default: without it a hop-0 reply shows no route in the
-    /// Meshtastic Android app, which takes a zero bitfield for a legacy frame.
     pub ok_to_mqtt: bool,
 }
 
 impl LoRaConfig {
-    /// Factory / first-boot default: EU_868 [`MODEM_DEFAULT_PRESET`].
     pub fn eu868_default() -> Self {
         let mut cfg = Self {
             region: EU_868,
@@ -67,7 +60,6 @@ impl LoRaConfig {
         }
     }
 
-    /// Apply a modem preset (EU_868), deriving SF/BW/CR from `modem_preset_params`.
     pub fn apply_modem_preset(&mut self, modem_preset: u8) {
         let params = modem_preset_params(modem_preset, false);
         self.modem_preset = modem_preset;
@@ -81,7 +73,6 @@ impl LoRaConfig {
     }
 }
 
-/// Runtime node configuration persisted to flash.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeConfig {
     pub node_num: u32,
@@ -89,21 +80,13 @@ pub struct NodeConfig {
     pub public_key: [u8; 32],
     pub channel_key: CryptoKey,
     pub lora: LoRaConfig,
-    /// Configurable admin public keys only (built-ins are firmware constants).
     pub admin_public_keys: [[u8; 32]; ADMIN_KEY_SLOTS],
-    /// `ModuleConfig.TelemetryConfig.device_update_interval` (seconds).
-    /// Zero means unset → firmware default (20 min).
     pub device_update_interval_secs: u32,
-    /// Configured device role (`Config.DeviceConfig.role`). Default CLIENT (0).
     pub device_role: u8,
-    /// `Config.PositionConfig.position_broadcast_secs`. Zero means the role default.
     pub position_broadcast_secs: u32,
-    /// `Config.PositionConfig.fixed_position`.
     pub fixed_position: bool,
-    /// `Position.latitude_i` / `longitude_i` (degrees * 1e7).
     pub latitude_i: i32,
     pub longitude_i: i32,
-    /// False until `set_fixed_position` stores a coordinate pair.
     pub has_fixed_coords: bool,
 }
 
@@ -126,9 +109,8 @@ impl NodeConfig {
         }
     }
 
-    /// Primary channel hash (empty stored name → preset display name + PSK).
     pub fn primary_channel_hash(&self) -> u8 {
-        let len = self.channel_key.length.max(0) as usize;
+        let len = self.channel_key.len();
         mesh_radio::primary_channel_hash(
             "",
             self.lora.modem_preset,
@@ -138,7 +120,6 @@ impl NodeConfig {
     }
 }
 
-/// Expand default PSK index byte `1` to the 16-byte default key.
 pub fn default_channel_key() -> CryptoKey {
     CryptoKey::from_bytes(&DEFAULT_PSK)
 }

@@ -1,5 +1,3 @@
-//! Power-policy helpers — host checks for Phase 8 idle detection.
-
 use mesh_protocol::PacketHeader;
 use mesh_routing::{InboundPacket, Router};
 use static_cell::StaticCell;

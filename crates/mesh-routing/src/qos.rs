@@ -1,9 +1,8 @@
-//! Channel congestion relay gating (stateless, 0 bytes).
-
 use mesh_protocol::{qos_tier, QosTier};
 
-/// Stateless relay gate based on channel utilization tier thresholds.
-pub struct ChannelQoS;
+pub struct ChannelQoS {
+    primary_channel: u8,
+}
 
 impl Default for ChannelQoS {
     fn default() -> Self {
@@ -13,12 +12,15 @@ impl Default for ChannelQoS {
 
 impl ChannelQoS {
     pub const fn new() -> Self {
-        Self
+        Self::with_primary_channel(0)
     }
 
-    /// Returns `true` when relay is allowed at the current channel utilization.
+    pub const fn with_primary_channel(primary_channel: u8) -> Self {
+        Self { primary_channel }
+    }
+
     pub fn can_relay(&self, decoded_portnum: Option<u32>, channel: u8, chutil_pct: f32) -> bool {
-        let tier = qos_tier(decoded_portnum, channel);
+        let tier = qos_tier(decoded_portnum, channel, self.primary_channel);
         let threshold = match tier {
             QosTier::Low => 25.0,
             QosTier::Medium => 30.0,
@@ -28,9 +30,8 @@ impl ChannelQoS {
         chutil_pct < threshold
     }
 
-    /// Human-readable threshold for logging.
-    pub fn suppress_threshold_pct(decoded_portnum: Option<u32>, channel: u8) -> f32 {
-        match qos_tier(decoded_portnum, channel) {
+    pub fn suppress_threshold_pct(&self, decoded_portnum: Option<u32>, channel: u8) -> f32 {
+        match qos_tier(decoded_portnum, channel, self.primary_channel) {
             QosTier::Low => 25.0,
             QosTier::Medium => 30.0,
             QosTier::High => 38.0,
@@ -62,5 +63,13 @@ mod tests {
         let qos = ChannelQoS::new();
         assert!(qos.can_relay(Some(num::ROUTING_APP), 0, 37.0));
         assert!(!qos.can_relay(Some(num::ROUTING_APP), 0, 38.0));
+    }
+
+    #[test]
+    fn text_priority_uses_configured_primary_hash() {
+        let qos = ChannelQoS::with_primary_channel(0x77);
+        assert!(qos.can_relay(Some(num::TEXT_MESSAGE_APP), 0x77, 99.0));
+        assert!(!qos.can_relay(Some(num::TEXT_MESSAGE_APP), 0, 99.0));
+        assert!(!qos.can_relay(None, 0x77, f32::NAN));
     }
 }

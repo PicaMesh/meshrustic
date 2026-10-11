@@ -1,47 +1,35 @@
-//! One physical radio slot (driver + bounded queues).
-
 use crate::airtime::AirTime;
 use crate::config::RadioConfig;
 use crate::frame::{RadioId, RxFrame, TxFrame};
 use crate::interface::{RadioError, RadioInterface};
 use crate::queue::{QueueError, RxQueue, TxQueue, DEFAULT_RX_QUEUE, DEFAULT_TX_QUEUE};
 
-/// Result of one `RadioSlot::service` poll.
 #[derive(Clone, Copy, Default)]
 pub struct ServiceReport {
     pub rx: Option<RxFrame>,
     pub tx_len: Option<u8>,
-    /// Packet id from the 16-byte mesh header (when present). Set when a frame is sent *or*
-    /// when a queued frame is held, so the report names the frame that waited.
+    pub rx_restart_error: Option<RadioError>,
     pub tx_id: Option<u32>,
-    /// Destination node from the mesh header (when present).
     pub tx_to: Option<u32>,
-    /// TX queue had a frame but hourly duty cycle blocked dequeue.
+    pub tx_from: Option<u32>,
     pub duty_cycle_blocked: bool,
-    /// TX queue had a frame but a reception was in progress; retried on the next poll.
     pub tx_deferred_rx_busy: bool,
-    /// TX queue had a frame but a received frame had not yet reached the router; the router
-    /// gets to cancel the queued relay first (a copy of the same packet is the usual reason).
     pub tx_deferred_rx_pending: bool,
-    /// TX queue had a frame but the channel-access gate (post-RX turnaround, post-TX gap) held it.
     pub tx_held: bool,
-    /// Frames waiting in the TX queue after this poll.
     pub tx_queue_len: u8,
-    /// Last completed reception's ordinal (0 if none yet). Advances once per `poll_recv` frame.
     pub rx_ordinal: u32,
-    /// Hardware receptions completed during this poll (not leftover queue depth).
     pub receptions: u8,
-    /// The queued TX was held behind this completed reception, when that is known.
     pub held_behind_rx: Option<u32>,
 }
 
-fn mesh_header_id_to(payload: &[u8]) -> Option<(u32, u32)> {
+fn mesh_header_id_to(payload: &[u8]) -> Option<(u32, u32, u32)> {
     if payload.len() < crate::config::PACKET_HEADER_LEN {
         return None;
     }
     let to = u32::from_le_bytes(payload[0..4].try_into().ok()?);
     let id = u32::from_le_bytes(payload[8..12].try_into().ok()?);
-    Some((id, to))
+    let from = u32::from_le_bytes(payload[4..8].try_into().ok()?);
+    Some((id, to, from))
 }
 
 fn oldest_rx_ordinal(last: u32, queued: usize) -> Option<u32> {
@@ -57,6 +45,7 @@ pub struct RadioSlot<D, const RX: usize = DEFAULT_RX_QUEUE, const TX: usize = DE
     pub rx_queue: RxQueue<RX>,
     pub tx_queue: TxQueue<TX>,
     rx_ordinal: u32,
+    rx_restart_pending: bool,
 }
 
 impl<D, const RX: usize, const TX: usize> RadioSlot<D, RX, TX>
@@ -70,6 +59,7 @@ where
             rx_queue: RxQueue::new(),
             tx_queue: TxQueue::new(),
             rx_ordinal: 0,
+            rx_restart_pending: false,
         }
     }
 
@@ -85,21 +75,21 @@ where
         self.driver.init()
     }
 
-    /// Poll hardware, enqueue RX frames, and send the head of the TX queue when the channel is
-    /// clear. The release decision is made here, with the frame in hand, so a held frame is
-    /// named in the report together with the reason it waited.
-    ///
-    /// `may_tx` is the board's post-reception / post-TX gate. Listen-before-talk and "router
-    /// has not seen this RX yet" are decided here from the modem and the receive queue; they
-    /// defer the send but are not themselves a reason to extend that gate.
     pub fn service(
         &mut self,
         air_time: &mut AirTime,
         may_tx: bool,
     ) -> Result<ServiceReport, RadioError> {
         let mut report = ServiceReport::default();
+        if self.rx_restart_pending {
+            self.driver.start_rx()?;
+            self.rx_restart_pending = false;
+        }
 
-        while let Some(frame) = self.driver.poll_recv()? {
+        while self.rx_queue.len() < RX {
+            let Some(frame) = self.driver.poll_recv()? else {
+                break;
+            };
             let ms = crate::packet_time::packet_time_ms(self.config(), frame.len as usize, true);
             air_time.log_airtime(crate::airtime::AirtimeLog::RxAll, ms);
             let _ = self.rx_queue.push(frame);
@@ -112,19 +102,16 @@ where
         report.rx_ordinal = self.rx_ordinal;
 
         if let Some(tx) = self.tx_queue.front() {
-            if let Some((id, to)) = mesh_header_id_to(tx.payload()) {
+            if let Some((id, to, from)) = mesh_header_id_to(tx.payload()) {
                 report.tx_id = Some(id);
                 report.tx_to = Some(to);
+                report.tx_from = Some(from);
             }
             if self.driver.rx_in_progress()? {
-                // Listen before talk: a packet is arriving. Keying up now collides with it, and
-                // SR's half-airtime slots assume an earlier slot's copy is heard, not trampled.
                 report.tx_deferred_rx_busy = true;
             } else if !self.rx_queue.is_empty() {
-                // A frame just completed and has not been seen by the router yet. Sending now
-                // would put our relay on the air a few ms before the dedupe that cancels it
-                // runs: two colocated nodes did exactly that, one keying up the instant the
-                // other's copy ended.
+                // Sending before the router processes RX can race the duplicate cancellation and put an
+                // unnecessary relay on air.
                 report.tx_deferred_rx_pending = true;
                 report.held_behind_rx = oldest_rx_ordinal(self.rx_ordinal, self.rx_queue.len());
             } else if !may_tx {
@@ -135,9 +122,13 @@ where
             } else if air_time.is_tx_allowed_duty_cycle() {
                 if let Ok(tx) = self.tx_queue.pop() {
                     let len = tx.len;
-                    self.driver.send(&tx)?;
+                    let sent = self.driver.send(&tx);
                     air_time.log_tx_packet(self.config(), len as usize);
-                    self.driver.start_rx()?;
+                    let resumed = self.driver.start_rx();
+                    self.rx_restart_pending = resumed.is_err();
+                    sent?;
+                    // RX recovery must not hide a successful transmission from duplicate suppression.
+                    report.rx_restart_error = resumed.err();
                     report.tx_len = Some(len);
                 }
             } else {
@@ -161,11 +152,11 @@ impl<D, const RX: usize, const TX: usize> RadioSlot<D, RX, TX> {
         self.tx_queue.len()
     }
 
-    /// Drop queued frames carrying mesh packet `id` (a copy of the packet was heard, or the
-    /// relay was cancelled for another reason). Returns how many frames were removed.
-    pub fn remove_tx(&mut self, id: u32) -> usize {
-        self.tx_queue
-            .remove_where(|f| mesh_header_id_to(f.payload()).is_some_and(|(fid, _)| fid == id))
+    pub fn remove_tx(&mut self, from: u32, id: u32) -> usize {
+        self.tx_queue.remove_where(|f| {
+            mesh_header_id_to(f.payload())
+                .is_some_and(|(fid, _, origin)| fid == id && origin == from)
+        })
     }
 }
 
@@ -173,7 +164,6 @@ impl<D, const RX: usize, const TX: usize> RadioSlot<D, RX, TX>
 where
     D: RadioInterface,
 {
-    /// A frame is being received right now: nothing should be handed to the radio for TX.
     pub fn rx_busy(&mut self) -> Result<bool, RadioError> {
         self.driver.rx_in_progress()
     }
@@ -275,15 +265,13 @@ mod tests {
         slot.enqueue_tx(TxFrame::new(0, &frame_with_id(0x1234)).unwrap())
             .unwrap();
 
-        // The reception just completed: it is returned, the TX waits.
         let report = slot.service(&mut air, true).unwrap();
         assert!(report.rx.is_some());
         assert!(report.tx_deferred_rx_pending);
         assert!(report.tx_len.is_none());
         assert_eq!(slot.driver.sent, 0);
 
-        // The router saw a copy of the same packet and cancels our relay.
-        assert_eq!(slot.remove_tx(0x1234), 1);
+        assert_eq!(slot.remove_tx(0, 0x1234), 1);
         let report = slot.service(&mut air, true).unwrap();
         assert!(report.tx_len.is_none());
         assert_eq!(slot.driver.sent, 0);
@@ -307,8 +295,8 @@ mod tests {
             .unwrap();
         slot.enqueue_tx(TxFrame::new(0, &frame_with_id(3)).unwrap())
             .unwrap();
-        assert_eq!(slot.remove_tx(2), 1);
-        assert_eq!(slot.remove_tx(2), 0);
+        assert_eq!(slot.remove_tx(0, 2), 1);
+        assert_eq!(slot.remove_tx(0, 2), 0);
         assert_eq!(slot.tx_queue_len(), 2);
         let mut air = AirTime::new(EU_868);
         let first = slot.service(&mut air, true).unwrap();
@@ -390,9 +378,7 @@ mod tests {
             },
         );
         let mut air = AirTime::new(EU_868);
-        slot.rx_queue
-            .push(rx_frame(&frame_with_id(0x11)))
-            .unwrap();
+        slot.rx_queue.push(rx_frame(&frame_with_id(0x11))).unwrap();
         slot.enqueue_tx(TxFrame::new(0, &frame_with_id(0x22)).unwrap())
             .unwrap();
 
@@ -403,5 +389,106 @@ mod tests {
         assert_eq!(report.tx_id, Some(0x22));
         assert!(report.tx_len.is_none());
         assert_eq!(slot.driver.sent, 0);
+    }
+    #[test]
+    fn queue_cancellation_does_not_remove_same_id_from_other_originators() {
+        let mut slot = RadioSlot::<MockRadio>::new(
+            0,
+            MockRadio {
+                busy: false,
+                sent: 0,
+                cfg: RadioConfig::eu868_default(),
+                inbox: None,
+            },
+        );
+        for from in [1u32, 2] {
+            let mut frame = frame_with_id(42);
+            frame[4..8].copy_from_slice(&from.to_le_bytes());
+            slot.enqueue_tx(TxFrame::new(0, &frame).unwrap()).unwrap();
+        }
+        assert_eq!(slot.remove_tx(1, 42), 1);
+        assert_eq!(slot.tx_queue_len(), 1);
+        assert_eq!(slot.remove_tx(1, 42), 0);
+        assert_eq!(slot.remove_tx(2, 42), 1);
+    }
+
+    struct FailingRadio {
+        cfg: RadioConfig,
+        resumed: bool,
+        send_ok: bool,
+        fail_resume_once: bool,
+    }
+    impl RadioInterface for FailingRadio {
+        fn radio_id(&self) -> RadioId {
+            0
+        }
+        fn config(&self) -> &RadioConfig {
+            &self.cfg
+        }
+        fn init(&mut self) -> Result<(), RadioError> {
+            Ok(())
+        }
+        fn poll_recv(&mut self) -> Result<Option<RxFrame>, RadioError> {
+            Ok(None)
+        }
+        fn send(&mut self, _: &TxFrame) -> Result<(), RadioError> {
+            if self.send_ok {
+                Ok(())
+            } else {
+                Err(RadioError::Timeout)
+            }
+        }
+        fn start_rx(&mut self) -> Result<(), RadioError> {
+            if self.fail_resume_once {
+                self.fail_resume_once = false;
+                return Err(RadioError::Hardware);
+            }
+            self.resumed = true;
+            Ok(())
+        }
+    }
+    #[test]
+    fn failed_transmission_restores_reception_and_charges_possible_airtime() {
+        let mut slot = RadioSlot::<FailingRadio>::new(
+            0,
+            FailingRadio {
+                cfg: RadioConfig::eu868_default(),
+                resumed: false,
+                send_ok: false,
+                fail_resume_once: false,
+            },
+        );
+        let mut air = AirTime::new(EU_868);
+        slot.enqueue_tx(TxFrame::new(0, &[0; 20]).unwrap()).unwrap();
+        assert!(matches!(
+            slot.service(&mut air, true),
+            Err(RadioError::Timeout)
+        ));
+        assert!(slot.driver.resumed);
+        assert!(air.utilization_tx_percent() > 0.0);
+    }
+    #[test]
+    fn successful_tx_is_reported_when_rx_restart_fails_and_is_retried() {
+        let mut slot = RadioSlot::<FailingRadio>::new(
+            0,
+            FailingRadio {
+                cfg: RadioConfig::eu868_default(),
+                resumed: false,
+                send_ok: true,
+                fail_resume_once: true,
+            },
+        );
+        let mut air = AirTime::new(EU_868);
+        slot.enqueue_tx(TxFrame::new(0, &frame_with_id(42)).unwrap())
+            .unwrap();
+        let report = slot.service(&mut air, true).unwrap();
+        assert_eq!(report.tx_len, Some(20));
+        assert_eq!(report.tx_id, Some(42));
+        assert_eq!(report.rx_restart_error, Some(RadioError::Hardware));
+        assert!(!slot.driver.resumed);
+        let next = slot.service(&mut air, true).unwrap();
+        assert!(slot.driver.resumed);
+        assert!(next.tx_len.is_none());
+        assert!(next.rx_restart_error.is_none());
     }
 }

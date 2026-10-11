@@ -1,5 +1,3 @@
-//! Fixed-position broadcasts: admin cadence and coordinates, no replies to requests.
-
 use mesh_crypto::{encrypt_packet, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_routing::{
@@ -21,8 +19,10 @@ fn admin(router: &mut Router, from: u32, remote_pk: &[u8; 32], msg: &AdminMessag
 }
 
 fn passkey(router: &mut Router, from: u32, remote_pk: &[u8; 32], now: u32) -> [u8; 8] {
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_POSITION);
+    let get = AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_POSITION),
+        ..Default::default()
+    };
     admin(router, from, remote_pk, &get, now);
     assert!(router.admin_state().has_session);
     router.admin_state().session_passkey
@@ -32,9 +32,9 @@ fn passkey(router: &mut Router, from: u32, remote_pk: &[u8; 32], now: u32) -> [u
 fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
     let our = 0xA11C_E001;
     let peer = 0xB22D_E002;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x31; 16]), 1);
-    let (_peer_priv, peer_pub) = generate_keypair(Some(&[0x32; 16]), 2);
-    let (_other_priv, other_pub) = generate_keypair(Some(&[0x33; 16]), 3);
+    let (node_priv, node_pub) = generate_keypair([0x31; 32]);
+    let (_peer_priv, peer_pub) = generate_keypair([0x32; 32]);
+    let (_other_priv, other_pub) = generate_keypair([0x33; 32]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut router = Router::new(our);
     router.load_node_config(&cfg);
@@ -42,26 +42,28 @@ fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
 
     let now = 10_000u32;
     let key = passkey(&mut router, peer, &peer_pub, now);
-    let mut set = AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
-        position_broadcast_secs: POSITION_BROADCAST_SECS_CLIENT + 600,
-        fixed_position: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = key;
+    let set = AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
+            position_broadcast_secs: POSITION_BROADCAST_SECS_CLIENT + 600,
+            fixed_position: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: key,
+    };
     admin(&mut router, peer, &peer_pub, &set, now + 1);
     let _ = router.poll_admin_tx(now + 1);
 
     let key = passkey(&mut router, peer, &peer_pub, now + 2);
-    let mut fix = AdminMessage::default();
-    fix.payload = AdminPayload::SetFixedPosition(WireFixedPosition {
-        latitude_i: 52_520_000,
-        longitude_i: 13_405_000,
-        has_latitude_i: true,
-        has_longitude_i: true,
-    });
-    fix.has_session_passkey = true;
-    fix.session_passkey = key;
+    let fix = AdminMessage {
+        payload: AdminPayload::SetFixedPosition(WireFixedPosition {
+            latitude_i: 52_520_000,
+            longitude_i: 13_405_000,
+            has_latitude_i: true,
+            has_longitude_i: true,
+        }),
+        has_session_passkey: true,
+        session_passkey: key,
+    };
     admin(&mut router, peer, &peer_pub, &fix, now + 3);
 
     let tx = router
@@ -123,10 +125,11 @@ fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
     );
 
     let key = passkey(&mut router, peer, &peer_pub, now + 5);
-    let mut clear = AdminMessage::default();
-    clear.payload = AdminPayload::RemoveFixedPosition;
-    clear.has_session_passkey = true;
-    clear.session_passkey = key;
+    let clear = AdminMessage {
+        payload: AdminPayload::RemoveFixedPosition,
+        has_session_passkey: true,
+        session_passkey: key,
+    };
     admin(&mut router, peer, &peer_pub, &clear, now + 6);
     router.run_maintenance(now + 6 + interval_ms, 100);
     assert!(router.poll_position_tx(now + 6 + interval_ms).is_none());
@@ -137,9 +140,9 @@ fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
 fn no_broadcast_until_fixed_position_is_enabled_and_coordinates_are_set() {
     let our = 0xA11C_E010;
     let peer = 0xB22D_E011;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x41; 16]), 4);
-    let (_peer_priv, peer_pub) = generate_keypair(Some(&[0x42; 16]), 5);
-    let (_other_priv, other_pub) = generate_keypair(Some(&[0x43; 16]), 6);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
+    let (_peer_priv, peer_pub) = generate_keypair([0x42; 32]);
+    let (_other_priv, other_pub) = generate_keypair([0x43; 32]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut router = Router::new(our);
     router.load_node_config(&cfg);
@@ -157,13 +160,14 @@ fn no_broadcast_until_fixed_position_is_enabled_and_coordinates_are_set() {
     );
 
     let key = passkey(&mut router, peer, &peer_pub, now + 1);
-    let mut set = AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
-        position_broadcast_secs: POSITION_BROADCAST_SECS_CLIENT,
-        fixed_position: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = key;
+    let set = AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
+            position_broadcast_secs: POSITION_BROADCAST_SECS_CLIENT,
+            fixed_position: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: key,
+    };
     admin(&mut router, peer, &peer_pub, &set, now + 2);
     router.run_maintenance(now + 2, 100);
     assert!(
@@ -172,25 +176,27 @@ fn no_broadcast_until_fixed_position_is_enabled_and_coordinates_are_set() {
     );
 
     let key = passkey(&mut router, peer, &peer_pub, now + 3);
-    let mut fix = AdminMessage::default();
-    fix.payload = AdminPayload::SetFixedPosition(WireFixedPosition {
-        latitude_i: 52_520_000,
-        longitude_i: 13_405_000,
-        has_latitude_i: true,
-        has_longitude_i: true,
-    });
-    fix.has_session_passkey = true;
-    fix.session_passkey = key;
+    let fix = AdminMessage {
+        payload: AdminPayload::SetFixedPosition(WireFixedPosition {
+            latitude_i: 52_520_000,
+            longitude_i: 13_405_000,
+            has_latitude_i: true,
+            has_longitude_i: true,
+        }),
+        has_session_passkey: true,
+        session_passkey: key,
+    };
     admin(&mut router, peer, &peer_pub, &fix, now + 4);
 
     let key = passkey(&mut router, peer, &peer_pub, now + 5);
-    let mut off = AdminMessage::default();
-    off.payload = AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
-        position_broadcast_secs: POSITION_BROADCAST_SECS_CLIENT,
-        fixed_position: false,
-    }));
-    off.has_session_passkey = true;
-    off.session_passkey = key;
+    let off = AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
+            position_broadcast_secs: POSITION_BROADCAST_SECS_CLIENT,
+            fixed_position: false,
+        })),
+        has_session_passkey: true,
+        session_passkey: key,
+    };
     admin(&mut router, peer, &peer_pub, &off, now + 6);
     assert!(
         router.poll_position_tx(now + 6).is_none(),

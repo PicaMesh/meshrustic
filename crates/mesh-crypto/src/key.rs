@@ -1,8 +1,7 @@
-/// Channel AES key (128- or 256-bit). `length == 0` means no encryption.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CryptoKey {
     pub bytes: [u8; 32],
-    pub length: i8,
+    pub(crate) length: i8,
 }
 
 impl CryptoKey {
@@ -21,6 +20,14 @@ impl CryptoKey {
             key.length = len as i8;
         }
         key
+    }
+
+    pub const fn len(&self) -> usize {
+        self.length as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.length == 0
     }
 
     pub fn is_enabled(&self) -> bool {

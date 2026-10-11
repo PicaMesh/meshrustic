@@ -1,5 +1,3 @@
-//! SX1262 driver — chip-level backend with per-module profiles.
-
 use embassy_nrf::gpio::{Input, Output};
 use embassy_nrf::spim::Spim;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -22,10 +20,8 @@ use sx126x::op::status::ChipMode;
 use sx126x::reg::Register;
 use sx126x::{calc_rf_freq, SX126x};
 
-/// SX1262 high-power PA for up to +22 dBm (Semtech datasheet §13.1.14).
 const SX1262_PA_DUTY_CYCLE: u8 = 0x04;
 const SX1262_PA_HP_MAX: u8 = 0x07;
-/// Over-current protection for SX1262 HP TX (140 mA).
 const SX1262_OCP_140MA: u8 = 0x38;
 
 use super::module_profile::Sx1262ModuleProfile;
@@ -44,9 +40,7 @@ pub struct Sx1262Driver {
     profile: Sx1262ModuleProfile,
     config: RadioConfig,
     chip: RadioChip,
-    /// Result of the boot-time BUSY probe (see [`probe_module_ready`]).
     module_ready: bool,
-    /// When the current reception (preamble/sync/header seen, no RxDone yet) was first noticed.
     rx_active_since: Option<embassy_time::Instant>,
 }
 
@@ -67,19 +61,15 @@ impl Sx1262Driver {
         }
     }
 
-    /// Reception-in-progress flags: the modem has seen a preamble, sync word or header of a
-    /// frame that has not finished yet. Mirrors Meshtastic `isActivelyReceiving`.
     fn irq_rx_active(irq: IrqStatus) -> bool {
         irq.preamble_detected() || irq.syncword_valid() || irq.header_valid()
     }
 
-    /// Longest a genuine reception can stay in progress: preamble plus the largest frame.
     fn max_rx_in_progress(&self) -> embassy_time::Duration {
         let ms = packet_time_ms(&self.config, MAX_LORA_PAYLOAD, true) as u64;
         embassy_time::Duration::from_millis(ms.saturating_mul(2))
     }
 
-    /// Set LoRa modem parameters before [`RadioInterface::init`].
     pub fn set_radio_config(&mut self, config: RadioConfig) {
         self.config = config;
     }
@@ -269,10 +259,6 @@ impl Sx1262Driver {
         Ok(())
     }
 
-    /// Explain why SetRx did not land in RX: chip mode + command status from the status
-    /// byte, plus the SX126x device-error flags. `mode=none` means the status byte was
-    /// not a valid SX126x status at all, which points at MISO/SPI wiring rather than the
-    /// radio; `xosc_start` points at a TCXO/crystal mismatch with the module profile.
     fn log_set_rx_failure(&mut self, status: sx126x::op::status::Status) {
         use core::fmt::Write;
         let mode = match status.chip_mode() {
@@ -321,7 +307,6 @@ impl Sx1262Driver {
         crate::usb_log::log::radio::warn(msg.as_str());
     }
 
-    /// Semtech packet counters — useful to see if the modem sees any RF activity.
     pub fn chip_stats(&mut self) -> Result<(u16, u16, u16), RadioError> {
         self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
         let stats = self.chip.get_stats().map_err(|_| RadioError::Hardware)?;
@@ -393,10 +378,8 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn init(&mut self) -> Result<(), RadioError> {
-        // The sx126x crate busy-waits on BUSY with no timeout. On a module that is
-        // unpowered, unwired or held in reset, BUSY never drops and `chip.init` would
-        // spin forever inside the cooperative executor, starving every other task
-        // (USB CDC included, so the node never even enumerates). Refuse up front.
+        // An absent module can hold BUSY forever; entering the blocking driver then would starve the
+        // executor and prevent USB enumeration.
         if !self.module_ready {
             return Err(RadioError::InitFailed);
         }
@@ -462,9 +445,7 @@ impl RadioInterface for Sx1262Driver {
 
         if !irq.rx_done() {
             if Self::irq_rx_active(irq) {
-                // A frame is arriving: keep the flags so `rx_in_progress` can see them, but
-                // never forever. A false preamble detect or a frame we lost mid-air would
-                // otherwise block our transmitter indefinitely.
+                // A false preamble or lost frame must not block transmission indefinitely.
                 let now = embassy_time::Instant::now();
                 match self.rx_active_since {
                     None => {
@@ -526,7 +507,11 @@ impl RadioInterface for Sx1262Driver {
             .chip
             .write_bytes(
                 frame.payload(),
-                RxTxTimeout::from_ms(5_000),
+                RxTxTimeout::from_ms(
+                    mesh_radio::packet_time_ms(&self.config, frame.len as usize, false)
+                        .saturating_add(2_000)
+                        .min(30_000),
+                ),
                 self.config.preamble_length,
                 LoRaCrcType::CrcOn,
             )
@@ -545,8 +530,6 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn rx_in_progress(&mut self) -> Result<bool, RadioError> {
-        // `poll_recv` runs first in every service pass and leaves the in-progress flags set
-        // (aging them out if they go stale), so a fresh read here is authoritative.
         self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
         let irq = self
             .chip
@@ -561,17 +544,10 @@ impl RadioInterface for Sx1262Driver {
     }
 }
 
-/// Longest we wait for BUSY to drop after releasing NRST. The SX126x datasheet puts the
-/// post-reset BUSY window at a few milliseconds; a healthy module clears it well inside this.
 const BUSY_PROBE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(50);
 
-/// Pulse NRST and wait (bounded) for BUSY to go low.
-///
-/// Returns `false` when the module never signals ready, which means it is unpowered,
-/// not wired (BUSY floats high — the input has no pull), or still held in reset.
 fn probe_module_ready(pins: &mut LoRaPins) -> bool {
     pins.reset.set_low();
-    // 8.1: hold NRST low for at least 100 us.
     embassy_time::block_for(embassy_time::Duration::from_micros(200));
     pins.reset.set_high();
     let deadline = embassy_time::Instant::now() + BUSY_PROBE_TIMEOUT;
@@ -583,7 +559,6 @@ fn probe_module_ready(pins: &mut LoRaPins) -> bool {
     true
 }
 
-/// Build SPI + SX1262 for the Pro Micro DIY pinout.
 pub fn create_radio(
     spim: Spim<'static, embassy_nrf::peripherals::SPI3>,
     cs: Output<'static>,

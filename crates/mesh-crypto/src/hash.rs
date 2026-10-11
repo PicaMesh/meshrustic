@@ -1,12 +1,12 @@
 use sha2::{Digest, Sha256};
 
-/// SHA-256 over the first `input_len` bytes of `data`, writing the digest into `data[..32]`.
-///
-/// Chunked SHA-256 digest into a 32-byte output buffer.
-pub fn sha256_in_place(data: &mut [u8], input_len: usize) {
-    let len = input_len.min(data.len());
-    let digest = Sha256::digest(&data[..len]);
+pub fn sha256_in_place(data: &mut [u8], input_len: usize) -> bool {
+    if data.len() < 32 || input_len > data.len() {
+        return false;
+    }
+    let digest = Sha256::digest(&data[..input_len]);
     data[..32].copy_from_slice(&digest);
+    true
 }
 
 #[cfg(test)]
@@ -36,5 +36,14 @@ mod tests {
             hash,
             hex_to_bytes::<32>("28969cdfa74a12c82f3bad960b0b000aca2ac329deea5c2328ebc6f2ba9802c1")
         );
+    }
+    #[test]
+    fn undersized_digest_output_and_invalid_input_length_are_rejected() {
+        let mut short = [0xaa; 31];
+        assert!(!sha256_in_place(&mut short, 1));
+        assert_eq!(short, [0xaa; 31]);
+        let mut output = [0xaa; 32];
+        assert!(!sha256_in_place(&mut output, 33));
+        assert_eq!(output, [0xaa; 32]);
     }
 }

@@ -1,11 +1,7 @@
-# Used only in CI (explicitly via COMPOSE_FILE), never auto-loaded locally.
-# Swaps the named Docker volumes for bind mounts under ./.ci-cache so that
-# GitHub Actions' actions/cache (or GitLab's `cache:`) can persist the
-# cargo registry/git cache between runs — named Docker volumes don't
-# survive across ephemeral CI runner VMs the way a workspace path does.
+# Ephemeral CI runners need caches on bind mounts so actions/cache can retain them.
 services:
   dev:
     volumes:
       - .:/workspace
-      - ./.ci-cache/cargo-registry:/opt/cargo/registry
-      - ./.ci-cache/cargo-git:/opt/cargo/git
+      - ./.ci-cache/cargo-registry:/workspace/.cargo-home/registry
+      - ./.ci-cache/cargo-git:/workspace/.cargo-home/git

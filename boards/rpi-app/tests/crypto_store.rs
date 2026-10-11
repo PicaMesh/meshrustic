@@ -1,5 +1,3 @@
-//! Golden-vector crypto tests (public wire-format test vectors).
-
 use mesh_crypto::{decrypt_packet, encrypt_packet, CryptoEngine, CryptoKey};
 
 fn hex_bytes(hex: &str) -> Vec<u8> {
@@ -54,7 +52,7 @@ fn store_flash_round_trip() {
     use mesh_store::{decode, encode, generate_keypair, NodeConfig, STORE_RECORD_LEN};
 
     let device_id = [0x01u8; 16];
-    let (priv_key, pub_key) = generate_keypair(Some(&device_id), 0x1234_5678_9ABC_DEF0);
+    let (priv_key, pub_key) = generate_keypair([device_id[0]; 32]);
     let config = NodeConfig::first_boot(0x00A1_00B2, priv_key, pub_key);
 
     let mut buf = [0u8; STORE_RECORD_LEN];

@@ -1,58 +1,17 @@
-//! Flash record layout for NodeConfig (versioned, extensible).
-//!
-//! # Layout map (little-endian, `STORE_RECORD_LEN` = 256)
-//!
-//! | Offset | Len | Status | Content |
-//! |--------|-----|--------|---------|
-//! | 0 | 4 | frozen | Magic `MRST` (`0x4D525354`) |
-//! | 4 | 4 | frozen | `STORE_VERSION` (current = 4) |
-//! | 8 | 4 | frozen | `node_num` |
-//! | 12 | 32 | frozen | `private_key` |
-//! | 44 | 32 | frozen | `public_key` |
-//! | 76 | 1 | frozen | channel key length (0/16/32) |
-//! | 77 | 32 | frozen | channel key bytes |
-//! | 109 | 1 | frozen | region code |
-//! | 110 | 1 | frozen | modem_preset |
-//! | 111 | 4 | frozen | frequency_mhz (`f32`) |
-//! | 115 | 1 | frozen | spreading_factor |
-//! | 116 | 1 | frozen | coding_rate |
-//! | 117 | 1 | frozen | sync_word |
-//! | 118 | 1 | frozen | hop_limit |
-//! | 119 | 1 | frozen | tx_power_dbm |
-//! | 120 | 1 | frozen | use_preset (0/1) |
-//! | 121 | 1 | frozen (v4) | ok_to_mqtt (0/1); records before v4 decode as 1 |
-//! | 122 | 1 | frozen (v4+) | `device_role` (`Config.DeviceConfig.role`); older records are 0 = CLIENT |
-//! | 123 | 1 | reserved | must encode as 0; ignore on decode (future flags) |
-//! | 124 | 96 | frozen | `admin_public_keys[3][32]` |
-//! | 220 | 4 | v4+ | `device_update_interval_secs` (0 = default); was reserved zeros |
-//! | 224 | 4 | v4+ | `position_broadcast_secs` (0 = role default) |
-//! | 228 | 1 | v4+ | `fixed_position` (0/1) |
-//! | 229 | 1 | v4+ | `has_fixed_coords` (0/1) |
-//! | 230 | 4 | v4+ | `latitude_i` (i32 LE, degrees * 1e7) |
-//! | 234 | 4 | v4+ | `longitude_i` (i32 LE, degrees * 1e7) |
-//! | 238 | 14 | reserved | forward-compatible padding — encode 0; do not reinterpret |
-//! | 252 | 4 | frozen | CRC32 over bytes `[0..252)` |
-//!
-//! Additive settings: prefer consuming reserved bytes with a version bump only when
-//! semantics are incompatible. Always migrate older versions into `NodeConfig`.
-
 use crate::config::{LoRaConfig, NodeConfig, ADMIN_KEY_SLOTS};
 use mesh_crypto::CryptoKey;
 use mesh_radio::EU_868;
 
-pub const STORE_MAGIC: u32 = 0x4D52_5354; // "MRST"
-/// Current on-disk version (v3 = v2 field map + documented reserved region / migration).
+pub const STORE_MAGIC: u32 = 0x4D52_5354;
 pub const STORE_VERSION: u32 = 4;
 pub const STORE_VERSION_V1: u32 = 1;
 pub const STORE_VERSION_V2: u32 = 2;
 pub const STORE_VERSION_V3: u32 = 3;
 pub const STORE_RECORD_LEN: usize = 256;
 pub const STORE_RECORD_LEN_V1: usize = 128;
-/// Start of forward-compatible reserved tail (before CRC).
 pub const STORE_RESERVED_START: usize = 238;
 pub const STORE_RESERVED_END: usize = 252;
 pub const STORE_CRC_OFFSET: usize = 252;
-/// Flash offset of `device_update_interval_secs` (u32 LE).
 #[cfg(test)]
 pub const STORE_DEVICE_UPDATE_INTERVAL_OFFSET: usize = 220;
 
@@ -62,14 +21,17 @@ pub enum StoreError {
     BadMagic,
     BadVersion,
     BadCrc,
+    BadConfig,
 }
 
-/// Serialize `NodeConfig` into a fixed-size flash record (current version).
 pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> {
     if out.len() < STORE_RECORD_LEN {
         return Err(StoreError::TooShort);
     }
 
+    if !config.lora.frequency_mhz.is_finite() || config.lora.frequency_mhz <= 0.0 {
+        return Err(StoreError::BadConfig);
+    }
     out.fill(0);
     out[0..4].copy_from_slice(&STORE_MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&STORE_VERSION.to_le_bytes());
@@ -77,7 +39,7 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
     out[12..44].copy_from_slice(&config.private_key);
     out[44..76].copy_from_slice(&config.public_key);
 
-    let key_len = config.channel_key.length.max(0) as u8;
+    let key_len = config.channel_key.len() as u8;
     out[76] = key_len;
     let copy_len = (key_len as usize)
         .min(32)
@@ -96,7 +58,6 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
     out[120] = if lora.use_preset { 1 } else { 0 };
     out[121] = if lora.ok_to_mqtt { 1 } else { 0 };
     out[122] = config.device_role;
-    // 123 reserved (zeros)
 
     for i in 0..ADMIN_KEY_SLOTS {
         let off = 124 + i * 32;
@@ -108,14 +69,12 @@ pub fn encode(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> 
     out[229] = u8::from(config.has_fixed_coords);
     out[230..234].copy_from_slice(&config.latitude_i.to_le_bytes());
     out[234..238].copy_from_slice(&config.longitude_i.to_le_bytes());
-    // 238..252 reserved — left zero for forward compatibility
 
     let crc = crc32(&out[..STORE_CRC_OFFSET]);
     out[STORE_CRC_OFFSET..STORE_RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
     Ok(STORE_RECORD_LEN)
 }
 
-/// Decode a flash record; migrate older versions into the latest `NodeConfig`.
 pub fn decode(buf: &[u8]) -> Result<NodeConfig, StoreError> {
     if buf.len() < STORE_RECORD_LEN_V1 {
         return Err(StoreError::TooShort);
@@ -150,9 +109,12 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
     private_key.copy_from_slice(&buf[12..44]);
     public_key.copy_from_slice(&buf[44..76]);
 
-    let channel_key = decode_channel_key(buf[76], &buf[77..109]);
+    let channel_key = decode_channel_key(buf[76], &buf[77..109])?;
 
     let frequency_mhz = f32::from_le_bytes(buf[111..115].try_into().unwrap());
+    if !frequency_mhz.is_finite() || frequency_mhz <= 0.0 {
+        return Err(StoreError::BadConfig);
+    }
     let lora = LoRaConfig {
         region: EU_868,
         modem_preset: buf[110],
@@ -164,7 +126,6 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
         hop_limit: buf[118],
         tx_power_dbm: buf[119],
         use_preset: buf[120] != 0,
-        // Byte 121 was reserved (zero) before v4; those records get the default.
         ok_to_mqtt: if version >= STORE_VERSION {
             buf[121] != 0
         } else {
@@ -184,7 +145,6 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
     let has_fixed_coords = buf[229] != 0;
     let latitude_i = i32::from_le_bytes(buf[230..234].try_into().unwrap());
     let longitude_i = i32::from_le_bytes(buf[234..238].try_into().unwrap());
-    // Byte 122 was reserved (zero) before role persistence; those records stay CLIENT.
     let device_role = buf[122];
 
     Ok(NodeConfig {
@@ -204,7 +164,6 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
     })
 }
 
-/// Migrate a v1 (128-byte) record: load fields, zero admin keys.
 fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
     if buf.len() < STORE_RECORD_LEN_V1 {
         return Err(StoreError::TooShort);
@@ -221,10 +180,20 @@ fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
     private_key.copy_from_slice(&buf[12..44]);
     public_key.copy_from_slice(&buf[44..76]);
 
-    let channel_key = decode_channel_key(buf[76], &buf[77..109]);
+    let channel_key = {
+        // Legacy v1 radio bytes overwrote part of a 256-bit key; accepting it would silently install a
+        // corrupt channel key.
+        if buf[76] == 32 {
+            return Err(StoreError::BadConfig);
+        }
+        decode_channel_key(buf[76], &buf[77..96])?
+    };
 
     let frequency_mhz = f32::from_le_bytes(buf[98..102].try_into().unwrap());
     let modem_preset = buf[97];
+    if !frequency_mhz.is_finite() || frequency_mhz <= 0.0 {
+        return Err(StoreError::BadConfig);
+    }
     let lora = LoRaConfig {
         region: EU_868,
         modem_preset,
@@ -256,21 +225,21 @@ fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
     })
 }
 
-fn decode_channel_key(key_len: u8, bytes: &[u8]) -> CryptoKey {
-    let mut channel_key = CryptoKey::none();
-    if key_len == 16 && bytes.len() >= 16 {
-        channel_key = CryptoKey::from_bytes(&bytes[..16]);
-    } else if key_len == 32 && bytes.len() >= 32 {
-        channel_key = CryptoKey::from_bytes(&bytes[..32]);
+fn decode_channel_key(key_len: u8, bytes: &[u8]) -> Result<CryptoKey, StoreError> {
+    match key_len {
+        0 => Ok(CryptoKey::none()),
+        16 | 32 if bytes.len() >= key_len as usize => {
+            Ok(CryptoKey::from_bytes(&bytes[..key_len as usize]))
+        }
+        _ => Err(StoreError::BadConfig),
     }
-    channel_key
 }
 
 fn bandwidth_for_preset(modem_preset: u8) -> f32 {
     mesh_radio::modem_preset_params(modem_preset, false).bandwidth_khz
 }
 
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for byte in data {
         crc ^= u32::from(*byte);
@@ -285,7 +254,6 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Encode a legacy v1 record (tests / migration tooling).
 #[cfg(test)]
 fn encode_v1_for_test(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> {
     if out.len() < STORE_RECORD_LEN_V1 {
@@ -297,7 +265,7 @@ fn encode_v1_for_test(config: &NodeConfig, out: &mut [u8]) -> Result<usize, Stor
     out[8..12].copy_from_slice(&config.node_num.to_le_bytes());
     out[12..44].copy_from_slice(&config.private_key);
     out[44..76].copy_from_slice(&config.public_key);
-    let key_len = config.channel_key.length.max(0) as u8;
+    let key_len = config.channel_key.len() as u8;
     out[76] = key_len;
     let copy_len = (key_len as usize).min(32);
     out[77..77 + copy_len].copy_from_slice(&config.channel_key.bytes[..copy_len]);
@@ -315,7 +283,6 @@ fn encode_v1_for_test(config: &NodeConfig, out: &mut [u8]) -> Result<usize, Stor
     Ok(STORE_RECORD_LEN_V1)
 }
 
-/// Encode a v2 record (same field map as v3) for migration tests.
 #[cfg(test)]
 fn encode_v2_for_test(config: &NodeConfig, out: &mut [u8]) -> Result<usize, StoreError> {
     encode(config, out)?;
@@ -335,7 +302,7 @@ mod tests {
 
     #[test]
     fn ok_to_mqtt_off_survives_round_trip() {
-        let (priv_key, pub_key) = generate_keypair(Some(&[0x5Au8; 16]), 7);
+        let (priv_key, pub_key) = generate_keypair([0x5Au8; 32]);
         let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
         assert!(config.lora.ok_to_mqtt, "on by default");
         config.lora.ok_to_mqtt = false;
@@ -347,12 +314,11 @@ mod tests {
 
     #[test]
     fn v3_record_migrates_with_ok_to_mqtt_on() {
-        let (priv_key, pub_key) = generate_keypair(Some(&[0x5Bu8; 16]), 8);
+        let (priv_key, pub_key) = generate_keypair([0x5Bu8; 32]);
         let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
         config.lora.ok_to_mqtt = false;
         let mut buf = [0u8; STORE_RECORD_LEN];
         encode(&config, &mut buf).unwrap();
-        // A v3 record: same layout, byte 121 reserved as zero.
         buf[4..8].copy_from_slice(&STORE_VERSION_V3.to_le_bytes());
         buf[121] = 0;
         let crc = crc32(&buf[..STORE_CRC_OFFSET]);
@@ -371,7 +337,7 @@ mod tests {
     #[test]
     fn flash_round_trip_v3() {
         let device_id = [0xAAu8; 16];
-        let (priv_key, pub_key) = generate_keypair(Some(&device_id), 42);
+        let (priv_key, pub_key) = generate_keypair([device_id[0]; 32]);
         let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
         config.admin_public_keys[0] = [0x11; 32];
         config.admin_public_keys[2] = [0x33; 32];
@@ -392,7 +358,7 @@ mod tests {
         assert_eq!(decoded.public_key, pub_key);
         assert_eq!(decoded.lora.modem_preset, MODEM_SHORT_FAST);
         assert!(decoded.lora.use_preset);
-        assert_eq!(decoded.channel_key.length, 16);
+        assert_eq!(decoded.channel_key.len(), 16);
         assert_eq!(decoded.admin_public_keys[0], [0x11; 32]);
         assert_eq!(decoded.admin_public_keys[1], [0u8; 32]);
         assert_eq!(decoded.admin_public_keys[2], [0x33; 32]);
@@ -418,7 +384,7 @@ mod tests {
     #[test]
     fn device_role_survives_round_trip() {
         let mut config = NodeConfig::first_boot(1, [1; 32], [2; 32]);
-        config.device_role = 2; // ROUTER
+        config.device_role = 2;
         let mut buf = [0u8; STORE_RECORD_LEN];
         encode(&config, &mut buf).unwrap();
         assert_eq!(buf[122], 2);
@@ -557,5 +523,16 @@ mod tests {
         assert!(buf[STORE_RESERVED_START..STORE_RESERVED_END]
             .iter()
             .all(|&b| b == 0));
+    }
+
+    #[test]
+    fn invalid_stored_key_length_is_not_downgraded_to_plaintext() {
+        let config = NodeConfig::first_boot(1, [0; 32], [0; 32]);
+        let mut wire = [0; STORE_RECORD_LEN];
+        encode(&config, &mut wire).unwrap();
+        wire[76] = 17;
+        let crc = crc32(&wire[..STORE_CRC_OFFSET]);
+        wire[STORE_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode(&wire), Err(StoreError::BadConfig));
     }
 }

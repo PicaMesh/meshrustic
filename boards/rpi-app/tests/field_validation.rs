@@ -1,5 +1,3 @@
-//! Field-validation benches on host — traceroute chain + 3-node SR line.
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_radio::MODEM_SHORT_SLOW;
@@ -133,7 +131,7 @@ fn field_three_node_sr_learns_remote_route() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 2, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
 
     let result = graph_a.merge_topology(B, &header, &[remote], true, 100, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));

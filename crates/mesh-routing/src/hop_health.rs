@@ -1,8 +1,4 @@
-//! Next-hop health for named unicast forwards: remember hops that stay silent.
-
-/// Consecutive misses before a hop is treated as suspect.
 pub const HOP_HEALTH_SUSPECT_MISSES: u8 = 2;
-/// An entry, suspect or not, expires this many milliseconds after its last miss.
 pub const HOP_HEALTH_SUSPECT_TTL_MS: u32 = 10 * 60 * 1000;
 const MAX_HOP_HEALTH: usize = 8;
 
@@ -43,7 +39,6 @@ pub enum HopHealthEvent {
     },
 }
 
-/// Small RAM table keyed by `(destination, next hop)`. Nothing is persisted.
 pub struct HopHealth {
     entries: [HopHealthEntry; MAX_HOP_HEALTH],
 }
@@ -62,12 +57,11 @@ impl HopHealth {
     }
 
     fn find(&self, destination: u32, next_hop: u32) -> Option<usize> {
-        self.entries.iter().position(|e| {
-            e.is_occupied() && e.destination == destination && e.next_hop == next_hop
-        })
+        self.entries
+            .iter()
+            .position(|e| e.is_occupied() && e.destination == destination && e.next_hop == next_hop)
     }
 
-    /// The live entry for the pair, after dropping it when its last miss is older than the TTL.
     fn find_live(&mut self, destination: u32, next_hop: u32, now_ms: u32) -> Option<usize> {
         let idx = self.find(destination, next_hop)?;
         if now_ms.wrapping_sub(self.entries[idx].last_miss_ms) >= HOP_HEALTH_SUSPECT_TTL_MS {
@@ -77,7 +71,6 @@ impl HopHealth {
         Some(idx)
     }
 
-    /// True when `(destination, next_hop)` has reached the suspect threshold and has not expired.
     pub fn is_suspect(&mut self, destination: u32, next_hop: u32, now_ms: u32) -> bool {
         if destination == 0 || next_hop == 0 {
             return false;
@@ -86,13 +79,7 @@ impl HopHealth {
             .is_some_and(|idx| self.entries[idx].consecutive_misses >= HOP_HEALTH_SUSPECT_MISSES)
     }
 
-    /// Record that a named follow-up expired without hearing the nominated hop.
-    pub fn record_miss(
-        &mut self,
-        destination: u32,
-        next_hop: u32,
-        now_ms: u32,
-    ) -> HopHealthEvent {
+    pub fn record_miss(&mut self, destination: u32, next_hop: u32, now_ms: u32) -> HopHealthEvent {
         if destination == 0 || next_hop == 0 {
             return HopHealthEvent::None;
         }
@@ -114,7 +101,6 @@ impl HopHealth {
             .iter()
             .position(|e| !e.is_occupied())
             .unwrap_or_else(|| {
-                // Evict the oldest (earliest last_miss_ms, wrapping-aware via age).
                 let mut best = 0usize;
                 let mut best_age = 0u32;
                 for (i, e) in self.entries.iter().enumerate() {
@@ -135,7 +121,6 @@ impl HopHealth {
         HopHealthEvent::None
     }
 
-    /// Record that the nominated hop carried the packet, or the destination answered.
     pub fn record_success(&mut self, destination: u32, next_hop: u32) -> HopHealthEvent {
         if destination == 0 || next_hop == 0 {
             return HopHealthEvent::None;
@@ -187,7 +172,6 @@ mod tests {
         let _ = h.record_miss(dest, hop, 10);
         let _ = h.record_miss(dest, hop, 20);
         assert!(h.is_suspect(dest, hop, 30));
-        // Neutral: no API call for a foreign copy; state unchanged.
         assert!(h.is_suspect(dest, hop, 40));
         assert_eq!(
             h.record_success(dest, hop),
@@ -217,7 +201,6 @@ mod tests {
             h.record_miss(dest, hop, t),
             HopHealthEvent::BecameSuspect { misses: 2, .. }
         ));
-        // After expiry a suspect pair starts over and reports when it becomes suspect again.
         let later = t + HOP_HEALTH_SUSPECT_TTL_MS;
         assert!(!h.is_suspect(dest, hop, later));
         assert_eq!(h.record_miss(dest, hop, later), HopHealthEvent::None);

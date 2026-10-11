@@ -1,5 +1,3 @@
-//! Device telemetry wire-format tests (port 67).
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::PacketHeader;
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
@@ -102,9 +100,6 @@ fn router_schedules_periodic_device_telemetry() {
     assert_eq!(decoded.battery_level, Some(MAGIC_USB_BATTERY_LEVEL));
     assert!((decoded.voltage_v.unwrap()).abs() < 0.001);
 }
-
-/// A node whose ADC gives no usable pack reading must still broadcast the rest of the
-/// device metrics; only the two battery fields drop off the wire.
 #[test]
 fn telemetry_without_battery_still_carries_utilization() {
     static ROUTER: StaticCell<Router> = StaticCell::new();

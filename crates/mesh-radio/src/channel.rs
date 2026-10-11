@@ -1,10 +1,7 @@
-//! Primary channel hash from stored name and modem preset.
-
 use mesh_crypto::channel_hash;
 
 use crate::config::modem_preset_channel_name;
 
-/// Primary channel hash: xor(name) ^ xor(PSK), with empty name → preset display name.
 pub fn primary_channel_hash(
     stored_name: &str,
     modem_preset: u8,

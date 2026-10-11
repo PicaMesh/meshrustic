@@ -1,5 +1,3 @@
-//! Remote admin handler (ADMIN_APP): ACL, session passkey, get/set LoRa + Security + Device role.
-
 use mesh_crypto::sha256_in_place;
 use mesh_store::{NodeConfig, ADMIN_KEY_SLOTS, BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_ADMIN_KEY};
 
@@ -20,11 +18,8 @@ use crate::telemetry::min_device_update_interval_secs;
 use mesh_crypto::DEFAULT_PSK;
 use mesh_radio::eu868_config_for_preset;
 
-/// Session passkey validity window (ms).
 pub const ADMIN_SESSION_TTL_MS: u32 = 300_000;
 
-/// Default delay (seconds) when a client sends `reboot_seconds` without a value
-/// (kept for wire compatibility; LoRa preset apply uses soft radio reinit, not reboot).
 pub const ADMIN_PRESET_REBOOT_SECS: i32 = 2;
 
 pub const ROUTING_ERROR_BAD_REQUEST: u32 = 32;
@@ -53,20 +48,15 @@ pub struct AdminState {
     pub hop_limit: u8,
     pub tx_power_dbm: u8,
     pub ok_to_mqtt: bool,
-    /// Stored `device_update_interval` seconds; 0 = firmware default.
     pub device_update_interval_secs: u32,
-    /// Configured device role; mirrored into the graph and nodeinfo advert.
     pub device_role: u32,
-    /// Stored `position_broadcast_secs`. Zero means the role default.
     pub position_broadcast_secs: u32,
-    /// `Config.PositionConfig.fixed_position`. Broadcasts require this and coordinates.
     pub fixed_position: bool,
     pub latitude_i: i32,
     pub longitude_i: i32,
     pub has_fixed_coords: bool,
     pub pending_reboot_seconds: Option<i32>,
     pub config_dirty: bool,
-    /// Host/test only: replace Appendix A builtins for real PKI keypairs.
     #[cfg(any(test, feature = "std"))]
     builtin_override: Option<[[u8; 32]; 2]>,
 }
@@ -78,7 +68,6 @@ impl Default for AdminState {
 }
 
 impl AdminState {
-    /// Fresh admin state (const, so a `Router` can live in a const static).
     pub const fn new() -> Self {
         Self {
             session_passkey: [0; SESSION_PASSKEY_LEN],
@@ -121,7 +110,6 @@ impl AdminState {
         s
     }
 
-    /// Single import path: flash/`NodeConfig` → admin runtime state.
     pub fn import_node_config(&mut self, cfg: &NodeConfig) {
         self.admin_public_keys = cfg.admin_public_keys;
         self.private_key = cfg.private_key;
@@ -140,12 +128,6 @@ impl AdminState {
         self.has_fixed_coords = cfg.has_fixed_coords;
     }
 
-    /// Deprecated name kept as alias for call sites.
-    pub fn apply_node_config(&mut self, cfg: &NodeConfig) {
-        self.import_node_config(cfg);
-    }
-
-    /// Single export path: admin runtime → `NodeConfig` sections (keys + LoRa + role).
     pub fn export_to_node_config(&self, cfg: &mut NodeConfig) {
         cfg.admin_public_keys = self.admin_public_keys;
         cfg.lora.apply_modem_preset(self.modem_preset);
@@ -156,7 +138,7 @@ impl AdminState {
         cfg.private_key = self.private_key;
         cfg.public_key = self.public_key;
         cfg.device_update_interval_secs = self.device_update_interval_secs;
-        cfg.device_role = sanitize_device_role(self.device_role).min(u32::from(u8::MAX)) as u8;
+        cfg.device_role = sanitize_device_role(self.device_role) as u8;
         cfg.position_broadcast_secs = self.position_broadcast_secs;
         cfg.fixed_position = self.fixed_position;
         cfg.latitude_i = self.latitude_i;
@@ -164,15 +146,12 @@ impl AdminState {
         cfg.has_fixed_coords = self.has_fixed_coords;
     }
 
-    /// True only when fixed position is enabled and a non-zero lat/lon pair is stored.
-    /// Either missing means no broadcast: the flag alone, or coordinates alone, is not enough.
     pub fn broadcasts_fixed_position(&self) -> bool {
         self.fixed_position
             && self.has_fixed_coords
             && !(self.latitude_i == 0 && self.longitude_i == 0)
     }
 
-    /// Raise a stored interval after a role change. Returns whether the stored value moved.
     pub fn coerce_position_interval(&mut self) -> bool {
         let next = coerce_position_broadcast_secs(self.position_broadcast_secs, self.device_role);
         if next == self.position_broadcast_secs {
@@ -182,11 +161,6 @@ impl AdminState {
         true
     }
 
-    pub fn export_admin_keys_and_lora(&self, cfg: &mut NodeConfig) {
-        self.export_to_node_config(cfg);
-    }
-
-    /// Effective built-in admin public keys (Appendix A, or host/test override).
     pub fn effective_builtin_admin_keys(&self) -> [[u8; 32]; 2] {
         #[cfg(any(test, feature = "std"))]
         if let Some(keys) = self.builtin_override {
@@ -195,9 +169,6 @@ impl AdminState {
         BUILTIN_ADMIN_PUBLIC_KEYS
     }
 
-    /// Host/unit-test only: authorize generated keypairs as the two builtins.
-    ///
-    /// Firmware builds without `std` never compile this; production always uses Appendix A.
     #[cfg(any(test, feature = "std"))]
     pub fn set_builtin_admin_public_keys_for_test(&mut self, keys: [[u8; 32]; 2]) {
         self.builtin_override = Some(keys);
@@ -227,7 +198,6 @@ impl AdminState {
     }
 
     fn issue_session(&mut self, now_ms: u32) -> [u8; SESSION_PASSKEY_LEN] {
-        // Mix node private key (secret) + counter + time; do not derive from public material alone.
         let mut material = [0u8; 64];
         material[..32].copy_from_slice(&self.private_key);
         material[32..36].copy_from_slice(&now_ms.to_le_bytes());
@@ -248,9 +218,7 @@ impl AdminState {
         if !self.has_session || !msg.has_session_passkey {
             return false;
         }
-        if now_ms.wrapping_sub(self.session_valid_until_ms) < 0x8000_0000
-            && now_ms > self.session_valid_until_ms
-        {
+        if now_ms.wrapping_sub(self.session_valid_until_ms) < 0x8000_0000 {
             return false;
         }
         msg.session_passkey == self.session_passkey
@@ -261,20 +229,14 @@ impl AdminState {
 pub struct AdminOutcome {
     pub response: Option<AdminMessage>,
     pub routing_error: Option<u32>,
-    /// Mutating ops succeeded: router replies with ROUTING_APP error=NONE
-    /// (wire clients treat that as set/commit completion; WantAck alone is insufficient).
     pub routing_ok: bool,
-    /// Modem preset changed and should be applied to Router / radio.
     pub apply_modem_preset: Option<u8>,
-    /// Device role changed and should be applied to the graph and nodeinfo advert.
     pub apply_device_role: Option<u32>,
     pub config_dirty: bool,
     pub reboot_seconds: Option<i32>,
-    /// `set_fixed_position` landed: send one broadcast now, then follow the cadence.
     pub broadcast_position: bool,
 }
 
-/// True for admin GET-style ops that may be safely re-run on WantAck dupe retries.
 pub fn admin_request_is_idempotent_read(payload: &AdminPayload) -> bool {
     matches!(
         payload,
@@ -286,7 +248,6 @@ pub fn admin_request_is_idempotent_read(payload: &AdminPayload) -> bool {
     )
 }
 
-/// Handle a decoded AdminMessage from an authorized-or-not remote peer.
 pub fn handle_admin(
     state: &mut AdminState,
     remote_pk: &[u8; 32],
@@ -403,45 +364,51 @@ pub fn handle_admin(
                 outcome.routing_error = Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY);
                 return outcome;
             }
+            let mut candidate = *state;
             let mut preset_changed = None;
-            if let Some(lora) = state.buffered_lora.take() {
-                match apply_lora_to_state(state, &lora) {
+            if let Some(lora) = candidate.buffered_lora.take() {
+                match apply_lora_to_state(&mut candidate, &lora) {
                     Ok(p) => {
                         preset_changed = Some(p);
                         outcome.config_dirty = true;
                     }
                     Err(()) => {
-                        outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
-                        return outcome;
+                        return AdminOutcome {
+                            routing_error: Some(ROUTING_ERROR_BAD_REQUEST),
+                            ..AdminOutcome::default()
+                        };
                     }
                 }
             }
-            if let Some(keys) = state.buffered_admin_keys.take() {
-                state.admin_public_keys = keys;
+            if let Some(keys) = candidate.buffered_admin_keys.take() {
+                candidate.admin_public_keys = keys;
                 outcome.config_dirty = true;
             }
-            if let Some(secs) = state.buffered_device_update_interval_secs.take() {
-                match apply_device_update_interval(state, secs) {
+            if let Some(secs) = candidate.buffered_device_update_interval_secs.take() {
+                match apply_device_update_interval(&mut candidate, secs) {
                     Ok(()) => outcome.config_dirty = true,
                     Err(()) => {
-                        outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
-                        return outcome;
+                        return AdminOutcome {
+                            routing_error: Some(ROUTING_ERROR_BAD_REQUEST),
+                            ..AdminOutcome::default()
+                        };
                     }
                 }
             }
-            if let Some(role) = state.buffered_device_role.take() {
-                state.device_role = role;
+            if let Some(role) = candidate.buffered_device_role.take() {
+                candidate.device_role = role;
                 outcome.apply_device_role = Some(role);
                 outcome.config_dirty = true;
             }
-            if let Some(pos) = state.buffered_position.take() {
-                apply_position_config(state, &pos);
+            if let Some(pos) = candidate.buffered_position.take() {
+                apply_position_config(&mut candidate, &pos);
                 outcome.config_dirty = true;
             }
-            state.editing = false;
+            candidate.editing = false;
             outcome.apply_modem_preset = preset_changed;
-            // Soft radio reinit on the board — avoid sys_reset (UF2 boards enter upload mode).
-            state.config_dirty |= outcome.config_dirty;
+            // A software reset would enter UF2 upload mode instead of applying modem settings.
+            candidate.config_dirty |= outcome.config_dirty;
+            *state = candidate;
             outcome.routing_ok = true;
         }
         AdminPayload::SetConfig(config) => {
@@ -463,7 +430,6 @@ pub fn handle_admin(
                                 outcome.apply_modem_preset = Some(p);
                                 outcome.config_dirty = true;
                                 state.config_dirty = true;
-                                // Soft radio reinit on the board — avoid sys_reset (UF2 upload mode).
                             }
                             Err(()) => {
                                 outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
@@ -473,8 +439,6 @@ pub fn handle_admin(
                     }
                 }
                 ConfigPayload::Security(sec) => {
-                    // Apply flash admin_key slots only — ignore identity key fields on set.
-                    // Empty keys are dropped. No reboot required for admin_key-only updates.
                     let keys = security_keys_from_wire(&sec);
                     if state.editing {
                         state.buffered_admin_keys = Some(keys);
@@ -554,9 +518,10 @@ pub fn handle_admin(
                 outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
                 return outcome;
             }
-            // Stock treats 0,0 as "no position" and skips the send. Reject it so the
-            // set does not look successful while nothing is ever broadcast.
-            if pos.latitude_i == 0 && pos.longitude_i == 0 {
+            if (pos.latitude_i == 0 && pos.longitude_i == 0)
+                || !(-900_000_000..=900_000_000).contains(&pos.latitude_i)
+                || !(-1_800_000_000..=1_800_000_000).contains(&pos.longitude_i)
+            {
                 outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
                 return outcome;
             }
@@ -591,9 +556,7 @@ pub fn handle_admin(
             outcome.reboot_seconds = Some(secs);
             outcome.routing_ok = true;
         }
-        _ => {
-            // Unknown / response-only variants: ignore without mutating.
-        }
+        _ => {}
     }
 
     outcome
@@ -601,7 +564,6 @@ pub fn handle_admin(
 
 fn channel_for_request(index_plus_one: u32, channel_psk: &[u8], channel_hash: u8) -> WireChannel {
     if index_plus_one == 0 {
-        // Invalid / unset — treat as disabled index 0.
         return WireChannel {
             index: 0,
             role: CHANNEL_ROLE_DISABLED,
@@ -622,7 +584,6 @@ fn channel_for_request(index_plus_one: u32, channel_psk: &[u8], channel_hash: u8
         }
         settings.id = channel_hash as u32;
         settings.has_id = true;
-        // Empty name: hash path uses modem preset display name when use_preset.
         WireChannel {
             index: 0,
             role: CHANNEL_ROLE_PRIMARY,
@@ -653,7 +614,6 @@ fn security_get(state: &AdminState) -> WireSecurityConfig {
     if has_private_key {
         sec.private_key = state.private_key;
     }
-    // Configurable slots only — never inject built-ins.
     let mut count = 0u8;
     for slot in &state.admin_public_keys {
         if slot != &EMPTY_ADMIN_KEY && (count as usize) < MAX_ADMIN_KEYS {
@@ -675,7 +635,6 @@ fn security_keys_from_wire(sec: &WireSecurityConfig) -> [[u8; 32]; ADMIN_KEY_SLO
     let mut out = 0usize;
     for i in 0..n {
         let k = sec.admin_keys[i];
-        // Skip empty slots; keep only non-zero 32-byte keys (wire length already gated).
         if k == EMPTY_ADMIN_KEY {
             continue;
         }
@@ -689,17 +648,26 @@ fn security_keys_from_wire(sec: &WireSecurityConfig) -> [[u8; 32]; ADMIN_KEY_SLO
 }
 
 fn lora_region_accepted(lora: &WireLoRaConfig) -> bool {
-    lora.region == 0 || lora.region == REGION_EU_868
+    lora.use_preset
+        && (lora.region == 0 || lora.region == REGION_EU_868)
+        && matches!(lora.modem_preset, 0 | 1 | 3..=9)
+        && lora.hop_limit <= 7
+        && (0..=27).contains(&lora.tx_power)
 }
 
 fn apply_lora_to_state(state: &mut AdminState, lora: &WireLoRaConfig) -> Result<u8, ()> {
-    // v1: only EU_868; reject other regions (caller must not success-ACK).
     if !lora_region_accepted(lora) {
         return Err(());
     }
     let preset = lora.modem_preset as u8;
     state.modem_preset = preset;
     state.use_preset = true;
+    state.hop_limit = lora.hop_limit as u8;
+    state.tx_power_dbm = if lora.tx_power == 0 {
+        27
+    } else {
+        lora.tx_power as u8
+    };
     state.ok_to_mqtt = lora.config_ok_to_mqtt;
     Ok(preset)
 }
@@ -721,12 +689,10 @@ fn apply_device_update_interval(state: &mut AdminState, secs: u32) -> Result<(),
     Ok(())
 }
 
-/// Encode admin response payload bytes.
 pub fn encode_admin_response(msg: &AdminMessage) -> heapless::Vec<u8, 240> {
     encode_admin_message(msg)
 }
 
-/// Re-encode get_owner_response with the correct node id string.
 pub fn encode_owner_response(
     node_num: u32,
     identity: &NodeInfoIdentity,
@@ -759,8 +725,6 @@ fn push_varint_local(out: &mut heapless::Vec<u8, 240>, mut v: u32) {
     }
 }
 
-fn _keep_unused() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,8 +738,10 @@ mod tests {
 
     #[test]
     fn unauthorized_cannot_set() {
-        let mut state = AdminState::default();
-        state.public_key = [0x55; 32];
+        let mut state = AdminState {
+            public_key: [0x55; 32],
+            ..Default::default()
+        };
         let passkey = state.issue_session(1_000);
         let lora = WireLoRaConfig {
             use_preset: true,
@@ -785,10 +751,11 @@ mod tests {
             tx_power: 27,
             config_ok_to_mqtt: true,
         };
-        let mut msg = AdminMessage::default();
-        msg.payload = AdminPayload::SetConfig(ConfigPayload::Lora(lora));
-        msg.has_session_passkey = true;
-        msg.session_passkey = passkey;
+        let msg = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Lora(lora)),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let bytes = encode_admin_message(&msg);
         let outcome = handle_admin(
             &mut state,
@@ -810,12 +777,16 @@ mod tests {
 
     #[test]
     fn builtin_can_get_set_lora_and_security() {
-        let mut state = AdminState::default();
-        state.public_key = [0x55; 32];
+        let mut state = AdminState {
+            public_key: [0x55; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
 
-        let mut get = AdminMessage::default();
-        get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+        let get = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+            ..Default::default()
+        };
         let get_bytes = encode_admin_message(&get);
         let out = handle_admin(
             &mut state,
@@ -831,17 +802,18 @@ mod tests {
         let resp = out.response.unwrap();
         assert!(resp.has_session_passkey);
 
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-            use_preset: true,
-            modem_preset: mesh_radio::MODEM_SHORT_FAST as u32,
-            region: REGION_EU_868,
-            hop_limit: 3,
-            tx_power: 27,
-            config_ok_to_mqtt: true,
-        }));
-        set.has_session_passkey = true;
-        set.session_passkey = resp.session_passkey;
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+                use_preset: true,
+                modem_preset: mesh_radio::MODEM_SHORT_FAST as u32,
+                region: REGION_EU_868,
+                hop_limit: 3,
+                tx_power: 27,
+                config_ok_to_mqtt: true,
+            })),
+            has_session_passkey: true,
+            session_passkey: resp.session_passkey,
+        };
         let set_bytes = encode_admin_message(&set);
         let out2 = handle_admin(
             &mut state,
@@ -859,9 +831,10 @@ mod tests {
         assert!(out2.routing_ok);
         assert!(out2.response.is_none());
 
-        // Security get must not contain builtins.
-        let mut sget = AdminMessage::default();
-        sget.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
+        let sget = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY),
+            ..Default::default()
+        };
         let sget_bytes = encode_admin_message(&sget);
         let sout = handle_admin(
             &mut state,
@@ -887,22 +860,25 @@ mod tests {
 
     #[test]
     fn rejected_region_does_not_ack() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
-        state.public_key = [0x55; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            public_key: [0x55; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
         let passkey = state.issue_session(9_000);
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-            use_preset: true,
-            modem_preset: mesh_radio::MODEM_SHORT_FAST as u32,
-            region: 1, // US — not EU_868
-            hop_limit: 3,
-            tx_power: 27,
-            config_ok_to_mqtt: true,
-        }));
-        set.has_session_passkey = true;
-        set.session_passkey = passkey;
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+                use_preset: true,
+                modem_preset: mesh_radio::MODEM_SHORT_FAST as u32,
+                region: 1,
+                hop_limit: 3,
+                tx_power: 27,
+                config_ok_to_mqtt: true,
+            })),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let bytes = encode_admin_message(&set);
         let out = handle_admin(
             &mut state,
@@ -922,26 +898,30 @@ mod tests {
 
     #[test]
     fn session_passkey_not_public_time_xor() {
-        let mut state = AdminState::default();
-        state.private_key = [0x99; 32];
-        state.public_key = [0x11; 32];
+        let mut state = AdminState {
+            private_key: [0x99; 32],
+            public_key: [0x11; 32],
+            ..Default::default()
+        };
         let pk = state.issue_session(0x1234_5678);
-        // Old weak recipe put now_ms in the first 4 bytes — must not.
         assert_ne!(&pk[0..4], &0x1234_5678u32.to_le_bytes());
         let pk2 = state.issue_session(0x1234_5678);
-        assert_ne!(pk, pk2); // counter advances
+        assert_ne!(pk, pk2);
     }
 
     #[test]
     fn bad_session_rejects_set() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[1];
         state.issue_session(5_000);
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig::default()));
-        set.has_session_passkey = true;
-        set.session_passkey = [0xFF; 8];
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig::default())),
+            has_session_passkey: true,
+            session_passkey: [0xFF; 8],
+        };
         let bytes = encode_admin_message(&set);
         let out = handle_admin(
             &mut state,
@@ -960,21 +940,24 @@ mod tests {
 
     #[test]
     fn lora_set_does_not_schedule_reboot() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
         let passkey = state.issue_session(1_000);
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-            use_preset: true,
-            modem_preset: mesh_radio::MODEM_SHORT_FAST as u32,
-            region: REGION_EU_868,
-            hop_limit: 3,
-            tx_power: 27,
-            config_ok_to_mqtt: true,
-        }));
-        set.has_session_passkey = true;
-        set.session_passkey = passkey;
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+                use_preset: true,
+                modem_preset: mesh_radio::MODEM_SHORT_FAST as u32,
+                region: REGION_EU_868,
+                hop_limit: 3,
+                tx_power: 27,
+                config_ok_to_mqtt: true,
+            })),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let out = handle_admin(
             &mut state,
             &remote,
@@ -997,13 +980,17 @@ mod tests {
 
     #[test]
     fn get_channel_primary_and_disabled() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
-        state.public_key = [0x55; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            public_key: [0x55; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
 
-        let mut get = AdminMessage::default();
-        get.payload = AdminPayload::GetChannelRequest(1);
+        let get = AdminMessage {
+            payload: AdminPayload::GetChannelRequest(1),
+            ..Default::default()
+        };
         let out = handle_admin(
             &mut state,
             &remote,
@@ -1028,8 +1015,10 @@ mod tests {
             other => panic!("{:?}", other),
         }
 
-        let mut get2 = AdminMessage::default();
-        get2.payload = AdminPayload::GetChannelRequest(2);
+        let get2 = AdminMessage {
+            payload: AdminPayload::GetChannelRequest(2),
+            ..Default::default()
+        };
         let out2 = handle_admin(
             &mut state,
             &remote,
@@ -1052,16 +1041,17 @@ mod tests {
 
     #[test]
     fn get_device_and_module_config_reply() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
-        // The reply reports the role this node is actually running, which lives in the persisted
-        // state — not the value a caller happens to pass in. Set it the way a restored config
-        // would, or the GET below can only ever see the CLIENT default.
-        state.device_role = DEVICE_ROLE_ROUTER;
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            device_role: DEVICE_ROLE_ROUTER,
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
 
-        let mut get = AdminMessage::default();
-        get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE);
+        let get = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE),
+            ..Default::default()
+        };
         let out = handle_admin(
             &mut state,
             &remote,
@@ -1080,8 +1070,10 @@ mod tests {
             other => panic!("{:?}", other),
         }
 
-        let mut modreq = AdminMessage::default();
-        modreq.payload = AdminPayload::GetModuleConfigRequest(0);
+        let modreq = AdminMessage {
+            payload: AdminPayload::GetModuleConfigRequest(0),
+            ..Default::default()
+        };
         let mout = handle_admin(
             &mut state,
             &remote,
@@ -1101,13 +1093,17 @@ mod tests {
 
     #[test]
     fn security_get_includes_identity_keys_set_ignores_them() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
-        state.public_key = [0x55; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            public_key: [0x55; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
 
-        let mut sget = AdminMessage::default();
-        sget.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
+        let sget = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY),
+            ..Default::default()
+        };
         let sout = handle_admin(
             &mut state,
             &remote,
@@ -1130,17 +1126,20 @@ mod tests {
         }
         let passkey = get_resp.session_passkey;
 
-        let mut sec = WireSecurityConfig::default();
-        sec.has_public_key = true;
-        sec.public_key = [0xDE; 32];
-        sec.has_private_key = true;
-        sec.private_key = [0xAD; 32];
+        let mut sec = WireSecurityConfig {
+            has_public_key: true,
+            public_key: [0xDE; 32],
+            has_private_key: true,
+            private_key: [0xAD; 32],
+            ..Default::default()
+        };
         sec.admin_keys[0] = [0x11; 32];
         sec.admin_key_count = 1;
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Security(sec));
-        set.has_session_passkey = true;
-        set.session_passkey = passkey;
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Security(sec)),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let out = handle_admin(
             &mut state,
             &remote,
@@ -1157,24 +1156,26 @@ mod tests {
         assert_eq!(state.public_key, [0x55; 32]);
         assert_eq!(state.private_key, [0x42; 32]);
         assert_eq!(state.admin_public_keys[0], [0x11; 32]);
-        // admin_key-only Security set does not require reboot.
         assert!(out.reboot_seconds.is_none());
         assert!(state.pending_reboot_seconds.is_none());
     }
 
     #[test]
     fn set_device_role_applies_and_get_returns_it() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
         let passkey = state.issue_session(4_000);
 
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
-            role: DEVICE_ROLE_ROUTER,
-        }));
-        set.has_session_passkey = true;
-        set.session_passkey = passkey;
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
+                role: DEVICE_ROLE_ROUTER,
+            })),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let out = handle_admin(
             &mut state,
             &remote,
@@ -1191,8 +1192,10 @@ mod tests {
         assert_eq!(state.device_role, DEVICE_ROLE_ROUTER);
         assert!(out.config_dirty);
 
-        let mut get = AdminMessage::default();
-        get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE);
+        let get = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE),
+            ..Default::default()
+        };
         let gout = handle_admin(
             &mut state,
             &remote,
@@ -1200,7 +1203,7 @@ mod tests {
             0x11,
             &DEFAULT_PSK,
             0x77,
-            DEVICE_ROLE_CLIENT, // stale graph arg must not override admin state
+            DEVICE_ROLE_CLIENT,
             &encode_admin_message(&get),
             4_200,
         );
@@ -1211,12 +1214,13 @@ mod tests {
             other => panic!("{:?}", other),
         }
 
-        let mut set_client = AdminMessage::default();
-        set_client.payload = AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
-            role: DEVICE_ROLE_CLIENT,
-        }));
-        set_client.has_session_passkey = true;
-        set_client.session_passkey = state.issue_session(4_250);
+        let set_client = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
+                role: DEVICE_ROLE_CLIENT,
+            })),
+            has_session_passkey: true,
+            session_passkey: state.issue_session(4_250),
+        };
         let cout = handle_admin(
             &mut state,
             &remote,
@@ -1235,14 +1239,17 @@ mod tests {
 
     #[test]
     fn unknown_device_role_is_rejected() {
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
         let passkey = state.issue_session(5_000);
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig { role: 99 }));
-        set.has_session_passkey = true;
-        set.session_passkey = passkey;
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig { role: 99 })),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let out = handle_admin(
             &mut state,
             &remote,
@@ -1264,18 +1271,21 @@ mod tests {
         use crate::admin_codec::{WireFixedPosition, CONFIG_TYPE_POSITION};
         use crate::position::POSITION_BROADCAST_SECS_CLIENT;
 
-        let mut state = AdminState::default();
-        state.private_key = [0x42; 32];
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            ..Default::default()
+        };
         let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
         let passkey = state.issue_session(6_000);
 
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
-            position_broadcast_secs: 60,
-            fixed_position: true,
-        }));
-        set.has_session_passkey = true;
-        set.session_passkey = passkey;
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Position(WirePositionConfig {
+                position_broadcast_secs: 60,
+                fixed_position: true,
+            })),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let out = handle_admin(
             &mut state,
             &remote,
@@ -1297,15 +1307,16 @@ mod tests {
         assert!(!state.broadcasts_fixed_position());
 
         let passkey = state.issue_session(6_200);
-        let mut fix = AdminMessage::default();
-        fix.payload = AdminPayload::SetFixedPosition(WireFixedPosition {
-            latitude_i: 1,
-            longitude_i: 0,
-            has_latitude_i: false,
-            has_longitude_i: true,
-        });
-        fix.has_session_passkey = true;
-        fix.session_passkey = passkey;
+        let mut fix = AdminMessage {
+            payload: AdminPayload::SetFixedPosition(WireFixedPosition {
+                latitude_i: 1,
+                longitude_i: 0,
+                has_latitude_i: false,
+                has_longitude_i: true,
+            }),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let missing = handle_admin(
             &mut state,
             &remote,
@@ -1342,8 +1353,10 @@ mod tests {
         assert!(placed.broadcast_position);
         assert!(state.broadcasts_fixed_position());
 
-        let mut get = AdminMessage::default();
-        get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_POSITION);
+        let get = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_POSITION),
+            ..Default::default()
+        };
         let got = handle_admin(
             &mut state,
             &remote,
@@ -1361,6 +1374,77 @@ mod tests {
                 assert!(pos.fixed_position);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_is_valid_before_wrapped_deadline_and_expires_at_deadline() {
+        let mut state = AdminState::new();
+        let start = u32::MAX - 100;
+        let key = state.issue_session(start);
+        let msg = AdminMessage {
+            session_passkey: key,
+            has_session_passkey: true,
+            payload: AdminPayload::BeginEditSettings,
+        };
+        assert!(state.session_ok(&msg, start + 1));
+        assert!(state.session_ok(&msg, state.session_valid_until_ms.wrapping_sub(1)));
+        assert!(!state.session_ok(&msg, state.session_valid_until_ms));
+    }
+
+    #[test]
+    fn failed_commit_leaves_configuration_and_side_effects_unchanged() {
+        let mut state = AdminState::new();
+        let authorized = BUILTIN_ADMIN_PUBLIC_KEYS[0];
+        let key = state.issue_session(1);
+        state.editing = true;
+        state.buffered_lora = Some(WireLoRaConfig {
+            modem_preset: mesh_radio::MODEM_LONG_SLOW as u32,
+            ..WireLoRaConfig::default()
+        });
+        state.buffered_device_update_interval_secs = Some(1);
+        let before = state;
+        let msg = AdminMessage {
+            session_passkey: key,
+            has_session_passkey: true,
+            payload: AdminPayload::CommitEditSettings,
+        };
+        let result = handle_admin(
+            &mut state,
+            &authorized,
+            &identity(),
+            1,
+            &[],
+            0,
+            0,
+            &encode_admin_message(&msg),
+            2,
+        );
+        assert_eq!(state, before);
+        assert_eq!(result.routing_error, Some(ROUTING_ERROR_BAD_REQUEST));
+        assert!(!result.config_dirty);
+        assert_eq!(result.apply_modem_preset, None);
+    }
+    #[test]
+    fn lora_updates_apply_hops_and_power_and_reject_unsupported_parameters() {
+        let mut state = AdminState::new();
+        let mut wire = WireLoRaConfig {
+            hop_limit: 5,
+            tx_power: 10,
+            ..Default::default()
+        };
+        assert!(apply_lora_to_state(&mut state, &wire).is_ok());
+        assert_eq!(state.hop_limit, 5);
+        assert_eq!(state.tx_power_dbm, 10);
+        for (use_preset, hop_limit, tx_power) in
+            [(false, 5, 10), (true, 8, 10), (true, 5, -1), (true, 5, 28)]
+        {
+            wire.use_preset = use_preset;
+            wire.hop_limit = hop_limit;
+            wire.tx_power = tx_power;
+            assert!(apply_lora_to_state(&mut state, &wire).is_err());
+            assert_eq!(state.hop_limit, 5);
+            assert_eq!(state.tx_power_dbm, 10);
         }
     }
 }

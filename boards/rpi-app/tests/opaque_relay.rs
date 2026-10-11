@@ -1,8 +1,6 @@
 use mesh_protocol::PacketHeader;
 use mesh_routing::{copy_opaque_payload, relay_header, wire_may_relay, PacketPool, POOL_SIZE};
 use static_cell::StaticCell;
-
-/// Simulates relaying a frame whose ciphertext is not decodable (wrong key / unknown port).
 #[test]
 fn opaque_encrypted_frame_relays_without_decode() {
     static POOL: StaticCell<PacketPool> = StaticCell::new();

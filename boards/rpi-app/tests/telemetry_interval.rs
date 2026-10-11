@@ -1,5 +1,3 @@
-//! Device telemetry interval: default, admin set, persist/reload, zero→default.
-
 use mesh_crypto::{CryptoEngine, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_radio::{eu868_config_for_preset, MODEM_DEFAULT_PRESET, MODEM_SHORT_SLOW};
@@ -114,8 +112,10 @@ fn issue_passkey(
     packet_id: u32,
     now: u32,
 ) -> [u8; 8] {
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetModuleConfigRequest(MODULE_CONFIG_TYPE_TELEMETRY);
+    let get = AdminMessage {
+        payload: AdminPayload::GetModuleConfigRequest(MODULE_CONFIG_TYPE_TELEMETRY),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -173,9 +173,9 @@ fn zero_means_default_not_disable() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC0A1_0001u32;
     let peer = 0xD0A1_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x21; 16]), 1);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x22; 16]), 2);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x23; 16]), 3);
+    let (node_priv, node_pub) = generate_keypair([0x21; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x22; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -187,13 +187,15 @@ fn zero_means_default_not_disable() {
     seed_metrics(router);
 
     let passkey = issue_passkey(router, our, peer, &b1_priv, &node_pub, 0xA101, 1_000);
-    let mut set = AdminMessage::default();
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
-    set.payload =
-        AdminPayload::SetModuleConfig(ModuleConfigPayload::Telemetry(WireTelemetryConfig {
-            device_update_interval: 0,
-        }));
+    let set = AdminMessage {
+        has_session_passkey: true,
+        session_passkey: passkey,
+        payload: AdminPayload::SetModuleConfig(ModuleConfigPayload::Telemetry(
+            WireTelemetryConfig {
+                device_update_interval: 0,
+            },
+        )),
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -223,9 +225,9 @@ fn set_interval_and_persist_reload() {
     static ROUTER2: StaticCell<Router> = StaticCell::new();
     let our = 0xC0A2_0001u32;
     let peer = 0xD0A2_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x31; 16]), 1);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x32; 16]), 2);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x33; 16]), 3);
+    let (node_priv, node_pub) = generate_keypair([0x31; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x32; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -238,13 +240,15 @@ fn set_interval_and_persist_reload() {
 
     let passkey = issue_passkey(router, our, peer, &b1_priv, &node_pub, 0xA201, 3_000);
     let interval_secs = 600u32;
-    let mut set = AdminMessage::default();
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
-    set.payload =
-        AdminPayload::SetModuleConfig(ModuleConfigPayload::Telemetry(WireTelemetryConfig {
-            device_update_interval: interval_secs,
-        }));
+    let set = AdminMessage {
+        has_session_passkey: true,
+        session_passkey: passkey,
+        payload: AdminPayload::SetModuleConfig(ModuleConfigPayload::Telemetry(
+            WireTelemetryConfig {
+                device_update_interval: interval_secs,
+            },
+        )),
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -284,8 +288,10 @@ fn set_interval_and_persist_reload() {
     router2.run_maintenance(10_000 + interval_ms, 100);
     assert!(router2.poll_telemetry_tx(10_000 + interval_ms).is_some());
 
-    let mut get = AdminMessage::default();
-    get.payload = AdminPayload::GetModuleConfigRequest(MODULE_CONFIG_TYPE_TELEMETRY);
+    let get = AdminMessage {
+        payload: AdminPayload::GetModuleConfigRequest(MODULE_CONFIG_TYPE_TELEMETRY),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -309,9 +315,9 @@ fn below_airtime_floor_is_rejected() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC0A3_0001u32;
     let peer = 0xD0A3_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x41; 16]), 1);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x42; 16]), 2);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x43; 16]), 3);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&defaults);
@@ -322,13 +328,15 @@ fn below_airtime_floor_is_rejected() {
     assert!(floor > 1, "floor should be >1s so reject path is testable");
 
     let passkey = issue_passkey(router, our, peer, &b1_priv, &node_pub, 0xA301, 5_000);
-    let mut set = AdminMessage::default();
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
-    set.payload =
-        AdminPayload::SetModuleConfig(ModuleConfigPayload::Telemetry(WireTelemetryConfig {
-            device_update_interval: floor - 1,
-        }));
+    let set = AdminMessage {
+        has_session_passkey: true,
+        session_passkey: passkey,
+        payload: AdminPayload::SetModuleConfig(ModuleConfigPayload::Telemetry(
+            WireTelemetryConfig {
+                device_update_interval: floor - 1,
+            },
+        )),
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,

@@ -1,5 +1,3 @@
-//! Battery voltage via SAADC on P0.31 (1M + 1M divider to GND).
-
 use core::cell::RefCell;
 
 use critical_section::Mutex;
@@ -7,10 +5,7 @@ use embassy_nrf::saadc::Saadc;
 use embassy_time::{Duration, Timer};
 use mesh_routing::interpret_battery_reading;
 
-/// VBAT → 1M → tap (P0.31) → 1M → GND: V_tap = VBAT / 2.
 pub const ADC_MULTIPLIER: f32 = 2.0;
-/// Full-scale input of the SAADC channel configured in `main.rs`: internal 0.6 V
-/// reference with gain 1/6 ⇒ 0.6 / (1/6) = 3.6 V, not the 3.0 V rail voltage.
 pub const AREF_VOLTAGE: f32 = 3.6;
 pub const BATTERY_SENSE_BITS: u32 = 12;
 pub const BATTERY_SENSE_SAMPLES: u32 = 15;
@@ -20,8 +15,6 @@ pub struct BatteryReading {
     pub voltage_mv: u32,
     pub battery_level: u32,
     pub valid: bool,
-    /// Averaged raw SAADC counts behind this reading (kept for field diagnosis:
-    /// `voltage_mv` is zeroed whenever the reading is rejected as implausible).
     pub raw_adc: u32,
     pub usb_powered: bool,
 }

@@ -1,8 +1,4 @@
-//! SR routing decision log events (`[SR]` USB prefix).
-
 pub const MAX_SR_LOG: usize = 64;
-/// Destinations per downstream log line. Twelve ids fit a 256-byte USB line with room to
-/// spare; the array also sets the size of every `SrLogEvent`, so it is not made larger.
 pub const DOWNSTREAM_LOG_GROUP: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,8 +26,6 @@ pub enum SrLogEvent {
         hop_limit: u8,
         direct: bool,
     },
-    /// A peer's topology report was accepted outside the forward version window: `last` was
-    /// stored, `received` arrived after the peer's boot broadcast or two silent intervals.
     TopologyVersionResync {
         from: u32,
         received: u8,
@@ -42,30 +36,17 @@ pub enum SrLogEvent {
         half_airtime_ms: u32,
         candidates: u8,
         slot_index: u8,
-        /// Slot holders in order (first `ranked_len` valid); empty for unicast slots.
         ranked: [u32; crate::broadcast_relay::RANKED_LOG],
         ranked_len: u8,
         reason: crate::broadcast_relay::RelayReason,
-        /// Ranking inputs of the first candidates evaluated: (node, unique coverage, total
-        /// coverage, cost bucket). Unicast plans carry the tiered cost with coverage 0.
         evaluated: [(u32, u8, u8, u16); crate::broadcast_relay::RANKED_LOG],
         evaluated_len: u8,
-        /// Nodes counted as already covered before ranking.
         pre_covered: u8,
-        /// Our own neighbours the transmission did not cover — what earns us a slot and what T1
-        /// insures. Named, so two nodes' disagreement can be attributed rather than counted.
         uncovered: [u32; crate::broadcast_relay::UNCOVERED_LOG],
         uncovered_len: u8,
-        /// Transmissions expected ahead of ours, and how many of those are reserved positions
-        /// held by stock relay routers. This is the quantity T1 arming turns on, and it was
-        /// logged nowhere — so whether two nodes agreed about the insurance a packet earned
-        /// could not be read from a capture at all.
         slots_given: u8,
         reserved_slots: u8,
-        /// How many leading `ranked` entries are reservations, so the order line can mark them.
         reserved_ranked: u8,
-        /// Who already transmitted this packet by ranking time, and how many nodes each newly
-        /// covered. Planned later slots do not absorb; a heard copy does.
         absorbed: [(u32, u8); crate::broadcast_relay::RANKED_LOG],
         absorbed_len: u8,
     },
@@ -82,22 +63,18 @@ pub enum SrLogEvent {
         from: u32,
         reason: SrSkipReason,
     },
-    /// Inbound rate limiter tripped (kind: 0=text 1=routing 2=other 3=unknown 4=relay 5=relay-unresolved 6=young).
     RateLimitTrip {
         node_id: u32,
         kind: u8,
     },
-    /// Inbound rate limiter cleared after hysteresis.
     RateLimitClear {
         node_id: u32,
         kind: u8,
     },
-    /// Young-bucket diagnostic (local log / host). Broadcast is opt-in elsewhere.
     RateLimitYoungAnnounce {
         ids: [u32; 4],
         count: u8,
     },
-    /// Default-channel unicast to a limited originator.
     RateLimitDestDrop {
         from: u32,
         to: u32,
@@ -111,7 +88,6 @@ pub enum SrLogEvent {
     TopologyDirtySending {
         delay_ms: u32,
     },
-    /// A NodeInfo reply was queued behind a contention-window delay.
     NodeInfoReplyDelayed {
         delay_ms: u32,
     },
@@ -131,9 +107,6 @@ pub enum SrLogEvent {
         more_chunks: bool,
         continuation: bool,
     },
-    /// One packed neighbour from a received topology broadcast. Mirrored edges keep ETX,
-    /// not the wire RSSI/SNR/flags, and `data=` decrypt needs a TX enqueue, so this is
-    /// the capture of the list we actually heard.
     TopologyListedNeighbor {
         from: u32,
         node_id: u32,
@@ -154,7 +127,6 @@ pub enum SrLogEvent {
     NetworkTopologyHeader {
         direct_neighbors: u8,
         graph_nodes: u8,
-        /// Ball members tagged L1 / L2 / L3 (Unknown omitted from these counts).
         l1: u8,
         l2: u8,
         l3: u8,
@@ -177,8 +149,6 @@ pub enum SrLogEvent {
         node_id: u32,
         hears_us: bool,
         last_mirrored: bool,
-        /// Price of the edge and whether it rests on a measurement. Two nodes diffing their dumps
-        /// can see which links they disagree about, and whether a guess is behind it.
         etx_fixed: u16,
         measured: bool,
         class: crate::graph::NodeClass,
@@ -186,8 +156,6 @@ pub enum SrLogEvent {
     NetworkTopologyDownstreamHeader {
         count: u16,
     },
-    /// One line of the downstream dump: `relay: dest dest ...`. A relay with more than
-    /// [`DOWNSTREAM_LOG_GROUP`] destinations continues on further events for the same relay.
     NetworkTopologyDownstreamGroup {
         relay: u32,
         destinations: [u32; DOWNSTREAM_LOG_GROUP],
@@ -199,22 +167,15 @@ pub enum SrLogEvent {
         destination: u32,
     },
     TopologyLoggingComplete,
-    /// An empty bootstrap broadcast arrived inside the bootstrap-reply cooldown; no list sent.
     BootstrapReplyRateLimited,
-    /// A list went out after the bootstrap request and answered it; the reply was dropped.
     BootstrapReplyAlreadyAnswered,
-    /// The destination of this unicast hears its source directly (per the source's topology):
-    /// our relay waits `wait_ms` for the destination's ACK or reply before it may go out.
     UnicastDestHeardDirect {
         id: u32,
         wait_ms: u32,
     },
-    /// The destination answered the source: our queued relay of the request was cancelled.
     UnicastReplyCancel {
         id: u32,
     },
-    /// The radio was re-initialised for a new preset; queued transmissions timed for the old
-    /// air parameters (and addressed to nodes still on them) were dropped.
     RadioReconfigured {
         dropped: u8,
     },
@@ -229,10 +190,6 @@ pub enum SrLogEvent {
     RelayConfirmedHearsUs {
         node_id: u32,
     },
-    /// Broadcast relayed without ever being ranked: too few SR-capable direct neighbours to judge
-    /// coverage, so delivery wins over saving the packet. Logged because the relay is otherwise
-    /// indistinguishable in a capture from one the ranking chose, and silence here has twice cost
-    /// a field diagnosis.
     BroadcastUnrankedThinGraph {
         from: u32,
         direct_neighbors: u8,
@@ -245,7 +202,6 @@ pub enum SrLogEvent {
         role: u32,
         is_new: bool,
     },
-    /// The neighbour that made a broadcast relay worth its airtime (nobody else reaches it).
     CoverageFor {
         neighbor: u32,
     },
@@ -267,7 +223,6 @@ pub enum SrLogEvent {
         id: u32,
         reason: T1CancelReason,
     },
-    /// Unicast carrying a designated next hop: that byte owns slot 0, we take rank+1.
     UnicastDesignated {
         next_hop: u8,
         is_us: bool,
@@ -275,26 +230,21 @@ pub enum SrLogEvent {
         slot: u8,
         slot_delay_ms: u32,
     },
-    /// A copy of a unicast we were about to relay was heard: our copy is redundant.
     UnicastDupeCancel {
         id: u32,
         from: u32,
     },
-    /// We forwarded a unicast with a designated next hop and armed its follow-up.
     RelayRetxArmed {
         id: u32,
         next_hop: u8,
     },
-    /// Named hop stayed silent; the same copy was repeated to it.
     RelayRetxRepeat {
         id: u32,
     },
-    /// Named hop stayed silent after the repeat; retransmitted toward an alternate next hop.
     RelayRetxRedirect {
         id: u32,
         next_hop: u8,
     },
-    /// Named hop stayed silent and no stampable alternate existed; follow-up dropped.
     RelayRetxNoAlternate {
         id: u32,
     },
@@ -302,17 +252,14 @@ pub enum SrLogEvent {
         id: u32,
         reason: RelayRetxCancelReason,
     },
-    /// An originator's own retry was accepted for re-planning like a fresh reception.
     OriginatorRetryReplanned {
         id: u32,
     },
-    /// A next hop reached the consecutive-miss suspect threshold for a destination.
     NextHopSuspect {
         next_hop: u32,
         destination: u32,
         misses: u8,
     },
-    /// A previously suspect next hop was cleared by a success.
     NextHopHealthy {
         next_hop: u32,
         destination: u32,
@@ -334,16 +281,14 @@ pub enum SrLogEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayRetxCancelReason {
-    /// Someone relayed the packet on: the designated hop or a later slot.
     CopyHeard,
-    /// The destination answered (ACK, NAK or application reply).
     ReplyHeard,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum T1CancelReason {
+    Policy,
     RelayHeard,
-    /// We transmitted this packet ourselves; the source already had a copy to hear.
     OwnTransmission,
 }
 
@@ -355,36 +300,18 @@ pub enum SrSkipReason {
     RateLimited,
     OwnRebroadcast,
     UnknownDestination,
-    /// Broadcast a ranked SR peer was given a rung for: a node we coordinate with is expected to
-    /// carry it, and our copy would be the redundancy if theirs is lost.
     BetterNeighbor,
-    /// Broadcast a stock relay router holds a reserved position for. A different reason to stay
-    /// quiet from `BetterNeighbor`: the expected transmitter is a node we do not coordinate with
-    /// and whose firing time we cannot compute, so the only evidence it relayed is hearing it.
     RouterExpected,
-    /// Unicast whose next hop is the node we just heard it from.
     NextHopIsRelayer,
-    /// Unicast that would leave us with hop_limit 0 without a direct link to the target.
     DeadEndHop,
-    /// Unicast the transmitter, or an SR neighbour covering it, can already deliver.
     UnicastCovered,
-    /// Unicast we have no direct, downstream or next-hop path for.
     NoRelayPath,
-    /// Routing ACK toward a node its sender heard directly: it retraces the request's link and
-    /// a lost ACK is covered by the sender's own retransmission.
     ReplyRetracesLink,
-    /// Broadcast we were not given a slot for and owe no acknowledgement: no transmission is
-    /// expected, so there is nothing for a late copy to stand in for.
     AlreadyCovered,
-    /// Unicast whose only route is the unverified inbound-gateway guess, pointing back at the
-    /// node we heard the packet from: carrying it moves the packet away from its destination.
     UnverifiedBacktrack,
-    /// Last hop to the destination: a cheaper direct link already holds the early (and maybe
-    /// dest-ACK) slot, so we stay silent.
     LastHopReserved,
 }
 
-/// Sink for periodic topology graph dumps (may emit many lines).
 pub trait TopologyLogSink {
     fn emit(&mut self, event: SrLogEvent);
 }

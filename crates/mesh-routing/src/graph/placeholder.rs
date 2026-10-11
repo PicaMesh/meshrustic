@@ -1,6 +1,3 @@
-//! Synthetic node ids for unknown `relay_node` header bytes.
-
-/// High-byte prefix for placeholder nodes (`0xFF00_00xx`).
 pub const PLACEHOLDER_NODE_PREFIX: u32 = 0xFF00_0000;
 
 pub fn placeholder_node_id(relay_byte: u8) -> u32 {

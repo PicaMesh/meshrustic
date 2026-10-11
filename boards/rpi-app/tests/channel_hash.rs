@@ -1,5 +1,3 @@
-//! Primary channel hash golden vectors for modem presets.
-
 use mesh_crypto::{channel_hash, DEFAULT_PSK};
 use mesh_radio::{
     modem_preset_channel_name, primary_channel_hash, MODEM_DEFAULT_PRESET, MODEM_LONG_FAST,

@@ -1,5 +1,3 @@
-//! Admin ACL: builtins (real PKI), flash keys, unauthorized, Security omits builtins, G1/H2.
-
 use mesh_crypto::{CryptoEngine, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_radio::{primary_channel_hash, MODEM_DEFAULT_PRESET, MODEM_SHORT_FAST};
@@ -100,8 +98,10 @@ fn session_via_pki(
     packet_id: u32,
     now: u32,
 ) -> [u8; 8] {
-    let mut get = mesh_routing::AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
+    let get = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         router.node_num(),
         peer,
@@ -145,30 +145,30 @@ fn unauthorized_cannot_change_config() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA001_0001u32;
     let peer = 0xB001_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x10; 16]), 1);
-    let (peer_priv, peer_pub) = generate_keypair(Some(&[0x20; 16]), 2);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x30; 16]), 3);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x40; 16]), 4);
+    let (node_priv, node_pub) = generate_keypair([0x10; 32]);
+    let (peer_priv, peer_pub) = generate_keypair([0x20; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x30; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x40; 32]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
     router.set_node_identity(NodeInfoIdentity::for_node(our, node_pub));
     router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
-    // Peer is known via NODEINFO so PKI decrypt succeeds, but peer is not an admin.
     router.seed_nodeinfo_peer_for_test(peer, peer_pub, 50);
     let _ = b1_priv;
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-        use_preset: true,
-        modem_preset: MODEM_SHORT_FAST as u32,
-        region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
-        config_ok_to_mqtt: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = [1; 8];
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_SHORT_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+            config_ok_to_mqtt: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: [1; 8],
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -188,15 +188,15 @@ fn unauthorized_cannot_change_config() {
 
 #[test]
 fn builtin1_and_builtin2_can_set_lora() {
-    for i in 0..2usize {
-        static ROUTERS: [StaticCell<Router>; 2] = [StaticCell::new(), StaticCell::new()];
+    static ROUTERS: [StaticCell<Router>; 2] = [StaticCell::new(), StaticCell::new()];
+    for (i, cell) in ROUTERS.iter().enumerate() {
         let our = 0xA002_0001u32 + i as u32;
         let peer = 0xB002_0002u32;
-        let (node_priv, node_pub) = generate_keypair(Some(&[0x50 + i as u8; 16]), 10 + i as u64);
-        let (b1_priv, b1_pub) = generate_keypair(Some(&[0x60 + i as u8; 16]), 20 + i as u64);
-        let (b2_priv, b2_pub) = generate_keypair(Some(&[0x70 + i as u8; 16]), 30 + i as u64);
+        let (node_priv, node_pub) = generate_keypair([0x50 + i as u8; 32]);
+        let (b1_priv, b1_pub) = generate_keypair([0x60 + i as u8; 32]);
+        let (b2_priv, b2_pub) = generate_keypair([0x70 + i as u8; 32]);
         let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
-        let router = ROUTERS[i].init(Router::new(our));
+        let router = cell.init(Router::new(our));
         router.load_node_config(&cfg);
         router.set_node_identity(NodeInfoIdentity::for_node(our, node_pub));
         router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
@@ -208,17 +208,18 @@ fn builtin1_and_builtin2_can_set_lora() {
         };
         let passkey = session_via_pki(router, peer, &admin_priv, &node_pub, 0x10, 1_000);
 
-        let mut set = mesh_routing::AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-            use_preset: true,
-            modem_preset: MODEM_SHORT_FAST as u32,
-            region: REGION_EU_868,
-            hop_limit: 3,
-            tx_power: 27,
-            config_ok_to_mqtt: true,
-        }));
-        set.has_session_passkey = true;
-        set.session_passkey = passkey;
+        let set = mesh_routing::AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+                use_preset: true,
+                modem_preset: MODEM_SHORT_FAST as u32,
+                region: REGION_EU_868,
+                hop_limit: 3,
+                tx_power: 27,
+                config_ok_to_mqtt: true,
+            })),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
         let frame = build_pki_admin_frame(
             our,
             peer,
@@ -238,8 +239,8 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA003_0001u32;
     let peer = 0xB003_0002u32;
-    let (admin_priv, admin_pub) = generate_keypair(Some(&[0xAB; 16]), 0xDEAD);
-    let (node_priv, node_pub) = generate_keypair(Some(&[0xCD; 16]), 0xBEEF);
+    let (admin_priv, admin_pub) = generate_keypair([0xAB; 32]);
+    let (node_priv, node_pub) = generate_keypair([0xCD; 32]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.admin_public_keys[0] = admin_pub;
     let router = ROUTER.init(Router::new(our));
@@ -248,17 +249,18 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
 
     let passkey = session_via_pki(router, peer, &admin_priv, &node_pub, 0x30, 3_000);
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-        use_preset: true,
-        modem_preset: MODEM_SHORT_FAST as u32,
-        region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
-        config_ok_to_mqtt: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_SHORT_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+            config_ok_to_mqtt: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -271,10 +273,11 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
     let _ = router.poll_admin_tx(3_100);
     assert_eq!(router.modem_preset(), MODEM_SHORT_FAST);
 
-    let mut sget = mesh_routing::AdminMessage::default();
-    sget.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
-    sget.has_session_passkey = true;
-    sget.session_passkey = router.admin_state().session_passkey;
+    let sget = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY),
+        has_session_passkey: true,
+        session_passkey: router.admin_state().session_passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -286,8 +289,10 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
     pki_inbound(router, &frame, 3_200);
     let _ = router.poll_admin_tx(3_200);
 
-    let mut msg = mesh_routing::AdminMessage::default();
-    msg.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY);
+    let msg = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY),
+        ..Default::default()
+    };
     let out = mesh_routing::handle_admin(
         router.admin_state_mut(),
         &admin_pub,
@@ -319,8 +324,8 @@ fn stale_pki_then_channel_admin_cannot_mutate() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA006_0001u32;
     let peer = 0xB006_0002u32;
-    let (admin_priv, admin_pub) = generate_keypair(Some(&[0x11; 16]), 1);
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x22; 16]), 2);
+    let (admin_priv, admin_pub) = generate_keypair([0x11; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x22; 32]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.admin_public_keys[0] = admin_pub;
     let router = ROUTER.init(Router::new(our));
@@ -329,22 +334,22 @@ fn stale_pki_then_channel_admin_cannot_mutate() {
 
     let passkey = session_via_pki(router, peer, &admin_priv, &node_pub, 0x60, 6_000);
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-        use_preset: true,
-        modem_preset: MODEM_SHORT_FAST as u32,
-        region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
-        config_ok_to_mqtt: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_SHORT_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+            config_ok_to_mqtt: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = channel_admin_frame(our, peer, 0x61, &encode_admin_message(&set));
     pki_inbound(router, &frame, 6_100);
     assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
     let tx = router.poll_admin_tx(6_100).unwrap();
-    // Channel-only path has no remote PKI peer → channel-encrypted NAK fallback.
     let mut cipher = tx.bytes[PACKET_HEADER_LEN..tx.len as usize].to_vec();
     let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
@@ -370,9 +375,9 @@ fn clearing_flash_keys_leaves_builtins() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA004_0001u32;
     let peer = 0xB004_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x81; 16]), 41);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x82; 16]), 42);
-    let (b2_priv, b2_pub) = generate_keypair(Some(&[0x83; 16]), 43);
+    let (node_priv, node_pub) = generate_keypair([0x81; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x82; 32]);
+    let (b2_priv, b2_pub) = generate_keypair([0x83; 32]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.admin_public_keys[0] = [0x77; 32];
     let router = ROUTER.init(Router::new(our));
@@ -381,10 +386,11 @@ fn clearing_flash_keys_leaves_builtins() {
     router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
 
     let passkey = session_via_pki(router, peer, &b1_priv, &node_pub, 0x40, 4_000);
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Security(WireSecurityConfig::default()));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Security(WireSecurityConfig::default())),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -404,9 +410,9 @@ fn bad_session_key_rejects_set() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA005_0001u32;
     let peer = 0xB005_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x91; 16]), 51);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x92; 16]), 52);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x93; 16]), 53);
+    let (node_priv, node_pub) = generate_keypair([0x91; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x92; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x93; 32]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
@@ -414,17 +420,18 @@ fn bad_session_key_rejects_set() {
     router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
     let _ = session_via_pki(router, peer, &b1_priv, &node_pub, 0x50, 5_000);
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
-        use_preset: true,
-        modem_preset: MODEM_SHORT_FAST as u32,
-        region: REGION_EU_868,
-        hop_limit: 3,
-        tx_power: 27,
-        config_ok_to_mqtt: true,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = [0xFF; 8];
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
+            use_preset: true,
+            modem_preset: MODEM_SHORT_FAST as u32,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: 27,
+            config_ok_to_mqtt: true,
+        })),
+        has_session_passkey: true,
+        session_passkey: [0xFF; 8],
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -447,19 +454,19 @@ fn pki_decrypt_failure_nak_is_pki_encrypted() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA007_0001u32;
     let peer = 0xB007_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0xA1; 16]), 71);
-    let (peer_priv, peer_pub) = generate_keypair(Some(&[0xA2; 16]), 72);
-    let (wrong_priv, _wrong_pub) = generate_keypair(Some(&[0xA3; 16]), 73);
+    let (node_priv, node_pub) = generate_keypair([0xA1; 32]);
+    let (peer_priv, peer_pub) = generate_keypair([0xA2; 32]);
+    let (wrong_priv, _wrong_pub) = generate_keypair([0xA3; 32]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
     router.set_node_identity(NodeInfoIdentity::for_node(our, node_pub));
-    // Known peer pubkey so decrypt has candidates and the NAK can be PKI-encrypted.
     router.seed_nodeinfo_peer_for_test(peer, peer_pub, 50);
 
-    let mut get = mesh_routing::AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
-    // Ciphertext encrypted by a different keypair → ECDH with peer_pub fails.
+    let get = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,

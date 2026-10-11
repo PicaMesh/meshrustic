@@ -1,5 +1,3 @@
-//! Router flooding relay integration tests (host).
-
 use mesh_protocol::PacketHeader;
 use mesh_routing::{coordinated_relay, InboundPacket, Router, POOL_SIZE};
 use static_cell::StaticCell;

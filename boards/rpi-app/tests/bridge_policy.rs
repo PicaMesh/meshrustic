@@ -1,5 +1,3 @@
-//! Phase 9 bridge policy — host checks for cross-preset forwarding.
-
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
     coordinated_relay, evaluate_bridge_targets, BridgeDedupCache, BridgeEval, ChannelQoS,
@@ -107,9 +105,6 @@ fn unicast_bridge_wire(to: u32, from: u32, id: u32) -> heapless::Vec<u8, 64> {
     wire.extend_from_slice(&[0xAA, 0xBB, 0xCC]).unwrap();
     wire
 }
-
-/// Same four properties in either direction: one leg, the other radio, no same-radio relay,
-/// length preserved.
 fn assert_cross_radio_unicast_bridge(rx_radio: u8, target_radio: u8) {
     let mut router = Router::new(0x677a_1caf);
     let dest = 0x5889_1234u32;

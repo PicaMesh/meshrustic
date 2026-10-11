@@ -1,5 +1,3 @@
-//! Full topology graph (edges + downstream) ported from reference NeighborGraph.
-
 pub mod downstream;
 pub mod edge;
 pub mod etx;
@@ -14,8 +12,8 @@ pub use edge::{
     EDGE_SIGNIFICANT_CHANGE, MAX_EDGES_PER_NODE,
 };
 pub use etx::{
-    calculate_etx, etx_to_fixed, etx_to_signal, fixed_to_etx, normalize_rx_signal,
-    EtxFixed, SATURATED_RX_RSSI_DBM,
+    calculate_etx, etx_to_fixed, etx_to_signal, fixed_to_etx, normalize_rx_signal, EtxFixed,
+    SATURATED_RX_RSSI_DBM,
 };
 pub use placeholder::{
     get_placeholder_for_relay, is_placeholder_node, placeholder_node_id, PLACEHOLDER_NODE_PREFIX,
@@ -29,9 +27,6 @@ pub use route::{
     UNVERIFIED_HOP_COST_FACTOR,
 };
 
-/// Match the MT+SR fork (`NEIGHBOR_GRAPH_MAX_NEIGHBORS`): lockstep eviction under a full ball.
 pub const MAX_GRAPH_NODES: usize = 32;
 
-/// How deep the priced edge ball grows: 2 = L0+L1+L2; 3 also admits L3 publishers.
-/// See `docs/GRAPH_HORIZON_PLAN.md` §8.5 / Phase 6.
 pub const GRAPH_MAX_DEPTH: u8 = 3;

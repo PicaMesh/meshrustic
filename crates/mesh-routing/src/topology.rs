@@ -1,5 +1,4 @@
-//! Signal-routing topology wire format (V3 `packed_neighbors` on protobuf field 3).
-
+use crate::protobuf::{read_varint, skip_field};
 use mesh_crypto::{decrypt_packet, encrypt_packet, CryptoKey};
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
@@ -12,28 +11,18 @@ pub const PACKED_NEIGHBOR_HEADER_SIZE: usize = 5;
 pub const PACKED_NEIGHBOR_FLAG_SR_ACTIVE: u8 = 0x01;
 pub const PACKED_NEIGHBOR_FLAG_HEARS_US: u8 = 0x02;
 pub const PACKED_HEADER_FLAG_SR_ACTIVE: u8 = 0x01;
-/// More chunks of this topology version follow this packet.
 pub const PACKED_HEADER_FLAG_MORE_CHUNKS: u8 = 0x02;
-/// This packet is not the first chunk of its topology version.
 pub const PACKED_HEADER_FLAG_CONTINUATION: u8 = 0x04;
-/// Max neighbors per topology protobuf chunk (11 on wire; 28 entries fit in the 229-byte limit).
 pub const MAX_NEIGHBORS_PER_PACKET: usize = 28;
-/// Cap on `hop_limit` / `hop_start` for SR topology broadcasts (port 88).
-/// Other originated frames use the node's configured LoRa `hop_limit` as-is.
 pub const SR_BROADCAST_MAX_HOPS: u8 = 4;
 pub const SIGNAL_ROUTING_APP: u32 = 88;
 
-/// `Data.bitfield` (field 9). Stock stamps it on every frame it originates, and a receiver
-/// takes its presence as proof that the header's `hop_start` is populated: a frame with
-/// `hop_start` zero and no bitfield has travelled an unknown number of hops, and stock never
-/// ACKs a response whose hop count it does not know.
-pub const DATA_BITFIELD_OK_TO_MQTT: u8 = 1 << 0;
-pub const DATA_BITFIELD_WANT_RESPONSE: u8 = 1 << 1;
+pub const DATA_BITFIELD_OK_TO_MQTT: u32 = 1 << 0;
+pub const DATA_BITFIELD_WANT_RESPONSE: u32 = 1 << 1;
 const DATA_BITFIELD_FIELD: u32 = 9;
 
 pub const MAX_TOPOLOGY_PACKETS: usize = 4;
 
-/// Parsed `Data` protobuf fields (portnum + routing metadata).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodedData {
     pub portnum: u32,
@@ -41,12 +30,11 @@ pub struct DecodedData {
     pub dest: u32,
     pub request_id: u32,
     pub reply_id: u32,
-    /// The origin stamped `Data.bitfield`, so its `hop_start` can be trusted.
+    /// Bitfield presence is the compatibility evidence that hop_start was populated by the originator.
     pub has_bitfield: bool,
-    pub bitfield: u8,
+    pub bitfield: u32,
 }
 
-/// Optional fields when encoding a `Data` protobuf payload.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DataEncodeOpts {
     pub want_response: bool,
@@ -55,13 +43,10 @@ pub struct DataEncodeOpts {
     pub bitfield: DataBitfield,
 }
 
-/// How `Data.bitfield` is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataBitfield {
-    /// A frame we originate: stock's bits, with the MQTT bit from our LoRa setting.
     Ours { ok_to_mqtt: bool },
-    /// A frame we re-encode for relay: the origin's bitfield verbatim, none if it had none.
-    Origin(Option<u8>),
+    Origin(Option<u32>),
 }
 
 impl Default for DataBitfield {
@@ -77,17 +62,14 @@ pub struct PackedHeader {
     pub routing_version: u8,
     pub topology_version: u8,
     pub signal_routing_active: bool,
-    /// Set on every chunk except the last of a multi-packet list.
     pub more_chunks: bool,
-    /// Set on every chunk except the first of a multi-packet list.
     pub continuation: bool,
+    pub chunk_index: u8,
 }
 
 impl PackedHeader {
-    /// True when this packet carries the sender's whole list (single packet, or a sender that
-    /// predates the chunk flags), so "not listed" means "not heard".
     pub fn is_complete_list(&self) -> bool {
-        !self.more_chunks && !self.continuation
+        !self.more_chunks && !self.continuation && self.chunk_index == 0
     }
 }
 
@@ -108,14 +90,10 @@ pub struct TopologyChunk {
         [u8; PACKED_NEIGHBOR_HEADER_SIZE + MAX_NEIGHBORS_PER_PACKET * PACKED_NEIGHBOR_ENTRY_SIZE],
 }
 
-/// Header of a single-packet list (or the only chunk).
 pub fn write_packed_header(out: &mut [u8], topology_version: u8, signal_routing_active: bool) {
     write_packed_header_chunk(out, topology_version, signal_routing_active, false, false);
 }
 
-/// Header of one chunk of a possibly multi-packet list. Receivers only apply the "unlisted
-/// neighbour does not hear the sender" rule once they hold the whole list, so every chunk except
-/// the last carries `more_chunks` and every chunk except the first carries `continuation`.
 pub fn write_packed_header_chunk(
     out: &mut [u8],
     topology_version: u8,
@@ -123,6 +101,9 @@ pub fn write_packed_header_chunk(
     more_chunks: bool,
     continuation: bool,
 ) {
+    if out.len() < PACKED_NEIGHBOR_HEADER_SIZE {
+        return;
+    }
     out[0] = PACKED_NEIGHBOR_FORMAT_VERSION;
     out[1] = PACKED_NEIGHBOR_ENTRY_SIZE as u8;
     out[2] = SIGNAL_ROUTING_VERSION;
@@ -144,6 +125,9 @@ pub fn decode_packed_header(data: &[u8]) -> Option<PackedHeader> {
     if data.len() < PACKED_NEIGHBOR_HEADER_SIZE {
         return None;
     }
+    if data[4] >> 3 != 0 && data[4] & PACKED_HEADER_FLAG_CONTINUATION == 0 {
+        return None;
+    }
     Some(PackedHeader {
         format_version: data[0],
         entry_size: data[1],
@@ -152,6 +136,7 @@ pub fn decode_packed_header(data: &[u8]) -> Option<PackedHeader> {
         signal_routing_active: data[4] & PACKED_HEADER_FLAG_SR_ACTIVE != 0,
         more_chunks: data[4] & PACKED_HEADER_FLAG_MORE_CHUNKS != 0,
         continuation: data[4] & PACKED_HEADER_FLAG_CONTINUATION != 0,
+        chunk_index: data[4] >> 3,
     })
 }
 
@@ -167,9 +152,12 @@ pub fn decode_packed_neighbors(
         return None;
     }
     let payload_len = data.len().saturating_sub(PACKED_NEIGHBOR_HEADER_SIZE);
-    let mut count = payload_len / header.entry_size as usize;
-    if count > max_entries {
-        count = max_entries;
+    if !payload_len.is_multiple_of(header.entry_size as usize) {
+        return None;
+    }
+    let count = payload_len / header.entry_size as usize;
+    if count > max_entries.min(32) {
+        return None;
     }
     let mut out = heapless::Vec::new();
     for i in 0..count {
@@ -190,7 +178,7 @@ pub fn decode_packed_neighbors(
             hears_us: flags & PACKED_NEIGHBOR_FLAG_HEARS_US != 0,
             etx_variance: e[7],
         };
-        let _ = out.push(neighbor);
+        out.push(neighbor).ok()?;
     }
     Some((header, out))
 }
@@ -203,6 +191,9 @@ pub fn encode_packed_neighbor_entry(
     flags: u8,
     etx_variance: u8,
 ) {
+    if out.len() < PACKED_NEIGHBOR_ENTRY_SIZE {
+        return;
+    }
     out[0..4].copy_from_slice(&node_id.to_le_bytes());
     out[4] = rssi as u8;
     out[5] = snr as u8;
@@ -214,7 +205,9 @@ pub fn encode_signal_routing_info(packed: &[u8]) -> heapless::Vec<u8, 240> {
     let mut out = heapless::Vec::new();
     let _ = out.push((3 << 3) | 2);
     push_varint(&mut out, packed.len() as u32);
-    let _ = out.extend_from_slice(packed);
+    if out.extend_from_slice(packed).is_err() {
+        out.clear();
+    }
     out
 }
 
@@ -228,6 +221,22 @@ pub fn encode_data_payload_opts(
     opts: DataEncodeOpts,
 ) -> heapless::Vec<u8, 240> {
     let mut out = heapless::Vec::new();
+    let size = 1
+        + varint_size(portnum)
+        + 1
+        + varint_size(inner.len() as u32)
+        + inner.len()
+        + usize::from(opts.want_response) * 2
+        + usize::from(opts.request_id != 0) * 5
+        + usize::from(opts.reply_id != 0) * 5
+        + match opts.bitfield {
+            DataBitfield::Origin(None) => 0,
+            DataBitfield::Origin(Some(v)) => 1 + varint_size(v),
+            DataBitfield::Ours { .. } => 2,
+        };
+    if size > out.capacity() {
+        return out;
+    }
     let _ = out.push(1 << 3);
     push_varint(&mut out, portnum);
     let _ = out.push((2 << 3) | 2);
@@ -243,28 +252,24 @@ pub fn encode_data_payload_opts(
         push_fixed32_field(&mut out, 7, opts.reply_id);
     }
     match opts.bitfield {
-        // Every originated frame carries the bitfield, as stock does since 2.5.
         DataBitfield::Ours { ok_to_mqtt } => {
             let mut bitfield = 0u32;
             if ok_to_mqtt {
-                bitfield |= DATA_BITFIELD_OK_TO_MQTT as u32;
+                bitfield |= DATA_BITFIELD_OK_TO_MQTT;
             }
             if opts.want_response {
-                bitfield |= DATA_BITFIELD_WANT_RESPONSE as u32;
+                bitfield |= DATA_BITFIELD_WANT_RESPONSE;
             }
             push_varint_field(&mut out, DATA_BITFIELD_FIELD, bitfield);
         }
-        // A relayed frame keeps the origin's word: gateways read the MQTT bit from the copy
-        // they hear, and a receiver reads "hop_start populated" from the bitfield's presence.
         DataBitfield::Origin(Some(bitfield)) => {
-            push_varint_field(&mut out, DATA_BITFIELD_FIELD, bitfield as u32);
+            push_varint_field(&mut out, DATA_BITFIELD_FIELD, bitfield);
         }
         DataBitfield::Origin(None) => {}
     }
     out
 }
 
-/// Build an encrypted on-air frame for an app port (unicast or broadcast).
 pub fn build_app_wire_frame(
     to: u32,
     from: u32,
@@ -280,7 +285,7 @@ pub fn build_app_wire_frame(
     next_hop: u8,
 ) -> Option<(u8, [u8; MAX_WIRE_LEN])> {
     let plaintext = encode_data_payload_opts(portnum, inner, opts);
-    if plaintext.len() > MAX_PACKET_PAYLOAD {
+    if plaintext.is_empty() || plaintext.len() > MAX_PACKET_PAYLOAD {
         return None;
     }
     let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
@@ -297,7 +302,7 @@ pub fn build_app_wire_frame(
         want_ack,
         false,
         next_hop,
-        (from & 0xFF) as u8, // relay byte = sender, as stock stamps its own frames
+        (from & 0xFF) as u8,
     );
     let mut bytes = [0u8; MAX_WIRE_LEN];
     header.encode_to((&mut bytes[..PACKET_HEADER_LEN]).try_into().ok()?);
@@ -319,6 +324,9 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
     while idx < data.len() {
         let (tag, mut i) = read_varint(data, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
@@ -329,12 +337,12 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
             }
             (2, 2) => {
                 let (len, ni) = read_varint(data, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > data.len() {
                     return None;
                 }
                 payload.clear();
-                let _ = payload.extend_from_slice(&data[ni..end]);
+                payload.extend_from_slice(&data[ni..end]).ok()?;
                 i = end;
             }
             (3, 0) => {
@@ -359,7 +367,7 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
             (9, 0) => {
                 let (v, ni) = read_varint(data, i)?;
                 decoded.has_bitfield = true;
-                decoded.bitfield = v as u8;
+                decoded.bitfield = v;
                 i = ni;
             }
             _ => {
@@ -371,7 +379,6 @@ pub fn decode_data_payload_full(data: &[u8]) -> Option<(DecodedData, heapless::V
     if !have_portnum {
         return None;
     }
-    // Stock mirrors the want_response bit of the bitfield into `want_response` on receive.
     if decoded.has_bitfield && decoded.bitfield & DATA_BITFIELD_WANT_RESPONSE != 0 {
         decoded.want_response = true;
     }
@@ -393,6 +400,9 @@ pub fn build_topology_wire_frame(
         return None;
     }
     let sr_info = encode_signal_routing_info(packed);
+    if sr_info.is_empty() {
+        return None;
+    }
     let plaintext = encode_data_payload_opts(
         SIGNAL_ROUTING_APP,
         &sr_info,
@@ -401,7 +411,7 @@ pub fn build_topology_wire_frame(
             ..Default::default()
         },
     );
-    if plaintext.len() > MAX_PACKET_PAYLOAD {
+    if plaintext.is_empty() || plaintext.len() > MAX_PACKET_PAYLOAD {
         return None;
     }
     let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
@@ -468,10 +478,13 @@ pub fn extract_packed_neighbors(
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         if field == 3 && wire == 2 {
             let (len, ni) = read_varint(payload, i)?;
-            let end = ni + len as usize;
+            let end = ni.checked_add(len as usize)?;
             if end > payload.len() {
                 return None;
             }
@@ -508,42 +521,8 @@ fn push_varint(out: &mut heapless::Vec<u8, 240>, mut v: u32) {
     }
 }
 
-fn read_varint(data: &[u8], mut idx: usize) -> Option<(u32, usize)> {
-    let mut result = 0u32;
-    let mut shift = 0u32;
-    for _ in 0..5 {
-        if idx >= data.len() {
-            return None;
-        }
-        let byte = data[idx];
-        idx += 1;
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, idx));
-        }
-        shift += 7;
-    }
-    None
-}
-
-fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
-    match wire {
-        0 => {
-            let (_, i) = read_varint(data, idx)?;
-            Some(i)
-        }
-        2 => {
-            let (len, mut i) = read_varint(data, idx)?;
-            i += len as usize;
-            if i > data.len() {
-                None
-            } else {
-                Some(i)
-            }
-        }
-        1 | 5 => Some(idx + if wire == 1 { 8 } else { 4 }),
-        _ => None,
-    }
+fn varint_size(value: u32) -> usize {
+    ((32 - value.leading_zeros()).max(1) as usize).div_ceil(7)
 }
 
 #[cfg(test)]
@@ -609,10 +588,8 @@ mod tests {
 
     #[test]
     fn bitfield_want_response_bit_is_mirrored_on_receive() {
-        // portnum 1, empty payload, bitfield with only the want_response bit: no field 3.
         let (decoded, _) = decode_data_payload_full(&[0x08, 0x01, 0x12, 0x00, 0x48, 0x02]).unwrap();
         assert!(decoded.want_response);
-        // A frame from an origin without the bitfield.
         let (decoded, _) = decode_data_payload_full(&[0x08, 0x01, 0x12, 0x00]).unwrap();
         assert!(!decoded.has_bitfield);
         assert!(!decoded.want_response);
@@ -709,5 +686,52 @@ mod tests {
         let (hdr, neighbors) = extract_packed_neighbors(&payload).unwrap();
         assert_eq!(hdr.topology_version, 3);
         assert_eq!(neighbors.len(), 0);
+    }
+    #[test]
+    fn malformed_packed_lists_cannot_become_authoritative() {
+        let mut wire = [0; PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE + 1];
+        write_packed_header(&mut wire, 1, true);
+        assert!(decode_packed_neighbors(&wire, 32).is_none());
+        assert!(decode_packed_neighbors(&wire[..wire.len() - 1], 0).is_none());
+        wire[4] |= 1 << 3;
+        assert!(decode_packed_header(&wire).is_none());
+    }
+
+    #[test]
+    fn maximum_frame_length_is_representable_and_oversize_is_rejected() {
+        let key = CryptoKey::none();
+        let inner = [0x55; 232];
+        let (len, _) = build_app_wire_frame(
+            1,
+            2,
+            3,
+            0,
+            3,
+            3,
+            false,
+            &key,
+            1,
+            &inner,
+            DataEncodeOpts::default(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(len as usize, MAX_WIRE_LEN);
+        assert!(build_app_wire_frame(
+            1,
+            2,
+            3,
+            0,
+            3,
+            3,
+            false,
+            &key,
+            1,
+            &[0x55; 233],
+            DataEncodeOpts::default(),
+            0
+        )
+        .is_none());
+        assert!(encode_data_payload(1, &[0; 240]).is_empty());
     }
 }

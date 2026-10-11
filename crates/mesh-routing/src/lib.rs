@@ -1,9 +1,8 @@
-//! Static routing infrastructure — zero heap.
 #![no_std]
-// Wire builders and graph observers take every header field as a plain argument (no heap,
-// no allocation-free parameter structs worth the churn); the 8-11 argument signatures are
-// intentional here.
+// Keeping wire fields explicit avoids extra parameter objects in the allocation-free embedded interface.
 #![allow(clippy::too_many_arguments)]
+
+mod protobuf;
 
 pub mod admin;
 pub mod admin_codec;
@@ -66,9 +65,7 @@ pub use coordinated_relay::{
     cw_size_from_snr, half_airtime_ms, slot_time_for_preset, transmission_record_window_ms,
     tx_delay_ms_worst, DEFAULT_SLOT_MS,
 };
-pub use enter_dfu::{
-    payload_is_enter_dfu, DFU_CONFIRM_TEXT, DFU_ENTER_DELAY_SECS, ENTER_DFU_TEXT,
-};
+pub use enter_dfu::{payload_is_enter_dfu, DFU_CONFIRM_TEXT, DFU_ENTER_DELAY_SECS, ENTER_DFU_TEXT};
 pub use graph::{
     calculate_etx, calculate_route, can_deliver, covers, delivery_hop_cost_fixed, etx_to_fixed,
     etx_to_signal, find_better_positioned_neighbor, fixed_to_etx, get_placeholder_for_relay,
@@ -140,9 +137,9 @@ pub use topology::{
     encode_packed_neighbor_entry, encode_signal_routing_info, extract_packed_neighbors,
     try_decrypt_data, try_decrypt_data_full, write_packed_header, write_packed_header_chunk,
     DataBitfield, DataEncodeOpts, DecodedData, PackedHeader, PackedNeighbor,
-    DATA_BITFIELD_OK_TO_MQTT, DATA_BITFIELD_WANT_RESPONSE,
-    MAX_NEIGHBORS_PER_PACKET, MAX_TOPOLOGY_PACKETS, PACKED_NEIGHBOR_HEADER_SIZE,
-    SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION, SR_BROADCAST_MAX_HOPS,
+    DATA_BITFIELD_OK_TO_MQTT, DATA_BITFIELD_WANT_RESPONSE, MAX_NEIGHBORS_PER_PACKET,
+    MAX_TOPOLOGY_PACKETS, PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
+    SR_BROADCAST_MAX_HOPS,
 };
 pub use traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,

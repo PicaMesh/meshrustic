@@ -3,7 +3,6 @@ use aes::{Aes128, Aes256, Block};
 
 use crate::key::CryptoKey;
 
-/// Single-block AES-ECB encrypt.
 pub fn aes_ecb_encrypt_block(key: &[u8], input: &[u8; 16], output: &mut [u8; 16]) {
     match key.len() {
         16 => {
@@ -22,7 +21,6 @@ pub fn aes_ecb_encrypt_block(key: &[u8], input: &[u8; 16], output: &mut [u8; 16]
     }
 }
 
-/// In-place AES-CTR matching Arduino Crypto `CTR` with 16-byte IV and 4-byte counter.
 pub fn aes_ctr_crypt(key: &CryptoKey, nonce: &[u8; 16], data: &mut [u8]) {
     if key.length <= 0 {
         return;
@@ -44,7 +42,6 @@ pub fn aes_ctr_crypt(key: &CryptoKey, nonce: &[u8; 16], data: &mut [u8]) {
         }
         offset += chunk;
 
-        // Big-endian increment of the counter field (last COUNTER_SIZE bytes).
         for i in (BLOCK_SIZE - COUNTER_SIZE..BLOCK_SIZE).rev() {
             iv[i] = iv[i].wrapping_add(1);
             if iv[i] != 0 {

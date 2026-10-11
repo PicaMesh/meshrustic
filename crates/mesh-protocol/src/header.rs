@@ -4,7 +4,6 @@ use crate::constants::{
     PACKET_FLAGS_WANT_ACK_MASK, PACKET_HEADER_LEN,
 };
 
-/// On-air LoRa packet header (16 bytes, little-endian).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketHeader {
     pub to: u32,
@@ -16,7 +15,6 @@ pub struct PacketHeader {
     pub relay_node: u8,
 }
 
-/// Logical packet fields after decoding the 16-byte LoRa header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParsedPacket {
     pub to: u32,
@@ -91,11 +89,6 @@ impl PacketHeader {
         self.flags & PACKET_FLAGS_WANT_ACK_MASK != 0
     }
 
-    /// Drop the acknowledgement request from a frame we are about to re-send on somebody's behalf.
-    ///
-    /// A retransmission copy is not a new request: the record that answers the original is held by
-    /// the originator, and a copy that still asks for an acknowledgement can be taken by the
-    /// sending path as a fresh reliable transmission and restart its retry interval.
     pub fn clear_want_ack(&mut self) {
         self.flags &= !PACKET_FLAGS_WANT_ACK_MASK;
     }
@@ -129,7 +122,6 @@ impl PacketHeader {
         })
     }
 
-    /// Decode header into logical fields for routing and crypto.
     pub fn parse(&self) -> ParsedPacket {
         let hop_start = self.hop_start();
         ParsedPacket {
@@ -155,7 +147,6 @@ impl PacketHeader {
     }
 }
 
-/// Header plus trailing encrypted payload bytes.
 pub struct EncodedPacket<'a> {
     pub header: PacketHeader,
     pub payload: &'a [u8],

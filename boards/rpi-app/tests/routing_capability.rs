@@ -1,11 +1,9 @@
-//! Capability cache, stock relay slots, passive topology roles, and T1 originated broadcasts.
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{portnum::num, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_routing::{
     coordinated_relay, write_packed_header, CapabilityStatus, InboundPacket, NeighborGraph, Router,
     TopologyMergeResult, CAPABILITY_TTL_MS, DEVICE_ROLE_CLIENT_HIDDEN, DEVICE_ROLE_CLIENT_MUTE,
-    DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, DEVICE_ROLE_TRACKER, MAX_CAPABILITY_RECORDS,
+    DEVICE_ROLE_REPEATER, DEVICE_ROLE_TRACKER, MAX_CAPABILITY_RECORDS,
 };
 
 #[test]
@@ -23,21 +21,11 @@ fn passive_node_tracks_relayed_topology_capability() {
     graph.set_device_role(DEVICE_ROLE_CLIENT_MUTE);
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 2, true);
-    let (header, _) = mesh_routing::decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = mesh_routing::decode_packed_neighbors(&packed[..5], 8).unwrap();
     let result = graph.merge_topology(0xBB, &header, &[], false, 100, 0);
     assert!(matches!(result, TopologyMergeResult::IgnoredFormat));
     assert_eq!(graph.capability_status(0xBB), CapabilityStatus::SrActive);
 }
-
-/// A ROUTER that publishes its own neighbour list does not take the stock router's early slot.
-///
-/// The node here broadcasts topology with `signal_routing_active: false`, which makes it SR-passive,
-/// not stock — and a node that publishes is ranked on what it published rather than compensated for
-/// by role. The test was named for the opposite claim while setting up a publisher.
-///
-/// Note what this exposes: establishing that a *genuinely* stock router hears the transmitter has no
-/// reachable path today, because the inferred edge is gated on `Legacy` and nothing ever marks a
-/// ROUTER legacy. That is the stock-router coverage blindness, not a gap in this test.
 #[test]
 fn a_publishing_router_does_not_take_the_stock_early_slot() {
     let mut graph = NeighborGraph::new();
@@ -47,7 +35,7 @@ fn a_publishing_router_does_not_take_the_stock_early_slot() {
 
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 1, false);
-    let (header, _) = mesh_routing::decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = mesh_routing::decode_packed_neighbors(&packed[..5], 8).unwrap();
     let remote = mesh_routing::PackedNeighbor {
         node_id: 0xDD,
         rssi: -75,
@@ -57,16 +45,10 @@ fn a_publishing_router_does_not_take_the_stock_early_slot() {
         etx_variance: 0,
     };
     graph.merge_topology(0xBB, &header, &[remote], true, 0, 0);
-
-    // Two candidates, not one: the publisher is ranked like any peer now that its role buys it
-    // nothing. It used to be consumed by the reservation pre-pass and so never counted.
-    let (idx_self_only, count_alone) = graph.relay_slot_index(99, 0, 0);
+    let (idx_self_only, count_alone) = graph.relay_slot_index(99, 0, 0, 0);
     assert_eq!(count_alone, 2);
     assert_eq!(idx_self_only, 0);
-
-    // It is still a candidate — it published, so it can be ranked — but it holds no reserved
-    // position, so our own rung stays where it was when we ranked alone.
-    let (idx_with_publisher, _count) = graph.relay_slot_index(99, 0xDD, 0);
+    let (idx_with_publisher, _count) = graph.relay_slot_index(99, 0xDD, 0xDD, 0);
     assert!(!graph.capability().is_immediate_relay_router(0xBB));
     assert_eq!(
         idx_with_publisher, idx_self_only,
@@ -135,7 +117,7 @@ fn three_node_topology_versions_converge() {
 
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 3, true);
-    let (header, _) = mesh_routing::decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = mesh_routing::decode_packed_neighbors(&packed[..5], 8).unwrap();
     let neighbor = mesh_routing::PackedNeighbor {
         node_id: 0xC000_0003,
         rssi: -75,
@@ -149,7 +131,7 @@ fn three_node_topology_versions_converge() {
     assert!(matches!(r1, TopologyMergeResult::Applied { .. }));
 
     write_packed_header(&mut packed, 4, true);
-    let (header2, _) = mesh_routing::decode_packed_neighbors(&packed, 8).unwrap();
+    let (header2, _) = mesh_routing::decode_packed_neighbors(&packed[..5], 8).unwrap();
     let r2 = a.merge_topology(0xB000_0002, &header2, &[neighbor], false, 200, 0);
     assert!(matches!(r2, TopologyMergeResult::Applied { .. }));
 }

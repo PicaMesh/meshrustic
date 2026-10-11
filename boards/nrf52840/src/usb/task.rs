@@ -1,11 +1,3 @@
-//! Embassy task: USB CDC ACM device + log drain + host command input.
-//!
-//! The command read side is Part C of the H1 controlled-node experiment harness (see
-//! `tmp/controlled-node-harness-plan-20260911.md` in the MeshRustic repo): it lets an operator
-//! make this node originate a frame, which is otherwise impossible to arrange over the write-only
-//! link this task used to be. A line is parsed here and handed to the radio task over a small
-//! channel; nothing here talks to the radio directly.
-
 use crate::Irqs;
 use embassy_futures::join::join3;
 use embassy_nrf::peripherals;
@@ -27,22 +19,12 @@ static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 static CDC_STATE: StaticCell<State> = StaticCell::new();
 static SERIAL_NUMBER: StaticCell<[u8; 8]> = StaticCell::new();
 
-/// The USB serial-number string, as this node's id in lowercase hex.
-///
-/// Every board used to report `0001`, so two of them attached at once were indistinguishable:
-/// udev builds `/dev/serial/by-id/` from the serial, could only create one link for the pair, and
-/// the second board appeared under no stable name at all. Logging tools then silently captured one
-/// node and missed the other. The id is already known here — it is derived from the chip's factory
-/// DEVICEID and may be overridden from flash — so it costs nothing to publish and makes the by-id
-/// link name the node.
 fn serial_number_str(node_num: u32) -> &'static str {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let buf = SERIAL_NUMBER.init([0u8; 8]);
     for (i, byte) in buf.iter_mut().enumerate() {
         *byte = HEX[((node_num >> (28 - i * 4)) & 0xF) as usize];
     }
-    // Always ASCII hex by construction; the fallback keeps this total rather than panicking in a
-    // task that runs before anything can report the panic.
     core::str::from_utf8(buf).unwrap_or("meshrustic")
 }
 
@@ -81,19 +63,11 @@ pub async fn usb_task(
             crate::usb_log::set_usb_connected(true);
             defmt::info!("USB CDC connected");
             log::push_line("[meshrustic] USB log ready");
-            // Identity and firmware on every connection, not once at boot. Lines pushed before
-            // this task runs are written into a 16 KB ring that the node fills long before a host
-            // attaches, so a boot-time stamp is evicted and never seen — which is exactly what
-            // happened to the first attempt. Re-stating it here also answers "what is this node
-            // running?" for a capture started at any time, not only one that caught a reboot.
             log::mesh::node_id(node_num);
             log::mesh::device_role(super::published_device_role());
             log::push_line(concat!("[meshrustic] build ", env!("MR_BUILD")));
 
             loop {
-                // One complete line, then USB packets of it. Taking the line out of the
-                // ring before the await means a full ring drops some other whole line,
-                // not the middle of this one.
                 let mut buf = [0u8; log::MAX_LOG_LINE];
                 let n = log::read_line(&mut buf);
                 if n > 0 {
@@ -119,10 +93,6 @@ pub async fn usb_task(
         }
     };
 
-    // Part C: host command input. A fixed-capacity line accumulator, reset on every new
-    // connection so a line left partial by a disconnect can never be silently completed by
-    // bytes from the next session. A complete, parsed line is handed to the radio task through
-    // `host_cmd`; a rejected or dropped one is logged with its specific reason, never silent.
     let cmd_run = async {
         let mut acc: LineAccumulator<MAX_COMMAND_LINE> = LineAccumulator::new();
         loop {
@@ -132,16 +102,13 @@ pub async fn usb_task(
                 let mut buf = [0u8; 64];
                 let n = match receiver.read_packet(&mut buf).await {
                     Ok(n) => n,
-                    Err(_) => break, // disconnected: outer loop waits for the next connection
+                    Err(_) => break,
                 };
                 for &b in &buf[..n] {
                     let Some(line_result) = acc.push_byte(b) else {
                         continue;
                     };
                     match line_result {
-                        // The accumulator itself only ever reports LineTooLong; a line that fit
-                        // is parsed, which is where the rest of `CommandError`'s variants come
-                        // from -- `reason_for` covers both.
                         Err(err) => log::mesh::host_command_rejected(reason_for(err)),
                         Ok(line) => match mesh_routing::parse_line(&line) {
                             Ok(cmd) => {
@@ -160,7 +127,6 @@ pub async fn usb_task(
     join3(usb_run, log_run, cmd_run).await;
 }
 
-/// Which check failed, for the log line -- never a silent drop.
 fn reason_for(err: CommandError) -> &'static [u8] {
     match err {
         CommandError::LineTooLong => b"line too long",

@@ -1,5 +1,3 @@
-//! Unified routing core — RX pipeline, graph maintenance, coordinated relay (Phase 6).
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{
     is_direct_packet, num::TEXT_MESSAGE_APP, PacketHeader, ParsedPacket, NODENUM_BROADCAST,
@@ -9,10 +7,11 @@ use mesh_radio::{
     eu868_config_for_preset, packet_time_ms, primary_channel_hash, MODEM_DEFAULT_PRESET,
 };
 
+#[cfg(feature = "pki")]
+use crate::admin::ROUTING_ERROR_PKI_UNKNOWN_PUBKEY;
 use crate::admin::{
     encode_admin_response, encode_owner_response, handle_admin, AdminState,
     ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED, ROUTING_ERROR_PKI_FAILED,
-    ROUTING_ERROR_PKI_UNKNOWN_PUBKEY,
 };
 use crate::admin_codec::{AdminPayload, ADMIN_APP};
 use crate::coordinated_relay::{
@@ -37,8 +36,8 @@ use crate::rate_limit::NodeRateLimiter;
 use crate::relay::{copy_opaque_payload, relay_header_with_next_hop_opts, wire_may_relay};
 use crate::relay_identity::RelayIdentityCache;
 use crate::reliable::{
-    bump_reliable_delays, due_retransmit, named_followup, schedule_reliable, stop_reliable,
-    stop_reliable_for, NamedFollowup, PendingReliable, MAX_PENDING_RELIABLE, NAMED_FOLLOWUP_TRIES,
+    bump_reliable_delays, due_retransmit, named_followup, schedule_reliable, stop_reliable_for,
+    NamedFollowup, PendingReliable, MAX_PENDING_RELIABLE, NAMED_FOLLOWUP_TRIES,
 };
 use crate::routing_ack::{
     build_ack_nak_frame, decode_routing_payload, encode_routing_error, hop_limit_for_response,
@@ -66,11 +65,10 @@ pub const MAX_WIRE_LEN: usize = PACKET_HEADER_LEN + MAX_PACKET_PAYLOAD;
 const MAX_PENDING_RELAYS: usize = 8;
 
 fn psk_bytes(key: &CryptoKey) -> &[u8] {
-    let len = key.length.max(0) as usize;
+    let len = key.len();
     &key.bytes[..len]
 }
 
-/// Raw RX frame passed in from a radio driver task.
 pub struct InboundPacket<'a> {
     pub radio_id: u8,
     pub rssi: i16,
@@ -78,14 +76,11 @@ pub struct InboundPacket<'a> {
     pub bytes: &'a [u8],
 }
 
-/// Outcome of `Router::process_inbound`.
 #[derive(Clone, Copy)]
 pub struct ProcessResult {
     pub parsed: ParsedPacket,
     pub duplicate: bool,
     pub rate_limited: bool,
-    /// Default-channel unicast to a limited originator or dest-volume sink
-    /// (WantResponse-amplification cut).
     pub dest_rate_limited: bool,
     pub handle: Option<PacketHandle>,
     pub radio_id: u8,
@@ -96,7 +91,6 @@ pub struct ProcessResult {
     pub decoded_data: Option<DecodedData>,
 }
 
-/// Built relay frame ready for the radio TX queue.
 #[derive(Clone, Copy)]
 pub struct RelayPlan {
     pub len: u8,
@@ -104,7 +98,6 @@ pub struct RelayPlan {
     pub delay_ms: u32,
 }
 
-/// TX decisions for one received frame (same-radio relay + optional cross-preset bridge).
 #[derive(Clone, Copy)]
 pub struct TxPlan {
     pub relay: Option<RelayPlan>,
@@ -151,13 +144,12 @@ const MAX_PENDING_RETRANSMITS: usize = 4;
 struct PendingRetransmit {
     active: bool,
     canceled: bool,
-    /// The frame left the router but may still be waiting behind listen-before-talk. A copy
-    /// heard now must pull it back out of the radio queue, exactly as a committed relay does:
-    /// without this an insurer that fired before hearing the first one put a second copy on the
-    /// air 0.4 to 1.0 s later (six times in 109 min, field 2026-09-08).
     fired: bool,
+    from: u32,
+    resolved_relay: Option<u32>,
     packet_id: u32,
     fire_after_ms: u32,
+    decoded_portnum: Option<u32>,
     len: u8,
     bytes: [u8; MAX_WIRE_LEN],
 }
@@ -204,10 +196,8 @@ struct PendingAdmin {
     bytes: [u8; MAX_WIRE_LEN],
 }
 
-/// Minimum spacing between topology lists sent in answer to empty bootstrap broadcasts.
 pub const BOOTSTRAP_REPLY_MIN_MS: u32 = 120_000;
 
-/// Shared static router state.
 pub struct Router {
     node_num: u32,
     pool: PacketPool,
@@ -219,9 +209,6 @@ pub struct Router {
     graph: NeighborGraph,
     pending: [PendingRelay; MAX_PENDING_RELAYS],
     pending_topology: PendingTopology,
-    /// Uptime at which a direct SR neighbour's empty bootstrap broadcast asked for our list
-    /// (0 = nothing pending). The timestamp, not a flag: a list that goes out after the
-    /// request has already answered it.
     pending_topology_reply_ms: u32,
     pending_nodeinfo: PendingNodeInfo,
     pending_telemetry: PendingTelemetry,
@@ -229,33 +216,25 @@ pub struct Router {
     pending_traceroute: PendingTraceroute,
     pending_retransmits: [PendingRetransmit; MAX_PENDING_RETRANSMITS],
     pending_reliable: [PendingReliable; MAX_PENDING_RELIABLE],
-    /// Latest channel utilization reported by the radio task (drives retransmit backoff).
     channel_util_pct: f32,
     pending_ack: PendingAck,
-    /// PKI "Entering DFU" text. Kept off `pending_ack` so the WantAck routing ACK still goes out.
     pending_dfu_confirm: PendingAck,
     pending_admin: [PendingAdmin; MAX_PENDING_ADMIN],
-    pending_admin_count: u8,
-    /// Packet ids whose relay we cancelled after it may already have been handed to the radio;
-    /// the board pulls matching frames back out of the radio's TX queue.
-    tx_cancels: heapless::Vec<u32, 8>,
-    /// When we last answered an empty bootstrap broadcast with our topology (0 = never).
-    /// Bootstrap replies are rate-limited so a burst of empty broadcasts cannot make every node
-    /// flood the channel with its list.
-    last_bootstrap_reply_ms: u32,
+    tx_cancels: heapless::Vec<(u32, u32), 8>,
+    /// Bootstrap reply throttling prevents simultaneous restarts from making every node flood the
+    /// channel.
+    last_bootstrap_reply_ms: Option<u32>,
     nodeinfo_identity: NodeInfoIdentity,
     nodeinfo_cache: NodeInfoCache,
-    last_nodeinfo_ms: u32,
+    last_nodeinfo_ms: Option<u32>,
     last_nodeinfo_reply_to: u32,
     last_nodeinfo_reply_ms: u32,
-    last_telemetry_ms: u32,
-    last_position_ms: u32,
+    last_telemetry_ms: Option<u32>,
+    last_position_ms: Option<u32>,
     device_metrics: DeviceMetricsSnapshot,
     channel_key: CryptoKey,
     channel_hash: u8,
     modem_preset: u8,
-    /// Preset the radio is actually running. `set_modem_preset` updates `modem_preset` first;
-    /// `radio_reconfigured` compares the two so a no-op apply does not drop the graph.
     operating_preset: u8,
     use_preset: bool,
     hop_limit: u8,
@@ -263,20 +242,12 @@ pub struct Router {
     sr_log: SrLog,
     bridge_dedup: crate::bridge::BridgeDedupCache,
     admin: AdminState,
-    /// Remote pubkey from last successful PKI admin decrypt (for reply encryption).
     admin_reply_remote_pk: Option<[u8; 32]>,
-    /// True when last admin decrypt used PKI (vs channel).
     admin_reply_use_pki: bool,
-    /// Pending PKI decrypt failure to NAK when addressed to us.
     pending_pki_error: Option<u32>,
-    /// When an admin (or PKI) module reply is queued for this RX, skip a separate
-    /// WantAck ACK — the reply's `Data.request_id` already stops reliable retransmit.
     module_reply_suppresses_ack: bool,
-    /// LoRa preset changed; board must soft-reinit the radio (no sys_reset).
     pending_radio_reinit: bool,
-    /// Packet id of a duplicate that named us as next hop and is being forwarded as a hand-off.
-    designated_repeat_id: Option<u32>,
-    /// Arm Adafruit BLE OTA DFU after this many seconds (PKI `ENTER DFU` DM).
+    designated_repeat_id: Option<(u32, u32)>,
     pending_ota_dfu_seconds: Option<i32>,
 }
 
@@ -292,7 +263,6 @@ impl Router {
         )
     }
 
-    /// Primary channel hash from stored name + modem preset.
     pub fn with_modem_preset(
         node_num: u32,
         stored_channel_name: &str,
@@ -329,11 +299,8 @@ impl Router {
         )
     }
 
-    /// Router with no node id or channel yet. Boards place this in a `ConstStaticCell` so the
-    /// ~70 KB router is laid out at link time instead of being built on the stack: the nRF52840
-    /// has ~100 KB of stack above its statics and `with_channel` needs a frame larger than the
-    /// router itself, which stopped the boards booting once the graph caps grew.
-    /// `load_node_config` must run before the router is used.
+    /// Static initialization avoids constructing the large routing graph on the constrained firmware
+    /// stack.
     pub const fn unconfigured() -> Self {
         Self::with_channel(0, CryptoKey::none(), 0, MODEM_DEFAULT_PRESET, true, 3)
     }
@@ -356,7 +323,7 @@ impl Router {
             rate_limit: NodeRateLimiter::with_node_num(node_num),
             pending_young_announce: None,
             relay_identity: RelayIdentityCache::new(),
-            qos: ChannelQoS::new(),
+            qos: ChannelQoS::with_primary_channel(channel_hash),
             graph,
             pending: [PendingRelay {
                 active: false,
@@ -406,8 +373,11 @@ impl Router {
                 active: false,
                 canceled: false,
                 fired: false,
+                from: 0,
+                resolved_relay: None,
                 packet_id: 0,
                 fire_after_ms: 0,
+                decoded_portnum: None,
                 len: 0,
                 bytes: [0; MAX_WIRE_LEN],
             }; MAX_PENDING_RETRANSMITS],
@@ -431,16 +401,15 @@ impl Router {
                 len: 0,
                 bytes: [0; MAX_WIRE_LEN],
             }; MAX_PENDING_ADMIN],
-            pending_admin_count: 0,
             tx_cancels: heapless::Vec::new(),
-            last_bootstrap_reply_ms: 0,
+            last_bootstrap_reply_ms: None,
             nodeinfo_identity: NodeInfoIdentity::unconfigured(),
             nodeinfo_cache: NodeInfoCache::new(),
-            last_nodeinfo_ms: 0,
+            last_nodeinfo_ms: None,
             last_nodeinfo_reply_to: 0,
             last_nodeinfo_reply_ms: 0,
-            last_telemetry_ms: 0,
-            last_position_ms: 0,
+            last_telemetry_ms: None,
+            last_position_ms: None,
             device_metrics: DeviceMetricsSnapshot::EMPTY,
             channel_key,
             channel_hash,
@@ -462,28 +431,23 @@ impl Router {
         }
     }
 
-    /// Graph access for host integration tests (`rpi-app`).
     #[doc(hidden)]
     pub fn graph_mut(&mut self) -> &mut NeighborGraph {
         &mut self.graph
     }
 
     pub fn set_node_identity(&mut self, identity: NodeInfoIdentity) {
-        // Role is configured separately (flash / admin). A rebuilt advert from `for_node` is
-        // always CLIENT; applying that here used to desync graph from admin.device_role and
-        // silently lose a persisted ROUTER on the next save.
         let role = self.graph.device_role();
         self.nodeinfo_identity = identity;
         self.nodeinfo_identity.advert.role = role;
         self.admin.public_key = self.nodeinfo_identity.public_key;
     }
 
-    /// Load persisted NodeConfig into admin + channel/modem state.
     pub fn load_node_config(&mut self, cfg: &mesh_store::NodeConfig) {
         self.node_num = cfg.node_num;
         self.graph.set_my_node(cfg.node_num);
         self.rate_limit.set_node_num(cfg.node_num);
-        self.admin.apply_node_config(cfg);
+        self.admin.import_node_config(cfg);
         self.nodeinfo_identity = NodeInfoIdentity::for_node(cfg.node_num, cfg.public_key);
         self.set_device_role(u32::from(cfg.device_role));
         self.set_modem_preset(
@@ -496,7 +460,6 @@ impl Router {
         self.hop_limit = cfg.lora.hop_limit;
     }
 
-    /// Export admin-managed fields into a NodeConfig for flash save.
     pub fn write_admin_into_config(&self, cfg: &mut mesh_store::NodeConfig) {
         self.admin.export_to_node_config(cfg);
         cfg.channel_key = self.channel_key;
@@ -515,12 +478,24 @@ impl Router {
         self.admin.pending_reboot_seconds.take()
     }
 
-    /// Seconds until the board should reset into Adafruit BLE OTA DFU.
     pub fn take_pending_ota_dfu_seconds(&mut self) -> Option<i32> {
         self.pending_ota_dfu_seconds.take()
     }
 
-    /// True after a LoRa preset change — board should reinit SX1262 without sys_reset.
+    /// A software reset would enter the UF2 bootloader rather than simply apply radio settings.
+    pub fn radio_config(&self) -> mesh_radio::RadioConfig {
+        let mut config = mesh_radio::eu868_config_for_preset(self.modem_preset);
+        config.hop_limit = self.hop_limit;
+        config.tx_power_dbm = self.admin.tx_power_dbm.min(22) as i8;
+        config
+    }
+
+    pub fn has_pending_control_tx(&self) -> bool {
+        self.pending_ack.active
+            || self.pending_dfu_confirm.active
+            || self.pending_admin.iter().any(|slot| slot.active)
+    }
+
     pub fn take_pending_radio_reinit(&mut self) -> bool {
         core::mem::take(&mut self.pending_radio_reinit)
     }
@@ -537,14 +512,7 @@ impl Router {
         self.rate_limit.announce_broadcast()
     }
 
-    /// The board applied a new modem preset. Everything still queued was heard on, timed for
-    /// and addressed to nodes on the old air parameters: relays and T1 insurance of packets
-    /// nobody on the new preset saw, reliable retries and routing ACKs the requester (who
-    /// stays on its preset) can no longer hear, and admin replies to that requester. Periodic
-    /// topology, NodeInfo and telemetry broadcasts stay: they introduce us on the new preset.
-    ///
-    /// When the operating preset actually changed, the neighbour graph is dropped too — those
-    /// links cannot exist on the new air — and we re-advertise from nothing as at boot.
+    /// Links learned on the previous RF parameters cannot establish connectivity on the new preset.
     pub fn radio_reconfigured(&mut self, now_ms: u32, slot_ms: u32) {
         let mut dropped = 0usize;
         for p in &mut self.pending {
@@ -575,7 +543,6 @@ impl Router {
                 dropped += 1;
             }
         }
-        self.pending_admin_count = 0;
         if self.pending_traceroute.active {
             self.pending_traceroute.active = false;
             dropped += 1;
@@ -589,7 +556,7 @@ impl Router {
             }
             self.graph.purge_for_preset_change();
             self.relay_identity.clear();
-            self.last_nodeinfo_ms = 0;
+            self.last_nodeinfo_ms = None;
             self.operating_preset = self.modem_preset;
             self.ensure_boot_broadcasts(now_ms, slot_ms);
         }
@@ -598,10 +565,6 @@ impl Router {
         });
     }
 
-    /// Host/unit-test only: run admin handler as if `remote_pk` completed PKI decrypt.
-    ///
-    /// Not compiled into firmware builds (no `std` / `test`). Prefer real PKI frames in
-    /// integration tests whenever a keypair is available.
     #[cfg(any(test, feature = "std"))]
     pub fn process_admin_as_pki_peer_for_test(
         &mut self,
@@ -628,13 +591,11 @@ impl Router {
         self.process_admin_rx(&parsed, inner, true, now_ms);
     }
 
-    /// Host/unit-test only: replace Appendix A builtin pubs with a known keypair set.
     #[cfg(any(test, feature = "std"))]
     pub fn set_builtin_admin_public_keys_for_test(&mut self, keys: [[u8; 32]; 2]) {
         self.admin.set_builtin_admin_public_keys_for_test(keys);
     }
 
-    /// Host/unit-test only: seed NODEINFO cache so PKI decrypt can try `public_key` for `node_num`.
     #[cfg(any(test, feature = "std"))]
     pub fn seed_nodeinfo_peer_for_test(
         &mut self,
@@ -654,12 +615,10 @@ impl Router {
         &mut self.admin
     }
 
-    /// Update cached device metrics before periodic telemetry broadcast.
     pub fn update_device_metrics(&mut self, metrics: DeviceMetricsSnapshot) {
         self.device_metrics = metrics;
     }
 
-    /// Recompute channel hash when LoRa preset or channel settings change.
     pub fn set_modem_preset(
         &mut self,
         stored_channel_name: &str,
@@ -677,16 +636,13 @@ impl Router {
             use_preset,
             psk_bytes(&channel_key),
         );
+        self.qos = ChannelQoS::with_primary_channel(self.channel_hash);
     }
 
     pub fn channel_hash(&self) -> u8 {
         self.channel_hash
     }
 
-    /// Our own configured device role, as the graph holds it.
-    ///
-    /// The role decides which ladder positions we take and whether peers reserve air for us, so a
-    /// capture that does not record it cannot be checked against the ladder it produced.
     pub fn device_role(&self) -> u32 {
         self.graph.device_role()
     }
@@ -699,7 +655,6 @@ impl Router {
         self.graph.edge_heard_on(peer)
     }
 
-    /// Our LoRa "OK to MQTT" setting: the MQTT bit of every Data bitfield we originate.
     pub fn ok_to_mqtt(&self) -> bool {
         self.admin.ok_to_mqtt
     }
@@ -714,9 +669,6 @@ impl Router {
         self.modem_preset
     }
 
-    /// Our own configured LoRa hop limit -- what any locally-originated frame should ask for
-    /// absent a caller-specific reason to ask for less (see `host_command`'s producer in the
-    /// board's radio task, the first caller of `send_local` outside a host test).
     pub fn hop_limit(&self) -> u8 {
         self.hop_limit
     }
@@ -725,10 +677,9 @@ impl Router {
         slot_time_for_preset(self.modem_preset)
     }
 
-    /// Call when a frame is actually queued for TX (own-rebroadcast detection).
-    pub fn record_tx_on_air(&mut self, packet_id: u32, now_ms: u32) {
+    pub fn record_tx_on_air(&mut self, from: u32, packet_id: u32, now_ms: u32) {
         if packet_id != 0 {
-            self.graph.record_our_transmission(packet_id, now_ms);
+            self.graph.record_our_transmission(from, packet_id, now_ms);
         }
     }
 
@@ -777,13 +728,13 @@ impl Router {
 
     pub fn ensure_boot_broadcasts(&mut self, now_ms: u32, slot_ms: u32) {
         if self.graph.can_send_topology()
-            && self.graph.last_topology_ms() == 0
+            && !self.graph.has_sent_topology()
             && !self.pending_topology.active
             && self.schedule_topology_broadcast(now_ms, slot_ms, false)
         {
             self.graph.commit_topology_broadcast(now_ms, false);
         }
-        if self.last_nodeinfo_ms == 0 && !self.pending_nodeinfo.active {
+        if self.last_nodeinfo_ms.is_none() && !self.pending_nodeinfo.active {
             self.schedule_nodeinfo_broadcast(now_ms);
         }
     }
@@ -798,7 +749,6 @@ impl Router {
         }
     }
 
-    /// One-time startup logs for SR / graph init.
     pub fn emit_startup_logs(&mut self) {
         self.sr_log.push(SrLogEvent::UsingNeighborGraph);
         self.sr_log.push(SrLogEvent::ModuleInitialized {
@@ -812,13 +762,11 @@ impl Router {
         });
     }
 
-    /// RX pipeline: parse, dedup, rate-limit, graph update, stash opaque payload.
     pub fn process_inbound(
         &mut self,
         packet: &InboundPacket<'_>,
         now_ms: u32,
     ) -> Option<ProcessResult> {
-        // Per-RX: module replies (admin, traceroute) for this packet suppress a separate WantAck ACK.
         self.module_reply_suppresses_ack = false;
         let header = PacketHeader::decode(packet.bytes).ok()?;
         let parsed = header.parse();
@@ -857,10 +805,6 @@ impl Router {
                 }
             }
             ObserveResult::Duplicate => {
-                // A copy that names our byte as next hop is the previous relay handing the
-                // packet to us (stock: `weWereNextHop`): forward it like a fresh reception
-                // instead of cancelling. B relayed a traceroute to A, A dropped it as a dupe
-                // and B retried three times into silence.
                 let our_byte = (self.node_num & 0xFF) as u8;
                 let designated_repeat = parsed.to != NODENUM_BROADCAST
                     && parsed.to != self.node_num
@@ -868,7 +812,9 @@ impl Router {
                     && parsed.next_hop == our_byte
                     && parsed.hop_limit > 0
                     && self.graph.is_active_routing_role()
-                    && !self.graph.has_our_transmission(parsed.id);
+                    && !self
+                        .graph
+                        .has_our_transmission(parsed.from, parsed.id, now_ms);
                 let originator_retry = parsed.to != NODENUM_BROADCAST
                     && parsed.to != self.node_num
                     && parsed.from != self.node_num
@@ -880,12 +826,12 @@ impl Router {
                     )
                     && (parsed.next_hop == 0 || parsed.next_hop == our_byte)
                     && parsed.hop_limit > 0
-                    && !self.graph.has_our_transmission(parsed.id)
+                    && !self
+                        .graph
+                        .has_our_transmission(parsed.from, parsed.id, now_ms)
                     && !self.has_pending_relay(parsed.from, parsed.id)
                     && !self.graph.is_committed_relay(parsed.from, parsed.id);
                 if designated_repeat || originator_retry {
-                    // Hand-off or originator retry: drop any later-slot frame / commit / retry
-                    // left by an earlier copy, then fall through like a fresh reception.
                     self.cancel_pending(parsed.from, parsed.id);
                     self.graph.cancel_relay(parsed.from, parsed.id);
                     self.cancel_relayed_retx(
@@ -894,7 +840,7 @@ impl Router {
                         RelayRetxCancelReason::CopyHeard,
                     );
                     if designated_repeat {
-                        self.designated_repeat_id = Some(parsed.id);
+                        self.designated_repeat_id = Some((parsed.from, parsed.id));
                     }
                     if originator_retry {
                         self.sr_log
@@ -952,15 +898,11 @@ impl Router {
             None
         };
 
-        // Rate-limit before graph/topology observe, so a dropped frame drives no relay, no
-        // topology merge and no downstream learning. The one exception is our own measurement of
-        // the link the frame arrived on, re-applied below: see the `rate_limited` branch.
         let decoded_portnum = decode.portnum;
         let rebroadcast_candidate = parsed.to != self.node_num
             && parsed.from != self.node_num
             && parsed.hop_limit > 0
             && self.graph.is_rebroadcaster();
-        // Direct first-hop: last hop is the originator. Multi-hop: resolve relay_node when possible.
         let resolved_relay = if direct {
             (parsed.from != 0 && parsed.from != self.node_num).then_some(parsed.from)
         } else {
@@ -1030,13 +972,8 @@ impl Router {
             self.pending_young_announce = Some(ann);
         }
         if rate_limited {
-            // A direct frame carrying a signal reading is our own measurement of that link, and
-            // it stays true whether or not we are dropping the payload. Discarding it would let a
-            // neighbour we are limiting age out of the graph, at which point it stops being a node
-            // we relay *behind* and becomes one we relay *for* — the limiter would manufacture the
-            // traffic it exists to suppress. The edge and its downstream invalidation are all we
-            // take: no relay planning, no topology merge, no activity or capability tracking.
-            // observe_direct_neighbor remaps clipped RSSI=0 (with SNR) and refuses unset 0/0.
+            // Discarding our link measurement would eventually turn a limited neighbour into an
+            // apparently unserved node and manufacture extra relays.
             if direct && !parsed.via_mqtt {
                 self.graph.observe_direct_neighbor(
                     parsed.from,
@@ -1085,14 +1022,6 @@ impl Router {
         }
 
         if direct {
-            // A frame that reached us direct and names our byte as its next hop proves the
-            // sender hears us: a next hop is learned from traffic received, so it could only
-            // have chosen us by hearing us. Same class of evidence as watching a peer carry our
-            // frame, and the sender's own list carries it too — but the list can be an interval
-            // away, and until then a reply to that neighbour cannot be framed as a last hop, so
-            // it goes out with a spare hop and gets relayed (field 2026-09-08: a traceroute
-            // reply to a neighbour 47 dB down was carried by two further relays because its
-            // requester had not yet published a list naming us).
             let our_byte = (self.node_num & 0xFF) as u8;
             if parsed.to != NODENUM_BROADCAST
                 && parsed.from != self.node_num
@@ -1112,12 +1041,8 @@ impl Router {
             }
         }
 
-        // Packets addressed to us are always processed (admin, DMs, requests); the
-        // per-source rate limiter only guards relay and graph work for other traffic
-        // (checked above, before graph observe).
-
         if let Some(data) = decoded_data.as_ref() {
-            self.maybe_cancel_relay_for_foreign_ack(&parsed, data);
+            self.maybe_cancel_relay_for_foreign_ack(&parsed, data, now_ms);
         }
 
         if let Some(data) = decoded_data {
@@ -1200,7 +1125,6 @@ impl Router {
             parsed.channel,
             &mut cipher[..payload_len],
         ) {
-            // Channel path must not inherit a prior PKI peer for admin ACL.
             self.admin_reply_remote_pk = None;
             self.admin_reply_use_pki = false;
             self.pending_pki_error = None;
@@ -1272,7 +1196,6 @@ impl Router {
                 ) {
                     continue;
                 }
-                // PKI plaintext length is cipher_len - 12 (MIC + extra nonce).
                 if payload_len < 12 {
                     continue;
                 }
@@ -1292,7 +1215,6 @@ impl Router {
                     );
                 }
             }
-            // Addressed decrypt failed: remember error for reply when a path exists.
             self.pending_pki_error = Some(if had_candidates {
                 ROUTING_ERROR_PKI_FAILED
             } else {
@@ -1311,7 +1233,6 @@ impl Router {
         )
     }
 
-    /// PKI private `ENTER DFU` from an authorized admin on a direct RF hop.
     fn maybe_arm_ota_dfu(
         &mut self,
         parsed: &ParsedPacket,
@@ -1339,13 +1260,10 @@ impl Router {
         if !payload_is_enter_dfu(text) {
             return;
         }
-        // The app marks the DM delivered only on a routing ACK. The text is a
-        // separate chat reply and must not occupy the ACK slot.
         let _ = self.queue_dfu_confirm(parsed, hop_start_known, now_ms);
         self.pending_ota_dfu_seconds = Some(DFU_ENTER_DELAY_SECS);
     }
 
-    /// PKI text back to the admin: "Entering DFU".
     fn queue_dfu_confirm(
         &mut self,
         parsed: &ParsedPacket,
@@ -1356,7 +1274,7 @@ impl Router {
             return false;
         };
         let (hop, next_hop) = self.response_header(parsed, hop_start_known);
-        let id = self.alloc_tx_id(now_ms);
+        let id = self.alloc_tx_id();
         let opts = DataEncodeOpts {
             want_response: false,
             request_id: parsed.id,
@@ -1392,7 +1310,6 @@ impl Router {
         hop_start_known: bool,
         now_ms: u32,
     ) {
-        // v1: admin is authorized only from this packet's successful PKI remote pubkey.
         let Some(remote_pk) = self
             .admin_reply_remote_pk
             .filter(|_| self.admin_reply_use_pki)
@@ -1419,13 +1336,13 @@ impl Router {
         );
 
         if let Some(preset) = outcome.apply_modem_preset {
+            self.hop_limit = self.admin.hop_limit;
             self.set_modem_preset("", preset, true, self.channel_key);
             self.pending_radio_reinit = true;
         }
         if let Some(role) = outcome.apply_device_role {
             self.set_device_role(role);
-            // Peers learn the new role from nodeinfo; force the next periodic advert out soon.
-            self.last_nodeinfo_ms = 0;
+            self.last_nodeinfo_ms = None;
         }
         if !self.admin.broadcasts_fixed_position() {
             self.pending_position.active = false;
@@ -1444,9 +1361,6 @@ impl Router {
         if let Some(resp) = outcome.response {
             self.schedule_admin_response(parsed, hop_start_known, &resp, now_ms);
         } else if outcome.routing_ok {
-            // Mutating admin ops complete with ROUTING_APP Error_NONE.
-            // This reply also serves as the WantAck ACK (no second ROUTING NONE).
-            // Always send — some clients omit Data.want_response on set.
             self.schedule_admin_routing_error(parsed, hop_start_known, ROUTING_ERROR_NONE, now_ms);
         }
     }
@@ -1459,10 +1373,8 @@ impl Router {
         now_ms: u32,
     ) {
         let (hop, next_hop) = self.response_header(parsed, hop_start_known);
-        let id = self.alloc_tx_id(now_ms);
+        let id = self.alloc_tx_id();
         let routing = encode_routing_error(error);
-        // Mirror setReplyTo: Data.request_id only (not reply_id), and copy WantAck so the reply
-        // alone can stop reliable retransmit (no second ACK).
         let opts = DataEncodeOpts {
             request_id: parsed.id,
             want_response: false,
@@ -1503,7 +1415,6 @@ impl Router {
         self.enqueue_admin_tx(now_ms, len, bytes);
     }
 
-    /// Prefer the current PKI peer, else NODEINFO cache for `from`.
     fn remote_pk_for_error_reply(&self, parsed: &ParsedPacket) -> Option<[u8; 32]> {
         if let Some(pk) = self.admin_reply_remote_pk {
             if pk.iter().any(|&b| b != 0) {
@@ -1535,8 +1446,7 @@ impl Router {
         };
         let hop = hop_limit_for_response(parsed, hop_start_known, self.hop_limit).max(1);
         let next_hop = 0u8;
-        let id = self.alloc_tx_id(now_ms);
-        // Clients correlate admin replies via Data.request_id (setReplyTo on the wire).
+        let id = self.alloc_tx_id();
         let opts = DataEncodeOpts {
             want_response: false,
             request_id: parsed.id,
@@ -1581,9 +1491,7 @@ impl Router {
     }
 
     fn enqueue_admin_tx(&mut self, now_ms: u32, len: u8, bytes: [u8; MAX_WIRE_LEN]) {
-        // Module reply serves as the WantAck ACK (skip separate first ACK).
         self.module_reply_suppresses_ack = true;
-        // Copy of request WantAck ⇒ reliable retx (~NUM_RELIABLE_RETX) until peer ACKs.
         if let Ok(hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) {
             let p = hdr.parse();
             if p.want_ack {
@@ -1611,19 +1519,14 @@ impl Router {
                     len,
                     bytes,
                 };
-                self.pending_admin_count = self
-                    .pending_admin_count
-                    .saturating_add(1)
-                    .min(MAX_PENDING_ADMIN as u8);
                 return;
             }
         }
-        // Queue full: drop the oldest slot (lowest next_tx_ms) and enqueue.
         let mut oldest = 0usize;
         for i in 1..MAX_PENDING_ADMIN {
             let a = self.pending_admin[i].next_tx_ms;
             let b = self.pending_admin[oldest].next_tx_ms;
-            if a.wrapping_sub(b) < 0x8000_0000 && a < b {
+            if now_ms.wrapping_sub(a) > now_ms.wrapping_sub(b) {
                 oldest = i;
             }
         }
@@ -1653,7 +1556,7 @@ impl Router {
             use mesh_crypto::CryptoEngine;
 
             let plaintext = encode_data_payload_opts(portnum, inner, opts);
-            if plaintext.len() + 12 > MAX_PACKET_PAYLOAD {
+            if plaintext.is_empty() || plaintext.len() + 12 > MAX_PACKET_PAYLOAD {
                 return None;
             }
             let mut engine = CryptoEngine::new();
@@ -1675,7 +1578,7 @@ impl Router {
                 to,
                 self.node_num,
                 packet_id,
-                0, // PKI frames use channel 0 on the air header
+                0,
                 hop_limit,
                 hop_limit,
                 want_ack,
@@ -1727,7 +1630,11 @@ impl Router {
         now_ms: u32,
         heard_on: u8,
     ) {
-        if parsed.from == 0 || parsed.from == self.node_num {
+        if parsed.from == 0
+            || parsed.from == self.node_num
+            || parsed.via_mqtt
+            || crate::graph::is_placeholder_node(parsed.from)
+        {
             return;
         }
         let Some((header, neighbor_list)) = extract_packed_neighbors(payload) else {
@@ -1816,32 +1723,26 @@ impl Router {
         if self.pending_topology.active || !self.graph.can_send_topology() {
             return;
         }
-        // Any list we transmitted after the request already answered it: the requester heard
-        // our neighbours, and a second list carries the same 5 to 28 entries under the next
-        // version number, which every receiver then accepts as a fresh report. On a mesh where
-        // two nodes relay for us, one avoidable list is six frames of airtime.
         let last_list_ms = self.graph.last_topology_list_ms();
-        if last_list_ms != 0 && (1..0x8000_0000).contains(&last_list_ms.wrapping_sub(requested_ms))
+        if last_list_ms
+            .is_some_and(|last| (1..0x8000_0000).contains(&last.wrapping_sub(requested_ms)))
         {
             self.sr_log.push(SrLogEvent::BootstrapReplyAlreadyAnswered);
             return;
         }
-        // At most one bootstrap-triggered list per BOOTSTRAP_REPLY_MIN_MS: a burst of empty
-        // broadcasts (many nodes rebooting, or a rogue) must not make every node answer each
-        // one. The requester is already in our graph and gets the next periodic list.
-        if self.last_bootstrap_reply_ms != 0
-            && now_ms.wrapping_sub(self.last_bootstrap_reply_ms) < BOOTSTRAP_REPLY_MIN_MS
+        if self
+            .last_bootstrap_reply_ms
+            .is_some_and(|last| now_ms.wrapping_sub(last) < BOOTSTRAP_REPLY_MIN_MS)
         {
             self.sr_log.push(SrLogEvent::BootstrapReplyRateLimited);
             return;
         }
         if self.schedule_topology_broadcast(now_ms, slot_ms, false) {
             self.graph.commit_topology_broadcast(now_ms, false);
-            self.last_bootstrap_reply_ms = now_ms.max(1);
+            self.last_bootstrap_reply_ms = Some(now_ms);
         }
     }
 
-    /// Decide whether to relay on the receiving radio (coordinated flooding path).
     pub fn evaluate_tx_plan(
         &mut self,
         result: &ProcessResult,
@@ -1863,7 +1764,10 @@ impl Router {
         let from_us = parsed.from == self.node_num;
         let to_us = parsed.to == self.node_num;
 
-        if self.graph.has_our_transmission(parsed.id) {
+        if self
+            .graph
+            .has_our_transmission(parsed.from, parsed.id, now_ms)
+        {
             self.pool.release(handle);
             self.sr_log.push(SrLogEvent::RelaySkip {
                 from: parsed.from,
@@ -1923,10 +1827,7 @@ impl Router {
         let broadcast_candidate = parsed.to == NODENUM_BROADCAST
             && self.graph.signal_routing_active()
             && parsed.from != self.node_num;
-        // Too few SR-capable direct neighbours to judge coverage: the relay goes out unranked,
-        // because delivering everywhere outranks saving a packet when the graph cannot say who
-        // else is covered. Say so — otherwise the capture shows a relay with no decision behind
-        // it and nothing to distinguish it from one the ranking chose.
+        // When coverage evidence is insufficient, delivery takes precedence over saving airtime.
         if broadcast_candidate && !self.graph.topology_healthy_for_broadcast() {
             let direct_neighbors = self.graph.neighbor_count();
             self.sr_log.push(SrLogEvent::BroadcastUnrankedThinGraph {
@@ -1935,12 +1836,6 @@ impl Router {
             });
         }
         let broadcast_plan = if broadcast_candidate && self.graph.topology_healthy_for_broadcast() {
-            // Eligibility for the acknowledgement pass is policy and belongs here, where the
-            // portnum and the header are known; the ladder it produces is mechanism and belongs in
-            // the ranking. Scoped to a text broadcast that arrived straight from its originator:
-            // that is the class whose delivery a person is shown, and a frame that reached us
-            // through a relay was rebroadcast by definition, so its originator already has its
-            // confirmation.
             let ack_eligible = result.decoded_portnum
                 == Some(mesh_protocol::portnum::num::TEXT_MESSAGE_APP)
                 && is_direct_packet(
@@ -1965,27 +1860,15 @@ impl Router {
         if let Some(ref relay_plan) = broadcast_plan {
             if relay_plan.should_relay {
                 self.graph
-                    .record_node_transmission(self.node_num, parsed.id, now_ms);
-                // Name the neighbour we are spending the airtime on, taken from the ranking
-                // that decided it: a relay nobody needs and a relay that saves a node look
-                // identical in the log without it. Recomputing it here against the transmitter
-                // alone named a neighbour that a ranked peer does reach.
+                    .record_node_transmission(self.node_num, parsed.from, parsed.id, now_ms);
+                // Naming the coverage target makes needless relays distinguishable from useful ones in
+                // captures.
                 if relay_plan.coverage_for != 0 {
                     self.sr_log.push(SrLogEvent::CoverageFor {
                         neighbor: relay_plan.coverage_for,
                     });
                 }
             } else {
-                // A late copy still goes on the air when a transmission is expected: the ranking
-                // gave a rung to a stock relay router or a ranked SR peer, or the acknowledgement
-                // pass put somebody ahead of us, and if their copy never comes ours is the
-                // redundancy that covers the loss.
-                //
-                // The `want_ack` witness term that used to widen this is gone. Stock strips that
-                // flag from every broadcast before transmission, so it was never set on the wire —
-                // 0 of 83,727 broadcast receptions carry it — and the election behind it has been
-                // replaced by the acknowledgement pass, which does not need the flag to know a
-                // message is one somebody is waiting on.
                 if relay_plan.slots_given > 0 {
                     self.arm_t1_for_deferred_broadcast(
                         &parsed,
@@ -1997,10 +1880,6 @@ impl Router {
                         now_ms,
                     );
                     self.log_slot_scheduling(&parsed, relay_plan, half_airtime);
-                    // Name which kind of transmission we are standing down for. A reserved stock
-                    // router and a ranked SR peer are different expectations — one we cannot
-                    // predict or coordinate with, the other we can — and merging them into one
-                    // reason makes the reservation's effect invisible in a capture.
                     let reason = if relay_plan.reserved_slots > 0 {
                         SrSkipReason::RouterExpected
                     } else {
@@ -2011,11 +1890,6 @@ impl Router {
                         reason,
                     });
                 } else {
-                    // Nobody was given a slot and nobody is waiting to be told: there is no
-                    // expected transmission for a late copy to stand in for. Measured over
-                    // 30 min on three nodes (2026-09-08): this declines ~100 copies per node
-                    // and costs no delivery — the asymmetry between two colocated nodes is
-                    // 3.2% with it and 2.9% without.
                     self.pool.release(handle);
                     self.log_slot_scheduling(&parsed, relay_plan, half_airtime);
                     self.sr_log.push(SrLogEvent::RelaySkip {
@@ -2040,15 +1914,8 @@ impl Router {
             return plan;
         }
 
-        // `verified` distinguishes a path whose every hop is backed by evidence that the
-        // receiver hears the transmitter from the inbound-gateway fallback, which only guesses
-        // that somebody past us can finish. Both may carry a packet; only the first may name a
-        // next hop.
         let mut route_verified = true;
         let picked_hop = if parsed.to != NODENUM_BROADCAST {
-            // The verdict belongs to the hop we were handed, not to the searched route: the
-            // picker also answers with a better-positioned neighbour, the downstream table or
-            // ourselves, and none of those is a confirmed path.
             let (hop, hop_verified) =
                 self.graph
                     .get_next_hop_verified(parsed.to, parsed.from, heard_from, now_ms);
@@ -2067,34 +1934,20 @@ impl Router {
         } else {
             0
         };
-        // The route picker answers "relay it ourselves" when it has no verified next hop. That
-        // must not go on the air as next_hop = our byte: receivers would treat us as the
-        // designated forwarder and wait for a second copy that never comes. Leave it clear so
-        // they coordinate by slot, and so we never arm retries waiting for ourselves.
+        // Naming ourselves as the next hop would make receivers wait for a forwarding copy that cannot
+        // arrive.
         let mut next_hop = if picked_hop == self.node_num {
             0
         } else {
             picked_hop
         };
-        // Path pick before guessed-route clearing: Routing ACK retrace suppress needs to know
-        // whether we still have an onward hop that is not the transmitter we heard.
         let onward_hop = next_hop;
 
-        // The packet names us as its next hop: the sender asked us to carry it, so no
-        // "somebody else is better placed" reason applies. Without this, a designated hop whose
-        // own route pointed back at the node it heard the frame from went silent and only a
-        // backup carried the packet, a slot late (seen on both nicenanos, 2026-09-07).
         let we_are_designated_hop =
             parsed.to != NODENUM_BROADCAST && parsed.next_hop == (self.node_num & 0xFF) as u8;
 
-        // Containment. A guessed route that points back at the node we heard the packet from
-        // carries the packet away from its destination: onto our own branch, where the only path
-        // anyone knows is the one it just arrived on. Nobody there can finish it, so the copy is
-        // pure airtime and, for a want_ack unicast, an invitation for the far side to retry
-        // through us again. Drop it — unless we were named as the next hop: the sender is
-        // waiting on us specifically, its retries would designate us again, and one frame from
-        // us costs less than three from it. That case falls through to the clear below, which is
-        // also what a verified route pointing back does.
+        // A sender explicitly handing us the packet will retry into the same silence; answering once
+        // costs less airtime.
         if parsed.to != NODENUM_BROADCAST
             && !route_verified
             && !we_are_designated_hop
@@ -2109,12 +1962,6 @@ impl Router {
             return plan;
         }
 
-        // A guessed route may still be worth carrying in any other direction, but it must not
-        // be stamped: the node it names never proved it hears the destination, and receivers
-        // treat the byte as a designation, standing down and waiting for a copy from a node
-        // that may have no way to send one. Cleared, we stay one candidate among the ranked
-        // slots and the others keep coordinating. A downstream chain that egresses via a
-        // neighbour we hear is not that guess — dest sits behind that neighbour — and is stamped.
         if !route_verified && next_hop != 0 {
             next_hop = 0;
             self.sr_log.push(SrLogEvent::RouteNextHop {
@@ -2125,9 +1972,7 @@ impl Router {
                 verified: false,
             });
         }
-        // Hand-off: the previous relay named us and our only route points back at it. Stock
-        // floods here (next_hop cleared) rather than dropping the packet, and so do we.
-        let designated_repeat = self.designated_repeat_id.take() == Some(parsed.id);
+        let designated_repeat = self.designated_repeat_id.take() == Some((parsed.from, parsed.id));
         if designated_repeat && parsed.to != NODENUM_BROADCAST && next_hop == heard_from {
             next_hop = 0;
             self.sr_log.push(SrLogEvent::RouteNextHop {
@@ -2139,10 +1984,8 @@ impl Router {
             });
         }
 
-        // Named as next hop while our only route runs back to the node that handed us the
-        // packet: forward it, but never back the way it came. Stamping the relayer would bounce
-        // it (it named us because its own route points at us), so the copy goes out with no next
-        // hop, as a designated repeat of a duplicate already does.
+        // Naming the previous relay would bounce the packet back towards the route that already led to
+        // us.
         if we_are_designated_hop && next_hop != 0 && next_hop == heard_from {
             next_hop = 0;
             self.sr_log.push(SrLogEvent::RouteNextHop {
@@ -2154,8 +1997,6 @@ impl Router {
             });
         }
 
-        // Relayer already holds the packet and can finish: handing it back is a dupe.
-        // If they cannot finish, clear next_hop and stay in the ranking as backup.
         if parsed.to != NODENUM_BROADCAST
             && !we_are_designated_hop
             && next_hop != 0
@@ -2179,16 +2020,7 @@ impl Router {
             next_hop = 0;
         }
 
-        // Every wait below is a floor on when our relay may key up, measured from the frame we
-        // just heard. Floors compose by `max`, never by addition: waiting for the destination's
-        // answer already carries us past stock's contention boundary, and adding the two delayed
-        // every relay on a confirmed link by a whole contention window for nothing.
-        //
-        // This floor applies when we heard the frame straight from its source and the source's
-        // own topology says the destination hears it: the destination most likely has the packet
-        // already, and its ACK or reply cancels our queued relay. Computed here so the ranking
-        // can fold it into the base before rank spacing is added — applied afterwards it would
-        // collapse two adjacent rungs onto the same millisecond.
+        // Applying a shared floor after rank spacing would collapse adjacent rungs onto one deadline.
         let dest_ack_floor = if parsed.to != NODENUM_BROADCAST
             && heard_from == parsed.from
             && self
@@ -2203,13 +2035,8 @@ impl Router {
             0
         };
 
-        // A next hop equal to the destination's own byte names no relayer: the source expects
-        // direct delivery (stock learns the destination as its own next hop from a direct
-        // reply). Nobody owns slot 0 then; cost or coverage decides as for an unnamed hop.
         let relayer_named = parsed.next_hop != 0 && parsed.next_hop != (parsed.to & 0xFF) as u8;
-        // Last-hop finish only when we actually have a direct edge: `can_deliver` alone is true
-        // for non-publishing (stock) destinations even without one, which would skip the flood
-        // coverage path for every NodeDB-only dest.
+        // A permissive delivery policy for non-publishers does not prove a direct last-hop link.
         let we_can_finish = parsed.to != NODENUM_BROADCAST
             && (self.graph.caps_last_hop(parsed.to)
                 || (self.graph.has_direct_edge(parsed.to)
@@ -2220,10 +2047,6 @@ impl Router {
                         parsed.to,
                     )));
 
-        // Designated hop with no route at all: NACK the originator and leave the data copy
-        // silent so named backups (or a later flood retry) can try another path. A hand-off
-        // whose only route points back at the peer still floods with next_hop cleared
-        // (`picked_hop != 0`); that is not a NO_ROUTE. Flood unicasts do not NACK.
         if we_are_designated_hop && picked_hop == 0 && !we_can_finish {
             self.pool.release(handle);
             self.schedule_nak(&parsed, false, ROUTING_ERROR_NO_ROUTE, now_ms);
@@ -2234,10 +2057,6 @@ impl Router {
             return plan;
         }
 
-        // Cost rank when the route picker found a path (or we can finish the last hop). The
-        // stamp on the air may still be cleared (unverified guess, hand-off backtrack); that is
-        // independent of whether cost ranking applies. Undesignated with no path at all →
-        // broadcast unique coverage (silent when nothing unique; no ack / Sparse echo).
         let has_cost_path = we_can_finish || picked_hop != 0;
         let unicast_ranking = if parsed.to != NODENUM_BROADCAST
             && parsed.to != self.node_num
@@ -2276,7 +2095,9 @@ impl Router {
             }
             _ => None,
         };
-        let unicast_plan = if unicast_plan.is_none() && !relayer_named && parsed.to != NODENUM_BROADCAST
+        let unicast_plan = if unicast_plan.is_none()
+            && !relayer_named
+            && parsed.to != NODENUM_BROADCAST
             && parsed.to != self.node_num
             && self.graph.signal_routing_active()
         {
@@ -2290,9 +2111,6 @@ impl Router {
                     half_airtime,
                     false,
                 );
-                // Broadcast invents a Sparse sole-candidate echo when unique coverage is empty
-                // so want_ack senders hear a rebroadcast. Undesignated unicast floods must not:
-                // stay silent and let the originator retry (no flood NACKs either).
                 let cover_carries = cover.should_relay
                     && cover.reason != crate::broadcast_relay::RelayReason::Sparse;
                 if cover_carries {
@@ -2312,7 +2130,6 @@ impl Router {
                     return plan;
                 }
             } else {
-                // Too thin to judge coverage: same unranked carry as a thin broadcast graph.
                 self.sr_log.push(SrLogEvent::BroadcastUnrankedThinGraph {
                     from: parsed.from,
                     direct_neighbors: self.graph.neighbor_count(),
@@ -2331,11 +2148,7 @@ impl Router {
             unicast_plan
         };
 
-        // A named backup transmits only when it will stamp a hop that is not the designated
-        // one and not the node it heard the packet from. Naming that hop again, or clearing
-        // the byte, is the same path: stock nodes flood from the wrong side, and the
-        // originator treats the rebroadcast as an implicit ack. A last hop the destination
-        // hears is delivery, so that copy still goes.
+        // A confirmed last hop can deliver even when no onward hop budget remains.
         if relayer_named && !we_are_designated_hop && !self.graph.caps_last_hop(parsed.to) {
             let stamp_byte = (next_hop & 0xFF) as u8;
             let names_designated = next_hop != 0 && stamp_byte == parsed.next_hop;
@@ -2349,10 +2162,6 @@ impl Router {
             }
         }
 
-        // A unicast that already names a next hop keeps SR coordination: the designated node
-        // owns slot 0 and every other candidate shifts down one slot. A heard copy cancels that
-        // backup when the designated hop advances the route (non-zero next_hop / hop_limit
-        // progress), or when the transmitter can finish / is ranked ahead — not on a weak flood.
         let designated_plan = if parsed.to != NODENUM_BROADCAST && relayer_named {
             Some(self.plan_designated_unicast(
                 &parsed,
@@ -2370,10 +2179,6 @@ impl Router {
         };
         let unicast_plan = unicast_plan.or(designated_plan);
 
-        // Heard straight from the source, and the source's own topology lists the destination:
-        // a Routing ACK on a true local link is not relayed when we cannot improve delivery
-        // (no onward hop, hop is back at the transmitter, or dest already heard this TX). A hub
-        // that still has a path toward a multi-hop originator must carry the receipt.
         if parsed.to != NODENUM_BROADCAST && heard_from == parsed.from {
             let src_edge = self
                 .graph
@@ -2399,8 +2204,6 @@ impl Router {
                         return plan;
                     }
                 }
-                // The wait itself is already folded into every candidate's base above; this
-                // only records that it applied, so a capture shows why the ladder sits late.
                 if edge.hears_us && unicast_plan.is_some() {
                     self.sr_log.push(SrLogEvent::UnicastDestHeardDirect {
                         id: parsed.id,
@@ -2420,8 +2223,6 @@ impl Router {
                 self.node_num,
             )
             .is_some();
-        // Strong hop: stamp it. Weak: flood on the air (next unset) but remember the intended
-        // peer so only that node can cancel our follow-up.
         let intended_hop = if priced_last_hop { parsed.to } else { next_hop };
         let strong_intended = if intended_hop == 0 {
             false
@@ -2461,8 +2262,8 @@ impl Router {
             }
         };
 
-        // 2. A unicast leaving us with hop_limit 0 can only still be delivered by a node that
-        // is the destination itself; without a direct link to the target it is dead airtime.
+        // With no hop budget, an unverified target has no remaining relay path and consumes airtime
+        // without delivering.
         if parsed.to != NODENUM_BROADCAST
             && relay_hdr.hop_limit() == 0
             && !self.graph.has_direct_edge(parsed.to)
@@ -2621,8 +2422,6 @@ impl Router {
                 )
             },
         );
-        // Taken separately rather than widened into the tuple above: three more elements would
-        // push it past readability for no gain.
         let plan_for_log = broadcast_plan.as_ref().or(unicast_plan.as_ref());
         let slots_given = plan_for_log.map_or(0, |p| p.slots_given);
         let reserved_slots = plan_for_log.map_or(0, |p| p.reserved_slots);
@@ -2728,35 +2527,93 @@ impl Router {
         plan
     }
 
-    /// Return the next pending relay whose slot time has elapsed.
+    // Admission may change while listen-before-talk holds a frame; rechecking must not charge it twice.
+    pub fn queued_frame_allowed(&self, bytes: &[u8], now_ms: u32) -> bool {
+        if bytes.len() > MAX_WIRE_LEN {
+            return false;
+        }
+        let Ok(header) = PacketHeader::decode(bytes) else {
+            return false;
+        };
+        let parsed = header.parse();
+        if parsed.from == self.node_num {
+            return true;
+        }
+        if !self.graph.is_rebroadcaster() {
+            return false;
+        }
+        let mut cipher = [0; crate::pool::MAX_PACKET_PAYLOAD];
+        let payload = &bytes[PACKET_HEADER_LEN..];
+        cipher[..payload.len()].copy_from_slice(payload);
+        let portnum = crate::topology::try_decrypt_data_full(
+            &self.channel_key,
+            parsed.from,
+            parsed.id,
+            self.channel_hash,
+            parsed.channel,
+            &mut cipher[..payload.len()],
+        )
+        .map(|(data, _)| data.portnum);
+        let packet = crate::rate_limit::RateLimitPacket {
+            from: parsed.from,
+            to: parsed.to,
+            decoded_portnum: portnum,
+            now_ms,
+            rebroadcast_candidate: true,
+            resolved_relay: self.graph.committed_heard_from(parsed.from, parsed.id),
+            airtime_ms: 0,
+            channel_util_pct: self.channel_util_pct,
+            graph_established: self.graph.neighbor_count() > 0,
+            on_default_channel: parsed.channel == self.channel_hash
+                && psk_bytes(&self.channel_key) == DEFAULT_PSK.as_slice(),
+        };
+        !self.rate_limit.would_drop(&packet)
+            && self
+                .qos
+                .can_relay(portnum, parsed.channel, self.channel_util_pct)
+    }
+
+    pub fn discard_queued_forward(&mut self, from: u32, id: u32) {
+        self.cancel_pending(from, id);
+        self.graph.cancel_relay(from, id);
+        self.cancel_t1_retransmit(from, id, T1CancelReason::Policy);
+        crate::reliable::stop_reliable_for(&mut self.pending_reliable, from, id);
+    }
+
     pub fn poll_ready_relay(&mut self, now_ms: u32) -> Option<RelayPlan> {
         let mut best_idx = None;
-        let mut best_after = u32::MAX;
+        let mut best_age = 0;
         for idx in 0..self.pending.len() {
             if !self.pending[idx].active {
                 continue;
             }
-            // Already on the air from us (an earlier plan for the same packet): drop, do not repeat.
-            if self.graph.has_our_transmission(self.pending[idx].id) {
+            if self
+                .graph
+                .has_our_transmission(self.pending[idx].from, self.pending[idx].id, now_ms)
+            {
                 self.pending[idx].active = false;
                 continue;
             }
             let pending = &self.pending[idx];
+            if !self.queued_frame_allowed(&pending.bytes[..pending.len as usize], now_ms) {
+                let from = pending.from;
+                let id = pending.id;
+                self.pending[idx].active = false;
+                self.graph.cancel_relay(from, id);
+                continue;
+            }
             if now_ms.wrapping_sub(pending.tx_after_ms) >= 0x8000_0000 {
                 continue;
             }
-            if pending.tx_after_ms < best_after {
-                best_after = pending.tx_after_ms;
+            let age = now_ms.wrapping_sub(pending.tx_after_ms);
+            if best_idx.is_none() || age > best_age {
+                best_age = age;
                 best_idx = Some(idx);
             }
         }
         let idx = best_idx?;
         let pending = self.pending[idx];
         self.pending[idx].active = false;
-        // The committed relay stays until the radio reports the frame on the air
-        // (`note_tx_done`): a copy heard while the frame waits in the radio queue still runs
-        // the coverage check and can pull the frame back. Release used to forget the relay here,
-        // which let the frame go out regardless of what arrived in the meantime.
         let upstream = self
             .graph
             .committed_heard_from(pending.from, pending.id)
@@ -2793,49 +2650,43 @@ impl Router {
             self.graph
                 .commit_topology_broadcast(now_ms, report.topology_dirty_send);
         }
-        if (self.last_nodeinfo_ms == 0
-            || now_ms.wrapping_sub(self.last_nodeinfo_ms) >= NODEINFO_BROADCAST_MS)
+        if self
+            .last_nodeinfo_ms
+            .is_none_or(|last| now_ms.wrapping_sub(last) >= NODEINFO_BROADCAST_MS)
             && !self.pending_nodeinfo.active
         {
             self.schedule_nodeinfo_broadcast(now_ms);
         }
-        // Channel utilization, air util and uptime are always worth broadcasting, so this
-        // is deliberately not gated on having a battery reading: an unknown pack voltage
-        // only drops fields 1-2 from the encoded DeviceMetrics.
-        if (self.last_telemetry_ms == 0
-            || now_ms.wrapping_sub(self.last_telemetry_ms)
-                >= device_telemetry_interval_ms(self.admin.device_update_interval_secs))
-            && !self.pending_telemetry.active
+        if self.last_telemetry_ms.is_none_or(|last| {
+            now_ms.wrapping_sub(last)
+                >= device_telemetry_interval_ms(self.admin.device_update_interval_secs)
+        }) && !self.pending_telemetry.active
         {
             self.schedule_telemetry_broadcast(now_ms);
         }
         if !self.admin.broadcasts_fixed_position() {
-            // Disabled or no coordinates: drop anything already queued.
             self.pending_position.active = false;
-        } else if (self.last_position_ms == 0
-            || now_ms.wrapping_sub(self.last_position_ms)
+        } else if self.last_position_ms.is_none_or(|last| {
+            now_ms.wrapping_sub(last)
                 >= position_broadcast_interval_ms(
                     self.admin.position_broadcast_secs,
                     self.admin.device_role,
-                ))
-            && !self.pending_position.active
+                )
+        }) && !self.pending_position.active
         {
             self.schedule_position_broadcast(now_ms);
         }
         report
     }
 
-    /// Stream the full topology graph dump to `sink` (bypasses the SR log ring buffer).
     pub fn emit_topology_log<S: crate::sr_log::TopologyLogSink>(&self, sink: &mut S) {
         self.graph.emit_topology_log(self.node_num, sink);
     }
 
-    /// Receiving radio index for a captured inbound frame (v1: single radio).
     pub fn received_on_radio(packet: &InboundPacket<'_>) -> u8 {
         packet.radio_id
     }
 
-    /// Resolve the NodeNum of the relaying neighbor for SR flooding decisions.
     pub fn resolve_heard_from_node(
         &mut self,
         relay_node: u8,
@@ -2848,22 +2699,12 @@ impl Router {
             .resolve_heard_from(relay_node, source, rssi, snr, &self.graph, now_ms)
     }
 
-    /// Record a relay-byte mapping (host tests and topology learning paths).
     #[doc(hidden)]
     pub fn remember_relay_identity(&mut self, node_id: u32, relay_byte: u8, now_ms: u32) {
         self.relay_identity
             .remember_relay_identity(node_id, relay_byte, now_ms);
     }
 
-    /// Slot plan for a unicast whose header already names a next hop.
-    ///
-    /// The designated node owns slot 0. If that is us we relay at once. Otherwise we keep our
-    /// normal unicast rank shifted by one slot, behind a slot-0 wait sized for the designated
-    /// node: one half-airtime for an SR peer (deterministic), the worst-case stock contention
-    /// window plus one airtime for a stock or unknown node. A heard copy cancels that backup on
-    /// the designated hop's relay byte (boot-graph safe) or when the transmitter can finish /
-    /// is ranked ahead (`perhaps_cancel_dupe`). Bystanders therefore recover a failed designated
-    /// hop within a slot instead of staying silent.
     fn plan_designated_unicast(
         &mut self,
         parsed: &ParsedPacket,
@@ -2871,12 +2712,7 @@ impl Router {
         rssi: i16,
         snr: i8,
         half_airtime: u32,
-        // The packet airtime, not a slot time. The caller's variable is named `slot_ms` and is
-        // neither — it is `packet_time_ms(config, 64, ...)` — which is why the two waits below take
-        // it and the stock contention floor above does not.
         airtime_ms: u32,
-        // Zero unless the destination is expected to answer for itself; a floor like the others,
-        // so it composes by `max`.
         dest_ack_floor: u32,
         now_ms: u32,
         ranking: Option<Result<crate::broadcast_relay::BroadcastRelayPlan, SrSkipReason>>,
@@ -2893,8 +2729,6 @@ impl Router {
             });
             return BroadcastRelayPlan {
                 should_relay: true,
-                // Named for a designated next hop as well: the same floor, for the same reason,
-                // and from the CAD slot time rather than the airtime this parameter carries.
                 slot_delay_ms: crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms())
                     .max(dest_ack_floor),
                 slot_index: 0,
@@ -2922,17 +2756,8 @@ impl Router {
                 self.graph.capability_status(n) == crate::capability::CapabilityStatus::SrActive
             })
             .unwrap_or(false);
-        // How long until the designated node's copy has left the air, which is what the rest of
-        // us are waiting out. The two cases start their clocks in different places, so they
-        // compose differently:
-        //   - an SR peer obeys this same model, so it keys up at the floor and then needs its
-        //     own contention delay (up to 2^CW slots at the current utilisation) plus one
-        //     airtime on top. A half-airtime reservation let us pre-empt a healthy designated
-        //     node by 200 ms in the field.
-        //   - a stock node knows nothing of the floor and starts contending the moment it hears
-        //     the frame, so its copy is clear after its own worst case plus one airtime. Adding
-        //     the floor to that would count the same silence twice; we simply never go before
-        //     our own floor either, which is a max.
+        // The acknowledgement floor already includes the initial wait; adding it again would count the
+        // same silence twice.
         let base = dest_ack_floor.max(crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()));
         let slot0_wait = if sr_active {
             base.saturating_add(
@@ -2945,7 +2770,6 @@ impl Router {
         } else {
             base.max(tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms))
         };
-        // Ranking Err → unranked backup behind the designated wait (silent designated hop).
         let (rank, count, ranked, ranked_len, reason, evaluated, evaluated_len, pre_covered) =
             match ranking {
                 Some(Ok(p)) => (
@@ -2959,11 +2783,11 @@ impl Router {
                     p.pre_covered,
                 ),
                 Some(Err(_)) => {
-                    // Coverage skipped us for the ranking, but a named next hop still needs a
-                    // backup. Take the unranked slot order rather than all backups sharing
-                    // slot 1: a silent designated hop would otherwise be answered by every
-                    // candidate at once.
-                    let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+                    // Giving every backup the same slot would cause simultaneous replies to a silent
+                    // designated hop.
+                    let (rank, count) =
+                        self.graph
+                            .relay_slot_index(parsed.id, parsed.from, heard_from, now_ms);
                     (
                         rank,
                         count,
@@ -2976,7 +2800,9 @@ impl Router {
                     )
                 }
                 None => {
-                    let (rank, count) = self.graph.relay_slot_index(parsed.id, heard_from, now_ms);
+                    let (rank, count) =
+                        self.graph
+                            .relay_slot_index(parsed.id, parsed.from, heard_from, now_ms);
                     (
                         rank,
                         count,
@@ -3009,12 +2835,10 @@ impl Router {
             evaluated,
             evaluated_len,
             pre_covered,
-            // Unicast plan: coverage does not enter into it.
             uncovered: [0; crate::broadcast_relay::UNCOVERED_LOG],
             uncovered_len: 0,
             coverage_for: 0,
             slots_given: 0,
-            // No reservation on a unicast ladder: the router window is a broadcast rule.
             reserved_slots: 0,
             reserved_ranked: 0,
             absorbed: [(0, 0); crate::broadcast_relay::RANKED_LOG],
@@ -3025,9 +2849,6 @@ impl Router {
         }
     }
 
-    /// How long to give a destination that heard the packet directly to answer it: its ACK
-    /// contention delay (the channel may look busier to it than to us, hence twice our
-    /// contention maximum) plus the ACK's airtime.
     fn dest_ack_wait_ms(&self, airtime_ms: u32) -> u32 {
         crate::channel_access::dest_ack_wait_ms(
             airtime_ms,
@@ -3038,7 +2859,6 @@ impl Router {
         )
     }
 
-    /// Unsolicited dest ACK is only useful when the last transmitter is SR.
     fn delivering_relayer_is_sr(
         &self,
         parsed: &ParsedPacket,
@@ -3062,18 +2882,8 @@ impl Router {
             .is_signal_routing()
     }
 
-    /// Hop budget for a reply we originate. A reply to a
-    /// direct neighbour that hears us goes out with hop limit 0 (1 on a marginal link) when
-    /// stock neighbours are around, so nobody relays a packet we deliver ourselves. A
-    /// traceroute reply from A to Dura went out with hop 2 and was relayed three times.
-    /// Header fields of a response to `parsed`: hop budget and next hop. A last-hop reply (the
-    /// requester hears us directly, stock nodes listen, and the request came direct) gets
-    /// `LAST_HOP_BUDGET` and names the requester as next hop; anything else keeps stock's budget
-    /// and no next hop.
     fn response_header(&self, parsed: &ParsedPacket, hop_start_known: bool) -> (u8, u8) {
         let base = hop_limit_for_response(parsed, hop_start_known, self.hop_limit);
-        // A request that reached us through a relay says the direct link is not carrying
-        // frames right now; the reply then keeps its hop budget so a relay can return it.
         let arrived_direct = is_direct_packet(
             parsed.from,
             parsed.hop_start,
@@ -3087,8 +2897,6 @@ impl Router {
         }
     }
 
-    /// How long an SR peer that owns the slot ahead of us needs before its relay has left the
-    /// air: its contention delay at the current utilisation plus one airtime.
     fn sr_peer_relay_wait_ms(&self, airtime_ms: u32) -> u32 {
         crate::channel_access::peer_relay_wait_ms(
             airtime_ms,
@@ -3143,12 +2951,10 @@ impl Router {
         true
     }
 
-    /// Cancel a scheduled T1 broadcast retransmit.
-    pub fn cancel_broadcast_retransmit(&mut self, packet_id: u32) {
-        self.cancel_t1_retransmit(packet_id, T1CancelReason::RelayHeard);
+    pub fn cancel_broadcast_retransmit(&mut self, from: u32, packet_id: u32) {
+        self.cancel_t1_retransmit(from, packet_id, T1CancelReason::RelayHeard);
     }
 
-    /// True when every direct neighbor is covered by accumulated transmitters (broadcast dupe cancel).
     pub fn all_neighbors_covered(
         &mut self,
         from: u32,
@@ -3160,7 +2966,6 @@ impl Router {
             .all_neighbors_covered(from, packet_id, dupe_relayer, now_ms)
     }
 
-    /// True when router has scheduled TX work (relays, topology, ACKs, retransmits).
     pub fn has_pending_work(&self) -> bool {
         self.pending.iter().any(|p| p.active)
             || self.pending_topology.active
@@ -3179,7 +2984,6 @@ impl Router {
             || self.graph.has_active_relay_commits()
     }
 
-    /// Originate an app payload on the primary channel (optionally with reliable retransmit).
     pub fn send_local(
         &mut self,
         to: u32,
@@ -3190,16 +2994,14 @@ impl Router {
         now_ms: u32,
         airtime_ms: u32,
     ) -> Option<RelayPlan> {
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let mut hop = hop_limit;
         let mut next_hop = 0u8;
         if to != NODENUM_BROADCAST && self.graph.caps_last_hop(to) {
             hop = hop.min(LAST_HOP_BUDGET);
             next_hop = (to & 0xFF) as u8;
         } else if to != NODENUM_BROADCAST {
-            // Originate-stamp only a confirmed path. Inbound-gateway / unverified guesses stay
-            // clear so the mesh cost-ranks instead of locking onto a Lab neighbour that cannot
-            // finish (field: Dura named MB59 for MR22).
+            // A guessed gateway cannot justify appointing a specific forwarder.
             let (sr_hop, verified) =
                 self.graph
                     .get_next_hop_verified(to, self.node_num, self.node_num, now_ms);
@@ -3242,10 +3044,24 @@ impl Router {
         }
         if to == NODENUM_BROADCAST && portnum != SIGNAL_ROUTING_APP {
             let half = crate::coordinated_relay::half_airtime_ms(airtime_ms);
-            let span = self
-                .graph
-                .relay_ladder_span_ms(packet_id, self.node_num, now_ms, half);
-            self.schedule_t1_broadcast(packet_id, len, frame, airtime_ms, 0, span, now_ms);
+            let span = self.graph.relay_ladder_span_ms(
+                packet_id,
+                self.node_num,
+                self.node_num,
+                now_ms,
+                half,
+            );
+            self.schedule_t1_broadcast(
+                packet_id,
+                len,
+                frame,
+                Some(portnum),
+                Some(self.node_num),
+                airtime_ms,
+                0,
+                span,
+                now_ms,
+            );
         }
         Some(RelayPlan {
             len,
@@ -3258,13 +3074,10 @@ impl Router {
         bump_reliable_delays(&mut self.pending_reliable, airtime_ms);
     }
 
-    /// Record the radio's current channel utilization; widens the reliable retransmit backoff.
     pub fn set_channel_utilization(&mut self, pct: f32) {
         self.channel_util_pct = pct;
     }
 
-    /// Reliable retransmit delay for a frame of `wire_len` bytes on the current preset
-    /// (Meshtastic `getRetransmissionMsec`: real airtime, contention window, processing margin).
     pub fn reliable_retx_delay_ms(&self, wire_len: u8, from: u32, id: u32) -> u32 {
         Self::retx_delay_for(
             self.modem_preset,
@@ -3276,9 +3089,8 @@ impl Router {
         )
     }
 
-    /// Backoff before a retry plus a per-node contention offset. Two relayers that armed
-    /// retries for the same packet at the same instant would otherwise fire in lockstep and
-    /// collide on every attempt.
+    /// Independent retry offsets prevent relayers that heard one packet together from colliding on every
+    /// attempt.
     fn retx_delay_for(
         preset: u8,
         util: f32,
@@ -3308,7 +3120,6 @@ impl Router {
             });
         };
         if !due.redirect {
-            // The nominated hop may simply have missed our frame: give it the same copy again.
             self.sr_log
                 .push(SrLogEvent::RelayRetxRepeat { id: due.packet_id });
             return Some(RelayPlan {
@@ -3317,7 +3128,6 @@ impl Router {
                 delay_ms: 0,
             });
         }
-        // Named hop silent twice: record one miss, then one directed alternate or drop.
         if let crate::hop_health::HopHealthEvent::BecameSuspect {
             next_hop,
             destination,
@@ -3332,7 +3142,6 @@ impl Router {
                 misses,
             });
         }
-        // Exclude nominated hop, upstream, originator and ourselves; never the destination.
         let mut excl_buf = [0u32; 4];
         let mut n_excl = 0usize;
         for id in [named.nominated_hop, named.upstream, due.from, self.node_num] {
@@ -3350,9 +3159,7 @@ impl Router {
             .route_excluding(due.to, now_ms, &excl_buf[..n_excl]);
         let chain_egress = self.graph.downstream_chain_egress(due.to, now_ms);
         let alt_byte = (alt_route.next_hop & 0xFF) as u8;
-        // An alternate sharing the nominated byte would be read as the silent hop again. A stock
-        // neighbour judges a duplicate by the first next_hop it recorded, so having heard our
-        // first copy it drops one that newly names it: only an SR alternate can take it.
+        // An alternate with the same relay byte would be mistaken for the silent nominated hop.
         let stampable = alt_route.next_hop != 0
             && alt_byte != named.nominated_byte
             && (alt_route.verified || chain_egress == Some(alt_route.next_hop))
@@ -3384,10 +3191,6 @@ impl Router {
         })
     }
 
-    /// Nominated forwards: when the intended hop stays silent, repeat once; strong named hops
-    /// then try one directed alternate. Weak hops (next unset) and priced last hops arm one
-    /// follow-up cancelled only by that nominee. Flood-salvage slots and last-hop backups do
-    /// not arm.
     fn arm_relayed_unicast_followup(
         &mut self,
         len: u8,
@@ -3494,22 +3297,14 @@ impl Router {
     }
 
     fn next_hop_carry_wait_ms(&self, next_hop: u32, airtime_ms: u32) -> u32 {
-        if next_hop != 0
-            && self
-                .graph
-                .capability_status(next_hop)
-                .is_signal_routing()
-        {
+        if next_hop != 0 && self.graph.capability_status(next_hop).is_signal_routing() {
             crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).saturating_add(airtime_ms)
         } else {
             tx_delay_ms_worst(self.cw_slot_ms()).saturating_add(airtime_ms)
         }
     }
 
-    /// Wait between named follow-up tries, counted from when our frame is handed to the radio:
-    /// our own contention and airtime, then the later of the nominated hop's carry wait and the
-    /// end of ranked slot 1 including its tie-break spread. A backup's copy downstream of us
-    /// has no destination-ACK floor, because that floor applies only to the source's own frame.
+    /// A destination-ACK floor applies to the originator’s frame, not to a downstream backup copy.
     fn named_followup_delay_ms(&self, nominated_hop: u32, airtime_ms: u32) -> u32 {
         let half = crate::coordinated_relay::half_airtime_ms(airtime_ms);
         let slot1_end = self
@@ -3529,12 +3324,8 @@ impl Router {
         half_airtime: u32,
         airtime_ms: u32,
     ) -> u32 {
-        // Slot 0 keys at the largest floor that applies (stock contention floor or dest-ACK).
-        // Later slots must wait until that leader copy would have left the air on every preset:
-        // peer_relay_wait is measured from t=0 (turnaround + contention + airtime), but when the
-        // floor is larger (LONG_MODERATE and slower; also LONG_FAST at low CW) the leader keys
-        // later — clear time is then floor+airtime. Taking only peer_relay_wait undercut the
-        // floor and let slot 1 fire before slot 0.
+        // A large scheduling floor can delay the leader beyond the nominal turnaround; backups must also
+        // allow its frame to finish.
         let earliest =
             crate::coordinated_relay::relay_floor_ms(self.cw_slot_ms()).max(dest_ack_floor);
         if slot == 0 {
@@ -3580,8 +3371,6 @@ impl Router {
         self.cancel_relayed_retx_from(from, id, reason, false);
     }
 
-    /// Cancel a relayed follow-up. When the copy came from the nominated hop (or the reason
-    /// is a destination reply), record a hop-health success; any other copy is neutral.
     fn cancel_relayed_retx_from(
         &mut self,
         from: u32,
@@ -3620,9 +3409,6 @@ impl Router {
         if now_ms.wrapping_sub(self.pending_ack.next_tx_ms) >= 0x8000_0000 {
             return None;
         }
-        if now_ms < self.pending_ack.next_tx_ms {
-            return None;
-        }
         self.pending_ack.active = false;
         Some(RelayPlan {
             len: self.pending_ack.len,
@@ -3636,9 +3422,6 @@ impl Router {
             return None;
         }
         if now_ms.wrapping_sub(self.pending_dfu_confirm.next_tx_ms) >= 0x8000_0000 {
-            return None;
-        }
-        if now_ms < self.pending_dfu_confirm.next_tx_ms {
             return None;
         }
         self.pending_dfu_confirm.active = false;
@@ -3658,17 +3441,11 @@ impl Router {
             if now_ms.wrapping_sub(slot.next_tx_ms) >= 0x8000_0000 {
                 continue;
             }
-            if now_ms < slot.next_tx_ms {
-                continue;
-            }
             best = Some(match best {
                 None => i,
                 Some(j) => {
-                    if slot
-                        .next_tx_ms
-                        .wrapping_sub(self.pending_admin[j].next_tx_ms)
-                        < 0x8000_0000
-                        && slot.next_tx_ms < self.pending_admin[j].next_tx_ms
+                    if now_ms.wrapping_sub(slot.next_tx_ms)
+                        > now_ms.wrapping_sub(self.pending_admin[j].next_tx_ms)
                     {
                         i
                     } else {
@@ -3680,7 +3457,6 @@ impl Router {
         let idx = best?;
         let slot = &mut self.pending_admin[idx];
         slot.active = false;
-        self.pending_admin_count = self.pending_admin_count.saturating_sub(1);
         Some(RelayPlan {
             len: slot.len,
             bytes: slot.bytes,
@@ -3699,9 +3475,6 @@ impl Router {
             return None;
         }
         if now_ms.wrapping_sub(self.pending_nodeinfo.next_tx_ms) >= 0x8000_0000 {
-            return None;
-        }
-        if now_ms < self.pending_nodeinfo.next_tx_ms {
             return None;
         }
         self.pending_nodeinfo.active = false;
@@ -3723,9 +3496,6 @@ impl Router {
         if now_ms.wrapping_sub(self.pending_position.next_tx_ms) >= 0x8000_0000 {
             return None;
         }
-        if now_ms < self.pending_position.next_tx_ms {
-            return None;
-        }
         self.pending_position.active = false;
         Some(RelayPlan {
             len: self.pending_position.len,
@@ -3739,9 +3509,6 @@ impl Router {
             return None;
         }
         if now_ms.wrapping_sub(self.pending_telemetry.next_tx_ms) >= 0x8000_0000 {
-            return None;
-        }
-        if now_ms < self.pending_telemetry.next_tx_ms {
             return None;
         }
         self.pending_telemetry.active = false;
@@ -3759,9 +3526,6 @@ impl Router {
         if now_ms.wrapping_sub(self.pending_traceroute.next_tx_ms) >= 0x8000_0000 {
             return None;
         }
-        if now_ms < self.pending_traceroute.next_tx_ms {
-            return None;
-        }
         self.pending_traceroute.active = false;
         Some(RelayPlan {
             len: self.pending_traceroute.len,
@@ -3775,9 +3539,6 @@ impl Router {
             return None;
         }
         if now_ms.wrapping_sub(self.pending_topology.next_tx_ms) >= 0x8000_0000 {
-            return None;
-        }
-        if now_ms < self.pending_topology.next_tx_ms {
             return None;
         }
         let idx = self.pending_topology.next_idx as usize;
@@ -3805,7 +3566,6 @@ impl Router {
         self.pool.free_count()
     }
 
-    /// Host/tests: return an inbound pool handle (process_inbound retains slots until relay/drop).
     pub fn release_packet(&mut self, handle: crate::pool::PacketHandle) {
         self.pool.release(handle);
     }
@@ -3822,18 +3582,15 @@ impl Router {
             return;
         }
         if let Some(data) = data {
-            // Stock: any reply carrying our request id (ACK, NAK or a module reply such as a
-            // traceroute response) is the acknowledgement; module replies replace the ACK.
             if data.request_id != 0 {
-                let _ = stop_reliable(&mut self.pending_reliable, data.request_id);
+                let _ =
+                    stop_reliable_for(&mut self.pending_reliable, self.node_num, data.request_id);
             }
             if data.portnum == ROUTING_APP {
                 let _ = inner.map(decode_routing_payload);
                 return;
             }
-            if parsed.from != self.node_num
-                && parsed.from != 0
-                && !self.module_reply_suppresses_ack
+            if parsed.from != self.node_num && parsed.from != 0 && !self.module_reply_suppresses_ack
             {
                 if parsed.want_ack {
                     if data.request_id == 0 && data.reply_id == 0 {
@@ -3842,13 +3599,9 @@ impl Router {
                         == Some(0)
                         || parsed.next_hop != 0
                     {
-                        // Stock: a response is acknowledged only when it reached us with zero hops
-                        // or through a designated next hop, and then with a hop-0 ACK; a relayed
-                        // response was already implicitly acknowledged by the relay.
                         self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
                     }
                 } else if self.delivering_relayer_is_sr(parsed, data.has_bitfield, now_ms) {
-                    // Hop-0 ACK so the last SR hop hears delivery. Stock last hops are not waiting.
                     self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
                 }
             }
@@ -3872,7 +3625,6 @@ impl Router {
         self.schedule_ack_with_hop(parsed, channel_hash, hop, next_hop, now_ms);
     }
 
-    /// Hop-limit 0 re-ACK. Must not re-run admin/modules — those already ran on first delivery.
     fn schedule_dupe_want_ack(&mut self, parsed: &ParsedPacket, channel_hash: u8, now_ms: u32) {
         self.schedule_ack_with_hop(parsed, channel_hash, 0, 0, now_ms);
     }
@@ -3888,7 +3640,7 @@ impl Router {
         if self.pending_ack.active {
             return;
         }
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let Some((len, frame)) = self.build_ack_nak_reply(
             parsed,
             packet_id,
@@ -3918,7 +3670,7 @@ impl Router {
             return;
         }
         let (hop, next_hop) = self.response_header(parsed, hop_start_known);
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let Some((len, frame)) =
             self.build_ack_nak_reply(parsed, packet_id, hop, next_hop, error, parsed.channel)
         else {
@@ -3932,9 +3684,7 @@ impl Router {
         };
     }
 
-    /// WantAck ACK/NAK must use the same crypto as the request: PKI when the inbound
-    /// packet was PKI-decrypted (Ch=0), otherwise channel PSK. Channel-encrypting a
-    /// PKI WantAck makes pure-PKI clients ignore the ACK and retransmit forever.
+    /// Requesters can only authenticate replies encrypted with the same key path as their request.
     fn build_ack_nak_reply(
         &self,
         parsed: &ParsedPacket,
@@ -3952,7 +3702,6 @@ impl Router {
         };
         if self.admin_reply_use_pki {
             if let Some(remote_pk) = self.remote_pk_for_error_reply(parsed) {
-                // hop may be 0 for original-sender WantAck dupe re-ACKs.
                 return self.build_pki_app_frame(
                     parsed.from,
                     packet_id,
@@ -3984,7 +3733,10 @@ impl Router {
         if parsed.from == 0 || parsed.from == self.node_num {
             return;
         }
-        if self.graph.has_our_transmission(parsed.id) {
+        if self
+            .graph
+            .has_our_transmission(parsed.from, parsed.id, now_ms)
+        {
             return;
         }
         let Some(identity) = decode_user(payload) else {
@@ -4007,7 +3759,7 @@ impl Router {
     }
 
     fn schedule_nodeinfo_broadcast(&mut self, now_ms: u32) {
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let Some((len, frame)) = build_nodeinfo_wire_frame(
             self.node_num,
             packet_id,
@@ -4020,12 +3772,10 @@ impl Router {
             return;
         };
         self.queue_nodeinfo_tx(now_ms, len, frame);
-        self.last_nodeinfo_ms = now_ms;
+        self.last_nodeinfo_ms = Some(now_ms);
     }
 
-    /// Contention-window delay for a reply several nodes may send to the same trigger
-    /// (Meshtastic `getTxDelayMsec`). Without it, colocated nodes answering one request
-    /// transmit inside each other's airtime.
+    /// Without contention, colocated nodes answering one request overlap each other’s airtime.
     fn reply_tx_delay_ms(&self, seed_a: u32, seed_b: u32) -> u32 {
         tx_delay_ms_contention(
             self.channel_util_pct,
@@ -4037,7 +3787,7 @@ impl Router {
     }
 
     fn schedule_nodeinfo_unicast(&mut self, to: u32, reply_id: u32, now_ms: u32) {
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let Some((len, frame)) = build_nodeinfo_reply_frame(
             to,
             self.node_num,
@@ -4065,7 +3815,7 @@ impl Router {
     }
 
     fn schedule_telemetry_broadcast(&mut self, now_ms: u32) {
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let Some((len, frame)) = build_device_telemetry_wire_frame(
             self.node_num,
             packet_id,
@@ -4078,14 +3828,14 @@ impl Router {
             return;
         };
         self.queue_telemetry_tx(now_ms, len, frame);
-        self.last_telemetry_ms = now_ms;
+        self.last_telemetry_ms = Some(now_ms);
     }
 
     fn schedule_position_broadcast(&mut self, now_ms: u32) {
         if !self.admin.broadcasts_fixed_position() {
             return;
         }
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let Some((len, frame)) = build_fixed_position_wire_frame(
             self.node_num,
             packet_id,
@@ -4102,7 +3852,7 @@ impl Router {
         self.pending_position.next_tx_ms = now_ms;
         self.pending_position.len = len;
         self.pending_position.bytes = frame;
-        self.last_position_ms = now_ms;
+        self.last_position_ms = Some(now_ms);
     }
 
     fn queue_telemetry_tx(&mut self, now_ms: u32, len: u8, frame: [u8; MAX_WIRE_LEN]) {
@@ -4143,7 +3893,7 @@ impl Router {
             return;
         }
         let (hop, next_hop) = self.response_header(parsed, data.has_bitfield);
-        let packet_id = self.alloc_tx_id(now_ms);
+        let packet_id = self.alloc_tx_id();
         let Some((len, frame)) = build_app_wire_frame(
             parsed.from,
             self.node_num,
@@ -4169,9 +3919,6 @@ impl Router {
         self.pending_traceroute.next_tx_ms = now_ms;
         self.pending_traceroute.len = len;
         self.pending_traceroute.bytes = frame;
-        // The reply carries request_id and is the ACK (stock: a module reply replaces the
-        // separate ACK). Sending both put two frames on the air back to back and Dura missed
-        // the second one every time.
         self.module_reply_suppresses_ack = true;
         self.sr_log.push(SrLogEvent::TracerouteAppended {
             towards: data.request_id == 0,
@@ -4184,8 +3931,6 @@ impl Router {
         if !self.graph.can_send_topology() {
             return false;
         }
-        // A dirty broadcast reacts to something every neighbour heard too (a new node, a
-        // report), so it gets a contention-window delay; periodic ones run on our own timer.
         let dirty_delay_ms = if dirty {
             self.reply_tx_delay_ms(self.graph.topology_version() as u32, now_ms)
         } else {
@@ -4212,7 +3957,7 @@ impl Router {
             else {
                 continue;
             };
-            let packet_id = self.alloc_tx_id(now_ms);
+            let packet_id = self.alloc_tx_id();
             let Some((len, frame)) = build_topology_wire_frame(
                 self.node_num,
                 packet_id,
@@ -4236,9 +3981,6 @@ impl Router {
         self.pending_topology.count = built;
         self.pending_topology.next_idx = 0;
         self.pending_topology.next_tx_ms = now_ms.wrapping_add(dirty_delay_ms);
-        // Chunks of one list are spaced by twice the packet airtime: our peers
-        // relay chunk N in the slots right after it, and our chunk N+1 must not land on top of
-        // them. Two contention slots, the previous value, were far shorter than one airtime.
         let cfg = eu868_config_for_preset(self.modem_preset);
         let airtime_ms = packet_time_ms(&cfg, longest_frame, false).max(slot_ms);
         self.pending_topology.spacing_ms = airtime_ms.saturating_mul(2);
@@ -4251,16 +3993,14 @@ impl Router {
         true
     }
 
-    /// Seed the packet id sequence with hardware entropy. Without it every boot replays the
-    /// same ids (counter mixed with uptime), and two nodes booting a minute apart collide in the
-    /// low id range: B dropped A's boot broadcast because id 0x3a matched one of B's own frames.
+    /// A hardware-random boot seed prevents deterministic packet-ID reuse across restarts.
     pub fn seed_tx_ids(&mut self, seed: u32) {
         self.next_tx_id = seed;
     }
 
-    fn alloc_tx_id(&mut self, now_ms: u32) -> u32 {
-        let id = self.next_tx_id ^ now_ms;
-        self.next_tx_id = self.next_tx_id.wrapping_add(1);
+    fn alloc_tx_id(&mut self) -> u32 {
+        let id = self.next_tx_id.max(1);
+        self.next_tx_id = id.wrapping_add(1).max(1);
         id
     }
 
@@ -4274,8 +4014,6 @@ impl Router {
         bytes: [u8; MAX_WIRE_LEN],
         unicast_flags: crate::unicast_relay::UnicastSlotFlags,
     ) -> bool {
-        // One pending frame per packet: a re-plan (hand-off, better slot) replaces the earlier
-        // frame instead of queueing a second copy of the same packet behind it.
         let existing = self
             .pending
             .iter()
@@ -4296,8 +4034,6 @@ impl Router {
         false
     }
 
-    /// Park an already-built relay frame as a pending relay due now, so the board releases it
-    /// through the same gated path as every other frame (post-reception hold, channel quiet).
     pub fn defer_relay(&mut self, plan: RelayPlan, radio_id: u8, now_ms: u32) -> bool {
         let Ok(header) = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN]) else {
             return false;
@@ -4314,30 +4050,24 @@ impl Router {
         )
     }
 
-    /// Remember that `id` must not go on the air from us, wherever its frame currently sits.
-    fn note_tx_cancel(&mut self, id: u32) {
-        if !self.tx_cancels.contains(&id) {
-            let _ = self.tx_cancels.push(id);
+    fn note_tx_cancel(&mut self, from: u32, id: u32) {
+        if !self.tx_cancels.contains(&(from, id)) {
+            let _ = self.tx_cancels.push((from, id));
         }
     }
 
-    /// Packet ids whose queued relay the board must remove from the radio TX queue. A copy heard
-    /// while our frame waits behind listen-before-talk is the usual case: the frame has left the
-    /// router but not the node, and only the radio queue can still stop it.
-    /// The radio finished sending `packet_id`: the committed relay is complete.
-    pub fn note_tx_done(&mut self, packet_id: u32) {
+    pub fn note_tx_done(&mut self, from: u32, packet_id: u32) {
         if packet_id != 0 {
-            self.graph.cancel_relay_for_id(packet_id);
-            // On the air: nothing left to pull back.
+            self.graph.cancel_relay(from, packet_id);
             for slot in &mut self.pending_retransmits {
-                if slot.packet_id == packet_id {
+                if slot.from == from && slot.packet_id == packet_id {
                     slot.fired = false;
                 }
             }
         }
     }
 
-    pub fn take_tx_cancels(&mut self, out: &mut heapless::Vec<u32, 8>) {
+    pub fn take_tx_cancels(&mut self, out: &mut heapless::Vec<(u32, u32), 8>) {
         out.clear();
         for id in self.tx_cancels.iter() {
             let _ = out.push(*id);
@@ -4384,20 +4114,22 @@ impl Router {
         let dropped = self.cancel_pending_lower_hop(parsed.from, parsed.id, parsed.hop_limit);
         if dropped {
             self.graph.cancel_relay(parsed.from, parsed.id);
-            self.note_tx_cancel(parsed.id);
+            self.note_tx_cancel(parsed.from, parsed.id);
         }
         dropped
     }
 
-    /// Zero hops away: the original transmitter's own frame, not a relayed copy.
-    /// Unicast WantAck retries use this to emit a hop_limit=0 re-ACK without re-running modules.
-    /// To-us DMs are never SR-suppressed for this check (SR is not used for packets to us).
     fn is_repeated_reliable_tx(parsed: &ParsedPacket, data: Option<&DecodedData>) -> bool {
         let hop_start_known = data.is_some_and(|d| d.has_bitfield);
         hops_away(parsed.hop_start, parsed.hop_limit, hop_start_known) == Some(0)
     }
 
-    fn maybe_cancel_relay_for_foreign_ack(&mut self, parsed: &ParsedPacket, data: &DecodedData) {
+    fn maybe_cancel_relay_for_foreign_ack(
+        &mut self,
+        parsed: &ParsedPacket,
+        data: &DecodedData,
+        now_ms: u32,
+    ) {
         if parsed.to == self.node_num || parsed.to == NODENUM_BROADCAST {
             return;
         }
@@ -4408,14 +4140,18 @@ impl Router {
         } else {
             return;
         };
-        // The destination answered the origin: our copy is redundant wherever it sits, still
-        // pending here, committed, or already handed to the radio queue (both nicenanos once
-        // transmitted 80 ms after logging "reply heard" because only the retries were stopped).
+        // A destination reply makes every retained copy redundant, including a frame already handed to
+        // the radio queue.
         let had_pending = self.cancel_pending(parsed.to, cancel_id);
         let committed = self.graph.is_committed_relay(parsed.to, cancel_id);
-        if had_pending || committed || self.graph.has_our_transmission(cancel_id) {
+        if had_pending
+            || committed
+            || self
+                .graph
+                .has_our_transmission(parsed.to, cancel_id, now_ms)
+        {
             self.graph.cancel_relay(parsed.to, cancel_id);
-            self.note_tx_cancel(cancel_id);
+            self.note_tx_cancel(parsed.to, cancel_id);
             self.sr_log
                 .push(SrLogEvent::UnicastReplyCancel { id: cancel_id });
         }
@@ -4427,11 +4163,6 @@ impl Router {
         );
     }
 
-    /// Graph / downstream learning shared by the first copy and later duplicates.
-    ///
-    /// A later copy may resolve a `hearsUs` neighbour that the first-heard relay byte could
-    /// not (placeholder / non-neighbour). Skipping observe on the dupe path left designated
-    /// unicasts with `NO_ROUTE` even after a usable copy arrived.
     fn observe_inbound_graph(
         &mut self,
         parsed: &ParsedPacket,
@@ -4469,11 +4200,6 @@ impl Router {
                     node_id,
                     total: self.graph.neighbor_count(),
                 });
-                // The graph marked the topology dirty; the list goes out on the dirty schedule
-                // (once TOPOLOGY_DIRTY_MIN_MS has passed since our last broadcast, jittered).
-                // Sending a list the instant each neighbour appeared made peers treat every
-                // partial boot-time list as authoritative and clear hears_us on their edge to
-                // us; the empty boot broadcast already asks them for theirs.
             }
         }
     }
@@ -4487,11 +4213,9 @@ impl Router {
         now_ms: u32,
     ) {
         if let Some(data) = decoded_data {
-            self.maybe_cancel_relay_for_foreign_ack(parsed, data);
+            self.maybe_cancel_relay_for_foreign_ack(parsed, data, now_ms);
         }
 
-        // Still learn the graph: a later copy may name a hearsUs neighbour the first copy did
-        // not resolve (field: first RX via 0xf0 placeholder, later via FCM6).
         let direct = is_direct_packet(
             parsed.from,
             parsed.hop_start,
@@ -4511,8 +4235,6 @@ impl Router {
         };
         self.observe_inbound_graph(parsed, packet, now_ms, known_relay);
 
-        // A nominated follow-up ends only when that hop carries the packet. Upstream,
-        // originator, and other peers leave it armed — coverage rank does not cancel it.
         if parsed.to != NODENUM_BROADCAST && parsed.from != self.node_num {
             let transmitter = self.resolve_heard_from_node(
                 parsed.relay_node,
@@ -4543,19 +4265,12 @@ impl Router {
             }
         }
 
-        // Hearing our own frame (rebroadcast) is an implicit ACK — always cancel
-        // reliable retx before any early return for WantAck re-ACK handling.
         if parsed.from == self.node_num {
-            let _ = stop_reliable(&mut self.pending_reliable, parsed.id);
+            let _ = stop_reliable_for(&mut self.pending_reliable, self.node_num, parsed.id);
             self.perhaps_cancel_dupe(parsed, packet, now_ms);
             return;
         }
 
-        // Dupe path never re-enters rate_limit / admin / modules (history short-circuit).
-        // A want_ack retry from the original sender is re-acknowledged at hop limit 0, as
-        // before. A unicast that did not ask for an ack is re-acknowledged the same way so a
-        // missed hop-0 ACK still stops the last relay. Idempotent admin reads still answer
-        // with the module reply instead of a second ACK.
         if parsed.to == self.node_num
             && parsed.from != self.node_num
             && decoded_data.is_none_or(|d| d.portnum != ROUTING_APP)
@@ -4634,11 +4349,10 @@ impl Router {
             }
         }
 
-        // Unicast: cancel when the heard copy can finish delivery, is ranked ahead with a path,
-        // or (for a named backup) is the designated hop / shows hop-limit progress on that
-        // designation. Keep the slot if we can finish and they cannot — a worse-placed copy
-        // must not kill the last hop. Broadcast coverage reasoning below does not apply.
-        let in_flight = self.graph.has_our_transmission(parsed.id);
+        // A worse-placed copy must not cancel the only node able to complete the last hop.
+        let in_flight = self
+            .graph
+            .has_our_transmission(parsed.from, parsed.id, now_ms);
         if parsed.to != NODENUM_BROADCAST && (committed || has_pending || in_flight) {
             let next_hop = self.graph.route_to(parsed.to, now_ms).next_hop;
             let dupe_relayer = heard_relayer.filter(|&n| n != 0 && n != self.node_num);
@@ -4663,7 +4377,7 @@ impl Router {
             {
                 self.graph.cancel_relay(parsed.from, parsed.id);
                 let canceled_pending = self.cancel_pending(parsed.from, parsed.id);
-                self.note_tx_cancel(parsed.id);
+                self.note_tx_cancel(parsed.from, parsed.id);
                 if canceled_pending || has_pending {
                     self.sr_log.push(SrLogEvent::UnicastDupeCancel {
                         id: parsed.id,
@@ -4674,27 +4388,20 @@ impl Router {
             return;
         }
 
-        // Set once the coverage test has decided our committed copy is no longer needed. That
-        // verdict is about the packet — the nodes we would have carried have been carried by
-        // somebody else, so transmitting adds a duplicate and nothing else — so it overrides the
-        // role gate, which answers a different question: whether a router may fall silent for
-        // reasons of its own. Without this a node configured ROUTER or ROUTER_LATE cancelled its
-        // insurance and then transmitted anyway.
+        // Completed coverage makes the packet redundant regardless of a role’s preference to keep
+        // relaying.
         let mut sr_coverage_cancel = false;
 
         if committed {
             if !has_pending {
-                // Released to the radio (or already sent). Someone relayed, so T1 is moot.
-                self.cancel_t1_retransmit(parsed.id, T1CancelReason::RelayHeard);
-                // Coverage decides, not the role: the frame may still be pullable from the radio
-                // queue, and a covered relay that goes out anyway is a duplicate we chose.
+                self.cancel_t1_retransmit(parsed.from, parsed.id, T1CancelReason::RelayHeard);
                 if let Some(heard_from) = heard_relayer {
                     if !self.all_neighbors_covered(parsed.from, parsed.id, heard_from, now_ms) {
                         return;
                     }
                 }
                 self.graph.cancel_relay(parsed.from, parsed.id);
-                self.note_tx_cancel(parsed.id);
+                self.note_tx_cancel(parsed.from, parsed.id);
                 self.sr_log.push(SrLogEvent::BroadcastDupeCancel {
                     id: parsed.id,
                     from: parsed.from,
@@ -4709,8 +4416,6 @@ impl Router {
             sr_coverage_cancel = true;
         }
 
-        // Non-SR traffic keeps stock's behaviour for our role; a committed relay the coverage test
-        // has released does not.
         if sr_coverage_cancel || self.graph.role_allows_canceling_dupe() {
             if rebroadcast {
                 self.graph.cancel_relay_on_rebroadcast(
@@ -4731,7 +4436,7 @@ impl Router {
                 .is_some();
             let canceled_pending = self.cancel_pending(parsed.from, parsed.id);
             if had_relay || canceled_pending {
-                self.note_tx_cancel(parsed.id);
+                self.note_tx_cancel(parsed.from, parsed.id);
                 self.sr_log.push(SrLogEvent::BroadcastDupeCancel {
                     id: parsed.id,
                     from: parsed.from,
@@ -4739,10 +4444,10 @@ impl Router {
             }
         }
 
-        self.cancel_t1_retransmit(parsed.id, T1CancelReason::RelayHeard);
+        self.cancel_t1_retransmit(parsed.from, parsed.id, T1CancelReason::RelayHeard);
 
         if parsed.from == self.node_num {
-            let _ = stop_reliable(&mut self.pending_reliable, parsed.id);
+            let _ = stop_reliable_for(&mut self.pending_reliable, self.node_num, parsed.id);
         }
     }
 
@@ -4754,11 +4459,36 @@ impl Router {
             if now_ms.wrapping_sub(slot.fire_after_ms) >= 0x8000_0000 {
                 continue;
             }
-            if now_ms < slot.fire_after_ms {
+            let parsed = PacketHeader::decode(&slot.bytes[..slot.len as usize])
+                .ok()?
+                .parse();
+            let pkt = crate::rate_limit::RateLimitPacket {
+                from: parsed.from,
+                to: parsed.to,
+                decoded_portnum: slot.decoded_portnum,
+                now_ms,
+                rebroadcast_candidate: true,
+                resolved_relay: slot.resolved_relay,
+                airtime_ms: 0,
+                channel_util_pct: self.channel_util_pct,
+                graph_established: self.graph.neighbor_count() > 0,
+                on_default_channel: parsed.channel == self.channel_hash
+                    && psk_bytes(&self.channel_key) == DEFAULT_PSK.as_slice(),
+            };
+            if (parsed.from != self.node_num && !self.graph.is_rebroadcaster())
+                || self.rate_limit.would_drop(&pkt)
+                || !self
+                    .qos
+                    .can_relay(slot.decoded_portnum, parsed.channel, self.channel_util_pct)
+            {
+                slot.active = false;
+                slot.canceled = true;
                 continue;
             }
-            // Our own TX already gave the source a retransmission to hear.
-            if self.graph.has_our_transmission(slot.packet_id) {
+            if self
+                .graph
+                .has_our_transmission(slot.from, slot.packet_id, now_ms)
+            {
                 let id = slot.packet_id;
                 slot.active = false;
                 slot.canceled = true;
@@ -4782,7 +4512,6 @@ impl Router {
         None
     }
 
-    /// Build a relay frame and arm T1 after we deferred (no ranked slot).
     fn arm_t1_for_deferred_broadcast(
         &mut self,
         parsed: &ParsedPacket,
@@ -4802,12 +4531,8 @@ impl Router {
             self.pool.release(handle);
             return;
         };
-        // The insurance copy carries no acknowledgement request, whatever the frame we heard
-        // carried. Cleared here rather than in the shared relay builder, which is also the
-        // ordinary path for relayed unicasts — those legitimately keep the flag, and stripping it
-        // there would break the reliable path for every one of them. A copy that still asks to be
-        // acknowledged can be read by a sending path as a fresh reliable transmission and restart
-        // the originator's retry interval, which is how one insured broadcast went out four times.
+        // Ordinary relayed unicasts still need the acknowledgement flag; clearing it in the shared
+        // builder would break their reliable path.
         relay_hdr.clear_want_ack();
         let mut bytes = [0u8; MAX_WIRE_LEN];
         relay_hdr.encode_to(
@@ -4823,17 +4548,30 @@ impl Router {
         };
         self.pool.release(handle);
         let len = (PACKET_HEADER_LEN + plen) as u8;
-        // Every node that deferred arms T1, so the insurers need the slot ladder too: firing
-        // together would collide precisely when the ranked relay was the frame that went missing.
-        // Same deterministic order as an unranked relay slot, one half-airtime apart.
+        // Insurers need separate slots because simultaneous retries collide exactly when the primary
+        // relay failed.
         let ahead = self
             .graph
-            .insurance_rung_index(parsed.id, heard_from, now_ms);
+            .insurance_rung_index(parsed.id, parsed.from, heard_from, now_ms);
         let stagger = (ahead as u32).saturating_mul(half_airtime_ms);
-        let span = self
-            .graph
-            .relay_ladder_span_ms(parsed.id, heard_from, now_ms, half_airtime_ms);
-        self.schedule_t1_broadcast(parsed.id, len, bytes, airtime_ms, stagger, span, now_ms);
+        let span = self.graph.relay_ladder_span_ms(
+            parsed.id,
+            parsed.from,
+            heard_from,
+            now_ms,
+            half_airtime_ms,
+        );
+        self.schedule_t1_broadcast(
+            parsed.id,
+            len,
+            bytes,
+            decoded_portnum,
+            Some(heard_from),
+            airtime_ms,
+            stagger,
+            span,
+            now_ms,
+        );
     }
 
     fn schedule_t1_broadcast(
@@ -4841,13 +4579,20 @@ impl Router {
         packet_id: u32,
         len: u8,
         bytes: [u8; MAX_WIRE_LEN],
+        decoded_portnum: Option<u32>,
+        resolved_relay: Option<u32>,
         airtime_ms: u32,
         stagger_ms: u32,
         ladder_span_ms: u32,
         now_ms: u32,
     ) {
+        let Ok(header) = PacketHeader::decode(&bytes[..len as usize]) else {
+            return;
+        };
+        let parsed = header.parse();
+        let from = parsed.from;
         for slot in &self.pending_retransmits {
-            if slot.active && slot.packet_id == packet_id {
+            if slot.active && slot.from == from && slot.packet_id == packet_id {
                 return;
             }
         }
@@ -4858,9 +4603,6 @@ impl Router {
         else {
             return;
         };
-        // Whichever of the two possible last transmissions is later: the worst stock draw, or the
-        // last rung of our own ladder. They are floors on the same instant and compose by `max`,
-        // never by addition — the ladder runs inside the stock window, it does not follow it.
         let fire_delay = tx_delay_ms_worst(self.cw_slot_ms())
             .max(ladder_span_ms)
             .saturating_add(airtime_ms)
@@ -4869,8 +4611,11 @@ impl Router {
             active: true,
             canceled: false,
             fired: false,
+            from,
+            resolved_relay,
             packet_id,
             fire_after_ms: now_ms.wrapping_add(fire_delay),
+            decoded_portnum,
             len,
             bytes,
         };
@@ -4880,9 +4625,6 @@ impl Router {
         });
     }
 
-    /// The ranking inputs behind a deferral. Logged on the defer path as well as on the commit
-    /// path: without it a field log shows that we stood down but not who we stood down for, and
-    /// a slot handed to a node that cannot deliver is invisible.
     fn log_slot_scheduling(
         &mut self,
         parsed: &ParsedPacket,
@@ -4910,11 +4652,11 @@ impl Router {
         });
     }
 
-    fn cancel_t1_retransmit(&mut self, packet_id: u32, reason: T1CancelReason) {
+    fn cancel_t1_retransmit(&mut self, from: u32, packet_id: u32, reason: T1CancelReason) {
         let mut pull_back = false;
         let mut canceled = false;
         for slot in &mut self.pending_retransmits {
-            if slot.packet_id != packet_id {
+            if slot.from != from || slot.packet_id != packet_id {
                 continue;
             }
             if slot.active && !slot.canceled {
@@ -4922,7 +4664,6 @@ impl Router {
                 slot.canceled = true;
                 canceled = true;
             } else if slot.fired {
-                // Already handed to the radio: only the TX queue can still stop it.
                 slot.fired = false;
                 pull_back = true;
                 canceled = true;
@@ -4930,7 +4671,7 @@ impl Router {
             break;
         }
         if pull_back {
-            self.note_tx_cancel(packet_id);
+            self.note_tx_cancel(from, packet_id);
         }
         if canceled {
             self.sr_log.push(SrLogEvent::T1Canceled {
@@ -5015,8 +4756,6 @@ mod tests {
             (LAST_HOP_BUDGET, (DEST & 0xFF) as u8),
             "last hop: one hop, the requester named as next hop"
         );
-        // The same request arriving through a relay: the direct link is not carrying frames
-        // right now, so the reply keeps a budget a relay can use to bring it back.
         let relayed = PacketHeader::from_fields(ME, DEST, 8, 0, 6, 7, true, false, 0, 0x99).parse();
         assert_eq!(
             router.response_header(&relayed, true),
@@ -5091,7 +4830,10 @@ mod tests {
         assert_eq!(n1, 2);
 
         let mut receiver = Router::new(RECEIVER);
-        receiver.graph_mut().edges_mut().ensure_local_node(SENDER, 1_000);
+        receiver
+            .graph_mut()
+            .edges_mut()
+            .ensure_local_node(SENDER, 1_000);
         receiver
             .graph_mut()
             .edges_mut()
@@ -5145,14 +4887,16 @@ mod tests {
                 .is_some(),
             "a dropped neighbour stays until the last chunk"
         );
-        assert!(receiver
-            .graph_mut()
-            .edges()
-            .find_node(UNLISTED)
-            .unwrap()
-            .find_edge(SENDER)
-            .unwrap()
-            .hears_us);
+        assert!(
+            receiver
+                .graph_mut()
+                .edges()
+                .find_node(UNLISTED)
+                .unwrap()
+                .find_edge(SENDER)
+                .unwrap()
+                .hears_us
+        );
         feed(&mut receiver, &second, 20_000 + 2 * airtime);
         let (dropped, count) = {
             let from_sender = receiver.graph_mut().edges().find_node(SENDER).unwrap();
@@ -5161,8 +4905,14 @@ mod tests {
                 from_sender.edge_count,
             )
         };
-        assert!(dropped, "the last chunk drops a neighbour the list no longer names");
-        assert_eq!(count, 30, "both chunks' neighbours are in the sender's list");
+        assert!(
+            dropped,
+            "the last chunk drops a neighbour the list no longer names"
+        );
+        assert_eq!(
+            count, 30,
+            "both chunks' neighbours are in the sender's list"
+        );
         let hears = receiver
             .graph_mut()
             .edges()
@@ -5215,7 +4965,6 @@ mod tests {
                 500,
             )
             .unwrap();
-        // The new-neighbour dirty broadcast is jittered; drain it before the empty-peer step.
         let drain_at = 500 + coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
         let _ = router.poll_topology_tx(drain_at);
 
@@ -5331,9 +5080,6 @@ mod tests {
         )));
     }
 
-    /// A new neighbour marks the topology dirty; the list follows on the dirty schedule with
-    /// jitter, not the instant the neighbour appears (partial boot-time lists made peers clear
-    /// hears_us on their edge to us).
     #[test]
     fn new_neighbour_dirty_topology_broadcast_waits_for_the_dirty_window() {
         use mesh_crypto::{CryptoKey, DEFAULT_PSK};
@@ -5405,7 +5151,6 @@ mod tests {
         assert!(router.poll_topology_tx(due + delay).is_some());
     }
 
-    /// Empty bootstrap broadcasts are answered at most once per BOOTSTRAP_REPLY_MIN_MS.
     #[test]
     fn bootstrap_replies_are_rate_limited() {
         use crate::topology::{build_topology_wire_frame, PACKED_NEIGHBOR_HEADER_SIZE};
@@ -5437,18 +5182,15 @@ mod tests {
                 .unwrap();
             router.run_maintenance(at, 20);
         };
-        // First bootstrap: answered.
         feed(&mut router, &bootstrap(P1, 0x91), 5_000);
         let max = coordinated_relay::tx_delay_ms_contention_max(router.cw_slot_ms());
         assert!((5_000..=5_000 + max).any(|t| router.poll_topology_tx(t).is_some()));
-        // Second one shortly after, from another node: rate-limited.
         feed(&mut router, &bootstrap(P2, 0x92), 20_000);
         assert!((20_000..=20_000 + max).all(|t| router.poll_topology_tx(t).is_none()));
         router.drain_sr_logs(&mut logs);
         assert!(logs
             .iter()
             .any(|e| matches!(e, SrLogEvent::BootstrapReplyRateLimited)));
-        // After the cooldown a bootstrap is answered again.
         feed(
             &mut router,
             &bootstrap(P1, 0x93),
@@ -5458,9 +5200,6 @@ mod tests {
         assert!((t3..=t3 + max).any(|t| router.poll_topology_tx(t).is_some()));
     }
 
-    /// A list that goes out after the bootstrap request has already answered it. Seen on a
-    /// node whose periodic list and a queued bootstrap reply left 170 ms apart, doubling every
-    /// relay of it downstream.
     #[test]
     fn bootstrap_reply_is_dropped_when_a_list_already_went_out() {
         use crate::topology::{build_topology_wire_frame, PACKED_NEIGHBOR_HEADER_SIZE};
@@ -5472,7 +5211,6 @@ mod tests {
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 1, true);
         let frame = build_topology_wire_frame(PEER, 0x94, 0x77, 3, &key, &packed, false).unwrap();
-        // The peer asks for our list before our own first list has gone out.
         router
             .process_inbound(
                 &InboundPacket {
@@ -5533,8 +5271,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(0x1111_1111));
 
-        // Relayed copy (foreign relay byte): not an originator retry, so it stays a plain
-        // duplicate and must not schedule another relay.
         let header = PacketHeader::from_fields(1, 2, 99, 0, 1, 2, false, false, 0, 0xAB);
         let wire = encode_wire(header, &[1, 2, 3]);
 
@@ -5561,9 +5297,6 @@ mod tests {
 
     #[test]
     fn duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor() {
-        // First-heard via an unresolved relay byte parks nothing; a later duplicate via a
-        // hearsUs neighbour must still run observe and park a stock originator (Czar/Z005/
-        // FCM6 race: first RX often 0xf0, later 0x6c).
         const ME: u32 = 0x63DC_8F8C;
         const STOCK: u32 = 0x4F51_78DC;
         const GATEWAY: u32 = 0x108A_EF6C;
@@ -5709,8 +5442,6 @@ mod tests {
             0,
         );
         graph.edges_mut().set_edge_hears_us(NEIGHBOR, STOCK, true);
-        // Transmitter already reaches STOCK. We hold nothing unique, so we defer and T1
-        // stands in if the repeater never transmits.
 
         let header =
             PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, false, false, 0, 0);
@@ -5733,7 +5464,6 @@ mod tests {
 
         let slot_ms = coordinated_relay::slot_time_for_preset(router.modem_preset());
         let fire_ms = coordinated_relay::tx_delay_ms_worst(slot_ms).saturating_add(airtime);
-        // Never inside the defer window; our own rung of the insurance ladder follows it.
         assert!(router.poll_t1_retransmit(1_000 + fire_ms - 1).is_none());
         let ladder =
             coordinated_relay::half_airtime_ms(airtime) * crate::graph::MAX_EDGES_PER_NODE as u32;
@@ -5742,11 +5472,6 @@ mod tests {
             .is_some());
     }
 
-    /// The insurance copy must never ask to be acknowledged. A frame we heard may carry
-    /// `want_ack` — stock strips it from its own broadcasts, but nothing on the wire guarantees
-    /// every sender does — and a copy that keeps the flag can be read by a sending path as a
-    /// fresh reliable transmission, restarting the originator's retry interval. Cleared on the
-    /// T1 snapshot alone: relayed unicasts legitimately keep the flag.
     #[test]
     fn the_insurance_copy_asks_for_no_acknowledgement() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -5786,8 +5511,6 @@ mod tests {
             graph.edges_mut().set_edge_hears_us(NEIGHBOR, STOCK, true);
         }
 
-        // want_ack set on the frame we hear: the stock repeater is reserved, we have
-        // nothing unique vs the transmitter, and T1 arms on the expected transmission.
         let header =
             PacketHeader::from_fields(NODENUM_BROADCAST, NEIGHBOR, 99, 0, 3, 3, true, false, 0, 0);
         let wire = encode_wire(header, &[0x01, 0x02]);
@@ -5826,9 +5549,6 @@ mod tests {
         );
     }
 
-    /// A copy heard after our insurance fired must still stop it: the frame has left the router
-    /// but waits behind listen-before-talk, and only the radio queue can pull it back. Field
-    /// 2026-09-08: six copies went out 0.4 to 1.0 s behind another insurer's for want of this.
     #[test]
     fn a_copy_heard_after_t1_fired_pulls_the_frame_back() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -5897,7 +5617,6 @@ mod tests {
         let mut cancels = heapless::Vec::new();
         router.take_tx_cancels(&mut cancels);
         assert!(cancels.is_empty(), "nothing to pull back yet");
-        // Another insurer's copy lands while ours is still queued.
         let relayed = encode_wire(
             PacketHeader::from_fields(
                 NODENUM_BROADCAST,
@@ -5924,11 +5643,10 @@ mod tests {
         );
         router.take_tx_cancels(&mut cancels);
         assert!(
-            cancels.contains(&99),
+            cancels.contains(&(NEIGHBOR, 99)),
             "the queued insurance frame must be pulled out of the radio queue"
         );
-        // And once the radio reports it went out, there is nothing left to cancel.
-        router.note_tx_done(99);
+        router.note_tx_done(NEIGHBOR, 99);
         let _ = router.process_inbound(
             &InboundPacket {
                 radio_id: 0,
@@ -5942,10 +5660,6 @@ mod tests {
         assert!(cancels.is_empty(), "already on the air: no pull-back");
     }
 
-    /// The same deferral once the peer's copy is actually heard: only observation of the air
-    /// cancels the insurance, never a repeat of the coverage question. Field evidence
-    /// (2026-09-08): two of seven late copies carried frames the graph believed were covered
-    /// but that were lost at -84 to -93 dBm, so the graph cannot answer this.
     #[test]
     fn t1_stands_down_when_the_peers_copy_is_heard() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -6004,7 +5718,6 @@ mod tests {
             .evaluate_tx_plan(&result, 0.0, airtime, 1_000)
             .relay
             .is_none());
-        // The repeater's copy arrives: the expected transmission happened after all.
         let relayed = encode_wire(
             PacketHeader::from_fields(
                 NODENUM_BROADCAST,
@@ -6047,11 +5760,6 @@ mod tests {
         )));
     }
 
-    /// Two nodes and nothing else: the sender's broadcast reaches no new node if we relay it,
-    /// but our copy is the only signal it can ever get that the mesh received it. The ranking
-    /// has nothing to weigh here (we are the only candidate), so the sole-candidate rule
-    /// relays immediately — the insurance timer never enters this case, whatever `want_ack`
-    /// says. Field-proven: `candidates=1 ... via=sparse` followed by a committed relay.
     #[test]
     fn two_node_mesh_relays_and_confirms_to_the_sender() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -6065,7 +5773,6 @@ mod tests {
             graph.confirm_direct_neighbor_hears_us(SRC);
             graph.capability_mut().track_topology(SRC, true, 0);
         }
-        // want_ack clear: no witness is owed, and none is needed to make us relay.
         let wire = encode_wire(
             PacketHeader::from_fields(NODENUM_BROADCAST, SRC, 0x79, 0, 3, 3, false, false, 0, 0),
             &[0x01, 0x02],
@@ -6103,10 +5810,6 @@ mod tests {
         )));
     }
 
-    /// Nobody was given a slot and no originator is waiting to be told: no transmission is
-    /// expected, so there is nothing for a late copy to stand in for. Measured over 30 min on
-    /// three field nodes (2026-09-08): this declines ~100 copies per node and costs no
-    /// delivery, while T1 traffic fell roughly tenfold.
     #[test]
     fn no_expected_transmission_arms_no_insurance() {
         use crate::topology::{decode_packed_neighbors, write_packed_header, PackedNeighbor};
@@ -6125,10 +5828,9 @@ mod tests {
             graph.capability_mut().track_topology(SRC, true, 0);
             graph.capability_mut().track_topology(PEER, true, 0);
         }
-        // The source reaches PEER itself, so the ranking hands out no slot at all.
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let entry = PackedNeighbor {
             node_id: PEER,
             rssi: -70,
@@ -6145,7 +5847,6 @@ mod tests {
             .graph_mut()
             .merge_topology(SRC, &header, &[entry, us], true, 0, 0);
 
-        // want_ack clear: the source asked for no acknowledgement either.
         let wire = encode_wire(
             PacketHeader::from_fields(NODENUM_BROADCAST, SRC, 0x77, 0, 3, 3, false, false, 0, 0),
             &[0x01, 0x02],
@@ -6244,13 +5945,6 @@ mod tests {
         );
     }
 
-    /// A covered relay is cancelled whatever our role, and the role still governs other traffic.
-    ///
-    /// The coverage test answers "has somebody already carried the nodes we would have carried";
-    /// the role gate answers "may a router fall silent for reasons of its own". They are different
-    /// questions and the first has to win, or a node configured ROUTER or ROUTER_LATE cancels its
-    /// insurance on hearing a copy and then transmits anyway — one extra frame with the backstop
-    /// already given up.
     #[test]
     fn coverage_cancels_a_committed_relay_whatever_our_role() {
         for role in [
@@ -6258,12 +5952,9 @@ mod tests {
             crate::nodeinfo::DEVICE_ROLE_ROUTER,
             crate::nodeinfo::DEVICE_ROLE_ROUTER_LATE,
         ] {
-            // A fresh router per role. Built as a local rather than through a StaticCell, which
-            // can only be initialised once and so cannot serve a loop.
             let mut router = Router::new(0x677a_1caf);
             router.set_device_role(role);
 
-            // One neighbour that hears us, so a broadcast from a second node gives us a rung.
             let neighbor_wire = encode_wire(
                 PacketHeader::from_fields(0xFFFF_FFFF, 0x1111_1111, 1, 0, 3, 3, false, false, 0, 0),
                 &[0x01],
@@ -6312,8 +6003,6 @@ mod tests {
                 "role {role}: a rung should have been taken"
             );
 
-            // The neighbour relays it. Its copy covers the only node we could have reached, so
-            // ours is redundant whatever our own role says about falling silent.
             let dupe = encode_wire(
                 PacketHeader::from_fields(
                     NODENUM_BROADCAST,
@@ -6345,7 +6034,6 @@ mod tests {
         }
     }
 
-    /// The role gate still applies where SR has not committed: stock behaviour for stock traffic.
     #[test]
     fn role_still_governs_traffic_we_did_not_commit_to() {
         let mut router = Router::new(0x677a_1caf);
@@ -6437,7 +6125,6 @@ mod tests {
             )
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        // Stock Meshtastic semantics: hop_limit 1 is relayed once more with hop_limit 0.
         let relay = plan
             .relay
             .or_else(|| {
@@ -6456,8 +6143,6 @@ mod tests {
     const UNI_SOURCE: u32 = 0xDD00_00DD;
     const UNI_DEST: u32 = 0xEE00_00EE;
 
-    /// Graph: we hear RELAYER directly, DEST is only known as downstream of RELAYER (no
-    /// verified two-hop route).
     fn setup_downstream_only_graph(router: &mut Router) {
         router
             .graph_mut()
@@ -6471,8 +6156,6 @@ mod tests {
             .update(UNI_ME, UNI_DEST, UNI_RELAYER, 2.0, 0, false, 0);
     }
 
-    /// Graph: verified route ME -> RELAYER -> DEST. RELAYER is an SR-active neighbour that
-    /// hears us and reports DEST as a neighbour that hears it.
     fn setup_unicast_graph(router: &mut Router) {
         setup_downstream_only_graph(router);
         router
@@ -6484,7 +6167,7 @@ mod tests {
             .confirm_direct_neighbor_hears_us(UNI_RELAYER);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let dest = PackedNeighbor {
             node_id: UNI_DEST,
             rssi: -75,
@@ -6493,13 +6176,10 @@ mod tests {
             hears_us: true,
             etx_variance: 0,
         };
-        // RELAYER must list us too, otherwise its report clears our hears_us flag on it.
         let us = PackedNeighbor {
             node_id: UNI_ME,
             ..dest
         };
-        // RELAYER overheard SOURCE: without this, ranking would still give RELAYER a slot
-        // because it can reach DEST, and we would wait for a copy it never received.
         let source = PackedNeighbor {
             node_id: UNI_SOURCE,
             hears_us: false,
@@ -6515,7 +6195,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_downstream_only_graph(router);
-        // DEST sits behind RELAYER; RELAYER is a neighbour we hear, so the chain is stamped.
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x600, true);
         let (sent, _) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, (UNI_RELAYER & 0xFF) as u8);
@@ -6547,9 +6226,6 @@ mod tests {
 
     const UNI_PEER: u32 = 0xAB00_00AB;
 
-    /// Graph: DEST is only reachable by guess. GATEWAY reports DEST as a neighbour it hears,
-    /// DEST publishes topology and has never listed GATEWAY, so nothing says DEST hears it —
-    /// the inbound-gateway fallback, not a verified path.
     fn setup_unverified_gateway_graph(router: &mut Router, listener: Option<u32>) {
         let graph = router.graph_mut();
         graph.observe_direct_neighbor(UNI_RELAYER, -70, 8, 0, 0);
@@ -6558,7 +6234,7 @@ mod tests {
         graph.confirm_direct_neighbor_hears_us(UNI_RELAYER);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let us = PackedNeighbor {
             node_id: UNI_ME,
             rssi: -70,
@@ -6567,7 +6243,6 @@ mod tests {
             hears_us: true,
             etx_variance: 0,
         };
-        // GATEWAY hears DEST; DEST has never confirmed the reverse.
         let dest = PackedNeighbor {
             node_id: UNI_DEST,
             hears_us: false,
@@ -6576,8 +6251,6 @@ mod tests {
         router
             .graph_mut()
             .merge_topology(UNI_RELAYER, &header, &[dest, us], true, 0, 0);
-        // A second SR neighbour that reports the gateway, so a packet heard from it counts as
-        // reaching the gateway and the route survives the connectivity check.
         if let Some(peer) = listener {
             let graph = router.graph_mut();
             graph.observe_direct_neighbor(peer, -70, 8, 0, 0);
@@ -6593,29 +6266,22 @@ mod tests {
         }
     }
 
-    /// 2026-09-07: the branch gateway relayed unicasts for outside destinations back into the
-    /// branch, where the only path known was the one the packet arrived on.
     #[test]
     fn guessed_route_back_the_way_it_came_is_dropped() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unverified_gateway_graph(router, None);
-        // Heard from the gateway itself: our guess names it as next hop.
         let wire = unicast_wire(2, 3, 0, 0xBB, 0x701);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(!scheduled, "carrying it moves the packet away from DEST");
         assert_eq!(reason, Some(SrSkipReason::UnverifiedBacktrack));
     }
 
-    /// The same frame, but the sender named us as its next hop: it is waiting on us
-    /// specifically and its retries would designate us again, so one copy from us costs less
-    /// than three from it. Forwarded with the next hop cleared, never dropped.
     #[test]
     fn a_frame_named_for_us_is_forwarded_even_on_a_guessed_backtrack() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unverified_gateway_graph(router, None);
-        // Heard from the gateway, whose byte our guess names — but the frame names us.
         let wire = unicast_wire(2, 3, (UNI_ME & 0xFF) as u8, 0xBB, 0x703);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(scheduled, "named for us: carry it");
@@ -6631,8 +6297,6 @@ mod tests {
             .graph_mut()
             .set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
 
-        // Addressed to us, arrived direct, and the sender named our byte as its next hop: it can
-        // only have learned to route through us by hearing us.
         let header = PacketHeader::from_fields(
             UNI_ME,
             SENDER,
@@ -6673,8 +6337,6 @@ mod tests {
             .graph_mut()
             .observe_direct_neighbor(SENDER, -50, 12, 500, 0);
 
-        // Our byte is named, but the frame was relayed: the byte was stamped by the relayer, and
-        // it says nothing about whether the originator hears us.
         let header = PacketHeader::from_fields(
             UNI_ME,
             SENDER,
@@ -6708,7 +6370,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unverified_gateway_graph(router, Some(UNI_PEER));
-        // Heard from the other SR neighbour, so the guess points onward, not back.
         let wire = unicast_wire_ack(2, 3, 0, 0xAB, 0x702, true);
         let (sent, _) = forward_unicast(router, &wire, 0);
         assert_eq!(
@@ -6748,8 +6409,6 @@ mod tests {
             .unwrap();
         let (from, id) = (result.parsed.from, result.parsed.id);
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        // Only the relay of this packet counts; a directly heard source also queues a
-        // topology broadcast, which is unrelated pending work.
         let scheduled = plan.relay.is_some() || router.relay_tx_after(from, id, 0).is_some();
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
@@ -6765,7 +6424,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // Heard from RELAYER (relay byte 0xBB), and RELAYER is also our route to DEST.
         let wire = unicast_wire(2, 3, 0, 0xBB, 0x501);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(!scheduled);
@@ -6786,9 +6444,6 @@ mod tests {
         encode_wire(header, &[0xDE, 0xAD, 0xBE, 0xEF])
     }
 
-    /// Feed a unicast, release its relay (immediately or from the pending slot) and return the
-    /// transmitted frame header.
-    /// Returns the transmitted header and the time the relay left (retries are armed then).
     fn forward_unicast(router: &mut Router, wire: &[u8], now_ms: u32) -> (ParsedPacket, u32) {
         let result = router
             .process_inbound(
@@ -6819,14 +6474,12 @@ mod tests {
         )
     }
 
-    /// Wait between named follow-up tries for a forward of `wire` nominating `nominated`.
     fn named_followup_delay(router: &Router, wire: &[u8], nominated: u32) -> u32 {
         let cfg = eu868_config_for_preset(router.modem_preset());
         let airtime = packet_time_ms(&cfg, wire.len(), false).max(1);
         router.named_followup_delay_ms(nominated, airtime)
     }
 
-    /// Fire the named repeat and check it is our first copy unchanged; returns when it fired.
     fn expect_named_repeat(router: &mut Router, sent: &ParsedPacket, id: u32, at: u32) -> u32 {
         let repeat = router.poll_reliable_retransmit(at).expect("repeat due");
         let hdr = PacketHeader::decode(&repeat.bytes[..PACKET_HEADER_LEN])
@@ -6846,9 +6499,6 @@ mod tests {
 
     #[test]
     fn forwarded_want_ack_unicast_is_repeated_then_dropped_without_alternate() {
-        // Single path via RELAYER. Our relay was the originator's implicit ACK, so its
-        // retries have stopped: the repeat to RELAYER is the recovery, and with no
-        // stampable alternate nothing else is sent (no flood).
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
@@ -6937,7 +6587,6 @@ mod tests {
             .graph_mut()
             .edges_mut()
             .set_edge_hears_us(UNI_PEER, UNI_RELAYER, true);
-        // Odd id: we rank ahead of PEER among indirects, so PEER is the flood slot.
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x611, false);
         let (sent, _) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB);
@@ -6950,7 +6599,6 @@ mod tests {
     fn assert_originator_retry_replanned(next_hop: u8, relay: u8, id: u32, router: &mut Router) {
         setup_unicast_graph(router);
         router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
-        // First copy names someone else so we do not commit as designated.
         let first = unicast_wire_ack(3, 3, 0x55, 0xDD, id, false);
         let _ = router
             .process_inbound(
@@ -7024,48 +6672,51 @@ mod tests {
                 0,
             )
             .unwrap();
-        // Relayed copy with next_hop 0 (foreign relay byte): not an originator retry.
         let relayed = unicast_wire_ack(2, 3, 0, 0xAA, 0x702, false);
-        assert!(router
-            .process_inbound(
-                &InboundPacket {
-                    radio_id: 0,
-                    rssi: -70,
-                    snr: 8,
-                    bytes: &relayed,
-                },
-                50,
-            )
-            .unwrap()
-            .duplicate);
-        // Originator retry naming another node stays a duplicate.
+        assert!(
+            router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -70,
+                        snr: 8,
+                        bytes: &relayed,
+                    },
+                    50,
+                )
+                .unwrap()
+                .duplicate
+        );
         let named_other = unicast_wire_ack(3, 3, 0x55, 0xDD, 0x702, false);
-        assert!(router
-            .process_inbound(
-                &InboundPacket {
-                    radio_id: 0,
-                    rssi: -70,
-                    snr: 8,
-                    bytes: &named_other,
-                },
-                60,
-            )
-            .unwrap()
-            .duplicate);
-        // Preserved hop_limit with foreign relay byte is not an originator retry.
+        assert!(
+            router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -70,
+                        snr: 8,
+                        bytes: &named_other,
+                    },
+                    60,
+                )
+                .unwrap()
+                .duplicate
+        );
         let preserved = unicast_wire_ack(3, 3, 0, 0xAA, 0x702, false);
-        assert!(router
-            .process_inbound(
-                &InboundPacket {
-                    radio_id: 0,
-                    rssi: -70,
-                    snr: 8,
-                    bytes: &preserved,
-                },
-                70,
-            )
-            .unwrap()
-            .duplicate);
+        assert!(
+            router
+                .process_inbound(
+                    &InboundPacket {
+                        radio_id: 0,
+                        rssi: -70,
+                        snr: 8,
+                        bytes: &preserved,
+                    },
+                    70,
+                )
+                .unwrap()
+                .duplicate
+        );
     }
 
     #[test]
@@ -7079,7 +6730,6 @@ mod tests {
         let cfg = eu868_config_for_preset(router.modem_preset());
         let airtime = packet_time_ms(&cfg, wire.len(), false).max(1);
         let half = coordinated_relay::half_airtime_ms(airtime);
-        // Our frame leaves the air, then a slot-1 backup (with its tie-break spread) does.
         let own_tx = router.sr_peer_relay_wait_ms(airtime);
         let slot1_end = router.unicast_named_slot_delay_ms(1, 0, half, airtime)
             + coordinated_relay::tie_break_range_ms(half)
@@ -7101,7 +6751,6 @@ mod tests {
         expect_named_repeat(router, &sent, 0x612, armed_at + delay);
     }
 
-    /// A second, verified path to DEST via `peer`.
     fn add_second_path(router: &mut Router, peer: u32) {
         router
             .graph_mut()
@@ -7172,7 +6821,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // Same low byte as RELAYER: a frame naming it would read as the silent hop again.
         add_second_path(router, 0xAB00_00BB);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x614, false);
         let (sent, armed_at) = forward_unicast(router, &wire, 0);
@@ -7198,7 +6846,6 @@ mod tests {
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x617, false);
         let (sent, armed_at) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB);
-        // PEER stops looking like an SR node: its route stays, its status becomes unknown.
         router.graph_mut().capability_mut().clear();
         let alt =
             router
@@ -7228,7 +6875,6 @@ mod tests {
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x615, false);
         let (sent, _) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB);
-        // SOURCE did not hear our relay and retries: it has not carried the packet past us.
         let retry = unicast_wire_ack(3, 3, 0, 0xDD, 0x615, false);
         let dupe = router
             .process_inbound(
@@ -7246,7 +6892,6 @@ mod tests {
             router.has_pending_reliable(0x615),
             "originator's copy must not cancel our follow-up"
         );
-        // RELAYER's copy is the packet moving on.
         let carried = unicast_wire_ack(2, 3, 0, 0xBB, 0x615, false);
         let _ = router
             .process_inbound(
@@ -7274,7 +6919,6 @@ mod tests {
         let wire = unicast_wire_ack(2, 3, 0, upstream_byte, 0x618, false);
         let (sent, _) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB);
-        // PEER did not hear our relay and repeats its own frame.
         let _ = router
             .process_inbound(
                 &InboundPacket {
@@ -7299,7 +6943,6 @@ mod tests {
         setup_unicast_graph(router);
         let _ = router.graph_mut().record_hop_miss(UNI_DEST, UNI_RELAYER, 0);
         let _ = router.graph_mut().record_hop_miss(UNI_DEST, UNI_RELAYER, 1);
-        // Only path: a suspect hop is still stamped.
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x616, false);
         let (sent, _) = forward_unicast(router, &wire, 10);
         assert_eq!(sent.next_hop, 0xBB);
@@ -7361,8 +7004,6 @@ mod tests {
         for (want_ack, id, hop_limit, hop_start) in
             [(false, 0x901u32, 3u8, 3u8), (true, 0x902u32, 2, 3)]
         {
-            // Requested ACK: one hop already used, so the reply has a budget to travel back.
-            // Unsolicited dest ACK: hops-away 0 so the originator is the delivering relayer.
             let (len, frame) = build_app_wire_frame(
                 UNI_ME,
                 UNI_SOURCE,
@@ -7414,7 +7055,6 @@ mod tests {
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x603, true);
         let _ = forward_unicast(router, &wire, 0);
         assert!(router.has_pending_reliable(0x603));
-        // RELAYER carries it on (one more hop used, its relay byte).
         let copy = unicast_wire_ack(1, 3, 0, 0xBB, 0x603, true);
         let dupe = router
             .process_inbound(
@@ -7448,7 +7088,6 @@ mod tests {
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x619, true);
         let _ = forward_unicast(router, &wire, 0);
         assert!(router.has_pending_reliable(0x619));
-        // PEER is not the nominated hop: its copy must not cancel our follow-up.
         let peer_copy = unicast_wire_ack(2, 3, 0, (UNI_PEER & 0xFF) as u8, 0x619, true);
         let dupe = router
             .process_inbound(
@@ -7476,7 +7115,6 @@ mod tests {
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x604, true);
         let _ = forward_unicast(router, &wire, 0);
         assert!(router.has_pending_reliable(0x604));
-        // DEST acks SOURCE for 0x604 on the primary channel.
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let (len, ack) = build_ack_nak_frame(
             UNI_SOURCE,
@@ -7517,7 +7155,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // Heard from SOURCE with our byte (0xCC) as next hop; DEST is downstream via RELAYER.
         let wire = unicast_wire(3, 3, 0xCC, 0xDD, 0x502);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(scheduled);
@@ -7530,7 +7167,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // First copy names RELAYER (0xBB) as next hop: we take a later slot.
         let wire = unicast_wire(3, 3, 0xBB, 0xDD, 0x611);
         let result = router
             .process_inbound(
@@ -7545,8 +7181,6 @@ mod tests {
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         assert!(plan.relay.is_none());
-        // RELAYER forwards it naming us. Our own route to DEST goes through RELAYER, so the
-        // hand-off is honoured by flooding with next_hop cleared instead of being dropped.
         let copy = unicast_wire(2, 3, 0xCC, 0xBB, 0x611);
         let result = router
             .process_inbound(
@@ -7574,8 +7208,6 @@ mod tests {
             )),
             "hand-off takes slot 0; log: {logs:?}"
         );
-        // Slot 0 still sits behind a floor, so it is pending, not inline — now stock's own
-        // contention floor rather than the broadcast ladder's origin.
         let origin = crate::coordinated_relay::relay_floor_ms(
             crate::coordinated_relay::slot_time_for_preset(router.modem_preset()),
         );
@@ -7583,9 +7215,6 @@ mod tests {
             router.poll_ready_relay(50 + origin - 1).is_none(),
             "slot 0 sits at the ladder origin, inside the peers' turnaround"
         );
-        // The rung's tie-break offset is strictly positive and can reach the whole range, so the
-        // poll has to clear the origin plus that range — derived, not a fixed margin, or the test
-        // passes or fails on which offset this packet id happens to hash to.
         let jitter_max = coordinated_relay::tie_break_range_ms(coordinated_relay::half_airtime_ms(
             coordinated_relay::DEFAULT_SLOT_MS,
         ));
@@ -7598,24 +7227,18 @@ mod tests {
         assert_eq!(hdr.next_hop, 0, "route pointed back at the relayer: flood");
         assert_eq!(hdr.relay_node, 0xCC);
         assert_eq!(hdr.hop_limit, 1);
-        router.record_tx_on_air(0x611, 50 + origin + 20);
+        router.record_tx_on_air(UNI_SOURCE, 0x611, 50 + origin + 20);
         assert!(
             router.poll_ready_relay(50 + origin + 10_000).is_none(),
             "the first copy's later-slot frame was replaced, not queued behind the hand-off"
         );
     }
 
-    /// 2026-09-06 17:31: Dura's request to FCM6 carried FCM6's own byte as next hop. Both
-    /// nicenanos waited the worst-case stock delay for a relayer that cannot exist.
-    /// 2026-09-07: a unicast named A as next hop, A's own route to the destination pointed back
-    /// at the node A heard it from, and A skipped it as "next hop is relayer". The designated hop
-    /// forwards; only bystanders may defer.
     #[test]
     fn designated_hop_forwards_even_when_our_route_points_back_at_the_relayer() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // Our route to the destination runs through the node we hear the packet from.
         assert_eq!(
             router.graph_mut().route_to(UNI_DEST, 0).next_hop,
             UNI_RELAYER,
@@ -7639,10 +7262,6 @@ mod tests {
             plan.relay.is_none(),
             "slot 0 is scheduled, never released inside the evaluation"
         );
-        // Owning slot 0 is not "immediately": it waits the larger of stock's contention floor and
-        // the destination's own chance to answer, both floors on the same instant. The relay's own
-        // `delay_ms` is the residue left at poll time — zero by then — so it says nothing about
-        // when the slot was, and bounding it proved nothing.
         let floor = coordinated_relay::relay_floor_ms(coordinated_relay::slot_time_for_preset(
             router.modem_preset(),
         ));
@@ -7727,8 +7346,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // next_hop 0x99 names an unknown (treated as stock) node: it owns slot 0, we wait at
-        // least the worst-case stock delay plus one airtime before our own slot.
         let wire = unicast_wire(3, 3, 0x99, 0xDD, 0x503);
         let result = router
             .process_inbound(
@@ -7759,9 +7376,6 @@ mod tests {
             SrLogEvent::UnicastDesignated { next_hop: 0x99, is_us: false, sr_active: false, slot, .. } if *slot >= 1
         )));
 
-        // Designated hop advances with a stamped onward next_hop: named backup stands down.
-        // A weak flood (next_hop unset) from that hop must not cancel — see
-        // `named_backup_cancels_on_strong_designated_copy_not_weak_flood`.
         let copy = unicast_wire(2, 3, (UNI_DEST & 0xFF) as u8, 0x99, 0x503);
         let dupe = router
             .process_inbound(
@@ -7786,9 +7400,6 @@ mod tests {
             .any(|e| matches!(e, SrLogEvent::UnicastDupeCancel { id: 0x503, .. })));
     }
 
-    /// Named backup armed with a real alternate stamp: the designated hop is known but cannot
-    /// finish, so finish/rank would keep our slot. A **strong** copy from it (non-zero next_hop)
-    /// must still cancel — that is the flag wiring through commit → `perhaps_cancel_dupe`.
     #[test]
     fn named_backup_cancels_on_designated_hop_when_finish_unknown() {
         const DESIG: u32 = 0x9900_0099;
@@ -7805,7 +7416,6 @@ mod tests {
             .track_topology(DESIG, true, 0);
         router.remember_relay_identity(DESIG, 0x99, 0);
 
-        // Packet names DESIG; our path stamps RELAYER — a real named backup.
         let wire = unicast_wire(7, 7, 0x99, 0xDD, 0x509);
         let result = router
             .process_inbound(
@@ -7819,7 +7429,10 @@ mod tests {
             )
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        assert!(plan.relay.is_none(), "backup waits behind designated slot 0");
+        assert!(
+            plan.relay.is_none(),
+            "backup waits behind designated slot 0"
+        );
         let tx_after = router
             .relay_tx_after(UNI_SOURCE, 0x509, 0)
             .expect("named backup armed");
@@ -7841,7 +7454,6 @@ mod tests {
             "without designation flags a non-finisher does not cancel"
         );
 
-        // Weak flood from designated: backup stays.
         let weak = unicast_wire(6, 7, 0, 0x99, 0x509);
         let weak_dupe = router
             .process_inbound(
@@ -7860,7 +7472,6 @@ mod tests {
             "weak flood from designated hop must not cancel the named backup"
         );
 
-        // Strong onward stamp from designated: cancel even without finish proof.
         let copy = unicast_wire(6, 7, (UNI_RELAYER & 0xFF) as u8, 0x99, 0x509);
         let dupe = router
             .process_inbound(
@@ -7902,7 +7513,7 @@ mod tests {
             .track_topology(PEER, true, 0);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let dest = PackedNeighbor {
             node_id: UNI_DEST,
             rssi: -75,
@@ -7919,8 +7530,6 @@ mod tests {
             .graph_mut()
             .merge_topology(PEER, &header, &[dest, us], true, 0, 0);
 
-        // Named hop owns slot 0; ranking UnicastCover because PEER already reaches DEST —
-        // previously that Err aborted the whole plan. Relay byte is PEER (not our path hop).
         let wire = unicast_wire(3, 3, 0x99, 0xAA, 0x505);
         let result = router
             .process_inbound(
@@ -7971,15 +7580,11 @@ mod tests {
         assert_eq!(hdr.relay_node, 0xCC);
     }
 
-    /// A later slot is an alternative path. A backup that would clear next_hop, or stamp the
-    /// hop the packet already names, stands down: that copy implicit-acks the originator and
-    /// floods from the wrong side of the mesh.
     #[test]
     fn named_backup_without_another_hop_does_not_relay() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // Our only route to DEST is RELAYER (0xBB), and the packet already names that hop.
         let wire = unicast_wire(3, 3, 0xBB, 0xDD, 0x507);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(!scheduled, "restamping the designated hop is not a backup");
@@ -7987,20 +7592,18 @@ mod tests {
 
         static ROUTER2: StaticCell<Router> = StaticCell::new();
         let router = ROUTER2.init(Router::new(UNI_ME));
-        // DEST is known, but nothing confirms a hop that hears us, so the copy would leave
-        // with next_hop cleared.
         router
             .graph_mut()
             .observe_direct_neighbor(UNI_DEST, -90, 0, 0, 0);
         let wire = unicast_wire(3, 3, 0x99, 0xDD, 0x508);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
-        assert!(!scheduled, "a backup with nothing to stamp must stay silent");
+        assert!(
+            !scheduled,
+            "a backup with nothing to stamp must stay silent"
+        );
         assert_eq!(reason, Some(SrSkipReason::NoRelayPath));
     }
 
-    /// The relayer we heard the packet from is the first hop of a verified path, but cannot
-    /// finish it alone: handing the packet back is not a dupe, so we stay in the ranking with
-    /// next_hop cleared. (A guessed route pointing back is the different, contained case.)
     #[test]
     fn next_hop_is_relayer_clears_when_they_cannot_finish() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -8016,7 +7619,7 @@ mod tests {
         }
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let heard = PackedNeighbor {
             node_id: UNI_ME,
             rssi: -70,
@@ -8025,9 +7628,6 @@ mod tests {
             hears_us: true,
             etx_variance: 0,
         };
-        // ME -> RELAYER -> PEER -> DEST, every hop confirmed by the node that receives it.
-        // RELAYER has no edge to DEST of its own, so can_deliver(RELAYER, DEST) is false and
-        // there is no downstream entry either: it cannot finish in one hop.
         let via_peer = PackedNeighbor {
             node_id: UNI_PEER,
             ..heard
@@ -8046,8 +7646,6 @@ mod tests {
         router
             .graph_mut()
             .merge_topology(UNI_PEER, &header, &[to_dest, gw], true, 0, 0);
-        // DEST's own measurement of PEER. hears_us on PEER's edge is PEER's SNR of DEST, which
-        // does not price the hop into DEST.
         router.graph_mut().edges_mut().update_edge(
             UNI_ME,
             UNI_DEST,
@@ -8069,18 +7667,14 @@ mod tests {
         assert_ne!(reason, Some(SrSkipReason::UnverifiedBacktrack));
     }
 
-    /// After a preset switch the requester stays on its preset: retries, T1 insurance, ACKs
-    /// and committed relays timed for the old air parameters must not go out on the new one.
     #[test]
     fn preset_switch_drops_stale_retransmits_and_relays() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // A forwarded want_ack unicast arms relayed retries once its relay leaves.
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x801, true);
         let (_, released_at) = forward_unicast(router, &wire, 0);
         assert!(router.has_pending_reliable(0x801));
-        // A second unicast still sits in its relay slot.
         let wire2 = unicast_wire(3, 3, 0, 0xDD, 0x802);
         let result = router
             .process_inbound(
@@ -8175,8 +7769,6 @@ mod tests {
         assert!(router.poll_topology_tx(200).is_none());
     }
 
-    /// A copy heard after our relay left the router (it may sit in the radio queue behind
-    /// listen-before-talk) must be reported so the board can pull the frame back.
     #[test]
     fn dupe_cancel_reports_the_frame_for_radio_removal() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -8198,15 +7790,12 @@ mod tests {
         let tx_after = router
             .relay_tx_after(UNI_SOURCE, 0x901, 0)
             .expect("later slot");
-        // The slot fires: the frame leaves the router for the radio queue, and the board records
-        // the transmission as it queues the frame.
         assert!(router.poll_ready_relay(tx_after).is_some());
-        router.record_tx_on_air(0x901, tx_after);
+        router.record_tx_on_air(UNI_SOURCE, 0x901, tx_after);
         let mut cancels = heapless::Vec::new();
         router.take_tx_cancels(&mut cancels);
         assert!(cancels.is_empty());
 
-        // RELAYER's copy arrives while our frame is still queued in the radio.
         let copy = unicast_wire(2, 3, 0, 0xBB, 0x901);
         let dupe = router
             .process_inbound(
@@ -8221,20 +7810,18 @@ mod tests {
             .unwrap();
         assert!(dupe.duplicate);
         router.take_tx_cancels(&mut cancels);
-        assert_eq!(cancels.as_slice(), &[0x901]);
+        assert_eq!(cancels.as_slice(), &[(UNI_SOURCE, 0x901)]);
         router.take_tx_cancels(&mut cancels);
         assert!(cancels.is_empty(), "reported once");
     }
 
-    /// A broadcast copy heard after our relay left the router pulls the frame back only when the
-    /// transmitters heard so far cover every neighbour we reach; TX done ends the relay's life.
     #[test]
     fn released_broadcast_relay_is_pulled_back_only_when_covered() {
         const ME: u32 = 0xCC00_00CC;
         const SRC: u32 = 0xDD00_00DD;
-        const PEER: u32 = 0x1100_0011; // ranks ahead of us: covers three nodes
-        const UNIQ: u32 = 0xEE00_00EE; // hears only us
-        const OTHER: u32 = 0x9900_0099; // does not hear the source; its copy covers UNIQ
+        const PEER: u32 = 0x1100_0011;
+        const UNIQ: u32 = 0xEE00_00EE;
+        const OTHER: u32 = 0x9900_0099;
         const X: u32 = 0x7700_0077;
         const Y: u32 = 0x8800_0088;
         const Z: u32 = 0x6600_0066;
@@ -8253,7 +7840,7 @@ mod tests {
             }
             let mut packed = [0u8; 16];
             write_packed_header(&mut packed, 1, true);
-            let (h, _) = decode_packed_neighbors(&packed, 8).unwrap();
+            let (h, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
             let nb = |id: u32| PackedNeighbor {
                 node_id: id,
                 rssi: -70,
@@ -8281,18 +7868,16 @@ mod tests {
             )
             .unwrap();
         let _plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        // PEER ranks first; we still queue a later slot for UNIQ (delayed, so TxPlan.relay is none).
         let tx_after = router
             .relay_tx_after(SRC, 0xB02, 0)
             .expect("our later slot");
         assert!(router.poll_ready_relay(tx_after).is_some());
-        router.record_tx_on_air(0xB02, tx_after);
+        router.record_tx_on_air(SRC, 0xB02, tx_after);
         assert!(
             router.graph_mut().is_committed_relay(SRC, 0xB02),
             "relay outlives release"
         );
 
-        // PEER's copy: it does not reach UNIQ, so our queued frame stays.
         let mut cancels = heapless::Vec::new();
         let copy = encode_wire(
             PacketHeader::from_fields(0xFFFF_FFFF, SRC, 0xB02, 0, 2, 3, false, false, 0, 0x11),
@@ -8314,7 +7899,6 @@ mod tests {
         assert!(cancels.is_empty(), "UNIQ is still uncovered");
         assert!(router.graph_mut().is_committed_relay(SRC, 0xB02));
 
-        // OTHER's copy reaches UNIQ: now everyone is covered and the frame is pulled back.
         let copy2 = encode_wire(
             PacketHeader::from_fields(0xFFFF_FFFF, SRC, 0xB02, 0, 2, 3, false, false, 0, 0x99),
             &[1, 2, 3, 4],
@@ -8331,7 +7915,7 @@ mod tests {
             )
             .unwrap();
         router.take_tx_cancels(&mut cancels);
-        assert_eq!(cancels.as_slice(), &[0xB02]);
+        assert_eq!(cancels.as_slice(), &[(SRC, 0xB02)]);
         assert!(!router.graph_mut().is_committed_relay(SRC, 0xB02));
     }
 
@@ -8358,13 +7942,11 @@ mod tests {
             .expect("later slot");
         assert!(router.poll_ready_relay(tx_after).is_some());
         assert!(router.graph_mut().is_committed_relay(UNI_SOURCE, 0x902));
-        router.note_tx_done(0x902);
+        router.note_tx_done(UNI_SOURCE, 0x902);
         assert!(!router.graph_mut().is_committed_relay(UNI_SOURCE, 0x902));
         assert!(!router.graph_mut().has_active_relay_commits());
     }
 
-    /// The destination answered the source while our relay of the request sat in the radio
-    /// queue: the frame must be reported for removal, not just the retries stopped.
     #[test]
     fn reply_heard_pulls_the_queued_relay() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -8372,7 +7954,7 @@ mod tests {
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x605, true);
         let (_, released_at) = forward_unicast(router, &wire, 0);
-        router.record_tx_on_air(0x605, released_at);
+        router.record_tx_on_air(UNI_SOURCE, 0x605, released_at);
         let mut cancels = heapless::Vec::new();
         router.take_tx_cancels(&mut cancels);
         assert!(cancels.is_empty());
@@ -8400,7 +7982,7 @@ mod tests {
             released_at + 20,
         );
         router.take_tx_cancels(&mut cancels);
-        assert_eq!(cancels.as_slice(), &[0x605]);
+        assert_eq!(cancels.as_slice(), &[(UNI_SOURCE, 0x605)]);
         let mut logs = heapless::Vec::new();
         router.drain_sr_logs(&mut logs);
         assert!(logs
@@ -8408,8 +7990,6 @@ mod tests {
             .any(|e| matches!(e, SrLogEvent::UnicastReplyCancel { id: 0x605 })));
     }
 
-    /// Graph where SRC and DST are both our direct neighbours and SRC's topology says DST hears
-    /// it. Unicasts SRC -> DST heard straight from SRC reach DST without us.
     fn setup_source_reaches_destination(router: &mut Router) {
         const SRC: u32 = 0xDD00_00DD;
         const DST: u32 = 0xEE00_00EE;
@@ -8421,7 +8001,7 @@ mod tests {
         }
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let nb = |id: u32| PackedNeighbor {
             node_id: id,
             rssi: -70,
@@ -8438,7 +8018,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_source_reaches_destination(router);
-        // Heard straight from SRC (relay byte 0xDD), addressed to DST.
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x606, true);
         let result = router
             .process_inbound(
@@ -8466,14 +8045,12 @@ mod tests {
             })
             .expect("ack wait logged");
         assert!(wait >= coordinated_relay::DEFAULT_SLOT_MS);
-        // commit_relay adds a deterministic tie-break of up to half a slot either way.
         let jitter = half_airtime_ms(coordinated_relay::DEFAULT_SLOT_MS).max(50) / 2;
         assert!(
             tx_after + jitter >= wait,
             "tx_after {tx_after} < ack wait {wait}"
         );
 
-        // DST acks SRC: the held relay is cancelled and nothing goes out.
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let (len, ack) = build_ack_nak_frame(
             UNI_SOURCE,
@@ -8506,7 +8083,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_source_reaches_destination(router);
-        // SRC acks DST for some earlier packet; SRC lists DST as a neighbour it hears.
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let (len, ack) = build_ack_nak_frame(
             UNI_DEST,
@@ -8526,15 +8102,13 @@ mod tests {
         assert_eq!(reason, Some(SrSkipReason::ReplyRetracesLink));
     }
 
-    /// Hub between a remote leaf and a multi-hop originator: the leaf's Routing ACK must be
-    /// carried toward the originator even when the leaf's topology spuriously lists that node.
     #[test]
     fn routing_ack_from_a_remote_leaf_is_relayed_toward_the_originator() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
-        const HUB: u32 = 0x1080_006C; // FCM6-like last byte
-        const LEAF: u32 = 0x49B5_E08C; // Z00b-like, shares 0x8c with city peer
-        const CITY: u32 = 0x63DC_8F8C; // Czar-like
-        const ORIG: u32 = 0x979E_D146; // Dura-like originator behind CITY
+        const HUB: u32 = 0x1080_006C;
+        const LEAF: u32 = 0x49B5_E08C;
+        const CITY: u32 = 0x63DC_8F8C;
+        const ORIG: u32 = 0x979E_D146;
         let router = ROUTER.init(Router::new(HUB));
         let g = router.graph_mut();
         for n in [LEAF, CITY] {
@@ -8545,7 +8119,7 @@ mod tests {
         g.capability_mut().track_topology(ORIG, true, 0);
         let mut packed = [0u8; 16];
         write_packed_header(&mut packed, 1, true);
-        let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+        let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
         let nb = |id: u32, hears: bool| PackedNeighbor {
             node_id: id,
             rssi: -70,
@@ -8554,7 +8128,6 @@ mod tests {
             hears_us: hears,
             etx_variance: 0,
         };
-        // CITY reaches ORIG; LEAF spuriously lists ORIG (the old over-broad suppress trigger).
         g.merge_topology(CITY, &header, &[nb(ORIG, true), nb(HUB, true)], true, 0, 0);
         g.merge_topology(LEAF, &header, &[nb(ORIG, false), nb(HUB, true)], true, 0, 0);
         g.merge_topology(ORIG, &header, &[nb(CITY, true)], true, 0, 0);
@@ -8581,9 +8154,6 @@ mod tests {
         assert_ne!(reason, Some(SrSkipReason::ReplyRetracesLink));
     }
 
-    /// Field case of 2026-09-03: the relayer that actually reaches the destination must own
-    /// slot 0 even when our node id is lower; we follow only after its relay would have
-    /// cleared the air, and stand down when its copy arrives.
     #[test]
     fn undesignated_unicast_defers_to_the_neighbour_that_reaches_the_destination() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -8624,7 +8194,6 @@ mod tests {
                 if ranked[0] == UNI_RELAYER && ranked[1] == UNI_ME
         )), "slot log: {logs:?}");
 
-        // RELAYER's copy (relay byte 0xBB, one hop used) cancels our pending relay.
         let copy = unicast_wire(2, 3, 0, 0xBB, 0x701);
         let dupe = router
             .process_inbound(
@@ -8641,10 +8210,6 @@ mod tests {
         assert!(router.relay_tx_after(UNI_SOURCE, 0x701, 0).is_none());
     }
 
-    /// Two floors on the same instant compose by `max`, not by addition. When the source's own
-    /// topology says the destination hears it, we wait for that answer — and that wait already
-    /// carries us well past stock's contention boundary, so adding the boundary on top delayed
-    /// every relay on a confirmed link by a whole contention window and bought nothing.
     #[test]
     fn the_destination_ack_wait_absorbs_the_contention_floor_rather_than_stacking() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -8660,13 +8225,9 @@ mod tests {
             .graph_mut()
             .capability_mut()
             .track_topology(UNI_DEST, true, 0);
-        // The source has to be a known neighbour for its relay byte to resolve to it, or the
-        // frame does not count as heard straight from the source.
         router
             .graph_mut()
             .observe_direct_neighbor(UNI_SOURCE, -70, 8, 0, 0);
-        // The source publishes an edge to the destination and flags that it is heard back: the
-        // destination is expected to answer for itself.
         router.graph_mut().edges_mut().update_edge(
             UNI_ME,
             UNI_SOURCE,
@@ -8682,7 +8243,6 @@ mod tests {
             .edges_mut()
             .set_edge_hears_us(UNI_SOURCE, UNI_DEST, true);
 
-        // Relay byte is the source's own, so this arrived straight from it.
         let wire = unicast_wire(3, 3, 0, 0xDD, 0x703);
         let result = router
             .process_inbound(
@@ -8710,8 +8270,6 @@ mod tests {
             .map(|r| r.delay_ms)
             .or_else(|| router.relay_tx_after(UNI_SOURCE, 0x703, 0))
             .expect("slot 0 planned");
-        // The rung tie-break rides on top of every committed relay, so the wait is the ACK
-        // floor plus at most that range — and, decisively, well short of the two summed.
         let tie_break =
             coordinated_relay::tie_break_range_ms(coordinated_relay::half_airtime_ms(airtime));
         assert!(
@@ -8725,14 +8283,11 @@ mod tests {
         );
     }
 
-    /// Flood unicast (`next_hop=0`) with no stampable path: use broadcast unique coverage.
-    /// A neighbour that adds nothing beyond the originator's TX stays silent (Lab: angl).
     #[test]
     fn undesignated_flood_without_route_stays_silent_when_already_covered() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         router.set_device_role(crate::nodeinfo::DEVICE_ROLE_ROUTER);
-        // Only the originator as neighbour: its TX already covers everyone we reach.
         router
             .graph_mut()
             .observe_direct_neighbor(UNI_SOURCE, -40, 12, 0, 0);
@@ -8743,15 +8298,19 @@ mod tests {
             .graph_mut()
             .capability_mut()
             .track_topology(UNI_SOURCE, true, 0);
-        // Dest is known in the graph but we have no stampable path to it.
-        router.graph_mut().edges_mut().ensure_local_node(UNI_DEST, 0);
+        router
+            .graph_mut()
+            .edges_mut()
+            .ensure_local_node(UNI_DEST, 0);
         let wire = unicast_wire(7, 7, 0, 0xDD, 0x7a01);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
-        assert!(!scheduled, "silent expected, scheduled={scheduled} reason={reason:?}");
+        assert!(
+            !scheduled,
+            "silent expected, scheduled={scheduled} reason={reason:?}"
+        );
         assert_eq!(reason, Some(SrSkipReason::AlreadyCovered));
     }
 
-    /// Designated next hop with no route: Routing NO_ROUTE to the originator, no data relay.
     #[test]
     fn designated_hop_with_no_route_nacks_originator() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -8763,7 +8322,10 @@ mod tests {
         router
             .graph_mut()
             .confirm_direct_neighbor_hears_us(UNI_SOURCE);
-        router.graph_mut().edges_mut().ensure_local_node(UNI_DEST, 0);
+        router
+            .graph_mut()
+            .edges_mut()
+            .ensure_local_node(UNI_DEST, 0);
         let wire = unicast_wire(3, 3, (UNI_ME & 0xFF) as u8, 0xDD, 0x7a02);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(!scheduled, "no data relay when designated with no route");
@@ -8778,18 +8340,10 @@ mod tests {
         assert_eq!(hdr.from, UNI_ME);
         let key = CryptoKey::from_bytes(&DEFAULT_PSK);
         let mut cipher = nak.bytes[PACKET_HEADER_LEN..nak.len as usize].to_vec();
-        // NAK is channel-encrypted with the inbound frame's channel byte (0x77 in these
-        // fixtures), which may differ from the router's primary hash under the default preset.
         let ch = hdr.channel;
-        let (data, inner) = crate::topology::try_decrypt_data_full(
-            &key,
-            hdr.from,
-            hdr.id,
-            ch,
-            ch,
-            &mut cipher,
-        )
-        .expect("NAK decrypts");
+        let (data, inner) =
+            crate::topology::try_decrypt_data_full(&key, hdr.from, hdr.id, ch, ch, &mut cipher)
+                .expect("NAK decrypts");
         assert_eq!(data.portnum, ROUTING_APP);
         assert_eq!(data.request_id, 0x7a02);
         let routing = decode_routing_payload(&inner).expect("routing payload");
@@ -8811,7 +8365,6 @@ mod tests {
             .graph_mut()
             .capability_mut()
             .track_topology(UNI_DEST, true, 0);
-        // No named next hop: we are the sole cost-ranked candidate (direct to DEST).
         let wire = unicast_wire(3, 3, 0, 0xDD, 0x702);
         let result = router
             .process_inbound(
@@ -8825,16 +8378,6 @@ mod tests {
             )
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        // Slot 0 sits at stock's own contention floor, `2 * CWmax * slot_time`, not at the
-        // broadcast ladder's origin — the two answer different questions and had been sharing a
-        // value by accident. Below this floor no stock non-router ever transmits, so a relay that
-        // keyed up earlier would go out while a stock neighbour was still reading the frame we are
-        // answering: it could not hear our copy, would not cancel its own, and the duplicate we
-        // were avoiding would happen regardless.
-        // The CAD slot time for our preset — the quantity stock's boundary is expressed in. Not
-        // the value passed to evaluate_tx_plan, which is a packet airtime despite being called
-        // `slot_ms`; deriving the floor from that gave a value ten times too large and this test
-        // still passed, because it computed the same wrong thing.
         let floor = coordinated_relay::relay_floor_ms(coordinated_relay::slot_time_for_preset(
             router.modem_preset(),
         ));
@@ -8860,9 +8403,6 @@ mod tests {
         );
     }
 
-    /// On LONG_MODERATE (and slower) the contention floor exceeds peer_relay_wait for typical
-    /// airtimes, so a slot-1 delay of only peer_relay_wait undercuts slot 0. Slot 1 must wait
-    /// until the leader copy would have left the air (max(peer_wait, floor+airtime)).
     #[test]
     fn undesignated_unicast_later_slot_waits_for_leader_clear_when_floor_dominates() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -8911,8 +8451,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // Our route still stamps RELAYER (0xBB). The designated hop is a different SR peer, so
-        // the backup is a real alternative and the slot-0 wait is the one we measure.
         router
             .graph_mut()
             .observe_direct_neighbor(UNI_PEER, -70, 8, 0, 0);
@@ -8953,7 +8491,6 @@ mod tests {
             delay < stock_wait,
             "SR peer slot-0 wait {delay} should be far below stock {stock_wait}"
         );
-        // ...but not shorter than the peer's own queue delay plus one airtime.
         let min_wait = coordinated_relay::DEFAULT_SLOT_MS
             + coordinated_relay::tx_delay_ms_contention_max_at(
                 0.0,
@@ -8970,8 +8507,6 @@ mod tests {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(UNI_ME));
         setup_unicast_graph(router);
-        // Heard directly from SOURCE with one hop left: relaying would leave hop_limit 0 and
-        // DEST is not our direct neighbour.
         let wire = unicast_wire(1, 1, 0, 0xDD, 0x503);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(!scheduled);
@@ -8986,7 +8521,6 @@ mod tests {
         router
             .graph_mut()
             .observe_direct_neighbor(UNI_DEST, -40, 12, 0, 0);
-        // Same half-ETX bucket as RELAYER's link: odd id picks the higher node id, which is us.
         let wire = unicast_wire(1, 1, 0, 0xDD, 0x505);
         let (scheduled, reason) = unicast_skip_reason(router, &wire);
         assert!(
@@ -9021,7 +8555,6 @@ mod tests {
     fn packets_addressed_to_us_bypass_rate_limit() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(LAST_HOP_ME));
-        // Undecodable payload lands in the OTHER bucket (4 per window).
         for id in 1..=8u32 {
             let header = PacketHeader::from_fields(
                 LAST_HOP_ME,
@@ -9052,8 +8585,6 @@ mod tests {
                 "packet {id} addressed to us must not be rate limited"
             );
         }
-        // Control: the same burst addressed elsewhere is throttled by the same bucket
-        // (undecodable frames count against UNKNOWN, 12 per window).
         let mut limited = false;
         for id in 100..=115u32 {
             let header = PacketHeader::from_fields(
@@ -9081,7 +8612,6 @@ mod tests {
                 )
                 .unwrap();
             limited |= result.rate_limited;
-            // Release the pool slot as the radio task would.
             let _ = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
         }
         assert!(
@@ -9117,7 +8647,6 @@ mod tests {
             )
             .unwrap();
         let plan = router.evaluate_tx_plan(&result, 0.0, coordinated_relay::DEFAULT_SLOT_MS, 0);
-        // `u32::MAX` looks "before" a small tx_after under wrapping subtract; poll at due time.
         let ready = plan.relay.is_some()
             || router
                 .relay_tx_after(LAST_HOP_SOURCE, 43, 0)
@@ -9159,5 +8688,29 @@ mod tests {
                 .and_then(|tx| router.poll_ready_relay(tx))
                 .is_some();
         assert!(ready);
+    }
+    #[test]
+    fn local_packet_ids_are_unique_and_never_zero() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        router.seed_tx_ids(0);
+        assert_eq!(router.alloc_tx_id(), 1);
+        assert_eq!(router.alloc_tx_id(), 2);
+        router.seed_tx_ids(u32::MAX);
+        assert_eq!(router.alloc_tx_id(), u32::MAX);
+        assert_eq!(router.alloc_tx_id(), 1);
+    }
+
+    #[test]
+    fn queued_insurance_cancellation_is_scoped_to_originator() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        router.pending_retransmits[0].from = 2;
+        router.pending_retransmits[0].packet_id = 42;
+        router.pending_retransmits[0].active = true;
+        router.cancel_broadcast_retransmit(3, 42);
+        assert!(router.pending_retransmits[0].active);
+        router.cancel_broadcast_retransmit(2, 42);
+        assert!(!router.pending_retransmits[0].active);
     }
 }

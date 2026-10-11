@@ -1,5 +1,3 @@
-//! Host three-node SR bench — line topology without hardware.
-
 use mesh_routing::{
     decode_packed_neighbors, write_packed_header, NeighborGraph, PackedNeighbor,
     TopologyMergeResult, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, MAX_DOWNSTREAM,
@@ -31,7 +29,7 @@ fn three_node_line_learns_remote_via_topology() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 2, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
 
     let result = a.merge_topology(0xB000_0002, &header, &[remote], true, 100, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
@@ -79,7 +77,7 @@ fn three_node_middle_node_defers_to_stock_router() {
     c.edges_mut().set_edge_hears_us(B, D, true);
     c.track_node_role(D, DEVICE_ROLE_REPEATER, 0);
 
-    assert_eq!(c.find_best_relay_candidate(0x99, B, 0), D);
+    assert_eq!(c.find_best_relay_candidate(0x99, B, B, 0), D);
 
     let half = mesh_routing::coordinated_relay::half_airtime_ms(
         mesh_routing::coordinated_relay::DEFAULT_SLOT_MS,

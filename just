@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Host entry point — only Docker is required on the machine. All recipes run
-# inside the dev container via the in-container justfile.
-#
-# Compatible with Linux, macOS, and Windows/WSL2 (run from a bash shell in the
-# repo root; clone inside the WSL filesystem, not /mnt/c).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,16 +13,18 @@ if ! docker compose version >/dev/null 2>&1; then
     echo "error: docker compose v2 not found — install the Compose plugin" >&2
     exit 1
 fi
-
-# Do not use UID/GID here — bash on macOS treats UID as read-only.
 export HOST_UID="$(id -u)"
 export HOST_GID="$(id -g)"
 
+# Build/test must also work on hosts without USB passthrough; hardware access is opt-in.
 COMPOSE=(docker compose)
-
-# CI bind-mounts .ci-cache/* into the container. If those host paths do not
-# exist, Docker creates them as root, then TMPDIR=/workspace/.ci-cache/tmp is
-# unwritable and prost/flip-link fail with a confusing NotFound.
+if [ -z "${COMPOSE_FILE:-}" ]; then
+    COMPOSE+=(-f docker-compose.yml)
+    if [ "${1:-}" = flash ]; then
+        COMPOSE+=(-f docker-compose.override.yml)
+    fi
+fi
+# Docker creates absent bind sources as root, which makes codegen scratch unwritable.
 ensure_cache_dirs() {
     mkdir -p "$ROOT/.ci-cache/tmp" \
              "$ROOT/.ci-cache/cargo-registry" \
@@ -35,8 +32,6 @@ ensure_cache_dirs() {
 }
 
 run_dev() {
-    # docker compose run does not accept docker run's combined -it shorthand.
-    # Compose allocates a TTY automatically when stdin is a terminal.
     ensure_cache_dirs
     "${COMPOSE[@]}" run --rm dev "$@"
 }

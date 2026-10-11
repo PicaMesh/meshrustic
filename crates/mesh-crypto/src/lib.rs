@@ -1,6 +1,7 @@
-//! Mesh channel and PKI crypto (original PicaMesh implementation).
-
 #![no_std]
+
+#[cfg(test)]
+extern crate std;
 
 mod aes;
 mod channel;
@@ -28,5 +29,4 @@ pub use aes::{aes_ctr_crypt, aes_ecb_encrypt_block};
 #[cfg(feature = "pki")]
 pub use pki::CryptoEngine;
 
-/// Maximum payload size for one AES-CTR channel encrypt/decrypt call.
 pub const MAX_BLOCKSIZE: usize = 256;

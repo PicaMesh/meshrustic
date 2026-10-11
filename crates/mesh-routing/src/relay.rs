@@ -1,28 +1,13 @@
-//! Opaque relay — forward on-air frames without decoding portnum or protobuf.
-//!
-//! MeshRustic relays **all** portnums (text, telemetry, ATAK, unknown, undecoded/wrong-key
-//! ciphertext). Protobuf types exist only for ports the router must **parse** (routing, SR,
-//! nodeinfo, traceroute). Relay copies the encrypted payload bytes unchanged.
-
 use mesh_protocol::{PacketHeader, ParsedPacket};
 
-/// Whether this frame is eligible for relay consideration at the wire layer.
-///
-/// Does not inspect payload or portnum. Further gates (dedup, rate limit, QoS, SR slot,
-/// hop limit, `is_rebroadcaster`) apply in `Router::evaluate_tx_plan`.
 pub fn wire_may_relay(rx: &ParsedPacket, from_us: bool, to_us: bool) -> bool {
     !from_us && !to_us && rx.hop_limit > 0
 }
 
-/// Build the on-air header for relaying a received frame.
-///
-/// Payload bytes are not modified — copy separately with [`copy_opaque_payload`].
-/// Relay header updates: decrement `hop_limit`, set `relay_node` to our node byte.
 pub fn relay_header(rx: &ParsedPacket, our_node: u32) -> Option<PacketHeader> {
     relay_header_with_next_hop(rx, our_node, 0)
 }
 
-/// Same as [`relay_header`], but sets `next_hop` for SR unicast forwarding when non-zero.
 pub fn relay_header_with_next_hop(
     rx: &ParsedPacket,
     our_node: u32,
@@ -31,8 +16,6 @@ pub fn relay_header_with_next_hop(
     relay_header_with_next_hop_opts(rx, our_node, next_hop, false)
 }
 
-/// Build a relay header. `last_hop` names the destination as next hop so stock neighbours
-/// leave the frame alone; hop fields always decrement like any other hop.
 pub fn relay_header_with_next_hop_opts(
     rx: &ParsedPacket,
     our_node: u32,
@@ -45,12 +28,6 @@ pub fn relay_header_with_next_hop_opts(
 
     let (hop_limit, hop_start) = relay_hop_fields(rx)?;
     let relay_node = (our_node & 0xFF) as u8;
-    // Every relay names its own next hop or none, as stock NextHopRouter does. Copying the
-    // incoming byte was wrong both ways: when it named us, the frame left still naming us, so
-    // legacy nodes (which relay a unicast only when next_hop is clear or their own byte) never
-    // touched it and SR peers waited for a second copy from us; when it named a node that stayed
-    // silent, keeping its byte kept legacy routers out of the recovery.
-    // A last hop names the destination itself, so stock neighbours leave the frame alone.
     let next_hop_byte = if last_hop {
         (rx.to & 0xFF) as u8
     } else if next_hop != 0 {
@@ -73,11 +50,7 @@ pub fn relay_header_with_next_hop_opts(
     ))
 }
 
-/// Outgoing hop fields for a relay: decrement `hop_limit`, keep `hop_start`.
-///
-/// An inverted pair (`hop_start < hop_limit`) is unreadable: stock `getHopsAway` returns
-/// unknown and will not ACK a response. Treat travelled as zero so the emitted pair stays
-/// internally consistent, without rewriting the remaining hop budget.
+/// Preserving the remaining hop budget avoids inventing travelled hops for legacy headers.
 pub fn relay_hop_fields(rx: &ParsedPacket) -> Option<(u8, u8)> {
     if rx.hop_limit == 0 {
         return None;
@@ -91,7 +64,6 @@ pub fn relay_hop_fields(rx: &ParsedPacket) -> Option<(u8, u8)> {
     Some((hop_limit, hop_start))
 }
 
-/// Copy encrypted payload bytes unchanged into a TX pool slot.
 pub fn copy_opaque_payload(dst: &mut crate::pool::PacketSlot, src: &crate::pool::PacketSlot) {
     let len = src.payload_len as usize;
     debug_assert!(len <= dst.payload.len());
@@ -107,13 +79,6 @@ mod tests {
     use mesh_protocol::PacketHeader;
     use static_cell::StaticCell;
 
-    /// The shared relay builder passes an acknowledgement request through, and must keep doing so.
-    ///
-    /// Relayed unicasts carry it legitimately — 1,865 of 5,018 observed on this mesh do — and the
-    /// reliable path depends on it surviving a relay. Only the T1 insurance copy clears the flag,
-    /// at its own call site, because a retransmission is not a new request. Pinned here so a
-    /// future change cannot move that clear into the builder, where it would silently break every
-    /// relayed unicast.
     #[test]
     fn relay_builder_passes_want_ack_through_and_only_t1_clears_it() {
         let asking =
@@ -130,11 +95,9 @@ mod tests {
             "a relayed unicast keeps the request: the destination still owes the answer"
         );
 
-        // What the insurance copy does with the same header, at its own call site.
         let mut insured = relayed;
         insured.clear_want_ack();
         assert!(!insured.want_ack(), "the insurance copy asks for nothing");
-        // Nothing else about the frame moved.
         assert_eq!(insured.to, relayed.to);
         assert_eq!(insured.from, relayed.from);
         assert_eq!(insured.id, relayed.id);
@@ -201,7 +164,6 @@ mod tests {
 
     #[test]
     fn relay_without_own_route_clears_the_incoming_next_hop() {
-        // Named as next hop (0xCC) but with no onward route: the frame must not keep naming us.
         let parsed = PacketHeader::from_fields(
             0xDD00_00DD,
             0xBB00_00BB,
@@ -219,8 +181,6 @@ mod tests {
         assert_eq!(hdr.parse().next_hop, 0);
         assert_eq!(hdr.parse().relay_node, 0xCC);
 
-        // Relaying behind a silent designated node (0x99): its byte is dropped too, so legacy
-        // routers can carry our copy at once instead of after the retry fallback.
         let parsed = PacketHeader::from_fields(
             0xDD00_00DD,
             0xBB00_00BB,

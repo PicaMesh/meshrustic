@@ -1,16 +1,11 @@
-//! ConfigStore trait — RAM for tests, NVMC for firmware.
-
 use crate::config::NodeConfig;
 use crate::layout::{decode, encode, StoreError, STORE_RECORD_LEN};
 
-/// Persistent node configuration backend.
 pub trait ConfigStore {
-    /// Load config; return first-boot defaults when the record is missing/invalid.
     fn load(&mut self) -> NodeConfig;
     fn save(&mut self, config: &NodeConfig) -> Result<(), StoreError>;
 }
 
-/// In-memory store for host tests.
 pub struct RamConfigStore {
     buf: [u8; STORE_RECORD_LEN],
     valid: bool,
@@ -26,7 +21,6 @@ impl RamConfigStore {
         }
     }
 
-    /// Seed with an already-encoded record (e.g. corrupt CRC tests).
     pub fn from_bytes(defaults: NodeConfig, bytes: &[u8]) -> Self {
         let mut store = Self::new(defaults);
         let len = bytes.len().min(STORE_RECORD_LEN);

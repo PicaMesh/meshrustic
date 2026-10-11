@@ -1,27 +1,4 @@
-//! Cost-ranked relay coordination for unicasts.
-//!
-//! Every SR node that overhears a unicast computes the same candidate ordering from its graph,
-//! so the node best placed to deliver the packet keys up first and everybody else cancels on
-//! its copy. Candidates are ourselves (we overheard the frame) plus SR-active direct neighbours
-//! that are known to hear this copy's transmitter, ranked by cost to the destination:
-//!
-//! - deliverable hop to the destination ([`can_deliver`]), priced at the receiver when known;
-//! - known downstream relay of the destination: [`DOWNSTREAM_TIER_COST`];
-//! - deliverable hop to the shared next hop only: receiver-priced ETX with [`INDIRECT_TIER`].
-//!
-//! Costs are compared in buckets of [`COST_BUCKET_FIXED`] (half an ETX). Within a bucket, ties
-//! break by node id (packet-id parity). Before ranking, suppress only when a coverer is known to
-//! hold this copy (heard from them, or they already transmitted this id). A heard copy cancels a
-//! later slot when that transmitter can finish delivery, is ranked ahead of us with a path, or
-//! (for a named backup) is the designated hop / shows hop-limit progress on that designation —
-//! even when the graph cannot yet prove finish. We keep the slot if we can finish and they
-//! cannot. Finishing is a priced hop to the destination, or being its downstream gateway — not
-//! stock optimism without a link.
-//!
-//! Last hop (a priced hop to the destination): at most two such links if dest is SR, otherwise
-//! one. The second waits for dest's ACK. Indirect candidates still take later slots. Non-final
-//! hops: the last ranked non-direct slot floods (`next_hop` cleared) after the named next hop
-//! has had its chance, so stock neighbours may pick up.
+//! A backup must survive copies from nodes that cannot finish delivery.
 
 use crate::broadcast_relay::{BroadcastRelayPlan, RelayReason, RANKED_LOG};
 use crate::capability::{CapabilityCache, CapabilityStatus};
@@ -32,13 +9,9 @@ use crate::graph::{
 use crate::sr_log::SrSkipReason;
 
 pub const MAX_UNICAST_CANDIDATES: usize = MAX_EDGES_PER_NODE + 1;
-/// Cost of a candidate that is the destination's downstream relay without a reported edge.
 pub const DOWNSTREAM_TIER_COST: u16 = 0x7FFF;
-/// Set on the cost of candidates that only reach the shared next hop.
 pub const INDIRECT_TIER: u16 = 0x8000;
-/// Cost we give ourselves when the route picker said "relay it yourself" and no edge backs it.
 pub const BEST_EFFORT_SELF_COST: u16 = 0xFFFE;
-/// ETX costs are compared in buckets this wide (fixed-point, ETX × 100): half an ETX.
 pub const COST_BUCKET_FIXED: u16 = 50;
 const NO_PATH: u16 = u16::MAX;
 
@@ -60,17 +33,13 @@ pub struct UnicastCandidate {
     pub cost: u16,
 }
 
-/// How a committed unicast slot should treat a heard copy and whether it floods.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UnicastSlotFlags {
     pub last_hop_backup: bool,
     pub nonfinal_flood: bool,
     pub nominated_next_hop: u32,
-    /// Incoming `next_hop` byte when we armed as a named backup (0 = undesignated / not a backup).
-    /// Hearing that hop's copy cancels us even when the graph cannot yet prove it finishes.
+    /// A designated hop can make progress before topology reports prove its route.
     pub designated_next_hop: u8,
-    /// `hop_limit` on the copy we armed from; a later copy that still names `designated_next_hop`
-    /// with a strictly lower hop_limit means that hop progressed the frame.
     pub armed_hop_limit: u8,
 }
 
@@ -84,7 +53,6 @@ impl UnicastSlotFlags {
     };
 }
 
-/// `a` is placed earlier than `b` in the unicast ranking for `packet_id`.
 fn ranked_ahead(a: UnicastCandidate, b: UnicastCandidate, packet_id: u32) -> bool {
     let prefer_high_id = packet_id & 1 != 0;
     a.cost < b.cost
@@ -120,15 +88,12 @@ impl UnicastRelayContext<'_> {
         self.can_finish(node, destination, now_ms)
     }
 
-    /// A neighbour only gets a unicast slot if it is known to hear this copy's transmitter.
-    /// We ourselves always count: we are ranking because we received the frame.
+    /// Reception itself proves that we hold this copy.
     fn heard_this_copy(&self, heard_from: u32, node: u32) -> bool {
         heard_from == 0 || node == self.my_node || known_to_hear(self.edges, heard_from, node)
     }
 
-    /// Last-hop delivery: a priced hop to the destination, or we are its immediate
-    /// downstream parent. `can_deliver` alone is not enough — it is true for every unpublished dest.
-    /// Being the first SR hop we would appoint (chain egress) is not last-hop finish.
+    /// Appointing a chain egress does not prove delivery to the final destination.
     fn can_finish(&self, node: u32, destination: u32, now_ms: u32) -> bool {
         delivery_hop_cost_fixed(
             self.edges,
@@ -143,16 +108,14 @@ impl UnicastRelayContext<'_> {
     }
 
     fn candidate_cost(&self, node: u32, destination: u32, my_next_hop: u32, now_ms: u32) -> u16 {
-        if let Some(cost) =
-            delivery_hop_cost_fixed(
-                self.edges,
-                Some(self.capability),
-                node,
-                destination,
-                now_ms,
-                self.my_node,
-            )
-        {
+        if let Some(cost) = delivery_hop_cost_fixed(
+            self.edges,
+            Some(self.capability),
+            node,
+            destination,
+            now_ms,
+            self.my_node,
+        ) {
             return bucket(cost.min(DOWNSTREAM_TIER_COST - 1));
         }
         if self.downstream_relay(destination, now_ms) == Some(node) {
@@ -161,25 +124,19 @@ impl UnicastRelayContext<'_> {
         if self.chain_egress(destination, now_ms) == Some(node) {
             return DOWNSTREAM_TIER_COST;
         }
-        // Shared next hop must be a real forwarder (not us / dest) and reachable from `node`.
         if my_next_hop != 0
             && my_next_hop != destination
             && my_next_hop != node
             && my_next_hop != self.my_node
+            && can_deliver(self.edges, Some(self.capability), node, my_next_hop)
         {
-            // Raw price: this hop is into the shared relay, and two neighbours a few hundredths
-            // apart must stay in one bucket. The penalty for a reverse-only arrival applies to
-            // the hop into the destination, above.
-            if can_deliver(self.edges, Some(self.capability), node, my_next_hop) {
-                if let Some(cost) = hop_cost_fixed(self.edges, node, my_next_hop) {
-                    return bucket(cost.min(INDIRECT_TIER - 1)) | INDIRECT_TIER;
-                }
+            if let Some(cost) = hop_cost_fixed(self.edges, node, my_next_hop) {
+                return bucket(cost.min(INDIRECT_TIER - 1)) | INDIRECT_TIER;
             }
         }
         NO_PATH
     }
 
-    /// Neighbour that already transmitted this id, heard `heard_from`, and can finish delivery.
     fn better_positioned_neighbor(
         &self,
         heard_from: u32,
@@ -203,17 +160,6 @@ impl UnicastRelayContext<'_> {
     }
 }
 
-/// Rank the relay candidates for a unicast we overheard.
-///
-/// `my_next_hop` is what our route picker answered for `destination` (0 = no route, our own
-/// id = "relay it ourselves"). A neighbour that does not hear `heard_from` is not a candidate:
-/// a path to the destination is not evidence they received this copy. Returns the plan with our
-/// slot, or the reason we stay silent.
-///
-/// A priced hop to the destination is a last hop: at most two such links if dest is SR, else
-/// one. The extra directs return [`SrSkipReason::LastHopReserved`]. Indirect candidates still
-/// get slots. When two or more non-direct candidates remain, the last of them is the flood
-/// slot (`BroadcastRelayPlan::nonfinal_flood`).
 pub fn plan_unicast_relay(
     ctx: &UnicastRelayContext<'_>,
     packet_id: u32,
@@ -229,7 +175,7 @@ pub fn plan_unicast_relay(
     let source_relay = ctx.downstream_relay(source, now_ms);
     if let Some(relay) = source_relay {
         if source_relay == ctx.downstream_relay(destination, now_ms) && relay != me {
-            // Only if that gateway already holds this copy — otherwise we may be the sole hearer.
+            // A gateway without this copy cannot replace our relay.
             if relay == heard_from || has_transmitted(relay) {
                 return Err(SrSkipReason::UnicastCovered);
             }
@@ -250,8 +196,6 @@ pub fn plan_unicast_relay(
 
     let mut my_cost = ctx.candidate_cost(me, destination, my_next_hop, now_ms);
     if my_cost == NO_PATH && my_next_hop == me {
-        // The route picker fell back to us: stay in the ranking as last resort. A cleared
-        // next hop (flood) must not invent a cost slot — that path uses broadcast coverage.
         my_cost = BEST_EFFORT_SELF_COST;
     }
     if my_cost != NO_PATH {
@@ -284,8 +228,6 @@ pub fn plan_unicast_relay(
         }
     }
 
-    // Ascending cost; equal costs ordered by node id, direction chosen by packet-id parity so
-    // no node is favoured across packets.
     for i in 1..count {
         let mut j = i;
         while j > 0 && ranked_ahead(candidates[j], candidates[j - 1], packet_id) {
@@ -294,8 +236,6 @@ pub fn plan_unicast_relay(
         }
     }
 
-    // Last hop: at most two priced links if dest is SR (early + dest-ACK backup), otherwise
-    // one. Indirect candidates stay so the packet can still reach that link.
     let dest_sr = ctx.capability.status(destination).is_signal_routing();
     let i_am_direct = candidates[..count]
         .iter()
@@ -394,19 +334,6 @@ pub fn unicast_dupe_cancels(
     )
 }
 
-/// Whether a heard unicast copy should pull back our pending relay.
-///
-/// Cancel when the transmitter can finish (priced hop / dest's downstream) or is ranked ahead of
-/// us with a path. Keep when we can finish and they cannot. An unresolved relay byte is treated
-/// as a designated/stock hop we were waiting for only if we cannot finish ourselves.
-///
-/// Last-hop backup: only dest's own copy (or dest ACK, handled elsewhere) cancels. A flood slot
-/// stays for a same-hop named SR copy that cannot finish, and cancels when the nominated hop,
-/// dest, a finisher, or another flood copy is heard.
-///
-/// Named backup: cancel when the designated hop **advances** the route (stamps a non-zero
-/// `next_hop`, or the same designation with a lower `hop_limit`). A weak flood from that hop
-/// (`next_hop` unset) is not success — backups that can stamp a different path must stay armed.
 pub fn unicast_dupe_cancels_for(
     ctx: &UnicastRelayContext<'_>,
     packet_id: u32,
@@ -419,7 +346,6 @@ pub fn unicast_dupe_cancels_for(
     dupe_relay_byte: u8,
     dupe_hop_limit: u8,
 ) -> bool {
-    // Named-backup cancel that does not need a complete graph: the wire bytes are enough.
     if flags.designated_next_hop != 0 {
         let from_designated = dupe_relay_byte == flags.designated_next_hop
             || dupe_relayer.is_some_and(|relayer| {
@@ -427,19 +353,17 @@ pub fn unicast_dupe_cancels_for(
                     && !is_placeholder_node(relayer)
                     && (relayer & 0xFF) as u8 == flags.designated_next_hop
             });
-        // Strong / onward stamp from the designated hop: designation succeeded.
         if from_designated && dupe_next_hop != 0 {
             return true;
         }
-        // Designation progressed: same next_hop byte, strictly fewer hops remaining.
         if dupe_next_hop == flags.designated_next_hop
             && flags.armed_hop_limit != 0
             && dupe_hop_limit < flags.armed_hop_limit
         {
             return true;
         }
-        // Weak flood (next unset) from the designated hop: do not fall through to
-        // `!we_finish` — that would cancel on an unresolved relay byte alone.
+        // A weak flood is not proof that the designated hop advanced the route; cancelling here could
+        // discard the only usable backup.
         if from_designated {
             return false;
         }
@@ -447,7 +371,8 @@ pub fn unicast_dupe_cancels_for(
 
     let me = ctx.my_node;
     let we_finish = ctx.can_finish(me, destination, now_ms);
-    let Some(relayer) = dupe_relayer.filter(|&n| n != 0 && n != me && !is_placeholder_node(n)) else {
+    let Some(relayer) = dupe_relayer.filter(|&n| n != 0 && n != me && !is_placeholder_node(n))
+    else {
         return !we_finish;
     };
     if flags.last_hop_backup {
@@ -529,10 +454,6 @@ mod tests {
         }
     }
 
-    /// The 2026-09-03 17:12 field case: the phone (SR-passive) sends a traceroute to a node
-    /// downstream of the gateway. We, our SR peer and the gateway all hear the phone directly.
-    /// Nobody has received the gateway's topology yet; the destination is only known from the
-    /// downstream table.
     fn field_fixture() -> Fixture {
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
@@ -542,7 +463,6 @@ mod tests {
             edges.update_edge(ME, ME, n, etx, NOW, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(ME, n, true);
         }
-        // The phone lists all three of us and reports that we hear it; the peer lists us and the phone.
         for n in [ME, PEER, GW] {
             edges.update_edge(ME, PHONE, n, 1.2, NOW, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(PHONE, n, true);
@@ -609,9 +529,7 @@ mod tests {
 
     #[test]
     fn node_id_no_longer_decides_the_order() {
-        // Same graph, but swap which node is us: the peer (high id) sees the same ordering.
         let mut f = field_fixture();
-        // The peer's own edges: it hears the gateway too, so it is an indirect candidate.
         f.edges
             .update_edge(PEER, PEER, GW, 1.6, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(PEER, GW, true);
@@ -639,7 +557,6 @@ mod tests {
     #[test]
     fn direct_edge_beats_downstream_beats_indirect() {
         let mut f = field_fixture();
-        // The peer now reports a direct edge to the destination.
         f.edges
             .update_edge(ME, PEER, DEST, 3.0, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(PEER, DEST, true);
@@ -651,21 +568,15 @@ mod tests {
         assert_eq!(plan.slot_index, 2);
     }
 
-    /// Field case of 2026-09-03 23:18 (cfd2d4da): A and B were both indirect-tier candidates whose
-    /// costs differed by a few hundredths in opposite directions on each node, so each ranked the
-    /// other first, both took slot 3 and collided. Half-ETX buckets make them tie, and the
-    /// packet-id parity picks the same node on both.
     #[test]
     fn near_equal_costs_fall_to_the_node_id_tie_break() {
         let mut f = field_fixture();
-        // Our own link to the gateway prices at 1.31, the peer's reported one at 1.18.
         f.edges
             .update_edge(ME, ME, GW, 1.31, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(ME, GW, true);
         f.edges
             .update_edge(ME, PEER, GW, 1.18, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(PEER, GW, true);
-        // Even id: lower node id first, although our own link is the dearer one.
         let even = plan_unicast_relay(&f.ctx(), 0xcfd2_d4da, PHONE, PHONE, DEST, GW, NOW, |_| {
             false
         })
@@ -676,14 +587,11 @@ mod tests {
             !even.nonfinal_flood,
             "a named slot is not itself the flood slot"
         );
-        // Odd id: higher node id first.
         let odd = plan_unicast_relay(&f.ctx(), 0xcfd2_d4db, PHONE, PHONE, DEST, GW, NOW, |_| {
             false
         })
         .unwrap();
         assert_eq!(&odd.ranked[..3], &[GW, PEER, ME]);
-        // A genuinely worse own link (a full bucket apart, ETX cannot go below 1.0) loses
-        // regardless of parity.
         f.edges
             .update_edge(ME, ME, GW, 1.6, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(ME, GW, true);
@@ -703,7 +611,6 @@ mod tests {
         f.edges
             .update_edge(ME, ME, DEST, 2.0, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(ME, DEST, true);
-        // DEST is not SR: only the cheapest direct gets a slot.
         let even =
             plan_unicast_relay(&f.ctx(), 0x10, PHONE, PHONE, DEST, DEST, NOW, |_| false).unwrap();
         assert_eq!(even.ranked[0], ME, "even id: low node id first");
@@ -711,9 +618,8 @@ mod tests {
             !even.ranked[..even.ranked_len as usize].contains(&PEER),
             "the other direct link does not get a slot"
         );
-        let odd =
-            plan_unicast_relay(&f.ctx(), 0x11, PHONE, PHONE, DEST, DEST, NOW, |_| false)
-                .unwrap_err();
+        let odd = plan_unicast_relay(&f.ctx(), 0x11, PHONE, PHONE, DEST, DEST, NOW, |_| false)
+            .unwrap_err();
         assert_eq!(odd, SrSkipReason::LastHopReserved);
     }
 
@@ -808,9 +714,6 @@ mod tests {
 
     #[test]
     fn named_backup_cancels_on_strong_designated_copy_not_weak_flood() {
-        // Empty graph: cannot can_finish anyone toward DEST. A strong designated copy still
-        // cancels without finish proof; a weak flood must not (Lab: MB59 flooded next=0 and
-        // silenced Czar/MR3a backups that would have stamped a real path).
         let edges = EdgeStore::new();
         let capability = CapabilityCache::new();
         let downstream = DownstreamTable::new();
@@ -910,7 +813,6 @@ mod tests {
     #[test]
     fn relayer_that_reaches_the_destination_suppresses_us() {
         let f = field_fixture();
-        // Heard from the gateway itself, which holds the destination downstream.
         let err =
             plan_unicast_relay(&f.ctx(), 0x20, PHONE, GW, DEST, GW, NOW, |_| false).unwrap_err();
         assert_eq!(err, SrSkipReason::UnicastCovered);
@@ -919,8 +821,6 @@ mod tests {
     #[test]
     fn sr_neighbour_must_have_transmitted_to_suppress_us() {
         let mut f = field_fixture();
-        // DEST publishes: PEER does not reach it without confirmation. GW hears PEER and holds
-        // DEST downstream — but must have transmitted this id before we stand down.
         f.capability.track_topology(DEST, true, NOW);
         f.edges
             .update_edge(ME, GW, PEER, 1.3, NOW, EdgeSource::Reported, true, 0);
@@ -977,8 +877,6 @@ mod tests {
     #[test]
     fn no_path_and_a_real_next_hop_means_no_slot() {
         let mut f = field_fixture();
-        // We lost our edge to the gateway and the route names a node we have no edge to:
-        // no direct, downstream or indirect path for anyone.
         f.edges.remove_edges_to(GW);
         let err = plan_unicast_relay(&f.ctx(), 0x24, PHONE, PHONE, DEST, 0x5555_5555, NOW, |_| {
             false
@@ -1058,8 +956,6 @@ mod tests {
             .update_edge(ME, PEER, GW, 1.5, NOW, EdgeSource::Reported, true, 0);
         f.edges.set_edge_hears_us(PEER, GW, true);
         f.capability.track_topology(PEER, true, NOW);
-        // Neither finishes (DEST is GW's downstream). Equal indirect costs: even id ranks
-        // the lower id (ME) first, so PEER is behind us and we keep.
         assert!(!unicast_dupe_cancels(
             &f.ctx(),
             0x32,
@@ -1068,7 +964,6 @@ mod tests {
             NOW,
             Some(PEER)
         ));
-        // Odd id: higher id first, PEER is ahead.
         assert!(unicast_dupe_cancels(
             &f.ctx(),
             0x33,

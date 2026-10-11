@@ -1,5 +1,3 @@
-//! EU_868 + modem preset constants, radio HAL traits, and AirTime tracking.
-
 #![no_std]
 
 mod airtime;
@@ -46,7 +44,9 @@ mod tests {
         assert_eq!(params.bandwidth_khz, 250.0);
         assert_eq!(params.spreading_factor, 8);
         assert_eq!(EU_868.duty_cycle_percent, 10);
-        assert!(EU_868_DEFAULT_FREQ_MHZ >= EU_868.freq_start_mhz);
-        assert!(EU_868_DEFAULT_FREQ_MHZ <= EU_868.freq_end_mhz);
+        const {
+            assert!(EU_868_DEFAULT_FREQ_MHZ >= EU_868.freq_start_mhz);
+            assert!(EU_868_DEFAULT_FREQ_MHZ <= EU_868.freq_end_mhz);
+        }
     }
 }

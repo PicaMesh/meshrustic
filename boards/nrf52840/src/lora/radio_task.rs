@@ -1,11 +1,7 @@
-//! Embassy task driving radio 0 RX/TX and AirTime ticks.
-
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 use mesh_protocol::{num::TEXT_MESSAGE_APP, PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
-use mesh_radio::{
-    eu868_config_for_preset, packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868,
-};
+use mesh_radio::{packet_time_ms, AirTime, RadioError, RadioSlot, TxFrame, EU_868};
 use mesh_routing::channel_access::ChannelAccess;
 use mesh_routing::{
     wire_may_relay, ChannelQoS, DeviceMetricsSnapshot, HostCommand, InboundPacket, Router,
@@ -38,9 +34,6 @@ pub async fn radio_task(
     let profile = slot.driver.profile();
 
     if let Err(err) = slot.init() {
-        // Do not panic: a panic halts the executor and takes USB logging down with it,
-        // leaving a node that never enumerates and gives no hint why. Park this task
-        // and keep repeating the reason so it is visible on the CDC log.
         let reason = match err {
             RadioError::InitFailed => "init FAILED: SX1262 not responding (BUSY stuck high after reset) - check module power/wiring",
             RadioError::Busy => "init FAILED: radio busy",
@@ -49,8 +42,6 @@ pub async fn radio_task(
             RadioError::Hardware => "init FAILED: hardware/SPI error",
         };
         loop {
-            // Keep the watchdog fed: a parked node that keeps logging its reason is worth more
-            // than a 30 s reboot loop that shows three lines per cycle.
             if let Some(wdt) = watchdog.as_mut() {
                 wdt.pet();
             }
@@ -60,7 +51,6 @@ pub async fn radio_task(
         }
     }
     router.emit_startup_logs();
-    // Modem preset + channel key already applied via Router::load_node_config in main.
     let boot_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
     router.ensure_boot_broadcasts(boot_ms, packet_time_ms(slot.config(), 64, true).max(1));
     let cfg = slot.config();
@@ -80,113 +70,122 @@ pub async fn radio_task(
     let mut last_stats = Instant::now();
     let mut last_maintenance = Instant::now();
     let mut last_duty_log = Instant::now();
-    // Edge-triggered: one line per hold, not one per poll.
     let mut tx_held_logged = false;
     let boot_instant = Instant::now();
     let mut sr_log_buf: heapless::Vec<SrLogEvent, MAX_SR_LOG> = heapless::Vec::new();
     let mut reboot_deadline: Option<Instant> = None;
     let mut ota_dfu_deadline: Option<Instant> = None;
-    // Log line is queued before USB can send it. Keep petting across this window
-    // so the host sees the entry, then park. The park arms the bootloader's BLE
-    // OTA register; the watchdog timeout is the reset that enters it.
     let mut ota_park_at: Option<Instant> = None;
-    // LoRa preset: persist + soft-reinit after completion reply TX (never sys_reset).
     let mut radio_reinit_pending = false;
-    // The only decision point for keying up: post-reception turnaround, post-TX gap and the
-    // contention backoff all live in `ChannelAccess` (mesh-routing::channel_access), and both
-    // the router's polls and the radio queue itself are gated by it below.
+    let mut next_store_attempt = Instant::now();
     let mut access = ChannelAccess::new();
-    let mut tx_cancels: heapless::Vec<u32, 8> = heapless::Vec::new();
+    let mut tx_cancels: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
 
     const LOOP_ACTIVE_MS: u64 = 5;
     const LOOP_IDLE_MS: u64 = 100;
 
     loop {
-        // Every pass through this loop proves the executor and the router are still making
-        // progress; a hang anywhere in the firmware stops the petting and the WDT resets the chip.
         if let Some(wdt) = watchdog.as_mut() {
             wdt.pet();
         }
         let now_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
         let slot_ms = packet_time_ms(slot.config(), 64, true).max(1);
 
-        // Due frames keep the delay they were given. RadioSlot::service decides whether the
-        // head of the queue may key up, with that frame in hand, so a hold names the frame
-        // and the reason instead of applying one boolean to the whole pass.
         let may_tx = access.may_transmit(now_ms);
-        if let Some(relay) = router.poll_ready_relay(now_ms) {
+        // Removing a ready plan before queue capacity exists would lose it permanently.
+        router.set_channel_utilization(air.channel_utilization_percent());
+        if let Some(ack) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_ack_tx(now_ms))
+            .flatten()
+        {
+            enqueue_tx(ack, slot, router, node_num, b"ack");
+        }
+        if let Some(confirm) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_dfu_confirm_tx(now_ms))
+            .flatten()
+        {
+            enqueue_tx(confirm, slot, router, node_num, b"dfu");
+        }
+        if let Some(admin) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_admin_tx(now_ms))
+            .flatten()
+        {
+            enqueue_tx(admin, slot, router, node_num, b"admin");
+        }
+        if let Some(relay) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_ready_relay(now_ms))
+            .flatten()
+        {
             enqueue_tx(relay, slot, router, node_num, b"relay");
         }
-
-        if let Some(topo) = router.poll_topology_tx(now_ms) {
+        if let Some(topo) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_topology_tx(now_ms))
+            .flatten()
+        {
             enqueue_tx(topo, slot, router, node_num, b"topology");
         }
-
-        if let Some(nodeinfo) = router.poll_nodeinfo_tx(now_ms) {
+        if let Some(nodeinfo) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_nodeinfo_tx(now_ms))
+            .flatten()
+        {
             enqueue_tx(nodeinfo, slot, router, node_num, b"nodeinfo");
         }
-
-        if let Some(telemetry) = router.poll_telemetry_tx(now_ms) {
+        if let Some(telemetry) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_telemetry_tx(now_ms))
+            .flatten()
+        {
             enqueue_tx(telemetry, slot, router, node_num, b"telemetry");
         }
-
-        if let Some(position) = router.poll_position_tx(now_ms) {
+        if let Some(position) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_position_tx(now_ms))
+            .flatten()
+        {
             enqueue_tx(position, slot, router, node_num, b"position");
         }
-
-        if let Some(tr) = router.poll_traceroute_tx(now_ms) {
+        if let Some(tr) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_traceroute_tx(now_ms))
+            .flatten()
+        {
             enqueue_tx(tr, slot, router, node_num, b"traceroute");
         }
-
-        if let Some(t1) = router.poll_t1_retransmit(now_ms) {
+        if let Some(t1) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_t1_retransmit(now_ms))
+            .flatten()
+        {
             enqueue_tx(t1, slot, router, node_num, b"t1");
         }
-
-        router.set_channel_utilization(air.channel_utilization_percent());
-        if let Some(retx) = router.poll_reliable_retransmit(now_ms) {
+        if let Some(retx) = (!slot.tx_queue.is_full())
+            .then(|| router.poll_reliable_retransmit(now_ms))
+            .flatten()
+        {
             enqueue_tx(retx, slot, router, node_num, b"retx");
         }
 
-        if let Some(ack) = router.poll_ack_tx(now_ms) {
-            enqueue_tx(ack, slot, router, node_num, b"ack");
-        }
-
-        if let Some(confirm) = router.poll_dfu_confirm_tx(now_ms) {
-            enqueue_tx(confirm, slot, router, node_num, b"dfu");
-        }
-
-        if let Some(admin) = router.poll_admin_tx(now_ms) {
-            enqueue_tx(admin, slot, router, node_num, b"admin");
-        }
-
-        // A command typed at the USB host, one more producer in this chain. A non-blocking
-        // check -- the channel is drained here, never awaited -- so an empty queue costs
-        // nothing on this pass, same as every `poll_*` above. `send_local` is called exactly
-        // as any other originated frame would be: nothing shortcuts to the radio.
-        if let Ok(cmd) = host_cmd.try_receive() {
-            let (to, text) = match cmd {
-                HostCommand::Broadcast { text } => (NODENUM_BROADCAST, text),
-                HostCommand::Unicast { to, text } => (to, text),
-            };
-            let airtime_ms =
-                packet_time_ms(slot.config(), PACKET_HEADER_LEN + text.len(), true).max(1);
-            if let Some(plan) = router.send_local(
-                to,
-                TEXT_MESSAGE_APP,
-                &text,
-                false,
-                router.hop_limit(),
-                now_ms,
-                airtime_ms,
-            ) {
-                enqueue_tx(plan, slot, router, node_num, b"host-cmd");
+        if !slot.tx_queue.is_full() {
+            if let Ok(cmd) = host_cmd.try_receive() {
+                let (to, text) = match cmd {
+                    HostCommand::Broadcast { text } => (NODENUM_BROADCAST, text),
+                    HostCommand::Unicast { to, text } => (to, text),
+                };
+                let airtime_ms =
+                    packet_time_ms(slot.config(), PACKET_HEADER_LEN + text.len(), true).max(1);
+                if let Some(plan) = router.send_local(
+                    to,
+                    TEXT_MESSAGE_APP,
+                    &text,
+                    false,
+                    router.hop_limit(),
+                    now_ms,
+                    airtime_ms,
+                ) {
+                    enqueue_tx(plan, slot, router, node_num, b"host-cmd");
+                }
             }
         }
 
         if router.take_pending_radio_reinit() {
             radio_reinit_pending = true;
         }
-        // Explicit AdminMessage.reboot_seconds only (not LoRa preset apply).
         if let Some(secs) = router.take_pending_reboot_seconds() {
             persist_config(store, router);
             reboot_deadline = Some(Instant::now() + secs_to_delay(secs));
@@ -223,19 +222,31 @@ pub async fn radio_task(
             crate::usb_log::log::sr::emit(*event);
         }
 
+        // The radio can hold a queued frame after the router’s original admission decision.
+        while let Some(frame) = slot.tx_queue.front() {
+            if router.queued_frame_allowed(frame.payload(), now_ms) {
+                break;
+            }
+            if let Ok(header) = mesh_protocol::PacketHeader::decode(frame.payload()) {
+                router.discard_queued_forward(header.from, header.id);
+            }
+            let _ = slot.tx_queue.pop();
+        }
         match slot.service(air, may_tx) {
             Ok(mut report) => {
+                if report.rx_restart_error.is_some() {
+                    defmt::warn!("[Radio0] RX restart failed; retrying");
+                    crate::usb_log::log::radio::warn("RX restart failed; retrying");
+                }
                 let mut last_rx_id = 0u32;
                 while let Some(frame) = report.rx {
                     if let Ok(h) = PacketHeader::decode(frame.payload()) {
                         last_rx_id = h.parse().id;
                     }
                     handle_rx_frame(frame, slot, router, node_num, air);
-                    // A copy of a packet we queued cancels the relay: pull the frame back before
-                    // the radio gets to it.
                     router.take_tx_cancels(&mut tx_cancels);
-                    for id in tx_cancels.iter() {
-                        let removed = slot.remove_tx(*id);
+                    for (from, id) in tx_cancels.iter() {
+                        let removed = slot.remove_tx(*from, *id);
                         if removed > 0 {
                             defmt::info!("[Radio0] TX cancelled id=0x{:08x} (copy heard)", *id);
                             crate::usb_log::log::radio::tx_cancelled(*id);
@@ -277,8 +288,9 @@ pub async fn radio_task(
                         len
                     );
                     crate::usb_log::log::radio::tx_done(report.tx_id, report.tx_to, len);
-                    if let Some(id) = report.tx_id {
-                        router.note_tx_done(id);
+                    if let (Some(from), Some(id)) = (report.tx_from, report.tx_id) {
+                        router.record_tx_on_air(from, id, now_ms);
+                        router.note_tx_done(from, id);
                     }
                     access.note_tx_done((Instant::now().as_millis() & 0xFFFF_FFFF) as u32);
                 }
@@ -323,40 +335,39 @@ pub async fn radio_task(
             }
         }
 
-        // Soft-reinit after the completion reply has left the TX queue (old air params).
-        if radio_reinit_pending && slot.tx_queue_len() == 0 {
-            apply_modem_preset_soft(slot, router.modem_preset());
+        // Pending replies must leave on the old RF parameters before the requester loses contact.
+        if radio_reinit_pending && slot.tx_queue_len() == 0 && !router.has_pending_control_tx() {
+            apply_modem_preset_soft(slot, router);
             router.radio_reconfigured(now_ms, slot_ms);
             radio_reinit_pending = false;
         }
 
-        if router.admin_config_dirty() {
-            persist_config(store, router);
+        // A persistent flash fault must not trigger an erase on every 5 ms radio loop.
+        if router.admin_config_dirty()
+            && Instant::now() >= next_store_attempt
+            && !persist_config(store, router)
+        {
+            next_store_attempt = Instant::now() + Duration::from_secs(5);
         }
 
-        if Instant::now().duration_since(last_second) >= Duration::from_secs(1) {
+        while Instant::now().duration_since(last_second) >= Duration::from_secs(1) {
             air.tick_second();
             defmt::trace!(
                 "[Radio0] duty={}% chutil={}%",
                 air.utilization_tx_percent() as u32,
                 air.channel_utilization_percent() as u32
             );
-            last_second = Instant::now();
+            last_second += Duration::from_secs(1);
         }
 
         if Instant::now().duration_since(last_stats) >= Duration::from_secs(30) {
-            // One line, one read: `log_chip_status` fetches the same counters and prints them
-            // with the chip mode, so asking for them separately cost a second SPI round trip
-            // and a log line that its output already contained.
             let _ = slot.driver.log_chip_status();
             last_stats = Instant::now();
         }
 
         if Instant::now().duration_since(last_maintenance) >= Duration::from_secs(60) {
-            // Publish every cycle, including an invalid reading: keeping the previous
-            // snapshot would latch a stale "USB powered" 101 into every later broadcast
-            // once the pack reading goes away. An invalid reading drops the battery
-            // fields only — chutil/air util/uptime still go out.
+            // Retaining the previous valid snapshot would advertise stale battery or USB-power
+            // information after readings become invalid.
             let batt = crate::battery::latest();
             router.update_device_metrics(DeviceMetricsSnapshot {
                 battery_level: batt.valid.then_some(batt.battery_level),
@@ -367,12 +378,6 @@ pub async fn radio_task(
             });
             let report = router.run_maintenance(now_ms, slot_ms);
             if report.graph_log_due {
-                // Restate identity, role and build with each periodic dump. Emitting them only on
-                // USB connect was not enough: a logger that reattaches even twenty seconds after a
-                // reboot misses them, and they are evicted from the 16 KB ring long before it
-                // arrives. Three reflashes in a row produced captures that could not say which
-                // firmware or role they came from. One line a minute makes any capture
-                // self-describing, whenever it was started.
                 crate::usb_log::log::mesh::node_id(router.node_num());
                 crate::usb_log::publish_device_role(router.device_role());
                 crate::usb_log::log::mesh::device_role(router.device_role());
@@ -389,18 +394,7 @@ pub async fn radio_task(
             || !slot.rx_queue.is_empty();
         let sleep_ms = if busy { LOOP_ACTIVE_MS } else { LOOP_IDLE_MS };
 
-        // Wake on the radio's own interrupt line as well as on the tick. Every received frame
-        // carries `now_ms`, taken at the top of the next iteration, so before this the stamp was
-        // whichever tick happened to notice the frame — up to LOOP_IDLE_MS out. Waking on the edge
-        // makes it the instant the radio raised DIO1, and it is still taken before any SPI traffic,
-        // so the error no longer varies with payload length either.
-        //
-        // A rising edge, not a level: DIO1 stays high until the interrupt is cleared, so waiting on
-        // the level would return immediately and spin. Still `select`ed with the tick, which remains
-        // the backstop — a missed or spurious edge can cost latency, never the loop — and the tick
-        // alone continues to drive maintenance, transmit release and duty-cycle bookkeeping. The
-        // line is shared with the blocking transmit inside the radio crate, so a wake is not by
-        // itself evidence of a reception; what it meant is decided by the IRQ status read above.
+        // DIO1 remains high until its interrupt is cleared; a level wait would spin instead of yielding.
         match select(
             Timer::after_millis(sleep_ms),
             dio1_wake.wait_for_rising_edge(),
@@ -427,7 +421,6 @@ fn handle_rx_frame(
         bytes: frame.payload(),
     };
 
-    // Admin replies scheduled inside process_inbound size their retransmit backoff from this.
     router.set_channel_utilization(air.channel_utilization_percent());
     if let Some(result) = router.process_inbound(&inbound, now_ms) {
         crate::usb_log::log::radio::rx_packet(
@@ -492,7 +485,11 @@ fn handle_rx_frame(
                 result.parsed.from == node_num,
                 result.parsed.to == node_num,
             )
-            && !ChannelQoS::new().can_relay(result.decoded_portnum, result.parsed.channel, chutil)
+            && !ChannelQoS::with_primary_channel(router.channel_hash()).can_relay(
+                result.decoded_portnum,
+                result.parsed.channel,
+                chutil,
+            )
         {
             defmt::warn!(
                 "[QoS] Drop relay !{:08x} chutil {}%",
@@ -502,15 +499,8 @@ fn handle_rx_frame(
             crate::usb_log::log::qos::drop_relay(result.parsed.from, chutil);
         }
 
-        // Nothing leaves for the radio from here. An immediate relay is parked as a pending
-        // relay due now, and ACKs/admin/traceroute replies already sit in their pending slots;
-        // the loop top releases them once the post-reception hold has passed. Enqueueing here
-        // bypassed that hold and put replies on the air ~0 ms after the request, while the
-        // peer nodes were still busy with the request for 70-170 ms and heard none of them.
         if let Some(relay) = plan.relay {
             if !router.defer_relay(relay, result.radio_id, now_ms) {
-                // Pending table full: the radio queue is gated by ChannelAccess as well, so the
-                // frame still waits out the turnaround; it just cannot be pulled back by a dupe.
                 enqueue_tx(relay, slot, router, node_num, b"relay");
             }
         }
@@ -534,7 +524,7 @@ fn handle_rx_frame(
 fn enqueue_tx(
     relay: mesh_routing::RelayPlan,
     slot: &mut RadioSlot<Sx1262Driver>,
-    router: &mut Router,
+    _router: &mut Router,
     node_num: u32,
     kind: &[u8],
 ) {
@@ -545,11 +535,6 @@ fn enqueue_tx(
         relay.delay_ms,
         node_num,
     );
-
-    if let Ok(header) = PacketHeader::decode(&relay.bytes[..relay.len as usize]) {
-        let now_ms = (embassy_time::Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
-        router.record_tx_on_air(header.parse().id, now_ms);
-    }
 
     if let Some(tx) = TxFrame::new(slot.id, &relay.bytes[..relay.len as usize]) {
         match slot.enqueue_tx(tx) {
@@ -568,7 +553,7 @@ fn enqueue_tx(
     }
 }
 
-fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) {
+fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) -> bool {
     let mut cfg = store.load();
     router.write_admin_into_config(&mut cfg);
     let preset = cfg.lora.modem_preset;
@@ -587,17 +572,19 @@ fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) {
                 admin_keys
             );
             crate::usb_log::log::mesh::config_saved(admin_keys);
+            true
         }
         Err(_) => {
             defmt::warn!("[store] NodeConfig save failed");
             crate::usb_log::log::radio::warn("config save failed");
+            false
         }
     }
 }
 
-/// Apply a new LoRa modem preset without MCU reset (UF2 boards enter upload mode on sys_reset).
-fn apply_modem_preset_soft(slot: &mut RadioSlot<Sx1262Driver>, preset: u8) {
-    let cfg = eu868_config_for_preset(preset);
+/// A software reset would enter UF2 upload mode instead of applying radio settings.
+fn apply_modem_preset_soft(slot: &mut RadioSlot<Sx1262Driver>, router: &Router) {
+    let cfg = router.radio_config();
     let name = cfg.preset_log_name();
     defmt::info!(
         "[Radio0] soft-reinit preset {} @ {} MHz (no reboot)",
@@ -617,7 +604,6 @@ fn apply_modem_preset_soft(slot: &mut RadioSlot<Sx1262Driver>, preset: u8) {
     }
 }
 
-/// Soft-reset without entering Adafruit UF2 / CDC upload mode.
 fn soft_reset_skip_uf2() -> ! {
     crate::dfu::write_gpregret(crate::dfu::DFU_MAGIC_SKIP);
     cortex_m::peripheral::SCB::sys_reset()

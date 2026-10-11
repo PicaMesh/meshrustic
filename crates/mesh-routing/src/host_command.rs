@@ -1,54 +1,30 @@
-//! Host-typed command input over the USB debug link (Part C of the H1 controlled-node harness).
-//!
-//! Lets an operator make this node *originate* a frame -- controlling exactly which node is
-//! direct, which passive capture cannot arrange on its own. Two commands only: a broadcast text
-//! and a unicast text to a node id, one per ASCII line. Parsing writes into fixed-capacity
-//! buffers only; there is no heap here and none is added. The parsed command is handed to
-//! `Router::send_local` by the board's radio task, through the same channel-access gate every
-//! other originated frame already goes through -- nothing here talks to the radio directly.
-//!
-//! See `tmp/controlled-node-harness-plan-20260911.md` (MeshRustic repo) for the design this
-//! implements, including why this parser lives next to `Router::send_local` rather than in
-//! `mesh-protocol` (its sole consumer is that one function) and why the line accumulator resets
-//! on every new USB connection.
+//! Controlled origination makes experiments reproducible when passive captures cannot establish which
+//! node transmitted directly.
 
 use crate::pool::MAX_PACKET_PAYLOAD;
 use heapless::Vec;
 
-/// Longest message text a command may carry: the same ceiling `Router::send_local`'s own
-/// payload has, so a command can never ask for more than the wire format allows.
-pub const MAX_COMMAND_TEXT: usize = MAX_PACKET_PAYLOAD;
+pub const MAX_COMMAND_TEXT: usize = MAX_PACKET_PAYLOAD - 7;
 
-/// Longest raw line the grammar can ever produce: a keyword, a hex node id, the separating
-/// spaces, and the text, rounded up generously. A line longer than this is rejected outright
-/// (see `LineAccumulator`), not truncated and guessed at.
 pub const MAX_COMMAND_LINE: usize = MAX_COMMAND_TEXT + 32;
 
-/// A fully parsed host command, ready for `Router::send_local`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCommand {
-    /// `BCAST <text>` -- broadcast `text` on the primary channel.
-    Broadcast { text: Vec<u8, MAX_COMMAND_TEXT> },
-    /// `UNI <node-id> <text>` -- unicast `text` to `to`.
+    Broadcast {
+        text: Vec<u8, MAX_COMMAND_TEXT>,
+    },
     Unicast {
         to: u32,
         text: Vec<u8, MAX_COMMAND_TEXT>,
     },
 }
 
-/// Why a line was rejected. Every rejection is logged with its specific reason, never silently
-/// dropped and never guessed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandError {
-    /// The raw line exceeded `MAX_COMMAND_LINE` before a newline was seen.
     LineTooLong,
-    /// The line matched neither `BCAST` nor `UNI`.
     UnknownKeyword,
-    /// `UNI` was given with no node id token.
     MissingNodeId,
-    /// The node id token was not a valid hex node id.
     MalformedNodeId,
-    /// The message text (after the keyword and, for `UNI`, the node id) was empty.
     EmptyMessage,
 }
 
@@ -77,18 +53,15 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// If `line` starts with `keyword` followed by whitespace or end-of-line, return what follows
-/// the keyword (not yet trimmed). Case-sensitive: the grammar is a fixed, upper-case keyword.
 fn strip_keyword<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
     let rest = line.strip_prefix(keyword)?;
     match rest.first() {
         None => Some(rest),
         Some(&b) if is_ascii_space(b) => Some(rest),
-        _ => None, // e.g. "BCASTX ..." must not match "BCAST"
+        _ => None,
     }
 }
 
-/// Split on the first run of whitespace: `(first word, the rest, trimmed)`.
 fn split_first_word(bytes: &[u8]) -> (&[u8], &[u8]) {
     let bytes = trim(bytes);
     match bytes.iter().position(|&b| is_ascii_space(b)) {
@@ -97,8 +70,6 @@ fn split_first_word(bytes: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// Parse a node id written the same way the rest of the firmware logs one: optional leading
-/// `!` or `0x`/`0X`, then 1-8 hex digits.
 fn parse_hex_node_id(token: &[u8]) -> Option<u32> {
     let token = token
         .strip_prefix(b"!")
@@ -128,8 +99,6 @@ fn to_fixed_text(bytes: &[u8]) -> Result<Vec<u8, MAX_COMMAND_TEXT>, CommandError
     Ok(out)
 }
 
-/// Parse one complete line (no trailing newline/CR -- `LineAccumulator` strips those) into a
-/// command. Rejects, with a specific reason, anything that does not match either grammar.
 pub fn parse_line(line: &[u8]) -> Result<HostCommand, CommandError> {
     if line.len() > MAX_COMMAND_LINE {
         return Err(CommandError::LineTooLong);
@@ -161,10 +130,6 @@ pub fn parse_line(line: &[u8]) -> Result<HostCommand, CommandError> {
     Err(CommandError::UnknownKeyword)
 }
 
-/// Assembles raw USB bytes into complete lines with no heap, across as many reads as it takes
-/// to see a newline. Must be reset on every new connection (see the board's USB read loop): a
-/// line left partial by a host disconnecting mid-command must never be silently completed by
-/// bytes from the next session.
 pub struct LineAccumulator<const CAP: usize> {
     buf: Vec<u8, CAP>,
     overflowed: bool,
@@ -178,15 +143,11 @@ impl<const CAP: usize> LineAccumulator<CAP> {
         }
     }
 
-    /// Discard whatever partial line is in progress. Call this on every new connection.
     pub fn reset(&mut self) {
         self.buf.clear();
         self.overflowed = false;
     }
 
-    /// Feed one byte. Returns `Some` once `b` completes a line (on `\n`; a preceding `\r` is
-    /// dropped): `Ok(bytes)` if the line fit, `Err(LineTooLong)` if it did not -- the buffer is
-    /// cleared either way, so accumulation resumes cleanly on the very next byte.
     pub fn push_byte(&mut self, b: u8) -> Option<Result<Vec<u8, CAP>, CommandError>> {
         if b == b'\n' {
             let result = if self.overflowed {
@@ -322,7 +283,6 @@ mod tests {
             assert!(acc.push_byte(b).is_none());
         }
         assert_eq!(acc.push_byte(b'\n'), Some(Err(CommandError::LineTooLong)));
-        // The accumulator must be clean for the very next line.
         for &b in b"BCAST hi" {
             assert!(acc.push_byte(b).is_none());
         }
@@ -333,14 +293,10 @@ mod tests {
     #[test]
     fn line_accumulator_reset_drops_partial_line_across_a_reconnect() {
         let mut acc: LineAccumulator<64> = LineAccumulator::new();
-        // A line left partial by a disconnect: never terminated with '\n'.
         for &b in b"BCAST partial-comm-and-abandoned" {
             assert!(acc.push_byte(b).is_none());
         }
-        // Host disconnects mid-line; the board's read loop resets on the next connection.
         acc.reset();
-        // The next session's first command must be exactly its own bytes -- none of the
-        // abandoned partial line from before the reset.
         for &b in b"BCAST fresh command" {
             assert!(acc.push_byte(b).is_none());
         }

@@ -1,6 +1,3 @@
-//! Built-in admin public keys (always authorized; never exposed via SecurityConfig get).
-
-/// Built-in admin public keys (X25519). Never expose via SecurityConfig get.
 pub const BUILTIN_ADMIN_PUBLIC_KEYS: [[u8; 32]; 2] = [
     [
         0x9d, 0x37, 0xec, 0x73, 0x30, 0xca, 0x6e, 0xd0, 0x6d, 0x5b, 0xad, 0x4f, 0xa0, 0xa1, 0x9c,
@@ -14,10 +11,8 @@ pub const BUILTIN_ADMIN_PUBLIC_KEYS: [[u8; 32]; 2] = [
     ],
 ];
 
-/// Empty / cleared configurable admin key slot.
 pub const EMPTY_ADMIN_KEY: [u8; 32] = [0u8; 32];
 
-/// True when `remote_pk` is a built-in admin key or a non-empty flash slot.
 pub fn is_admin_authorized(remote_pk: &[u8; 32], flash: &[[u8; 32]; 3]) -> bool {
     BUILTIN_ADMIN_PUBLIC_KEYS.iter().any(|k| k == remote_pk)
         || flash

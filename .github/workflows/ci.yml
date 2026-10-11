@@ -5,10 +5,6 @@ on:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
-
-# Explicitly excludes docker-compose.override.yml (USB/privileged) — CI
-# runners have no attached hardware, and `devices: /dev/bus/usb` would
-# fail to start on a runner that doesn't have that path at all.
 env:
   COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
   REGISTRY: ghcr.io
@@ -20,7 +16,9 @@ permissions:
   actions: write
 
 jobs:
+  # Fork pull requests cannot publish packages; their checks build the same image locally.
   build-image:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.tag.outputs.image }}
@@ -40,10 +38,6 @@ jobs:
           name=$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/${name}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
-
-      # Same Dockerfile devs build locally — this is the whole point.
-      # The build record is a GitHub artifact (*.dockerbuild). nightly.link
-      # publishes every artifact on the workflow, so leave it off.
       - uses: docker/build-push-action@v6
         env:
           DOCKER_BUILD_RECORD_UPLOAD: false
@@ -58,23 +52,24 @@ jobs:
           cache-to: type=gha,mode=max
 
   check:
+    if: ${{ always() && !failure() && !cancelled() }}
     needs: build-image
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Additional boards join this matrix as they are scaffolded (Phase 0+).
           - board: nrf52840
             run_tests: false
           - board: rpi-app
             run_tests: true
     env:
-      DEV_IMAGE: ${{ needs.build-image.outputs.image }}
+      DEV_IMAGE: ${{ needs.build-image.outputs.image || 'yourorg/embedded-rust-dev:latest' }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/login-action@v3
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -86,23 +81,26 @@ jobs:
           path: |
             .ci-cache/cargo-registry
             .ci-cache/cargo-git
-            boards/${{ matrix.board }}/target
+            target
           key: cargo-${{ matrix.board }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ matrix.board }}-
 
       - name: Pull dev image
+        if: github.event_name != 'pull_request'
         run: docker pull "$DEV_IMAGE"
-
-      # Host-owned before compose bind-mounts them; Docker would otherwise
-      # create .ci-cache as root and TMPDIR would be unwritable.
       - run: mkdir -p .ci-cache/tmp .ci-cache/cargo-registry .ci-cache/cargo-git
       - run: chmod +x ./just
+      - if: github.event_name == 'pull_request'
+        run: ./just image
       - run: ./just build ${{ matrix.board }}
-      - run: ./just clippy ${{ matrix.board }}
+      - if: matrix.run_tests
+        run: ./just clippy ${{ matrix.board }} --workspace --exclude nrf52840 --all-targets
+      - if: ${{ !matrix.run_tests }}
+        run: ./just clippy ${{ matrix.board }}
       - run: ./just fmt-check ${{ matrix.board }}
       - if: matrix.run_tests
-        run: ./just test ${{ matrix.board }}
+        run: ./just test ${{ matrix.board }} --workspace --exclude nrf52840
       - if: matrix.board == 'nrf52840'
         run: ./just ota nrf52840
       - if: matrix.board == 'nrf52840'

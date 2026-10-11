@@ -1,5 +1,3 @@
-//! WPA-style AES-CCM (L=2) for PKI payloads (RFC 3610 profile).
-
 use crate::aes::aes_ecb_encrypt_block;
 
 const AES_BLOCK_SIZE: usize = 16;
@@ -98,7 +96,7 @@ fn encr_start(l: usize, nonce: &[u8], a: &mut [u8; AES_BLOCK_SIZE]) {
     a[1..=15 - l].copy_from_slice(&nonce[..15 - l]);
 }
 
-fn encr(l: usize, input: &[u8], output: &mut [u8], a: &mut [u8; AES_BLOCK_SIZE], key: &[u8]) {
+fn encr(input: &[u8], output: &mut [u8], a: &mut [u8; AES_BLOCK_SIZE], key: &[u8]) {
     let full_blocks = input.len() / AES_BLOCK_SIZE;
     let last = input.len() % AES_BLOCK_SIZE;
     let mut in_off = 0usize;
@@ -113,7 +111,6 @@ fn encr(l: usize, input: &[u8], output: &mut [u8], a: &mut [u8; AES_BLOCK_SIZE],
         }
         in_off += AES_BLOCK_SIZE;
         out_off += AES_BLOCK_SIZE;
-        let _ = l;
     }
 
     if last > 0 {
@@ -152,7 +149,6 @@ fn decr_auth(m: usize, a: &mut [u8; AES_BLOCK_SIZE], tag: &[u8], t: &mut [u8], k
     }
 }
 
-/// AES-CCM encrypt. Returns `false` on invalid parameters.
 pub fn aes_ccm_ae(
     key: &[u8],
     nonce: &[u8],
@@ -163,7 +159,9 @@ pub fn aes_ccm_ae(
     tag: &mut [u8],
 ) -> bool {
     const L: usize = 2;
-    if aad.len() > 30 || tag_len > AES_BLOCK_SIZE || crypt.len() < plain.len() {
+    if !valid_parameters(key, nonce, tag_len, plain.len(), aad, tag.len())
+        || crypt.len() < plain.len()
+    {
         return false;
     }
 
@@ -172,12 +170,11 @@ pub fn aes_ccm_ae(
     auth_start(tag_len, L, nonce, aad, plain.len(), &mut x, key);
     auth_blocks(plain, &mut x, key);
     encr_start(L, nonce, &mut a);
-    encr(L, plain, &mut crypt[..plain.len()], &mut a, key);
+    encr(plain, &mut crypt[..plain.len()], &mut a, key);
     encr_auth(tag_len, &x, &mut a, tag, key);
     true
 }
 
-/// AES-CCM decrypt + verify tag.
 pub fn aes_ccm_ad(
     key: &[u8],
     nonce: &[u8],
@@ -188,7 +185,9 @@ pub fn aes_ccm_ad(
     plain: &mut [u8],
 ) -> bool {
     const L: usize = 2;
-    if aad.len() > 30 || tag_len > AES_BLOCK_SIZE || plain.len() < crypt.len() {
+    if !valid_parameters(key, nonce, tag_len, crypt.len(), aad, tag.len())
+        || plain.len() < crypt.len()
+    {
         return false;
     }
 
@@ -198,8 +197,105 @@ pub fn aes_ccm_ad(
 
     encr_start(L, nonce, &mut a);
     decr_auth(tag_len, &mut a, tag, &mut t, key);
-    encr(L, crypt, &mut plain[..crypt.len()], &mut a, key);
+    encr(crypt, &mut plain[..crypt.len()], &mut a, key);
     auth_start(tag_len, L, nonce, aad, crypt.len(), &mut x, key);
     auth_blocks(&plain[..crypt.len()], &mut x, key);
-    constant_time_compare(&x[..tag_len], &t[..tag_len])
+    let authenticated = constant_time_compare(&x[..tag_len], &t[..tag_len]);
+    if !authenticated {
+        plain[..crypt.len()].fill(0);
+    }
+    authenticated
+}
+
+fn valid_parameters(
+    key: &[u8],
+    nonce: &[u8],
+    tag_len: usize,
+    len: usize,
+    aad: &[u8],
+    tag_capacity: usize,
+) -> bool {
+    matches!(key.len(), 16 | 32)
+        && nonce.len() >= 13
+        && (4..=16).contains(&tag_len)
+        && tag_len.is_multiple_of(2)
+        && tag_capacity >= tag_len
+        && len <= u16::MAX as usize
+        && aad.len() <= 30
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_parameters_are_rejected_without_writing() {
+        let mut crypt = [0x55; 8];
+        let mut tag = [0x55; 16];
+        for tag_len in [0, 1, 2, 3, 5, 17, usize::MAX] {
+            assert!(!aes_ccm_ae(
+                &[0; 32],
+                &[0; 16],
+                tag_len,
+                &[1; 8],
+                &[],
+                &mut crypt,
+                &mut tag
+            ));
+        }
+        assert!(!aes_ccm_ae(
+            &[0; 15],
+            &[0; 16],
+            8,
+            &[1; 8],
+            &[],
+            &mut crypt,
+            &mut tag
+        ));
+        assert!(!aes_ccm_ae(
+            &[0; 32],
+            &[0; 12],
+            8,
+            &[1; 8],
+            &[],
+            &mut crypt,
+            &mut tag
+        ));
+        assert!(!aes_ccm_ad(
+            &[0; 32],
+            &[0; 16],
+            8,
+            &[1; 8],
+            &[],
+            &[0; 7],
+            &mut crypt
+        ));
+        assert_eq!(crypt, [0x55; 8]);
+        assert_eq!(tag, [0x55; 16]);
+    }
+    #[test]
+    fn failed_authentication_erases_plaintext() {
+        let mut crypt = [0; 8];
+        let mut tag = [0; 8];
+        let mut plain = [0; 8];
+        assert!(aes_ccm_ae(
+            &[3; 32],
+            &[4; 16],
+            8,
+            b"testtext",
+            &[],
+            &mut crypt,
+            &mut tag
+        ));
+        tag[0] ^= 1;
+        assert!(!aes_ccm_ad(
+            &[3; 32],
+            &[4; 16],
+            8,
+            &crypt,
+            &[],
+            &tag,
+            &mut plain
+        ));
+        assert_eq!(plain, [0; 8]);
+    }
 }

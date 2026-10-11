@@ -1,41 +1,20 @@
-//! The stock-router window: where reserved positions and early ranked positions sit, and where
-//! the ladder's first rung lands once the window has been laid out.
-//!
-//! A stock ROUTER's delay is a hardware-seeded draw from a window whose width is set by the SNR it
-//! measured, a value that appears nowhere on the wire. Neither the draw nor the width is ours to
-//! compute, so a reserved position orders *our expectation* that the router transmits — not its
-//! transmission. That is why reservations are spaced by one slot time, stock's own granularity
-//! here, rather than by half an airtime: spacing an expectation by the airtime of a frame we are
-//! not sending states a precision we do not have, and it is the only spacing under which the
-//! window has a defined capacity.
-//!
-//! A ranked position is the opposite: it is a real transmit time of ours, so it takes a rung's
-//! separation — one floored half-airtime — and two of them can never collide because the ranking
-//! assigns them.
+//! Reservations describe another router’s uncertain draw; ranked positions are actual transmissions and
+//! need airtime separation.
 
 use crate::coordinated_relay::{relay_floor_ms, CW_MAX};
 
-/// Positions the window holds, at stock's granularity: `2·CWmax − 1`.
 pub const WINDOW_POSITIONS: u8 = 2 * CW_MAX - 1;
 
-/// Width of the stock-router window, in milliseconds.
 pub const fn window_width_ms(slot_time_ms: u32) -> u32 {
     slot_time_ms.saturating_mul(WINDOW_POSITIONS as u32)
 }
 
-/// Lays positions out from the window's start, each taking its own width.
-///
-/// Reservations and ranked positions share one window and one cursor: they are placed in rank
-/// order, so a top-ranked SR ROUTER is early at every preset, and a candidate for which no
-/// position remains falls past the transition keeping its rank.
 #[derive(Debug, Clone, Copy)]
 pub struct WindowLayout {
     width_ms: u32,
     slot_time_ms: u32,
     half_airtime_ms: u32,
-    /// Start of the next free position.
     cursor_ms: u32,
-    /// Start of the last position actually placed, and its width.
     last_placed_end_ms: Option<u32>,
     placed: u8,
 }
@@ -66,12 +45,10 @@ impl WindowLayout {
         Some(at)
     }
 
-    /// Reserve the next position for a stock relay router. One slot time wide.
     pub fn place_reserved(&mut self) -> Option<u32> {
         self.place(self.slot_time_ms)
     }
 
-    /// Take the next position for a ranked candidate of ours. One floored half-airtime wide.
     pub fn place_ranked(&mut self) -> Option<u32> {
         self.place(self.half_airtime_ms)
     }
@@ -84,22 +61,8 @@ impl WindowLayout {
         self.placed
     }
 
-    /// Where the ladder's first rung goes.
-    ///
-    /// Anchored to [`relay_floor_ms`] — `2·CWmax·slot_time`, stock's own border between the router
-    /// window and the contention window every other role draws from. The window laid out above is
-    /// the `2·CWmax − 1` slots immediately below that border, so the two are one geometry: the
-    /// first rung sits on the border the window ends at.
-    ///
-    /// The empty case is stated separately on purpose. Folding it into the formula leaves the last
-    /// position at zero and degenerates to a bare half-airtime — on a mesh with no router at all
-    /// that is 6,095 ms at LONG_SLOW, which is the bug an earlier capacity rule was withdrawn for.
-    ///
-    /// When the window is occupied the rung clears the last position by **at least** one floored
-    /// half-airtime, never exactly one: with a single reservation and no ranked position at
-    /// SHORT_SLOW the separation is the whole transition. It is not the bare transition either,
-    /// because at LONG_FAST and slower a half-airtime exceeds it and a rung there would land inside
-    /// the preceding position's frame.
+    /// At slow presets, a frame can outlast the transition window; the next rung must also clear the
+    /// preceding frame.
     pub fn first_rung_ms(&self) -> u32 {
         let transition = relay_floor_ms(self.slot_time_ms);
         match self.last_placed_end_ms {
@@ -109,20 +72,11 @@ impl WindowLayout {
     }
 }
 
-/// Hands out transmit positions in rank order: the window first, the ladder past the transition
-/// once it is full.
-///
-/// One allocator rather than one accumulator shared by two loops. The reservation pre-pass and the
-/// ranking loop previously advanced the same `slot_delay` by a half-airtime each, which priced a
-/// reservation as if it were a rung of ours and left the rung index to be reconstructed by dividing
-/// a delay. Here each position is placed by its own rule and carries its own index, so the index is
-/// what was assigned rather than what can be inferred afterwards.
 #[derive(Debug, Clone, Copy)]
 pub struct PositionAllocator {
     window: WindowLayout,
     half_airtime_ms: u32,
-    /// Frozen when the window first runs out: the ladder's start cannot move afterwards, or a
-    /// later spill would reorder the positions already handed out.
+    /// Moving the ladder origin after allocating a rung would reorder already assigned positions.
     ladder_start_ms: Option<u32>,
     next_index: u8,
 }
@@ -145,7 +99,6 @@ impl PositionAllocator {
         start.saturating_add((rung as u32).saturating_mul(self.half_airtime_ms))
     }
 
-    /// The position a stock relay router holds: one slot time wide, inside the window.
     pub fn take_reserved(&mut self) -> u32 {
         let at = match self.window.place_reserved() {
             Some(at) => at,
@@ -155,13 +108,6 @@ impl PositionAllocator {
         at
     }
 
-    /// Early-window rung for an **SR ROUTER** with unique coverage: inside the window while a
-    /// half-airtime still fits, otherwise on the ladder past the transition.
-    ///
-    /// Only the ROUTER role may call this. Stock relay routers are reserved separately
-    /// ([`Self::take_reserved`]); every other SR-active role uses [`Self::take_late_rung`] so it
-    /// sits past stock reservations and SR ROUTER early slots. An SR node's position is a real
-    /// transmit time, so it takes a rung's separation rather than a reservation's.
     pub fn take_rung(&mut self) -> u32 {
         let at = match self.window.place_ranked() {
             Some(at) => at,
@@ -171,22 +117,16 @@ impl PositionAllocator {
         at
     }
 
-    /// Late ladder rung for non-ROUTER SR-active candidates: always past the stock/SR-ROUTER
-    /// early window ([`WindowLayout::first_rung_ms`] / spill), never a position below the
-    /// preset-bound `relay_floor_ms` border.
     pub fn take_late_rung(&mut self) -> u32 {
         let at = self.spill();
         self.next_index = self.next_index.saturating_add(1);
         at
     }
 
-    /// Index the next position will be given: what a rung index means once positions are placed
-    /// by rule rather than spaced by one constant.
     pub const fn next_index(&self) -> u8 {
         self.next_index
     }
 
-    /// Where a transmission goes when nothing was placed ahead of it.
     pub fn first_free_ms(&mut self) -> u32 {
         if self.window.is_empty() {
             self.window.first_rung_ms()
@@ -207,7 +147,6 @@ mod tests {
         half_airtime_ms(packet_time_ms(&cfg, payload, true))
     }
 
-    /// Capacity for ranked positions, against the figures the design tabulates.
     fn ranked_capacity(preset: u8, payload: usize) -> u8 {
         let mut w = WindowLayout::new(slot_time_for_preset(preset), half_for(preset, payload));
         let mut n = 0u8;
@@ -243,7 +182,6 @@ mod tests {
 
     #[test]
     fn ranked_capacity_matches_the_design_table() {
-        // design Item 3b, recomputed from this crate's own airtime function
         assert_eq!(ranked_capacity(MODEM_SHORT_SLOW, 29), 3);
         assert_eq!(ranked_capacity(MODEM_SHORT_SLOW, 253), 1);
         assert_eq!(ranked_capacity(MODEM_LONG_FAST, 29), 2);
@@ -252,7 +190,6 @@ mod tests {
 
     #[test]
     fn the_window_never_holds_more_than_its_positions() {
-        // A slot time small against the window still cannot exceed the position count.
         let mut w = WindowLayout::new(1, 1);
         let mut n = 0u16;
         while w.place_reserved().is_some() {
@@ -263,7 +200,6 @@ mod tests {
 
     #[test]
     fn an_empty_window_puts_the_first_rung_at_the_transition() {
-        // Not at a bare half-airtime: that is the degenerate case a withdrawn rule produced.
         let slot = slot_time_for_preset(MODEM_LONG_FAST);
         let w = WindowLayout::new(slot, half_for(MODEM_LONG_FAST, 253));
         assert!(w.is_empty());
@@ -300,8 +236,6 @@ mod tests {
         let r0 = a.take_reserved();
         assert_eq!((r0, a.next_index()), (0, 1));
         let r1 = a.take_reserved();
-        // A reservation advances by a slot time, so dividing this delay by a half-airtime would
-        // put both reservations at index 0. The index is assigned, not inferred.
         assert_eq!(r1, slot);
         assert_eq!(r1 / half, 0);
         assert_eq!(a.next_index(), 2);
@@ -315,9 +249,6 @@ mod tests {
         let mut a = PositionAllocator::new(slot, half);
         assert_eq!(a.take_late_rung(), floor);
         assert_eq!(a.take_late_rung(), floor + half);
-        // An SR ROUTER early slot still lands at the window start even after late rungs were
-        // handed out only if we had placed early first; late-first then early is not the
-        // production order (ROUTER phase runs before late). Still: late alone stays at/after floor.
         let mut b = PositionAllocator::new(slot, half);
         b.take_rung();
         assert!(b.take_late_rung() >= floor);
@@ -327,7 +258,6 @@ mod tests {
     fn rungs_take_window_positions_while_a_half_airtime_fits() {
         let half = half_for(MODEM_SHORT_SLOW, 48);
         let mut a = PositionAllocator::new(slot_time_for_preset(MODEM_SHORT_SLOW), half);
-        // Empty window: the first ranked position is at the window start, not the transition.
         assert_eq!(a.take_rung(), 0);
         assert_eq!(a.take_rung(), half);
         assert_eq!(a.take_rung(), 2 * half);
@@ -335,8 +265,6 @@ mod tests {
 
     #[test]
     fn a_full_window_spills_ranked_positions_onto_the_ladder() {
-        // One half-airtime that fills the whole SHORT_SLOW window: the first ranked fits, the
-        // second must clear the transition.
         let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
         let half = window_width_ms(slot);
         let mut a = PositionAllocator::new(slot, half);
@@ -368,8 +296,6 @@ mod tests {
 
     #[test]
     fn reservations_and_ranked_positions_interleave_in_the_window() {
-        // Worked example from the design: SHORT_SLOW, 48 B — one reservation at 0, then ranked
-        // positions a half-airtime apart inside what remains.
         let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
         let half = half_for(MODEM_SHORT_SLOW, 48);
         let mut a = PositionAllocator::new(slot, half);
@@ -387,7 +313,6 @@ mod tests {
 
     #[test]
     fn a_single_reservation_at_short_slow_is_cleared_by_the_whole_transition() {
-        // The invariant is "at least" one half-airtime, not "exactly": here it is far more.
         let slot = slot_time_for_preset(MODEM_SHORT_SLOW);
         let half = half_for(MODEM_SHORT_SLOW, 48);
         let mut w = WindowLayout::new(slot, half);

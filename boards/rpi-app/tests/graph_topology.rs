@@ -1,5 +1,3 @@
-//! Graph topology merge, ETX, and downstream tests.
-
 use mesh_routing::{
     calculate_etx, decode_packed_neighbors, etx_to_signal, write_packed_header, NeighborEntry,
     NeighborGraph, PackedNeighbor, SrLog, SrLogEvent, TopologyMergeResult, MAX_EDGES_PER_NODE,
@@ -29,7 +27,7 @@ fn downstream_created_for_hears_us_remote_neighbor() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 1, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     let result = graph.merge_topology(0xBB, &header, &[neighbor], true, 200, 0);
     assert!(matches!(result, TopologyMergeResult::Applied { .. }));
 }
@@ -51,7 +49,7 @@ fn reported_edges_sort_before_mirrored_in_topology_pack() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 1, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     graph.merge_topology(0x22, &header, &[neighbor], true, 200, 0);
 
     let mut entries = [NeighborEntry::default(); MAX_EDGES_PER_NODE];
@@ -84,11 +82,11 @@ fn relay_slot_index_increases_with_more_candidates() {
     graph.set_my_node(0xAA);
     graph.observe_direct_neighbor(0x11, -70, 8, 0, 0);
     graph.observe_direct_neighbor(0x22, -70, 8, 0, 0);
-    let (_, count) = graph.relay_slot_index(42, 0, 0);
+    let (_, count) = graph.relay_slot_index(42, 0, 0, 0);
     assert_eq!(count, 3);
-    let (idx_self, _) = graph.relay_slot_index(42, 0, 0);
-    graph.record_node_transmission(0x11, 42, 0);
-    let (idx_after, count_after) = graph.relay_slot_index(42, 0, 0);
+    let (idx_self, _) = graph.relay_slot_index(42, 0, 0, 0);
+    graph.record_node_transmission(0x11, 0, 42, 0);
+    let (idx_after, count_after) = graph.relay_slot_index(42, 0, 0, 0);
     assert_eq!(count_after, 2);
     assert!(idx_after <= idx_self || count_after < count);
 }
@@ -118,7 +116,7 @@ fn merge_topology_accepts_high_version_on_first_contact() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 160, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     let result = graph.merge_topology(0xBB, &header, &[neighbor], true, 200, 0);
     assert!(matches!(
         result,
@@ -156,10 +154,6 @@ fn relayed_packet_creates_placeholder_edge_to_transmitter() {
 #[test]
 fn relayed_topology_from_unqualified_far_publisher_is_ignored() {
     use mesh_routing::{placeholder_node_id, DEVICE_ROLE_CLIENT};
-
-    // Horizon: a far originator heard only via an unresolved relay byte is not a ball
-    // publisher. Its topology version may be tracked, but listed neighbours are not ingested
-    // and are not parked as list-downstream of that sender.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0x677a_1caf);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
@@ -177,7 +171,7 @@ fn relayed_topology_from_unqualified_far_publisher_is_ignored() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 197, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     let result = graph.merge_topology(0x108a_ef6c, &header, &[neighbor], false, 2_000, 0);
     assert!(matches!(
         result,
@@ -194,10 +188,6 @@ fn relayed_topology_from_unqualified_far_publisher_is_ignored() {
 #[test]
 fn activity_alone_never_creates_a_node() {
     use mesh_routing::DEVICE_ROLE_CLIENT;
-
-    // Hearing a frame from a far node tells us it is alive, not that we know a link to it. An
-    // edgeless node used to be created here and removed by the next maintenance pass, which took
-    // every peer's published edge to that node with it.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.set_device_role(DEVICE_ROLE_CLIENT);
@@ -226,16 +216,13 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 197, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     graph.merge_topology(0x108a_ef6c, &header, &[neighbor], false, 2_000, 0);
 
     let mut log = SrLog::new();
     graph.emit_topology_log(0x677a_1caf, &mut log);
     let mut events = heapless::Vec::<SrLogEvent, { mesh_routing::MAX_SR_LOG }>::new();
     log.take(&mut events);
-
-    // Unqualified far list is not ingested: only us + placeholder stay in the graph, and no
-    // list-downstream rows are created from that publisher.
     assert!(events.iter().any(|event| matches!(
         event,
         SrLogEvent::NetworkTopologyHeader {
@@ -249,8 +236,6 @@ fn topology_log_header_includes_graph_and_downstream_counts() {
 
 #[test]
 fn emit_topology_log_lists_mirrored_l2_not_list_downstream() {
-    // Horizon depth≥2: an L1 listing a hearsUs peer promotes that peer into the ball as L2
-    // (mirrored), not as list-downstream of the L1.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.observe_direct_neighbor(0xBB, -70, 8, 100, 0);
@@ -265,7 +250,7 @@ fn emit_topology_log_lists_mirrored_l2_not_list_downstream() {
     };
     let mut packed = [0u8; 16];
     write_packed_header(&mut packed, 1, true);
-    let (header, _) = decode_packed_neighbors(&packed, 8).unwrap();
+    let (header, _) = decode_packed_neighbors(&packed[..5], 8).unwrap();
     graph.merge_topology(0xBB, &header, &[neighbor], true, 200, 0);
     assert!(graph.has_graph_node(0xCC));
     assert!(graph.get_downstream_relay(0xCC, 200).is_none());
@@ -292,7 +277,6 @@ fn emit_topology_log_lists_mirrored_l2_not_list_downstream() {
             ..
         }
     )));
-    // Us + the direct peer are L1; listed hearsUs peer is L2 in the ball.
     assert!(events.iter().any(|event| matches!(
         event,
         SrLogEvent::NetworkTopologyHeader {
@@ -335,7 +319,6 @@ fn topology_log_omits_self_as_neighbor() {
 
 #[test]
 fn direct_neighbor_count_counts_what_we_publish() {
-    // Our neighbour set is what we measured a link to, not who holds an edge back to us.
     let mut graph = NeighborGraph::new();
     graph.set_my_node(0xAA);
     graph.edges_mut().update_edge(

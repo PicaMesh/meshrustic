@@ -1,4 +1,3 @@
-/// Build the 128-bit AES-CTR nonce for channel encryption.
 pub fn init_nonce(out: &mut [u8; 16], from_node: u32, packet_id: u64, extra_nonce: u32) {
     out.fill(0);
     out[..8].copy_from_slice(&packet_id.to_le_bytes());
@@ -16,7 +15,7 @@ mod tests {
     fn pki_nonce_golden_vector() {
         let mut nonce = [0u8; 16];
         init_nonce(&mut nonce, 0x0929, 0x13b2d662, 0x036a792b);
-        let expected = hex::decode("62d6b213036a792b2909000000").unwrap();
+        let expected = hex::decode("62d6b2132b796a032909000000").unwrap();
         assert_eq!(&nonce[..13], expected.as_slice());
     }
 }

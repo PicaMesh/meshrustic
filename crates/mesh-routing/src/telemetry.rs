@@ -1,41 +1,29 @@
-//! TELEMETRY_APP (port 67) wire encode for periodic device metrics broadcasts.
-
 use mesh_crypto::{encrypt_packet, CryptoKey};
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 
 use crate::pool::MAX_PACKET_PAYLOAD;
 use crate::router::MAX_WIRE_LEN;
-use crate::topology::{
-    encode_data_payload_opts, DataBitfield, DataEncodeOpts,
-};
+use crate::topology::{encode_data_payload_opts, DataBitfield, DataEncodeOpts};
 
 pub const TELEMETRY_APP: u32 = 67;
-/// Default `ModuleConfig.TelemetryConfig.device_update_interval` when unset / zero (seconds).
 pub const DEFAULT_DEVICE_UPDATE_INTERVAL_SECS: u32 = 1_200;
-/// Default periodic device telemetry broadcast interval (20 min).
 pub const DEVICE_TELEMETRY_BROADCAST_MS: u32 = DEFAULT_DEVICE_UPDATE_INTERVAL_SECS * 1_000;
-/// Wire value when USB-powered (no battery percent).
 pub const MAGIC_USB_BATTERY_LEVEL: u32 = 101;
-/// Plausible single-cell LiPo range and SAADC saturation threshold.
 pub const MIN_BATTERY_MV: u32 = 2500;
 pub const MAX_BATTERY_MV: u32 = 4350;
 pub const ADC_SATURATED_RAW: u32 = 3950;
 
-/// Effective broadcast interval in ms: 0 / unset → default.
 pub fn device_telemetry_interval_ms(stored_secs: u32) -> u32 {
     let secs = if stored_secs == 0 {
         DEFAULT_DEVICE_UPDATE_INTERVAL_SECS
     } else {
         stored_secs
     };
-    secs.saturating_mul(1_000)
+    secs.saturating_mul(1_000).min(i32::MAX as u32)
 }
 
-/// Shortest accepted `device_update_interval` (seconds) for `radio`.
-///
-/// Derived so a single telemetry stream cannot alone fill the polite duty-cycle
-/// budget: `ceil(airtime_ms * 100 / polite_percent / 1000)`, using max-length
-/// packet airtime (conservative).
+/// The minimum interval prevents one telemetry stream from consuming the entire polite duty-cycle
+/// budget.
 pub fn min_device_update_interval_secs(radio: &mesh_radio::RadioConfig) -> u32 {
     let airtime_ms = mesh_radio::packet_time_ms(radio, 255, false).max(1);
     let polite_pct = (u32::from(radio.region.duty_cycle_percent) * 50 / 100).max(1);
@@ -43,13 +31,8 @@ pub fn min_device_update_interval_secs(radio: &mesh_radio::RadioConfig) -> u32 {
     interval_ms.div_ceil(1_000).max(1)
 }
 
-/// Fields advertised in `Telemetry.device_metrics` (port 67).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DeviceMetricsSnapshot {
-    /// `None` while the pack reading is unknown. Both battery fields then stay off the
-    /// wire (they have explicit presence in `DeviceMetrics`), so clients render "no
-    /// battery info" rather than a fabricated 0% or a stale PWR. The rest of the
-    /// metrics still go out.
     pub battery_level: Option<u32>,
     pub voltage_v: Option<f32>,
     pub channel_utilization: f32,
@@ -58,7 +41,6 @@ pub struct DeviceMetricsSnapshot {
 }
 
 impl DeviceMetricsSnapshot {
-    /// No readings yet (const form of `Default`).
     pub const EMPTY: Self = Self {
         battery_level: None,
         voltage_v: None,
@@ -68,11 +50,11 @@ impl DeviceMetricsSnapshot {
     };
 }
 
-/// Encode `Telemetry { device_metrics { ... } }` (time=0 when RTC unset).
 pub fn encode_device_telemetry(
     metrics: &DeviceMetricsSnapshot,
     out: &mut heapless::Vec<u8, 128>,
 ) -> bool {
+    out.clear();
     let mut device_metrics = heapless::Vec::<u8, 64>::new();
     if let Some(level) = metrics.battery_level {
         push_varint_field(&mut device_metrics, 1, level);
@@ -92,7 +74,6 @@ pub fn encode_device_telemetry(
     out.extend_from_slice(&device_metrics).is_ok()
 }
 
-/// Broadcast device telemetry to `NODENUM_BROADCAST`.
 pub fn build_device_telemetry_wire_frame(
     node_num: u32,
     packet_id: u32,
@@ -114,7 +95,7 @@ pub fn build_device_telemetry_wire_frame(
             ..Default::default()
         },
     );
-    if plaintext.len() > MAX_PACKET_PAYLOAD {
+    if plaintext.is_empty() || plaintext.len() > MAX_PACKET_PAYLOAD {
         return None;
     }
     let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
@@ -145,7 +126,6 @@ pub fn build_device_telemetry_wire_frame(
     Some((len as u8, bytes))
 }
 
-/// LiPo percent from voltage (single cell, same OCV endpoints as common mesh nodes).
 pub fn battery_level_from_mv(voltage_mv: u32) -> u32 {
     const EMPTY_MV: u32 = 3100;
     const FULL_MV: u32 = 4190;
@@ -158,12 +138,10 @@ pub fn battery_level_from_mv(voltage_mv: u32) -> u32 {
     }
 }
 
-/// Reject floating divider / ADC rail readings when no pack is connected.
 pub fn is_plausible_battery_reading(voltage_mv: u32, raw_adc: u32) -> bool {
     raw_adc < ADC_SATURATED_RAW && (MIN_BATTERY_MV..=MAX_BATTERY_MV).contains(&voltage_mv)
 }
 
-/// Map raw SAADC average to reported mV, level, and whether telemetry should run.
 pub fn interpret_battery_reading(
     voltage_mv: u32,
     raw_adc: u32,
@@ -187,7 +165,6 @@ pub struct DecodedDeviceMetrics {
     pub uptime_seconds: Option<u32>,
 }
 
-/// Decode `Telemetry.device_metrics` payload (for tests and RX logging).
 pub fn decode_device_metrics(payload: &[u8]) -> Option<DecodedDeviceMetrics> {
     let mut out = DecodedDeviceMetrics::default();
     let mut i = 0usize;
@@ -195,6 +172,9 @@ pub fn decode_device_metrics(payload: &[u8]) -> Option<DecodedDeviceMetrics> {
         let (tag, tag_len) = read_varint(payload, i)?;
         i += tag_len;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = tag & 7;
         match (field, wire) {
             (1, 0) => {
@@ -222,63 +202,29 @@ pub fn decode_device_metrics(payload: &[u8]) -> Option<DecodedDeviceMetrics> {
                 i += n;
                 out.uptime_seconds = Some(val);
             }
-            (_, 0) => {
-                let (_, n) = read_varint(payload, i)?;
-                i += n;
+            _ => {
+                i = crate::protobuf::skip_field(payload, i, wire as u8)?;
             }
-            (_, 5) if i + 4 <= payload.len() => {
-                i += 4;
-            }
-            (_, 2) => {
-                let (len, n) = read_varint(payload, i)?;
-                i += n;
-                i += len as usize;
-            }
-            (_, 1) if i + 8 <= payload.len() => {
-                i += 8;
-            }
-            _ => return None,
         }
     }
     Some(out)
 }
 
-/// Skip `Telemetry.time` and return nested `device_metrics` bytes.
 pub fn extract_device_metrics(payload: &[u8]) -> Option<&[u8]> {
-    let mut i = 0usize;
+    let mut i = 0;
+    let mut metrics = None;
     while i < payload.len() {
-        let (tag, _) = read_varint(payload, i)?;
-        let field = tag >> 3;
-        let wire = tag & 7;
-        i += varint_len(tag);
-        match (field, wire) {
-            (1, 5) if i + 4 <= payload.len() => {
-                i += 4;
-            }
-            (2, 2) => {
-                let (len, n) = read_varint(payload, i)?;
-                i += n;
-                let end = i + len as usize;
-                if end <= payload.len() {
-                    return Some(&payload[i..end]);
-                }
-                return None;
-            }
-            (_, 0) => {
-                let (_, n) = read_varint(payload, i)?;
-                i += n;
-            }
-            (_, 5) if i + 4 <= payload.len() => {
-                i += 4;
-            }
-            (_, 2) => {
-                let (len, n) = read_varint(payload, i)?;
-                i += n + len as usize;
-            }
-            _ => return None,
+        let (tag, next) = crate::protobuf::read_varint(payload, i)?;
+        if tag >> 3 == 0 {
+            return None;
+        }
+        i = crate::protobuf::skip_field(payload, next, (tag & 7) as u8)?;
+        if tag == (2 << 3) | 2 {
+            let (len, start) = crate::protobuf::read_varint(payload, next)?;
+            metrics = Some(payload.get(start..start.checked_add(len as usize)?)?);
         }
     }
-    None
+    metrics
 }
 
 fn push_varint_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, value: u32) {
@@ -305,32 +251,9 @@ fn push_varint<const N: usize>(out: &mut heapless::Vec<u8, N>, mut v: u32) {
     }
 }
 
-fn read_varint(data: &[u8], mut i: usize) -> Option<(u32, usize)> {
-    let start = i;
-    let mut val = 0u32;
-    let mut shift = 0u32;
-    while i < data.len() {
-        let byte = data[i];
-        i += 1;
-        val |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Some((val, i - start));
-        }
-        shift += 7;
-        if shift > 28 {
-            return None;
-        }
-    }
-    None
-}
-
-fn varint_len(mut v: u32) -> usize {
-    let mut n = 1usize;
-    while v >= 0x80 {
-        v >>= 7;
-        n += 1;
-    }
-    n
+fn read_varint(data: &[u8], i: usize) -> Option<(u32, usize)> {
+    let (value, end) = crate::protobuf::read_varint(data, i)?;
+    Some((value, end - i))
 }
 
 #[cfg(test)]

@@ -1,5 +1,3 @@
-//! Phase 9 multi-radio graph metadata (heard_on / egress_radio).
-
 use mesh_routing::{NeighborGraph, Route};
 
 #[test]
@@ -39,6 +37,7 @@ fn merge_topology_downstream_stores_via_radio() {
         signal_routing_active: true,
         more_chunks: false,
         continuation: false,
+        chunk_index: 0,
     };
     let neighbor = PackedNeighbor {
         node_id: 0xEE00_00EE,

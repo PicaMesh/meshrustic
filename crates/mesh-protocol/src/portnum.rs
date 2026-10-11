@@ -1,4 +1,3 @@
-//! Mesh port numbers for rate-limit and QoS classification.
 pub mod num {
     pub const UNKNOWN_APP: u32 = 0;
     pub const TEXT_MESSAGE_APP: u32 = 1;
@@ -17,7 +16,6 @@ pub enum RateLimitBucket {
     Text,
     Routing,
     Other,
-    /// Undecodable: a channel we hold no key for, or a PKI packet for someone else.
     Unknown,
 }
 
@@ -29,14 +27,8 @@ pub enum QosTier {
     Critical,
 }
 
-/// Rate-limit bucket for inbound classification.
-///
-/// `None` = decode failed / no portnum (a channel we hold no key for, or a PKI packet for
-/// another node) → **UNKNOWN** bucket. A relay without the key cannot tell chat from
-/// telemetry; with the OTHER threshold a private group chatting normally flowed through
-/// key-holding relays and died at the first relay without the key, while the TEXT
-/// threshold would let encrypted admin and DM traffic for others run at chat rates. The
-/// UNKNOWN bucket sits between the two; key holders judge the same packets by their port.
+/// An opaque relay cannot distinguish chat from control traffic; a separate budget avoids punishing
+/// private chat or admitting control floods at chat rates.
 pub fn rate_limit_bucket(decoded_portnum: Option<u32>) -> RateLimitBucket {
     let Some(portnum) = decoded_portnum else {
         return RateLimitBucket::Unknown;
@@ -50,18 +42,14 @@ pub fn rate_limit_bucket(decoded_portnum: Option<u32>) -> RateLimitBucket {
     }
 }
 
-/// QoS relay tier for channel-congestion gating.
-///
-/// `None` or `Some(0)` → **LOW** (undecoded / unset portnum).
-/// `channel` is the packet channel hash/index from the LoRa header (`MeshPacket.channel`).
-pub fn qos_tier(decoded_portnum: Option<u32>, channel: u8) -> QosTier {
+pub fn qos_tier(decoded_portnum: Option<u32>, channel: u8, primary_channel: u8) -> QosTier {
     let Some(portnum) = decoded_portnum.filter(|&p| p != num::UNKNOWN_APP) else {
         return QosTier::Low;
     };
 
     match portnum {
         num::TEXT_MESSAGE_APP | num::TEXT_MESSAGE_COMPRESSED_APP => {
-            if channel == 0 {
+            if channel == primary_channel {
                 QosTier::Critical
             } else {
                 QosTier::Medium
@@ -103,25 +91,27 @@ mod tests {
             rate_limit_bucket(Some(num::TELEMETRY_APP)),
             RateLimitBucket::Other
         );
-        // A packet we could not decode gets its own bucket, not OTHER: a relay without the key
-        // cannot tell chat from telemetry, and judging it at the OTHER threshold killed a private
-        // group's chat at the first relay that lacked the key. Pinned as distinct from OTHER so
-        // collapsing the two fails here rather than in the field.
         assert_eq!(rate_limit_bucket(None), RateLimitBucket::Unknown);
-        assert_ne!(rate_limit_bucket(None), rate_limit_bucket(Some(num::TELEMETRY_APP)));
+        assert_ne!(
+            rate_limit_bucket(None),
+            rate_limit_bucket(Some(num::TELEMETRY_APP))
+        );
     }
 
     #[test]
     fn qos_tiers_golden() {
-        assert_eq!(qos_tier(None, 0), QosTier::Low);
-        assert_eq!(qos_tier(Some(num::TELEMETRY_APP), 0), QosTier::Low);
-        assert_eq!(qos_tier(Some(num::NODEINFO_APP), 0), QosTier::Low);
+        assert_eq!(qos_tier(None, 0, 0), QosTier::Low);
+        assert_eq!(qos_tier(Some(num::TELEMETRY_APP), 0, 0), QosTier::Low);
+        assert_eq!(qos_tier(Some(num::NODEINFO_APP), 0, 0), QosTier::Low);
 
-        assert_eq!(qos_tier(Some(num::TEXT_MESSAGE_APP), 0), QosTier::Critical);
-        assert_eq!(qos_tier(Some(num::TEXT_MESSAGE_APP), 1), QosTier::Medium);
-        assert_eq!(qos_tier(Some(num::ADMIN_APP), 0), QosTier::Critical);
-        assert_eq!(qos_tier(Some(num::ROUTING_APP), 0), QosTier::High);
-        assert_eq!(qos_tier(Some(num::SIGNAL_ROUTING_APP), 0), QosTier::High);
-        assert_eq!(qos_tier(Some(num::TRACEROUTE_APP), 0), QosTier::High);
+        assert_eq!(
+            qos_tier(Some(num::TEXT_MESSAGE_APP), 0, 0),
+            QosTier::Critical
+        );
+        assert_eq!(qos_tier(Some(num::TEXT_MESSAGE_APP), 1, 0), QosTier::Medium);
+        assert_eq!(qos_tier(Some(num::ADMIN_APP), 0, 0), QosTier::Critical);
+        assert_eq!(qos_tier(Some(num::ROUTING_APP), 0, 0), QosTier::High);
+        assert_eq!(qos_tier(Some(num::SIGNAL_ROUTING_APP), 0, 0), QosTier::High);
+        assert_eq!(qos_tier(Some(num::TRACEROUTE_APP), 0, 0), QosTier::High);
     }
 }

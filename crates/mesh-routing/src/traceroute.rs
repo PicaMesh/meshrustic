@@ -1,12 +1,10 @@
-//! TRACEROUTE_APP (port 70) — append node id + SNR on rebroadcast.
-
+use crate::protobuf::{read_varint, skip_field};
 use mesh_protocol::{ParsedPacket, NODENUM_BROADCAST};
 
 use crate::routing_ack::hops_away;
 
 pub const TRACEROUTE_APP: u32 = 70;
 pub const ROUTE_SIZE: usize = 8;
-/// Unknown hop SNR marker on the wire (Meshtastic-compatible).
 pub const SNR_UNKNOWN: i32 = i8::MIN as i32;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -23,6 +21,9 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
     while idx < data.len() {
         let (tag, mut i) = read_varint(data, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 5) if i + 4 <= data.len() => {
@@ -35,11 +36,10 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
             (1, 2) => {
                 let (len, ni) = read_varint(data, i)?;
                 i = parse_fixed32_packed(
-                    &data[ni..ni + len as usize],
+                    data.get(ni..ni.checked_add(len as usize)?)?,
                     &mut out.route,
-                    ni + len as usize,
-                )
-                .unwrap_or(ni + len as usize);
+                    ni.checked_add(len as usize)?,
+                )?;
             }
             (2, 0) => {
                 let (v, ni) = read_signed_varint(data, i)?;
@@ -49,11 +49,10 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
             (2, 2) => {
                 let (len, ni) = read_varint(data, i)?;
                 i = parse_int32_packed(
-                    &data[ni..ni + len as usize],
+                    data.get(ni..ni.checked_add(len as usize)?)?,
                     &mut out.snr_towards,
-                    ni + len as usize,
-                )
-                .unwrap_or(ni + len as usize);
+                    ni.checked_add(len as usize)?,
+                )?;
             }
             (3, 5) if i + 4 <= data.len() => {
                 push_u32(
@@ -65,11 +64,10 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
             (3, 2) => {
                 let (len, ni) = read_varint(data, i)?;
                 i = parse_fixed32_packed(
-                    &data[ni..ni + len as usize],
+                    data.get(ni..ni.checked_add(len as usize)?)?,
                     &mut out.route_back,
-                    ni + len as usize,
-                )
-                .unwrap_or(ni + len as usize);
+                    ni.checked_add(len as usize)?,
+                )?;
             }
             (4, 0) => {
                 let (v, ni) = read_signed_varint(data, i)?;
@@ -79,11 +77,10 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
             (4, 2) => {
                 let (len, ni) = read_varint(data, i)?;
                 i = parse_int32_packed(
-                    &data[ni..ni + len as usize],
+                    data.get(ni..ni.checked_add(len as usize)?)?,
                     &mut out.snr_back,
-                    ni + len as usize,
-                )
-                .unwrap_or(ni + len as usize);
+                    ni.checked_add(len as usize)?,
+                )?;
             }
             _ => {
                 i = skip_field(data, i, wire)?;
@@ -96,6 +93,28 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
 
 pub fn encode_route_discovery(rd: &RouteDiscovery, out: &mut heapless::Vec<u8, 128>) -> bool {
     out.clear();
+    let snr_len = |snr: &i32| {
+        if *snr < 0 {
+            10
+        } else {
+            let mut value = *snr as u32;
+            let mut len = 1;
+            while value >= 128 {
+                value >>= 7;
+                len += 1;
+            }
+            len
+        }
+    };
+    let needed = 5 * (rd.route.len() + rd.route_back.len())
+        + rd.snr_towards
+            .iter()
+            .chain(rd.snr_back.iter())
+            .map(|snr| 1 + snr_len(snr))
+            .sum::<usize>();
+    if needed > out.capacity() {
+        return false;
+    }
     for &node in rd.route.iter() {
         push_fixed32_field(out, 1, node);
     }
@@ -111,7 +130,6 @@ pub fn encode_route_discovery(rd: &RouteDiscovery, out: &mut heapless::Vec<u8, 1
     true
 }
 
-/// Update RouteDiscovery before rebroadcast (wire-compatible traceroute hop append).
 pub fn alter_on_relay(
     rd: &mut RouteDiscovery,
     parsed: &ParsedPacket,
@@ -180,7 +198,6 @@ fn append_id_and_snr(
     }
 }
 
-/// Decrypt, append our hop, re-encrypt for relay.
 pub fn rebuild_relay_ciphertext(
     parsed: &ParsedPacket,
     decoded: &crate::topology::DecodedData,
@@ -221,20 +238,11 @@ pub fn rebuild_relay_ciphertext(
         rd.route_back.len()
     };
     let mut route_wire = heapless::Vec::<u8, 128>::new();
-    encode_route_discovery(&rd, &mut route_wire);
-    let plaintext = crate::topology::encode_data_payload_opts(
-        TRACEROUTE_APP,
-        &route_wire,
-        crate::topology::DataEncodeOpts {
-            want_response: decoded.want_response,
-            request_id: decoded.request_id,
-            reply_id: decoded.reply_id,
-            bitfield: crate::topology::DataBitfield::Origin(
-                data.has_bitfield.then_some(data.bitfield),
-            ),
-        },
-    );
-    if plaintext.len() > cipher.len() {
+    if !encode_route_discovery(&rd, &mut route_wire) {
+        return None;
+    }
+    let plaintext = replace_data_payload(&cipher[..cipher_len], &route_wire)?;
+    if plaintext.is_empty() || plaintext.len() > cipher.len() {
         return None;
     }
     let mut out = heapless::Vec::<u8, 240>::new();
@@ -247,6 +255,41 @@ pub fn rebuild_relay_ciphertext(
     );
     out.truncate(plaintext.len());
     Some((out, route_len.min(u8::MAX as usize) as u8))
+}
+
+// Relays must preserve addressing metadata and extensions they do not interpret.
+fn replace_data_payload(data: &[u8], payload: &[u8]) -> Option<heapless::Vec<u8, 240>> {
+    let mut out = heapless::Vec::new();
+    let mut i = 0;
+    let mut replaced = false;
+    while i < data.len() {
+        let start = i;
+        let (tag, next) = read_varint(data, i)?;
+        i = skip_field(data, next, (tag & 7) as u8)?;
+        if tag == (2 << 3) | 2 {
+            if replaced {
+                continue;
+            }
+            out.push(tag as u8).ok()?;
+            let mut length = payload.len() as u32;
+            loop {
+                out.push((length as u8 & 0x7f) | if length >= 128 { 0x80 } else { 0 })
+                    .ok()?;
+                length >>= 7;
+                if length == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(payload).ok()?;
+            replaced = true;
+        } else {
+            out.extend_from_slice(&data[start..i]).ok()?;
+        }
+    }
+    if !replaced || out.len() > crate::pool::MAX_PACKET_PAYLOAD {
+        return None;
+    }
+    Some(out)
 }
 
 fn push_u32(out: &mut heapless::Vec<u32, ROUTE_SIZE>, v: u32) -> Option<()> {
@@ -272,6 +315,9 @@ fn parse_fixed32_packed(
     out: &mut heapless::Vec<u32, ROUTE_SIZE>,
     end: usize,
 ) -> Option<usize> {
+    if !data.len().is_multiple_of(4) {
+        return None;
+    }
     let mut i = 0usize;
     while i + 4 <= data.len() {
         push_u32(
@@ -305,64 +351,20 @@ fn push_fixed32_field(out: &mut heapless::Vec<u8, 128>, field: u32, value: u32) 
 
 fn push_signed_varint_field(out: &mut heapless::Vec<u8, 128>, field: u32, v: i32) {
     let _ = out.push((field << 3) as u8);
-    push_varint_u32(out, v as u32);
-}
-
-fn push_varint_u32(out: &mut heapless::Vec<u8, 128>, mut v: u32) {
+    let mut value = v as i64 as u64;
     loop {
-        let mut byte = (v & 0x7F) as u8;
-        v >>= 7;
-        if v != 0 {
-            byte |= 0x80;
-        }
-        let _ = out.push(byte);
-        if v == 0 {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let _ = out.push(byte | if value != 0 { 0x80 } else { 0 });
+        if value == 0 {
             break;
         }
     }
 }
 
-fn read_varint(data: &[u8], mut idx: usize) -> Option<(u32, usize)> {
-    let mut result = 0u32;
-    let mut shift = 0u32;
-    for _ in 0..5 {
-        if idx >= data.len() {
-            return None;
-        }
-        let byte = data[idx];
-        idx += 1;
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, idx));
-        }
-        shift += 7;
-    }
-    None
-}
-
 fn read_signed_varint(data: &[u8], idx: usize) -> Option<(i32, usize)> {
-    let (uv, ni) = read_varint(data, idx)?;
+    let (uv, ni) = crate::protobuf::read_varint64(data, idx)?;
     Some((uv as i32, ni))
-}
-
-fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
-    match wire {
-        0 => {
-            let (_, i) = read_varint(data, idx)?;
-            Some(i)
-        }
-        2 => {
-            let (len, mut i) = read_varint(data, idx)?;
-            i += len as usize;
-            if i > data.len() {
-                None
-            } else {
-                Some(i)
-            }
-        }
-        1 | 5 => Some(idx + if wire == 1 { 8 } else { 4 }),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -383,7 +385,6 @@ mod tests {
     #[test]
     fn snr_only_when_packet_to_us() {
         let mut rd = RouteDiscovery::default();
-        // Direct unicast to us: append SNR only (no route id).
         let parsed =
             PacketHeader::from_fields(0xCC, 0xAA, 1, 0x77, 3, 3, false, false, 0, 0).parse();
         alter_on_relay(&mut rd, &parsed, true, 0xCC, 8, 0);
@@ -413,5 +414,45 @@ mod tests {
         encode_route_discovery(&rd, &mut wire);
         let decoded = decode_route_discovery(&wire).unwrap();
         assert_eq!(decoded, rd);
+    }
+
+    #[test]
+    fn signed_snr_roundtrips_and_oversized_trace_fails_atomically() {
+        let mut route = RouteDiscovery::default();
+        route.snr_towards.push(-128).unwrap();
+        let mut wire = heapless::Vec::new();
+        assert!(encode_route_discovery(&route, &mut wire));
+        assert_eq!(wire.len(), 11);
+        assert_eq!(decode_route_discovery(&wire), Some(route.clone()));
+        for _ in 1..ROUTE_SIZE {
+            route.snr_towards.push(-128).unwrap();
+        }
+        for _ in 0..ROUTE_SIZE {
+            route.snr_back.push(-128).unwrap();
+        }
+        assert!(!encode_route_discovery(&route, &mut wire));
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn malformed_packed_routes_are_rejected() {
+        for input in [
+            &[0x0a, 1, 0][..],
+            &[0x12, 1, 0x80][..],
+            &[0x0a, 0xff, 0xff, 0xff, 0xff, 0x0f][..],
+        ] {
+            assert!(decode_route_discovery(input).is_none());
+        }
+    }
+    #[test]
+    fn replacing_trace_preserves_all_other_envelope_fields() {
+        let original = [
+            8, 70, 18, 1, 0, 37, 1, 2, 3, 4, 48, 5, 72, 128, 2, 82, 2, 6, 7,
+        ];
+        let replacement = replace_data_payload(&original, &[10, 11]).unwrap();
+        assert_eq!(
+            replacement.as_slice(),
+            &[8, 70, 18, 2, 10, 11, 37, 1, 2, 3, 4, 48, 5, 72, 128, 2, 82, 2, 6, 7]
+        );
     }
 }

@@ -1,13 +1,8 @@
-//! Downstream routing table (remote node → relay neighbor).
-
 use mesh_radio::RadioId;
 
-/// Match the MT+SR fork (`NEIGHBOR_GRAPH_MAX_DOWNSTREAM`).
 pub const MAX_DOWNSTREAM: usize = 900;
-/// Walk dest → relay → … at most this many hops before treating the chain as a cycle.
 pub const MAX_DOWNSTREAM_CHAIN: usize = 16;
 
-/// First neighbour we can hear on a downstream walk from a destination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChainEgress {
     pub node: u32,
@@ -22,8 +17,6 @@ pub struct DownstreamEntry {
     pub via_radio: RadioId,
     pub cost_fixed: u16,
     pub last_update_ms: u32,
-    /// Set when the row came from a publisher's topology with `hearsUs` (or a
-    /// capacity demotion that kept that evidence). Relayed orphans stay false.
     pub list_learned: bool,
 }
 
@@ -93,7 +86,6 @@ impl DownstreamTable {
         best_relay.map(|relay| (relay, best_cost))
     }
 
-    /// Parent and last-hop cost when `destination` was parked from a topology list with `hearsUs`.
     pub fn list_downstream(
         &self,
         destination: u32,
@@ -118,8 +110,6 @@ impl DownstreamTable {
         best_relay.map(|relay| (relay, best_cost))
     }
 
-    /// Walk `destination` along `via` until `is_egress` is true. Dest need not be a neighbour of
-    /// its parent — a downstream row is enough. Returns none on a missing hop or a cycle.
     pub fn chain_egress(
         &self,
         destination: u32,
@@ -246,9 +236,7 @@ impl DownstreamTable {
             if self.entries[i].destination == destination && self.entries[i].relay == relay {
                 self.entries[i].cost_fixed = cost_fixed;
                 self.entries[i].last_update_ms = now_ms;
-                if via_radio != 0 {
-                    self.entries[i].via_radio = via_radio;
-                }
+                self.entries[i].via_radio = via_radio;
                 if list_learned {
                     self.entries[i].list_learned = true;
                 }
@@ -269,10 +257,10 @@ impl DownstreamTable {
             return;
         }
         let mut oldest_idx = 0usize;
-        let mut oldest = self.entries[0].last_update_ms;
+        let mut oldest = now_ms.wrapping_sub(self.entries[0].last_update_ms);
         for i in 1..self.count as usize {
-            if self.entries[i].last_update_ms < oldest {
-                oldest = self.entries[i].last_update_ms;
+            if now_ms.wrapping_sub(self.entries[i].last_update_ms) > oldest {
+                oldest = now_ms.wrapping_sub(self.entries[i].last_update_ms);
                 oldest_idx = i;
             }
         }
@@ -308,7 +296,6 @@ impl DownstreamTable {
         );
     }
 
-    /// Topology list with `hearsUs`: last hop is priced from the publisher, not a relayed guess.
     pub fn update_listed(
         &mut self,
         my_node: u32,
@@ -342,7 +329,13 @@ impl DownstreamTable {
         via_radio: RadioId,
         list_learned: bool,
     ) {
-        if destination == 0 || relay == 0 || destination == relay || destination == my_node {
+        if destination == 0
+            || relay == 0
+            || destination == relay
+            || destination == my_node
+            || !total_cost.is_finite()
+            || total_cost <= 0.0
+        {
             return;
         }
         if relay_has_direct_edge {
@@ -474,7 +467,10 @@ mod tests {
         table.update(0xAA, 0xDD, 0xBB, 2.0, 1_000, false, 0);
         assert!(table.list_downstream(0xDD, 1_500, 10_000).is_none());
         table.update_listed(0xAA, 0xDD, 0xCC, 3.0, 1_000, false, 0);
-        assert_eq!(table.list_downstream(0xDD, 1_500, 10_000), Some((0xCC, 300)));
+        assert_eq!(
+            table.list_downstream(0xDD, 1_500, 10_000),
+            Some((0xCC, 300))
+        );
         assert_eq!(table.get_relay(0xDD, 1_500, 10_000), Some(0xBB));
     }
 

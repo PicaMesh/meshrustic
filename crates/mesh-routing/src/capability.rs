@@ -1,5 +1,3 @@
-//! Peer SR capability cache (Legacy / Passive / SR-active / Unknown).
-
 use crate::nodeinfo::{
     DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_BASE, DEVICE_ROLE_CLIENT_HIDDEN,
     DEVICE_ROLE_CLIENT_MUTE, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER, DEVICE_ROLE_ROUTER_CLIENT,
@@ -9,7 +7,6 @@ use crate::nodeinfo::{
 use crate::sr_role::role_is_mute;
 
 pub const MAX_CAPABILITY_RECORDS: usize = 64;
-/// Three topology broadcast intervals plus a 20-second margin (2720 s).
 pub const CAPABILITY_TTL_MS: u32 = 3 * crate::neighbor_graph::TOPOLOGY_BROADCAST_MS + 20_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -22,7 +19,6 @@ pub enum CapabilityStatus {
 }
 
 impl CapabilityStatus {
-    /// MeshRustic or MT+SR, including mute/passive dests that still ACK.
     pub fn is_signal_routing(self) -> bool {
         matches!(self, Self::SrActive | Self::Passive)
     }
@@ -100,23 +96,34 @@ impl CapabilityCache {
         let legacy = capability_from_role(role);
         if let Some(rec) = self.find_mut(node_id) {
             rec.role = role;
-            rec.last_updated_ms = now_ms;
-            if legacy == CapabilityStatus::Legacy {
-                rec.status = CapabilityStatus::Legacy;
+            if !rec.status.is_signal_routing() {
+                rec.last_updated_ms = now_ms;
+                rec.status = legacy;
             }
             return;
         }
-        if (self.count as usize) >= MAX_CAPABILITY_RECORDS {
-            return;
-        }
-        let idx = self.count as usize;
+        let idx = if self.count as usize == MAX_CAPABILITY_RECORDS {
+            let victim = self
+                .records
+                .iter()
+                .enumerate()
+                .filter(|(_, rec)| !rec.status.is_signal_routing())
+                .max_by_key(|(_, rec)| now_ms.wrapping_sub(rec.last_updated_ms));
+            let Some((idx, _)) = victim else {
+                return;
+            };
+            idx
+        } else {
+            let idx = self.count as usize;
+            self.count += 1;
+            idx
+        };
         self.records[idx] = CapabilityRecord {
             node_id,
             status: legacy,
             role,
             last_updated_ms: now_ms,
         };
-        self.count += 1;
     }
 
     pub fn track_topology(&mut self, node_id: u32, signal_routing_active: bool, now_ms: u32) {
@@ -130,26 +137,33 @@ impl CapabilityCache {
         };
         if let Some(rec) = self.find_mut(node_id) {
             rec.last_updated_ms = now_ms;
-            if status == CapabilityStatus::SrActive || status == CapabilityStatus::Passive {
-                rec.status = status;
-            }
+            rec.status = status;
             return;
         }
-        if (self.count as usize) >= MAX_CAPABILITY_RECORDS {
-            return;
-        }
-        let idx = self.count as usize;
+        let idx = if self.count as usize == MAX_CAPABILITY_RECORDS {
+            let victim = self
+                .records
+                .iter()
+                .enumerate()
+                .filter(|(_, rec)| !rec.status.is_signal_routing())
+                .max_by_key(|(_, rec)| now_ms.wrapping_sub(rec.last_updated_ms));
+            let Some((idx, _)) = victim else {
+                return;
+            };
+            idx
+        } else {
+            let idx = self.count as usize;
+            self.count += 1;
+            idx
+        };
         self.records[idx] = CapabilityRecord {
             node_id,
             status,
             role: 0,
             last_updated_ms: now_ms,
         };
-        self.count += 1;
     }
 
-    /// Remove stale records. Returns neighbor ids whose SR/passive capability expired;
-    /// the graph should clear `hears_us` on those edges.
     pub fn prune(&mut self, now_ms: u32, my_node: u32) -> ([u32; MAX_CAPABILITY_RECORDS], u8) {
         let mut clear_hears_us = [0u32; MAX_CAPABILITY_RECORDS];
         let mut clear_hears_us_count = 0u8;
@@ -181,26 +195,7 @@ impl CapabilityCache {
         (clear_hears_us, clear_hears_us_count)
     }
 
-    /// A stock ROUTER that is not SR-active: it relays immediately and draws from the router
-    /// window.
-    ///
-    /// Does this node publish its own neighbour list?
-    ///
-    /// The one distinction that decides whether a role may be compensated for. Every SignalRouting
-    /// node broadcasts its direct neighbours — active and passive alike — so for those we read what
-    /// they published and their role tells us nothing extra. A stock node broadcasts nothing, so
-    /// its role is the only thing there is.
-    ///
-    /// `Unknown` counts as "publishes nothing", and that is not a gap in the reasoning: a stock
-    /// ROUTER is never marked `Legacy`, because the only paths into that state are a mute role and
-    /// our own node. Treating `Unknown` as a publisher would mean never recognising a stock router
-    /// at all.
-    ///
-    /// Excluding `Passive` is defensive rather than corrective. A SignalRouting node carrying a
-    /// router role is active by construction — the role is in the active class, and a node
-    /// advertises its active flag from that — so `Passive` alongside a router role should not
-    /// arise. It is excluded because the rule is "does it publish", and answering that by listing
-    /// the one status that happens to occur would leave the next reader to rediscover why.
+    /// A node that publishes nothing cannot prove coverage through an omitted topology list.
     pub fn publishes_topology(&self, node_id: u32) -> bool {
         matches!(
             self.status(node_id),
@@ -208,30 +203,7 @@ impl CapabilityCache {
         )
     }
 
-    /// A **stock** node, and a ROUTER.
-    ///
-    /// Role only ever compensates for what a node cannot tell us. A SignalRouting node publishes
-    /// its neighbours whether it is active or passive, so its role adds nothing its own list does
-    /// not already say, and reading a role instead of the list would substitute a guess for a
-    /// measurement. A stock node publishes nothing, so its role is all there is, and compensating
-    /// for it is the only way to place it at all. So the gate is "publishes nothing", which is
-    /// SR-active and passive excluded — not merely SR-active. A passive SignalRouting node still
-    /// broadcasts its direct neighbours, so its role must not be compensated for either.
-    ///
-    /// An unclassified node is left in: a stock ROUTER is only marked legacy once something else
-    /// establishes it, and until then it is `Unknown`, so requiring `Legacy` here would quietly
-    /// stop reserving for the very node the window exists for.
-    ///
-    /// ROUTER, REPEATER and ROUTER_CLIENT. ROUTER_CLIENT and REPEATER are deprecated as
-    /// *configuration* choices — 2.3.15 and 2.7.11 — but not withdrawn from the wire, and stock
-    /// still gives both the high-priority rebroadcast that relays even after hearing somebody
-    /// else's copy. Nodes carrying them are deployed today. Dropping them here would stop us
-    /// absorbing the coverage of a node that is going to transmit regardless, and we would add a
-    /// duplicate beside it. Deprecation governs what an operator should configure next; it does
-    /// not change what a node already on air does.
-    ///
-    /// A SignalRouting ROUTER is excluded, deliberately: it coordinates with us, so it is ranked
-    /// like any peer rather than reserved for.
+    /// A publisher’s measured list is stronger evidence than its advertised role.
     pub fn is_immediate_relay_router(&self, node_id: u32) -> bool {
         if self.publishes_topology(node_id) {
             return false;
@@ -242,18 +214,6 @@ impl CapabilityCache {
         )
     }
 
-    /// Will this node rebroadcast regardless and *not* stand down on hearing our copy?
-    ///
-    /// A separate question from whether it relays early, and from whether it is a relay router at
-    /// all: stock refuses to cancel a duplicate for ROUTER and ROUTER_LATE, so relaying behind one
-    /// of those adds a frame rather than replacing one. Added as its own name rather than by
-    /// narrowing the relay-router test, which also answers candidate admission and the owner
-    /// elections and must not move.
-    ///
-    /// CLIENT_BASE is deliberately absent. Stock also refuses to cancel there, but only for
-    /// traffic involving a favourited node, and a favourite list is local configuration that never
-    /// reaches the wire — no peer can evaluate it. The occasional duplicate alongside one is
-    /// accepted.
     pub fn will_not_cancel_for_us(&self, node_id: u32) -> bool {
         if self.status(node_id) == CapabilityStatus::SrActive {
             return false;
@@ -319,9 +279,6 @@ pub fn capability_from_role(role: u32) -> CapabilityStatus {
     }
 }
 
-/// Roles that broadcast SR topology. Every role does except LOST_AND_FOUND (and unknown
-/// roles): CLIENT_MUTE, TRACKER, SENSOR, TAK, TAK_TRACKER and CLIENT_HIDDEN announce their
-/// direct neighbours as SR-passive even though they never relay.
 pub fn role_may_send_topology(role: u32) -> bool {
     matches!(
         role,
@@ -371,8 +328,6 @@ mod tests {
 
     #[test]
     fn a_passive_publisher_is_not_reserved_for_either() {
-        // Role compensates only for nodes that publish nothing. A passive SR node still broadcasts
-        // its neighbours, so its ROUTER role must not earn a reserved window position.
         let mut cache = CapabilityCache::new();
         cache.track_role(0xBB, DEVICE_ROLE_ROUTER, 0);
         cache.track_topology(0xBB, false, 100);
@@ -418,5 +373,28 @@ mod tests {
         assert_eq!(cache.record_count(), MAX_CAPABILITY_RECORDS as u8);
         cache.track_topology(MAX_CAPABILITY_RECORDS as u32 + 1, true, 0);
         assert_eq!(cache.record_count(), MAX_CAPABILITY_RECORDS as u8);
+    }
+
+    #[test]
+    fn nodeinfo_does_not_refresh_or_downgrade_topology_evidence() {
+        let mut cache = CapabilityCache::new();
+        cache.track_topology(2, true, 10);
+        cache.track_role(2, DEVICE_ROLE_CLIENT, 20);
+        assert_eq!(cache.status_at(2, 1, 21), CapabilityStatus::SrActive);
+        assert_eq!(
+            cache.status_at(2, 1, 11 + CAPABILITY_TTL_MS),
+            CapabilityStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn full_cache_admits_topology_by_replacing_non_sr_evidence() {
+        let mut cache = CapabilityCache::new();
+        for id in 1..=MAX_CAPABILITY_RECORDS as u32 {
+            cache.track_role(id, DEVICE_ROLE_CLIENT, id);
+        }
+        cache.track_topology(1000, true, 100);
+        assert_eq!(cache.status(1000), CapabilityStatus::SrActive);
+        assert_eq!(cache.count as usize, MAX_CAPABILITY_RECORDS);
     }
 }

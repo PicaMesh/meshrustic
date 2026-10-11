@@ -1,5 +1,3 @@
-//! Phased broadcast relay slot scheduling (stock early slots → SR ranked → downstream).
-
 use crate::capability::{CapabilityCache, CapabilityStatus};
 use crate::graph::{
     coverage_owner, covers, delivery_hop_cost_fixed, is_placeholder_node, is_silent_publisher,
@@ -18,11 +16,7 @@ pub struct RelayCandidate {
     pub coverage_count: u8,
     pub avg_cost_fixed: u16,
     pub tier: u8,
-    /// Ranks above coverage count and cost: a configured ROUTER with unique coverage
-    /// is preferred over a non-ROUTER that reaches more neighbours. See [`role_rank`].
     pub role_rank: u8,
-    /// One neighbour this candidate covers that the transmitter did not reach: the reason the
-    /// relay is worth its airtime, named in the log rather than left to be guessed at.
     pub coverage_for: u32,
 }
 
@@ -32,62 +26,33 @@ pub struct BroadcastRelayPlan {
     pub slot_delay_ms: u32,
     pub slot_index: u8,
     pub candidate_count: u8,
-    /// Slot holders in slot order (first `ranked_len` entries), for the log: lets two nodes'
-    /// views of the same packet be compared side by side.
     pub ranked: [u32; RANKED_LOG],
     pub ranked_len: u8,
     pub reason: RelayReason,
-    /// Ranking inputs of the first candidates evaluated: (node, unique coverage, total coverage,
-    /// cost bucket). Lets two nodes' views of the same packet be compared when their orders
-    /// disagree: unique < total shows how much pre-coverage took away.
     pub evaluated: [(u32, u8, u8, u16); RANKED_LOG],
     pub evaluated_len: u8,
-    /// Nodes counted as already covered before ranking (source, heard-from and its good links).
     pub pre_covered: u8,
-    /// Our own neighbours this transmission did *not* cover, first `uncovered_len` valid. This is
-    /// exactly what earns us a slot and what T1 insures, so two nodes that disagree about a
-    /// packet can be compared by name rather than by the `pre_covered` count alone.
     pub uncovered: [u32; UNCOVERED_LOG],
     pub uncovered_len: u8,
-    /// Transmissions we expect ahead of ours: stock relay routers that have not transmitted
-    /// this packet yet, plus SR peers ranked into earlier slots. Zero means nothing is expected,
-    /// so there is nothing for a late copy to stand in for. Ranked peers are not assumed to
-    /// have covered anything until a copy is heard.
     pub slots_given: u8,
-    /// How many of `slots_given` are reserved positions held by stock relay routers rather than
-    /// rungs held by ranked SR peers. The two are different reasons to stay quiet — one expects a
-    /// node we do not coordinate with, the other a node we do — and a log that merges them cannot
-    /// say which. Needed to check that removing the reservation does not silently drop the
-    /// insurance arm it used to earn.
+    /// Captures need to distinguish reserved, uncoordinated routers from peers with deterministic relay
+    /// slots.
     pub reserved_slots: u8,
-    /// How many of the leading `ranked` entries came from the reservation pre-pass rather than
-    /// the ranking loop. Not the same as `reserved_slots`: a router that already transmitted this
-    /// packet is still listed, and still consumed the accumulator, but is no longer a
-    /// transmission we are waiting for. Lets the order line say which entries are reservations.
     pub reserved_ranked: u8,
-    /// Who already transmitted this packet by ranking time, and how many nodes each newly
-    /// covered: `(relay, credit)`. Planned later slots do not absorb; a heard copy does.
     pub absorbed: [(u32, u8); RANKED_LOG],
     pub absorbed_len: u8,
-    /// A neighbour our relay reaches that the transmitter did not (0 when the relay was taken
-    /// for another reason: sole candidate or downstream).
     pub coverage_for: u32,
-    /// Last hop: we are the dest-ACK-timed backup, not the early slot.
     pub last_hop_backup: bool,
-    /// Non-final last ranked slot: this copy goes out with `next_hop` cleared.
     pub nonfinal_flood: bool,
-    /// Ranking assigned a later flood slot, so named forwards do not arm their own insurance.
     pub has_nonfinal_flood_slot: bool,
 }
 
-/// Ranking inputs collected during the first pick, for the log.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EvaluatedList {
     pub items: [(u32, u8, u8, u16); RANKED_LOG],
     pub len: u8,
 }
 
-/// Record one candidate's ranking inputs for the log (first RANKED_LOG only).
 pub fn push_evaluated(
     out: &mut [(u32, u8, u8, u16); RANKED_LOG],
     len: &mut u8,
@@ -102,29 +67,19 @@ pub fn push_evaluated(
     }
 }
 
-/// How many slot holders the plan records for logging.
 pub const RANKED_LOG: usize = 4;
-/// Uncovered neighbours named in the log line. Six, not three: with a shorter list each node
-/// prints a *prefix* of its own edge order, so two nodes comparing a packet cannot tell a real
-/// disagreement from two different truncations of the same set — which cost a wrong lead on
-/// 2026-09-09. Six covers the whole neighbourhood this fits in one line.
 pub const UNCOVERED_LOG: usize = 6;
 
-/// Why the plan decided we relay (for the log; `None` when we defer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RelayReason {
     #[default]
     None,
-    /// We won a slot in the coverage ranking.
     Ranked,
-    /// We are the known downstream relay for the source or destination.
     Downstream,
-    /// Sparse mesh: we were the only candidate.
     Sparse,
-    /// Unicast: we hold a slot in the cost-to-destination ranking.
     UnicastCost,
-    /// Nobody had coverage to offer for a message its originator is waiting on, so we answer it:
-    /// stock turns a heard rebroadcast into its delivery confirmation and otherwise retransmits.
+    /// An originator awaiting delivery confirmation may retry unless it hears a rebroadcast, even when
+    /// no onward coverage remains.
     Acknowledgement,
 }
 
@@ -211,12 +166,10 @@ impl CoveredSet {
 
 pub struct BroadcastRelayContext<'a> {
     pub my_node: u32,
-    /// Our role rebroadcasts: needed to decide whether we may own an unconfirmed neighbour.
     pub my_node_relays: bool,
     pub edges: &'a EdgeStore,
     pub capability: &'a CapabilityCache,
     pub downstream: &'a DownstreamTable,
-    /// A node whose traffic the limiter is dropping is not a coverage target.
     pub dropped_coverage: YoungCoverageGate,
 }
 
@@ -238,19 +191,12 @@ fn get_coverage_if_relays(
         if target == 0 || is_placeholder_node(target) {
             continue;
         }
-        // A candidate's coverage set is what it published, and for ourselves what we publish.
-        // Mirrored edges are invisible to peers; counting them made colocated nodes disagree on
-        // slot order. An edge we invented from a relayed frame is invisible to everyone,
-        // including the candidate it is attributed to, so it belongs in nobody's set.
         if relay == my_node && edge.source != EdgeSource::Reported {
             continue;
         }
         if !edge.source.is_measured() {
             continue;
         }
-        // A neighbour nobody can be shown to reach is still worth one relay, but only from its
-        // owner: counting it everywhere made every node on the branch relay every frame for the
-        // same unconfirmed node (an Alert node that publishes nothing, 2026-09-07).
         if !admits_coverage(ctx, relay, target, now_ms) {
             continue;
         }
@@ -262,15 +208,6 @@ fn get_coverage_if_relays(
     count
 }
 
-/// Credit a relay we expect to transmit with everything it carries — by exactly the rule that
-/// admitted it in [`get_coverage_if_relays`]. Crediting only `covers` while admission also
-/// accepted ownership left an owned neighbour uncovered after its owner took a slot, so a later
-/// phase relayed for it a second time.
-/// Credit `relay` with everything it carries, and report how many nodes that newly covered.
-///
-/// The count is what makes absorption visible: it is the reason a later candidate finds nothing
-/// unique and stays quiet, and until now it was computed at three call sites and logged at none —
-/// so a capture could not say whether a reservation actually earned its suppression.
 fn absorb_relay_coverage(
     ctx: &BroadcastRelayContext<'_>,
     covered: &mut CoveredSet,
@@ -294,18 +231,10 @@ fn absorb_relay_coverage(
     covered.count.saturating_sub(before)
 }
 
-/// Does `relay` carry `target` if it transmits: it can be shown to deliver, or `target` is a
-/// neighbour nobody can be shown to reach and `relay` is the one node that owns it.
 fn admits_coverage(ctx: &BroadcastRelayContext<'_>, relay: u32, target: u32, now_ms: u32) -> bool {
-    // A publisher that has gone quiet is nobody's target, however good the link a peer published
-    // to it: our own link to it is already retracted, and crediting peers with reaching it hands
-    // them a slot they will decline.
     if is_silent_publisher(ctx.edges, Some(ctx.capability), target, now_ms) {
         return false;
     }
-    // Traffic the limiter is dropping is nobody's to carry: electing an owner for a young
-    // node while the shared young bucket is limiting holds a relay for a node nobody will
-    // relay for.
     if ctx.dropped_coverage.blocks(target) {
         return false;
     }
@@ -319,7 +248,6 @@ fn admits_coverage(ctx: &BroadcastRelayContext<'_>, relay: u32, target: u32, now
         ) == relay
 }
 
-/// Outcome of the acknowledgement pass: who answers, in what order, and whether we are one.
 struct AcknowledgementPlan {
     should_relay: bool,
     my_delay: u32,
@@ -328,18 +256,8 @@ struct AcknowledgementPlan {
     ranked_len: u8,
 }
 
-/// Answer a message its originator is waiting on, when the coverage ranking had nothing to offer.
-///
-/// Ordered by how well *the source* hears each candidate, best first — the opposite of stock's
-/// reverse-ETX flood order, which puts the worst-heard node first because it is optimising
-/// propagation. Here the purpose is that the originator hears the answer, so a copy it cannot hear
-/// achieves nothing.
-///
-/// The candidate set is the intersection of two conditions, and both are needed. We must be able to
-/// hear the candidate, or its copy cannot cancel our own rung and every candidate transmits. And
-/// there must be positive evidence that the source hears it, or the answer does not arrive. Two
-/// nodes with disjoint neighbourhoods may therefore each answer; that is bounded, and still far
-/// fewer copies than every node that heard the frame.
+/// Acknowledgement ranking needs the return direction: a relay the originator cannot hear does not stop
+/// retries.
 fn plan_acknowledgement(
     ctx: &BroadcastRelayContext<'_>,
     packet_id: u32,
@@ -353,10 +271,7 @@ fn plan_acknowledgement(
     }
     let my_edges = ctx.edges.find_node(ctx.my_node)?;
 
-    // Stand down for a neighbour that will rebroadcast regardless and will not cancel for us: its
-    // copy is the acknowledgement and ours would only add to it. A stock CLIENT is not such a
-    // node — it floods later than our rung and cancels on hearing us, so answering first removes
-    // its copy rather than adding to ours.
+    // An unconditional relayer already supplies the acknowledgement; our copy would only duplicate it.
     for i in 0..my_edges.edge_count as usize {
         let neighbor = my_edges.edges[i].to;
         if neighbor == 0 || neighbor == source {
@@ -370,7 +285,6 @@ fn plan_acknowledgement(
         }
     }
 
-    // Rank the candidates we can hear that the source can be shown to hear, ourselves included.
     let mut entries = [(0u32, 0u16); MAX_CANDIDATES];
     let mut count = 0usize;
     let consider = |node: u32, entries: &mut [(u32, u16); MAX_CANDIDATES], count: &mut usize| {
@@ -397,8 +311,6 @@ fn plan_acknowledgement(
         return None;
     }
 
-    // Bucketed price first, then the ladder's own tie-break so the work rotates across packets
-    // rather than always falling to the same node.
     let prefer_high = (packet_id & 1) != 0;
     let bucket = |cost: u16| cost / crate::unicast_relay::COST_BUCKET_FIXED;
     let better = |a: (u32, u16), b: (u32, u16)| {
@@ -438,7 +350,6 @@ fn plan_acknowledgement(
             plan.my_delay = delay;
             break;
         }
-        // A rung ahead of ours we are waiting on, so T1 insures the answer if it never comes.
         plan.slots_given = plan.slots_given.saturating_add(1);
         delay = delay.saturating_add(half);
     }
@@ -455,33 +366,12 @@ fn push_absorbed(list: &mut [(u32, u8); RANKED_LOG], len: &mut u8, relay: u32, c
     }
 }
 
-/// Ranking weight a candidate's own role earns it, above coverage count and cost.
-///
-/// ROUTER only, and only one step. Its operator has said this node is sited and powered to carry
-/// other people's traffic, which is a statement about the node that a link cost or a larger
-/// unique set cannot express: two candidates that both have leftover unique coverage are not
-/// equally good if one of them exists for the purpose. Timing is gated separately by
-/// [`may_take_early_window`]: only an SR ROUTER may sit inside the early window; other SR-active
-/// roles take late rungs even when they uniquely reach more neighbours.
-///
-/// ROUTER_LATE is excluded deliberately rather than overlooked: its whole meaning is to relay after
-/// everyone else, so promoting it would invert the role it was chosen for. The deprecated router
-/// roles are excluded for the reason given on `CapabilityCache::is_immediate_relay_router` — on a
-/// SignalRouting node a role buys nothing, because its published list already says what it reaches,
-/// and only a stock node's role is compensated for. Stock nodes do not reach this ranking at all;
-/// the reservation pre-pass removes them from the candidate set first.
-///
-/// A ROUTER with nothing unique to reach still takes nothing: the zero-coverage drop happens
-/// before any of this is consulted.
+/// The ROUTER role expresses an operator preference that link cost cannot capture. Promoting ROUTER_LATE
+/// would defeat its deliberate late-relay policy.
 fn role_rank(ctx: &BroadcastRelayContext<'_>, candidate: u32) -> u8 {
     u8::from(may_take_early_window(ctx, candidate))
 }
 
-/// Whether this SR candidate may take a position inside the stock-router early window.
-///
-/// Only `DEVICE_ROLE_ROUTER`. CLIENT, CLIENT_BASE, ROUTER_LATE, and every other SR-active role wait
-/// past stock reservations and SR ROUTER early slots (`PositionAllocator::take_late_rung`). Stock
-/// ROUTER/REPEATER/ROUTER_CLIENT never reach this test — they are reserved in the pre-pass.
 fn may_take_early_window(ctx: &BroadcastRelayContext<'_>, candidate: u32) -> bool {
     ctx.capability.role(candidate) == Some(crate::nodeinfo::DEVICE_ROLE_ROUTER)
 }
@@ -527,7 +417,6 @@ where
                 0,
             );
         }
-        // Sparse sole-candidate and stock-trailing slots are handled after ranking.
         if unique_count == 0 {
             continue;
         }
@@ -535,30 +424,23 @@ where
         let mut total_cost = 0f32;
         let mut valid_costs = 0u8;
         for &target in &unique[..unique_count as usize] {
-            if let Some(fixed) =
-                delivery_hop_cost_fixed(
-                    ctx.edges,
-                    Some(ctx.capability),
-                    candidate,
-                    target,
-                    now_ms,
-                    ctx.my_node,
-                )
-            {
+            if let Some(fixed) = delivery_hop_cost_fixed(
+                ctx.edges,
+                Some(ctx.capability),
+                candidate,
+                target,
+                now_ms,
+                ctx.my_node,
+            ) {
                 total_cost += fixed as f32 / 100.0;
                 valid_costs += 1;
             }
         }
-        // Admission guarantees a price: `covers` needs an edge in one direction or the other,
-        // ownership needs the candidate's own edge, and neither admits a target `can_deliver`
-        // would refuse — a publisher that never confirmed the candidate fails `covers`, and
-        // ownership skips publishers entirely.
         debug_assert!(
             unique_count == 0 || valid_costs > 0,
             "an admitted target always has a delivery price"
         );
 
-        // Own vs peer-reported ETX differ by hundredths; exact compare inverted colocated ranks.
         let avg_cost_fixed = if valid_costs > 0 {
             let fixed = (total_cost / valid_costs as f32 * 100.0) as u16;
             fixed / crate::unicast_relay::COST_BUCKET_FIXED
@@ -664,26 +546,6 @@ fn build_candidates(ctx: &BroadcastRelayContext<'_>, source: u32, heard_from: u3
         }
     }
 
-    for i in 0..my_edges.edge_count as usize {
-        let edge = my_edges.edges[i];
-        let neighbor = edge.to;
-        if neighbor == 0 || neighbor == heard_from || neighbor == source || !edge.hears_us {
-            continue;
-        }
-        if ctx.capability.status(neighbor) != CapabilityStatus::SrActive {
-            continue;
-        }
-        let Some(neighbor_edges) = ctx.edges.find_node(neighbor) else {
-            continue;
-        };
-        for j in 0..neighbor_edges.edge_count as usize {
-            if neighbor_edges.edges[j].to == heard_from {
-                candidates.insert(neighbor);
-                break;
-            }
-        }
-    }
-
     candidates
 }
 
@@ -709,7 +571,8 @@ pub fn plan_broadcast_relay<F>(
 where
     F: Fn(u32) -> bool,
 {
-    // Floored once, in coordinated_relay: a second application here would drift from it.
+    // Applying the spacing floor twice would make this schedule diverge from the shared timing
+    // calculation.
     let half = half_airtime_ms.max(crate::coordinated_relay::MIN_RUNG_SPACING_MS);
     let prefer_high = (packet_id & 1) != 0;
     let mut already_covered = build_already_covered(ctx.edges, ctx.capability, source, heard_from);
@@ -729,15 +592,11 @@ where
     let mut candidates = build_candidates(ctx, source, heard_from);
     let initial_candidates = candidates.count;
     let mut reason = RelayReason::None;
-    // Positions are placed by rule, not spaced by one constant: a reservation takes a slot time
-    // inside the stock-router window, a rung of ours takes a half-airtime, and anything the window
-    // cannot hold goes past the transition keeping its rank.
+    // Reservations describe an uncertain transmission; ranked rungs describe our actual send times, so
+    // they require different spacing.
     let mut positions = crate::relay_window::PositionAllocator::new(slot_time_ms, half);
     let mut should_relay = false;
     let mut my_delay = 0u32;
-    // Assigned when a position is handed to us, never reconstructed from a delay: once a
-    // reservation is a slot time wide and a rung a half-airtime, dividing one by the other names
-    // nothing.
     let mut my_slot_index = 0u8;
     let mut coverage_for = 0u32;
     let mut slots_given = 0u8;
@@ -766,10 +625,8 @@ where
             candidates.erase(neighbor);
             push_ranked(&mut ranked, &mut ranked_len, neighbor);
             reserved_ranked = reserved_ranked.saturating_add(1);
-            // Stock still occupies the early window — we cannot compute its draw — but its
-            // coverage is not subtracted until a copy is on the air. Assuming it would relay
-            // silenced every overlapping SR candidate, and the packet stayed uncarried when it
-            // did not.
+            // A reservation is an expectation rather than proof of delivery; subtracting its coverage
+            // before hearing it could leave the packet uncarried.
             if has_transmitted(neighbor) {
                 let credit = absorb_relay_coverage(ctx, &mut already_covered, neighbor, now_ms);
                 push_absorbed(&mut absorbed, &mut absorbed_len, neighbor, credit);
@@ -781,8 +638,6 @@ where
         }
     }
 
-    // Park non-ROUTER SR candidates. Early-window rungs are ROUTER-only; everyone else waits past
-    // stock reservations and SR ROUTER early slots on the late ladder.
     let mut late_candidates = NodeSet::new();
     {
         let mut i = 0u8;
@@ -797,7 +652,6 @@ where
         }
     }
 
-    // Phase 2a then 2b: SR ROUTER early-window rungs, then every other SR-active role late.
     for early in [true, false] {
         if should_relay {
             break;
@@ -850,9 +704,6 @@ where
                 break;
             }
 
-            // Ranked ahead of us, not yet on the air: they get a slot, we do not
-            // subtract their coverage. Unique is vs the transmitter (and copies
-            // already heard). If they never transmit, our later rung still fires.
             slots_given = slots_given.saturating_add(1);
         }
     }
@@ -870,7 +721,6 @@ where
         }
     }
 
-    // Sparse mesh: only we were a candidate and ranking found no unique coverage.
     if !should_relay && initial_candidates <= 1 {
         should_relay = true;
         reason = RelayReason::Sparse;
@@ -878,14 +728,7 @@ where
         my_delay = positions.first_free_ms();
     }
 
-    // Nobody had coverage to offer, and the originator is waiting to be told its message reached
-    // the mesh. Stock's only delivery confirmation for a broadcast is hearing somebody rebroadcast
-    // it, so suppressing every copy removes the signal it depends on and it retransmits into
-    // silence — the phone reports a failure for a message that in fact arrived everywhere.
-    //
-    // The ranking cannot answer this: it drops a candidate with no unique coverage, because the
-    // cost it ranks on is the mean delivery cost over the unique targets and there is nothing to
-    // price. So this is a second pass with its own price, run only when the ladder came out empty.
+    // Coverage ranking cannot select an acknowledgement relay when no unique target remains to price.
     if !should_relay && slots_given == 0 && ack_eligible {
         if let Some(ack) =
             plan_acknowledgement(ctx, packet_id, source, heard_from, half, slot_time_ms)
@@ -893,8 +736,6 @@ where
             should_relay = ack.should_relay;
             reason = RelayReason::Acknowledgement;
             my_delay = ack.my_delay;
-            // The acknowledgement pass builds its own ladder, ordered by how well the source hears
-            // each candidate, so our rung there is the number of answers ranked ahead of ours.
             my_slot_index = ack.slots_given;
             slots_given = ack.slots_given;
             for i in 0..ack.ranked_len {
@@ -932,7 +773,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    /// SHORT_SLOW slot time: the window these tests lay positions into is 15 of these.
     const TEST_SLOT_MS: u32 = 10;
 
     use super::*;
@@ -975,22 +815,12 @@ mod tests {
         }
     }
 
-    /// A reservation and a rung are different reasons to stay quiet, and the plan must say which.
-    ///
-    /// Both raise `slots_given`, so a log that carries only that total cannot tell a stock router
-    /// we cannot coordinate with from an SR peer we can — and it is the reservation whose removal
-    /// would silently drop the insurance arm it used to earn. `reserved_ranked` additionally
-    /// counts the leading order entries that are reservations, which is not the same number: a
-    /// router that already transmitted still holds its place in the order but is no longer a
-    /// transmission we are waiting for.
     #[test]
     fn reservation_and_rung_are_counted_apart() {
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
         let downstream = DownstreamTable::new();
         setup_stock_topology(&mut edges, &mut capability);
-        // A second neighbour of the transmitter, SR-active, so the ranking has something to rank
-        // besides the reserved router.
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, EE, true);
@@ -1023,8 +853,6 @@ mod tests {
         );
         assert_eq!(plan.ranked[0], DD, "reservations are listed before rungs");
 
-        // The same topology with the router's copy already on the air: it keeps its place in the
-        // order, so the marker still applies, but it is no longer awaited.
         let plan = plan_broadcast_relay(
             &ctx,
             1,
@@ -1047,18 +875,6 @@ mod tests {
         );
     }
 
-    /// When nobody has coverage to offer, somebody still answers a message its sender awaits.
-    ///
-    /// The ranking cannot do this: it drops a candidate with no unique coverage because the cost it
-    /// ranks on is the mean delivery cost over the unique targets, and there is nothing to price.
-    /// Without a second pass every node stays quiet, the originator never hears a rebroadcast —
-    /// stock's only delivery confirmation for a broadcast — and it reports a failure for a message
-    /// that arrived everywhere. Field 2026-09-09: four copies of one channel message and "Failed to
-    /// deliver to mesh" on the phone.
-    ///
-    /// The topology below is the one that produces an empty ladder: the source lists both of its
-    /// neighbours, so pre-coverage accounts for both and neither has anything unique left, and
-    /// there are two candidates so the sole-candidate rule does not fire either.
     #[test]
     fn somebody_answers_when_the_ladder_is_empty() {
         let mut edges = EdgeStore::new();
@@ -1066,17 +882,12 @@ mod tests {
         let downstream = DownstreamTable::new();
         let t0 = 1_000u32;
         edges.ensure_local_node(ME, t0);
-        // We hear the source and the peer; the peer hears the source.
         edges.update_edge(ME, ME, BB, 1.0, t0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, EE, 1.0, t0, EdgeSource::Reported, true, 0);
-        // The peer must be a candidate, or the sole-candidate rule relays before this pass is
-        // reached and the test proves nothing.
         edges.set_edge_hears_us(ME, EE, true);
         edges.update_edge(ME, EE, BB, 1.0, t0, EdgeSource::Mirrored, true, 0);
         capability.track_topology(BB, true, t0);
         capability.track_topology(EE, true, t0);
-        // The source published both of us, and that it hears us both: pre-coverage takes both off
-        // the table, and the answer has the evidence it needs.
         edges.update_edge(ME, BB, ME, 1.0, t0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, BB, EE, 1.0, t0, EdgeSource::Mirrored, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
@@ -1084,7 +895,6 @@ mod tests {
 
         let ctx = ctx(&edges, &capability, &downstream);
 
-        // Not eligible: nothing unique, nothing owed, so nobody speaks.
         let plan = plan_broadcast_relay(
             &ctx,
             1,
@@ -1102,7 +912,6 @@ mod tests {
             "with nothing unique to carry and no acknowledgement owed, we stay quiet"
         );
 
-        // Eligible: the same frame is answered, and the ladder names both answerers in order.
         let plan = plan_broadcast_relay(
             &ctx,
             1,
@@ -1126,15 +935,8 @@ mod tests {
         );
     }
 
-    /// The answer is ordered by how well the *source* hears each candidate, not by coverage.
-    ///
-    /// Coverage asks whether a relay reaches a target; an acknowledgement asks whether the
-    /// originator hears the relay. A copy the originator cannot hear tells it nothing and its retry
-    /// ladder runs regardless, so the candidate the source hears best answers first and the others
-    /// fall in behind — standing down when they hear that answer.
     #[test]
     fn the_source_hears_the_first_answerer_best() {
-        // Same topology as above, but the source hears the peer far better than us.
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
         let downstream = DownstreamTable::new();
@@ -1152,8 +954,6 @@ mod tests {
         edges.set_edge_hears_us(EE, BB, true);
 
         let ctx = ctx(&edges, &capability, &downstream);
-        // The packet id is even, so the tie-break would prefer the *lower* node id — us. Price
-        // must override it, or the ordering is not the one the design claims.
         let plan = plan_broadcast_relay(
             &ctx,
             2,
@@ -1182,10 +982,6 @@ mod tests {
         );
     }
 
-    /// A publisher we have stopped hearing is nobody's target, however good the edge a peer
-    /// published to it. Field 2026-09-08: the branch gateway died, maintenance retracted our own
-    /// link at the silence horizon, and the peers' lists kept naming it for another interval —
-    /// so every node credited its peers with covering it and handed them a slot each declined.
     #[test]
     fn a_publisher_we_stopped_hearing_is_nobody_s_target() {
         const GONE: u32 = 0xDEAD_0001;
@@ -1197,7 +993,6 @@ mod tests {
         edges.ensure_local_node(ME, t0);
         edges.update_edge(ME, ME, NEAR, 1.0, t0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, NEAR, true);
-        // The peer published a healthy link to the node, and the node itself once published too.
         edges.update_edge(ME, NEAR, GONE, 2.0, t0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, GONE, NEAR, 2.0, t0, EdgeSource::Mirrored, true, 0);
         capability.track_topology(NEAR, true, t0);
@@ -1206,7 +1001,6 @@ mod tests {
         let c = ctx(&edges, &capability, &downstream);
         let mut buf = [0u32; MAX_EDGES_PER_NODE];
 
-        // Inside the horizon the peer covers it.
         let inside = t0 + crate::neighbor_graph::PUBLISHER_SILENCE_MS;
         let n = get_coverage_if_relays(&c, NEAR, inside, &mut buf);
         assert!(
@@ -1214,7 +1008,6 @@ mod tests {
             "still heard: the peer's published link is coverage"
         );
 
-        // Past it, no peer covers it, so nobody is handed a slot for it.
         let past = inside + 1;
         let n = get_coverage_if_relays(&c, NEAR, past, &mut buf);
         assert!(
@@ -1225,7 +1018,6 @@ mod tests {
         absorb_relay_coverage(&c, &mut covered, NEAR, past);
         assert!(!covered.contains(GONE), "absorb credits the same set");
 
-        // Hearing it again restores it: the entry's own timestamp is the evidence.
         edges.update_node_activity(GONE, past, ME);
         let c = ctx(&edges, &capability, &downstream);
         let n = get_coverage_if_relays(&c, NEAR, past, &mut buf);
@@ -1234,7 +1026,6 @@ mod tests {
 
     #[test]
     fn a_dropped_young_node_is_not_a_coverage_target() {
-        // Must not collide with ME: absorb also credits the relay itself.
         const MUTE: u32 = 0x1100_0011;
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
@@ -1269,11 +1060,6 @@ mod tests {
         assert!(!covered.contains(MUTE), "absorb credits the same set");
     }
 
-    /// With a second candidate present — so the sole-candidate rule cannot fire — a mute stock
-    /// neighbour only we reach is carried by the ranking while our link is inside the coverage
-    /// ceiling, and not at all once it is past it. The deleted stock-coverage phase relayed in
-    /// both cases, which is the behaviour the ceiling exists to stop: over an ETX-8 link a copy
-    /// arrives about one time in eight, and the ranking would have spent a slot on it.
     #[test]
     fn a_mute_neighbour_past_the_ceiling_is_nobody_s_relay() {
         const PEER: u32 = 0xAB00_00AB;
@@ -1285,14 +1071,12 @@ mod tests {
             edges.update_edge(ME, ME, BB, 1.0, 0, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(ME, BB, true);
             capability.track_topology(BB, true, 0);
-            // A second SR candidate that heard the transmitter, covered by it already.
             edges.update_edge(ME, ME, PEER, 1.0, 0, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(ME, PEER, true);
             capability.track_topology(PEER, true, 0);
             edges.update_edge(ME, PEER, BB, 1.0, 0, EdgeSource::Mirrored, true, 0);
             edges.update_edge(ME, BB, PEER, 1.0, 0, EdgeSource::Mirrored, true, 0);
             edges.set_edge_hears_us(BB, PEER, true);
-            // The mute stock neighbour: only our own edge reaches it.
             capability.track_role(SS, DEVICE_ROLE_TRACKER, 0);
             for (from, to) in [(ME, SS), (SS, ME)] {
                 edges.update_edge(ME, from, to, our_etx, 0, EdgeSource::Reported, true, 0);
@@ -1322,10 +1106,6 @@ mod tests {
         );
     }
 
-    /// A peer that takes a slot because it *owns* a silent neighbour must be credited with it
-    /// when its coverage is absorbed, exactly as the admission credited it. Crediting only
-    /// `covers` left the neighbour looking uncovered after its owner was ranked, so a later
-    /// phase relayed for it a second time.
     #[test]
     fn an_owner_taking_a_slot_absorbs_the_neighbour_it_owns() {
         const PEER: u32 = 0xAB00_00AB;
@@ -1333,7 +1113,6 @@ mod tests {
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
         edges.ensure_local_node(ME, 0);
-        // The transmitter BB, an SR peer, and a silent node only the peer hears well.
         edges.update_edge(ME, ME, BB, 1.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
         capability.track_topology(BB, true, 0);
@@ -1342,11 +1121,9 @@ mod tests {
         capability.track_topology(PEER, true, 0);
         edges.update_edge(ME, PEER, SILENT, 1.0, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, ME, SILENT, 6.0, 0, EdgeSource::Reported, true, 0);
-        // The peer hears BB, so it is a candidate for this packet.
         edges.update_edge(ME, PEER, BB, 1.0, 0, EdgeSource::Mirrored, true, 0);
         let downstream = DownstreamTable::new();
         let ctx = ctx(&edges, &capability, &downstream);
-        // The peer owns SILENT on the better link, so absorbing its coverage must cover SILENT.
         assert_eq!(
             crate::graph::coverage_owner(&edges, &capability, ME, true, SILENT),
             PEER
@@ -1359,10 +1136,6 @@ mod tests {
         );
     }
 
-    /// A mute stock neighbour only we reach is carried by the ranking itself: coverage admits a
-    /// silent node on our own edge, so we take a ranked slot for it, and the separate fallback
-    /// that used to do this is gone — it applied no ETX ceiling, so it also relayed over links
-    /// the model calls undeliverable.
     #[test]
     fn mute_stock_neighbour_only_we_reach_is_carried_by_the_ranking() {
         const SS: u32 = 0xDD00_00DD;
@@ -1452,14 +1225,9 @@ mod tests {
             never_transmitted,
             false,
         );
-        // Immediate REPEATER takes the early slot. We have no neighbour the transmitter
-        // does not already reach, so we take no ranked rung.
         assert!(!plan.should_relay);
     }
 
-    /// Reachable-but-not-heard transmitter: we learned BB's list through a neighbour and have no
-    /// edge of our own to BB. `update_edge` only accepts a report about a node it can reach, so
-    /// the relaying neighbour has to exist or the fixture proves nothing.
     fn edges_with_remote_transmitter(bb_to_me_etx: f32) -> EdgeStore {
         const VIA: u32 = 0xDD00_00DD;
         let mut edges = EdgeStore::new();
@@ -1472,21 +1240,15 @@ mod tests {
         edges
     }
 
-    /// A one-way listing is not pre-coverage: BB hearing us says nothing about us hearing BB.
     #[test]
     fn one_way_listed_neighbor_is_not_precovered() {
         let edges = edges_with_remote_transmitter(1.5);
-        // We publish topology, so our silence about BB counts: BB listing us is not coverage.
         let mut capability = CapabilityCache::new();
         capability.track_topology(ME, true, 0);
         assert!(!build_already_covered(&edges, &capability, BB, BB).contains(ME));
-        // A node that publishes nothing could never confirm anything, so the listing is all the
-        // evidence there is and it does count.
         assert!(build_already_covered(&edges, &CapabilityCache::new(), BB, BB).contains(ME));
     }
 
-    /// The transmitter's own list is pre-coverage only for the neighbours it actually reaches:
-    /// a hop confirmed once but priced hopeless leaves us responsible for relaying.
     #[test]
     fn hopeless_confirmed_neighbor_is_not_precovered() {
         let mut edges = edges_with_remote_transmitter(40.0);
@@ -1512,8 +1274,6 @@ mod tests {
         edges.set_edge_hears_us(ME, BB, true);
         edges.set_edge_hears_us(ME, PEER, true);
         edges.set_edge_hears_us(ME, FF, true);
-        // Peer lists FF one-way (peer hears FF; FF does not hear peer). FF is not
-        // covered by the transmitter, so we take a slot whether or not the peer is ranked.
         edges.update_edge(ME, PEER, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, PEER, FF, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(PEER, BB, true);
@@ -1562,13 +1322,6 @@ mod tests {
         assert!(plan.should_relay);
     }
 
-    /// A stock REPEATER neighbour relieves us, exactly as a ROUTER does.
-    ///
-    /// REPEATER is deprecated as a configuration choice (2.7.11) but not withdrawn from the wire,
-    /// and stock still gives it the high-priority rebroadcast that fires even after hearing
-    /// somebody else's copy. It is going to transmit whether or not we do, so relaying beside it
-    /// adds a duplicate rather than delivering anything. Deprecation governs what an operator
-    /// should configure next, not what a node already on air does.
     #[test]
     fn repeater_neighbor_defers_like_field() {
         let mut edges = EdgeStore::new();
@@ -1615,9 +1368,6 @@ mod tests {
         assert_eq!(plan.reserved_slots, 1, "and it holds a reserved position");
     }
 
-    /// Two SR peers reach the same unique neighbour at the same tier. The one configured ROUTER is
-    /// ranked first even though its link is the dearer of the two: cost describes a link, the role
-    /// describes the node.
     #[test]
     fn an_sr_router_outranks_a_client_of_equal_coverage() {
         const RT: u32 = 0xAA00_0071;
@@ -1631,9 +1381,6 @@ mod tests {
             edges.update_edge(ME, ME, peer, 2.0, 0, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(ME, peer, true);
         }
-        // The transmitter already reaches both peers, so we hold nothing unique and the contest is
-        // between them. Both hear the transmitter and both uniquely reach FAR, which we do not; the
-        // ROUTER's link to FAR is the worse of the two.
         for peer in [RT, CL] {
             edges.update_edge(ME, BB, peer, 1.5, 0, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(BB, peer, true);
@@ -1665,8 +1412,6 @@ mod tests {
         assert_eq!(best.role_rank, 1);
     }
 
-    /// An SR ROUTER with unique coverage takes a window position (half-airtime wide), not a
-    /// reserved stock slot and not a post-transition ladder rung when the window still has room.
     #[test]
     fn an_sr_router_with_coverage_takes_a_window_position() {
         const FAR: u32 = 0xAA00_00FF;
@@ -1678,7 +1423,6 @@ mod tests {
         edges.set_edge_hears_us(ME, BB, true);
         capability.track_topology(ME, true, 0);
         capability.track_role(ME, crate::nodeinfo::DEVICE_ROLE_ROUTER, 0);
-        // Unique coverage of FAR: the transmitter does not reach it, we do.
         edges.update_edge(ME, ME, FAR, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, FAR, true);
         let plan = plan_broadcast_relay(
@@ -1704,12 +1448,9 @@ mod tests {
             "empty window: the first ranked position is at the window start"
         );
         assert_eq!(plan.slot_index, 0);
-        // And it must not be treated as a stock immediate router for the pre-pass.
         assert!(!capability.is_immediate_relay_router(ME));
     }
 
-    /// Non-ROUTER SR-active roles wait past the early window even when they have unique coverage.
-    /// The ladder border is preset-bound `relay_floor_ms`, not the 250 ms peer-turnaround artefact.
     #[test]
     fn a_client_with_coverage_takes_a_late_rung_past_the_transition() {
         const FAR: u32 = 0xAA00_00FF;
@@ -1744,7 +1485,6 @@ mod tests {
         );
     }
 
-    /// CLIENT_BASE is SR-active but not ROUTER: same late placement as CLIENT.
     #[test]
     fn client_base_with_coverage_takes_a_late_rung() {
         const FAR: u32 = 0xAA00_00FE;
@@ -1778,7 +1518,6 @@ mod tests {
         );
     }
 
-    /// A CLIENT that outranks an SR ROUTER on coverage still waits past that ROUTER's early slot.
     #[test]
     fn client_outranking_router_on_coverage_still_waits_past_early_window() {
         const RT: u32 = 0xAA00_0071;
@@ -1796,7 +1535,6 @@ mod tests {
         capability.track_role(ME, crate::nodeinfo::DEVICE_ROLE_CLIENT, 0);
         capability.track_topology(RT, true, 0);
         capability.track_role(RT, crate::nodeinfo::DEVICE_ROLE_ROUTER, 0);
-        // ROUTER reaches FAR; we reach FAR and FAR2 so coverage outranks.
         for (who, target) in [(RT, FAR), (ME, FAR), (ME, FAR2)] {
             edges.update_edge(ME, who, target, 1.5, 0, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(who, target, true);
@@ -1830,8 +1568,6 @@ mod tests {
         );
     }
 
-    /// An SR ROUTER with unique coverage ranks ahead of a CLIENT that uniquely reaches more
-    /// neighbours. Coverage orders within a window, not across the ROUTER / non-ROUTER split.
     #[test]
     fn router_with_unique_beats_a_client_with_more_coverage() {
         const RT: u32 = 0xAA00_0071;
@@ -1853,7 +1589,6 @@ mod tests {
             edges.set_edge_hears_us(peer, FAR, true);
             capability.track_topology(peer, true, 0);
         }
-        // Only the CLIENT reaches the second far node.
         edges.update_edge(ME, CL, FAR2, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(CL, FAR2, true);
         capability.track_role(RT, crate::nodeinfo::DEVICE_ROLE_ROUTER, 0);
@@ -1875,8 +1610,6 @@ mod tests {
         );
     }
 
-    /// ROUTER_LATE earns no promotion. Its role means "relay after everyone else", so ranking it
-    /// first would invert the behaviour its operator chose.
     #[test]
     fn router_late_earns_no_ranking_promotion() {
         const RL: u32 = 0xAA00_0073;
@@ -1899,15 +1632,12 @@ mod tests {
         let downstream = DownstreamTable::new();
         const FF: u32 = 0xAA00_00FF;
         edges.ensure_local_node(ME, 0);
-        // Direct: ME ↔ BB (heard_from), ME ↔ EE (SR peer).
         edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
         edges.set_edge_hears_us(ME, EE, true);
-        // Transmitter BB already covers ME's only other neighbor EE.
         edges.update_edge(ME, BB, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(BB, EE, true);
-        // EE uniquely covers remote FF (we do not hear FF).
         edges.update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, ME, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, EE, FF, 1.5, 0, EdgeSource::Reported, true, 0);
@@ -1946,24 +1676,18 @@ mod tests {
         const HH1: u32 = 0xAA00_0044;
         const HH2: u32 = 0xAA00_0055;
         edges.ensure_local_node(ME, 0);
-        // Direct neighbours: BB is the transmitter, EE an SR peer that hears us.
         edges.update_edge(ME, ME, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
         edges.set_edge_hears_us(ME, EE, true);
-        // Our reported coverage beyond the transmitter: EE and KK.
         edges.update_edge(ME, ME, KK, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, KK, true);
-        // Two mirrored edges learned from relayed packets: real, but never in our broadcast.
         edges.update_edge(ME, ME, HH1, 2.0, 0, EdgeSource::Mirrored, true, 0);
         edges.update_edge(ME, ME, HH2, 2.0, 0, EdgeSource::Mirrored, true, 0);
         edges.set_edge_hears_us(ME, HH1, true);
         edges.set_edge_hears_us(ME, HH2, true);
-        // EE hears the transmitter too, so both candidates sit in the same bidi tier and
-        // only coverage decides the order.
         edges.update_edge(ME, EE, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(EE, BB, true);
-        // EE reports three neighbours that hear it.
         for n in [FF, GG, JJ] {
             edges.update_edge(ME, EE, n, 1.5, 0, EdgeSource::Reported, true, 0);
             edges.set_edge_hears_us(EE, n, true);
@@ -1973,7 +1697,6 @@ mod tests {
         capability.track_topology(EE, true, 0);
         capability.track_topology(ME, true, 0);
 
-        // Even id: on a tie the lower id (ME) would win, so only the coverage counts decide.
         let plan = plan_broadcast_relay(
             &ctx(&edges, &capability, &downstream),
             0x98,
@@ -1986,10 +1709,6 @@ mod tests {
             never_transmitted,
             false,
         );
-        // Counting the mirrored edges we would claim 4 unique nodes and take slot 0 while EE,
-        // seeing only our 2 reported ones, ranks itself first: both in slot 0. Reported-only
-        // gives us 2 against EE's 3, so EE leads and we trail in slot 1 with KK still unique
-        // vs the transmitter — a peer ranked ahead does not take KK off the table.
         assert!(plan.should_relay);
         assert_eq!(plan.slot_index, 1);
         assert_eq!(plan.ranked_len, 2);
@@ -1997,9 +1716,6 @@ mod tests {
         assert_eq!(plan.ranked[1], ME);
     }
 
-    /// Two SR candidates that both uniquely reach the same neighbour the transmitter does not:
-    /// both take a slot. Coverage of a peer merely ranked first is subtracted only when that
-    /// peer's copy is heard.
     #[test]
     fn overlapping_unique_vs_transmitter_both_take_slots() {
         let mut edges = EdgeStore::new();
@@ -2050,8 +1766,6 @@ mod tests {
         assert_eq!(plan.absorbed_len, 0, "planned peers do not absorb");
     }
 
-    /// A reserved stock router that also reaches our unique neighbour does not take that
-    /// neighbour off the table until its copy is heard.
     #[test]
     fn stock_reservation_does_not_absorb_unheard_coverage() {
         let mut edges = EdgeStore::new();
@@ -2103,7 +1817,6 @@ mod tests {
         assert!(plan.absorbed_len > 0);
     }
 
-    /// ME and a peer both neighbour a mute stock node SS that nobody upstream reaches.
     fn stock_fixture(peer: u32) -> (EdgeStore, CapabilityCache) {
         const SS: u32 = 0xDD00_00DD;
         let mut edges = EdgeStore::new();
@@ -2114,22 +1827,16 @@ mod tests {
         edges.update_edge(ME, ME, SS, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
         edges.set_edge_hears_us(ME, peer, true);
-        // BB reaches the peer directly, so neither of us has unique hears_us coverage of the
-        // other. SS is still unique vs the transmitter for whoever admits it.
         edges.update_edge(ME, BB, peer, 2.0, 0, EdgeSource::Reported, true, 0);
-        // The peer reports BB and SS as its neighbours too.
         edges.update_edge(ME, peer, BB, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.update_edge(ME, peer, SS, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(peer, BB, true);
         capability.track_topology(peer, true, 0);
         capability.track_topology(ME, true, 0);
-        capability.track_role(SS, DEVICE_ROLE_TRACKER, 0); // mute legacy
+        capability.track_role(SS, DEVICE_ROLE_TRACKER, 0);
         (edges, capability)
     }
 
-    /// A silent neighbour (mute, publishes nothing) is relayed for by exactly one node: the one
-    /// whose link to it is best, since its receive path is all anyone can measure. Before this,
-    /// every neighbour claimed it and the whole branch relayed every frame.
     #[test]
     fn silent_neighbour_is_relayed_for_by_the_best_link_only() {
         const SS: u32 = 0xDD00_00DD;
@@ -2160,15 +1867,12 @@ mod tests {
         );
     }
 
-    /// The plan names the neighbour that earned the relay. The log used to recompute it against
-    /// the transmitter alone, which named a node a ranked peer does reach.
     #[test]
     fn plan_names_the_neighbour_the_relay_is_for() {
         const SS: u32 = 0xDD00_00DD;
         const PEER: u32 = 0xEE00_00EE;
         let downstream = DownstreamTable::new();
         let (mut edges, capability) = stock_fixture(PEER);
-        // Only our link reaches SS, so ranking picks us and SS is what we relay for.
         edges.update_edge(ME, ME, SS, 1.0, 0, EdgeSource::Reported, true, 0);
         let plan = plan_broadcast_relay(
             &ctx(&edges, &capability, &downstream),
@@ -2184,12 +1888,9 @@ mod tests {
         );
         assert!(plan.should_relay);
         assert_eq!(plan.coverage_for, SS);
-        // The log names what the transmission missed, so two nodes that disagree about a packet
-        // can be compared by name instead of by the pre-covered count alone.
         assert_eq!(&plan.uncovered[..plan.uncovered_len as usize], &[SS]);
     }
 
-    /// A transmission that reached everything of ours leaves nothing to name.
     #[test]
     fn plan_names_nothing_when_the_transmitter_covered_it_all() {
         const SS: u32 = 0xDD00_00DD;
@@ -2197,7 +1898,6 @@ mod tests {
         let downstream = DownstreamTable::new();
         let (mut edges, capability) = stock_fixture(PEER);
         edges.update_edge(ME, ME, SS, 1.0, 0, EdgeSource::Reported, true, 0);
-        // The transmitter reaches SS too, so it is pre-covered.
         edges.update_edge(ME, BB, SS, 2.0, 0, EdgeSource::Reported, true, 0);
         let plan = plan_broadcast_relay(
             &ctx(&edges, &capability, &downstream),
@@ -2218,7 +1918,6 @@ mod tests {
     fn stock_neighbour_covered_by_transmitter_needs_no_relay() {
         let downstream = DownstreamTable::new();
         let (mut edges, capability) = stock_fixture(0xEE00_00EE);
-        // BB itself reaches SS.
         edges.update_edge(ME, BB, 0xDD00_00DD, 2.0, 0, EdgeSource::Reported, true, 0);
         let plan = plan_broadcast_relay(
             &ctx(&edges, &capability, &downstream),
@@ -2240,7 +1939,6 @@ mod tests {
         let mut edges = EdgeStore::new();
         let mut capability = CapabilityCache::new();
         let downstream = DownstreamTable::new();
-        // Not a placeholder id (0xFF00_xxxx are reserved).
         const FF: u32 = 0xAA00_00FF;
         const GG: u32 = 0xAA00_0011;
         edges.ensure_local_node(ME, 0);
@@ -2248,7 +1946,6 @@ mod tests {
         edges.update_edge(ME, ME, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, BB, true);
         edges.set_edge_hears_us(ME, EE, true);
-        // Transmitter already covers EE, so ME's unique coverage is only GG.
         edges.update_edge(ME, BB, EE, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(BB, EE, true);
         edges.update_edge(ME, EE, BB, 1.5, 0, EdgeSource::Reported, true, 0);
@@ -2257,7 +1954,6 @@ mod tests {
         edges.set_edge_hears_us(EE, BB, true);
         edges.set_edge_hears_us(EE, ME, true);
         edges.set_edge_hears_us(EE, FF, true);
-        // ME also uniquely reaches GG (EE does not).
         edges.update_edge(ME, ME, GG, 2.0, 0, EdgeSource::Reported, true, 0);
         edges.set_edge_hears_us(ME, GG, true);
         capability.track_topology(EE, true, 0);

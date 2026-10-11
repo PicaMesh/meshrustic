@@ -1,6 +1,7 @@
-//! Relay-byte → NodeNum resolution for coordinated flooding (heard-from).
-
-use crate::graph::{calculate_etx, is_placeholder_node, placeholder_node_id, EdgeStore};
+use crate::graph::{
+    calculate_etx, is_placeholder_node, normalize_rx_signal, placeholder_node_id, EdgeSource,
+    EdgeStore,
+};
 use crate::neighbor_graph::NeighborGraph;
 
 pub const MAX_RELAY_IDENTITY_ENTRIES: usize = 16;
@@ -18,9 +19,9 @@ struct RelayIdentityBucket {
     relay_id: u8,
     entries: [RelayIdentityEntry; MAX_CANDIDATES_PER_BUCKET],
     entry_count: u8,
+    overflow_at: Option<u32>,
 }
 
-/// Fixed-size cache mapping 1-byte relay ids to recently heard NodeNums.
 pub struct RelayIdentityCache {
     buckets: [RelayIdentityBucket; MAX_RELAY_IDENTITY_ENTRIES],
     bucket_count: u8,
@@ -42,6 +43,7 @@ impl RelayIdentityCache {
                     last_heard_ms: 0,
                 }; MAX_CANDIDATES_PER_BUCKET],
                 entry_count: 0,
+                overflow_at: None,
             }; MAX_RELAY_IDENTITY_ENTRIES],
             bucket_count: 0,
         }
@@ -52,7 +54,11 @@ impl RelayIdentityCache {
     }
 
     pub fn remember_relay_identity(&mut self, node_id: u32, relay_byte: u8, now_ms: u32) {
-        if relay_byte == 0 || node_id == 0 {
+        if relay_byte == 0
+            || node_id == 0
+            || is_placeholder_node(node_id)
+            || node_id as u8 != relay_byte
+        {
             return;
         }
 
@@ -88,6 +94,8 @@ impl RelayIdentityCache {
                 last_heard_ms: now_ms,
             };
             bucket.entry_count += 1;
+        } else {
+            bucket.overflow_at = Some(now_ms);
         }
     }
 
@@ -117,57 +125,59 @@ impl RelayIdentityCache {
         now_ms: u32,
         modem_preset: u8,
     ) -> Option<u32> {
+        if relay_byte == 0 {
+            return None;
+        }
         let bucket = self.buckets[..self.bucket_count as usize]
             .iter()
-            .find(|b| b.relay_id == relay_byte)?;
-
-        let mut best_node = 0u32;
-        let mut newest = 0u32;
+            .find(|b| b.relay_id == relay_byte);
+        if bucket
+            .and_then(|b| b.overflow_at)
+            .is_some_and(|at| now_ms.wrapping_sub(at) <= RELAY_ID_CACHE_TTL_MS)
+        {
+            return None;
+        }
         let mut direct = [0u32; MAX_CANDIDATES_PER_BUCKET];
         let mut direct_etx = [0u16; MAX_CANDIDATES_PER_BUCKET];
-        let mut direct_count = 0usize;
-
-        for i in 0..bucket.entry_count as usize {
-            let entry = bucket.entries[i];
+        let mut direct_count = 0;
+        if let Some(me) = edges.find_node(my_node) {
+            for edge in &me.edges[..me.edge_count as usize] {
+                if edge.to as u8 != relay_byte
+                    || is_placeholder_node(edge.to)
+                    || edge.source != EdgeSource::Reported
+                {
+                    continue;
+                }
+                if direct_count == direct.len() {
+                    return None;
+                }
+                direct[direct_count] = edge.to;
+                direct_etx[direct_count] = edge.etx_fixed;
+                direct_count += 1;
+            }
+        }
+        if direct_count > 0 {
+            let best = Self::pick_best_direct_candidate(
+                &direct[..direct_count],
+                &direct_etx[..direct_count],
+                rssi,
+                snr,
+                modem_preset,
+            );
+            return (best != 0).then_some(best);
+        }
+        let bucket = bucket?;
+        let mut found = None;
+        for entry in &bucket.entries[..bucket.entry_count as usize] {
             if now_ms.wrapping_sub(entry.last_heard_ms) > RELAY_ID_CACHE_TTL_MS {
                 continue;
             }
-            if is_placeholder_node(entry.node_id) {
-                continue;
+            if found.is_some_and(|id| id != entry.node_id) {
+                return None;
             }
-            if let Some(etx_fixed) = Self::direct_edge_etx_fixed(edges, my_node, entry.node_id) {
-                if direct_count < MAX_CANDIDATES_PER_BUCKET {
-                    direct[direct_count] = entry.node_id;
-                    direct_etx[direct_count] = etx_fixed;
-                    direct_count += 1;
-                }
-            } else if entry.last_heard_ms >= newest {
-                newest = entry.last_heard_ms;
-                best_node = entry.node_id;
-            }
+            found = Some(entry.node_id);
         }
-
-        let best_direct = Self::pick_best_direct_candidate(
-            bucket,
-            &direct[..direct_count],
-            &direct_etx[..direct_count],
-            rssi,
-            snr,
-            now_ms,
-            modem_preset,
-        );
-
-        let result = if best_direct != 0 {
-            best_direct
-        } else {
-            best_node
-        };
-
-        if result == 0 || is_placeholder_node(result) {
-            None
-        } else {
-            Some(result)
-        }
+        found
     }
 
     pub fn resolve_heard_from(
@@ -195,10 +205,6 @@ impl RelayIdentityCache {
             return resolved;
         }
 
-        if let Some(real) = graph.match_relay_byte_on_outgoing_edges(relay_node) {
-            self.remember_relay_identity(real, relay_node, now_ms);
-            return real;
-        }
         if let Some(placeholder) = graph.match_relay_placeholder_on_outgoing_edges(relay_node) {
             return placeholder;
         }
@@ -226,20 +232,11 @@ impl RelayIdentityCache {
         }
     }
 
-    fn direct_edge_etx_fixed(edges: &EdgeStore, my_node: u32, peer: u32) -> Option<u16> {
-        edges
-            .find_node(my_node)
-            .and_then(|node| node.find_edge(peer))
-            .map(|edge| edge.etx_fixed)
-    }
-
     fn pick_best_direct_candidate(
-        _bucket: &RelayIdentityBucket,
         direct: &[u32],
         direct_etx: &[u16],
         rssi: i16,
         snr: i8,
-        _now_ms: u32,
         modem_preset: u8,
     ) -> u32 {
         if direct.is_empty() {
@@ -248,7 +245,7 @@ impl RelayIdentityCache {
         if direct.len() == 1 {
             return direct[0];
         }
-        if rssi != 0 {
+        if let Some((rssi, snr)) = normalize_rx_signal(rssi, snr) {
             let packet_etx = calculate_etx(rssi as i32, snr as f32, modem_preset);
             let packet_etx_fixed = (packet_etx * 100.0).clamp(1.0, 65535.0) as u16;
             let mut best = direct[0];
@@ -265,14 +262,12 @@ impl RelayIdentityCache {
                     tied = true;
                 }
             }
-            // Two neighbours sharing a last byte with the same ETX distance cannot be told
-            // apart from the frame alone. No answer is safer than naming the wrong one.
+            // Equal signal distances cannot identify which of two neighbours sharing a relay byte
+            // transmitted.
             return if tied { 0 } else { best };
         }
 
-        // Without RX metrics, two direct candidates that share a byte are ambiguous — the same
-        // rule as `match_relay_byte_on_outgoing_edges`. Picking the newest used to collapse
-        // distinct full IDs (e.g. Czar and Z00b both `0x8c`) into whichever spoke last.
+        // Without RX metrics, colliding relay bytes remain ambiguous.
         0
     }
 }
@@ -350,12 +345,18 @@ mod tests {
 
         cache.remember_relay_identity(CZAR, 0x8C, 1_000);
         cache.remember_relay_identity(ZOOB, 0x8C, 2_000);
-        // Both full IDs remain; without RX metrics we must not collapse them to "newest".
         assert_eq!(
-            cache.resolve_relay_identity(0x8C, 0, 0, graph.edges(), ME, 3_000, graph.modem_preset()),
+            cache.resolve_relay_identity(
+                0x8C,
+                0,
+                0,
+                graph.edges(),
+                ME,
+                3_000,
+                graph.modem_preset()
+            ),
             None
         );
-        // Strong local RX matches ZOOB's edge, not CZAR's weaker city link.
         assert_eq!(
             cache.resolve_relay_identity(
                 0x8C,

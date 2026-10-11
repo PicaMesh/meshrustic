@@ -1,5 +1,3 @@
-//! Duplicate RX handling — role cancel, upgrade, want_ack re-ACK.
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::num::TEXT_MESSAGE_APP;
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
@@ -17,19 +15,6 @@ fn wire_bytes(header: PacketHeader, payload: &[u8]) -> heapless::Vec<u8, 280> {
     let _ = out.extend_from_slice(payload);
     out
 }
-
-/// A ROUTER cancels a committed relay when the copy it heard covered everything it would have
-/// carried.
-///
-/// This asserted the opposite until the coverage verdict was given precedence over the role. The
-/// two answer different questions — coverage asks whether anyone still needs our copy, the role
-/// asks whether a router may fall silent on its own account — and letting the role win meant a
-/// ROUTER cancelled its insurance on hearing a copy and then transmitted anyway: one extra frame
-/// with the backstop already surrendered. Here the node knows no neighbours at all, so it has
-/// nothing unique to carry and the copy covers it entirely.
-///
-/// The role still governs traffic SR did not commit to, and a relay with unique coverage is kept
-/// whatever the role — both pinned in the router's own unit tests.
 #[test]
 fn router_role_cancels_committed_relay_once_covered() {
     const US: u32 = 0xAABB_CCDD;
@@ -166,7 +151,6 @@ fn repeated_want_ack_to_us_schedules_ack_on_duplicate() {
 
 #[test]
 fn router_role_repeated_want_ack_still_re_acks() {
-    // Field log 0041: SR-active router skipped WantAck dupe re-ACK → intermittent admin save.
     const US: u32 = 0xCCCC_CCCE;
     const FROM: u32 = 0x1111_1112;
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
@@ -220,16 +204,11 @@ fn router_role_repeated_want_ack_still_re_acks() {
 
 #[test]
 fn want_ack_to_us_is_never_rate_limited_even_from_a_limited_node() {
-    // Packets addressed to us are processed and ACKed regardless of the sender's bucket state:
-    // they are never relayed, and dropping them silently breaks admin/DM delivery. The bucket
-    // still fills up (the TEXT burst below), it just never applies to traffic for us.
     const US: u32 = 0xCCCC_CCCF;
     const FROM: u32 = 0x1111_1113;
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
     let mut router = Router::with_channel(US, key, 0x77, MODEM_SHORT_SLOW, true, 3);
     router.set_device_role(DEVICE_ROLE_ROUTER);
-
-    // Exhaust TEXT bucket (threshold 30); buckets are independent.
     for id in 1u32..=31 {
         let (len, frame) = build_app_wire_frame(
             US,
@@ -252,8 +231,6 @@ fn want_ack_to_us_is_never_rate_limited_even_from_a_limited_node() {
             snr: 8,
             bytes: &frame[..usize::from(len)],
         };
-        // Mirror the radio task: every processed packet goes through evaluate_tx_plan, which
-        // is what returns its packet-pool slot.
         if let Some(result) = router.process_inbound(&inbound, id * 10) {
             let _ = router.evaluate_tx_plan(
                 &result,

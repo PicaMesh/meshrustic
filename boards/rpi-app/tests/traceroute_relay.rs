@@ -1,5 +1,3 @@
-//! TRACEROUTE_APP relay integration — append node id + SNR on rebroadcast.
-
 use mesh_crypto::{CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, NODENUM_BROADCAST, PACKET_HEADER_LEN};
 use mesh_radio::MODEM_SHORT_SLOW;
@@ -163,8 +161,6 @@ fn traceroute_reply_stops_our_reliable_retransmit() {
         .parse()
         .id;
     assert!(router.has_pending_reliable(request_id));
-    // The peer answers with a traceroute reply (request_id set) and no separate ACK, as stock
-    // Meshtastic does: that reply is the acknowledgement.
     let (len, reply) = build_app_wire_frame(
         ME,
         PEER,
@@ -238,8 +234,6 @@ fn traceroute_reply_replaces_the_separate_ack() {
             100,
         )
         .expect("accepted");
-    // The reply carries request_id and is the ACK; a separate ACK frame right before it was
-    // what receivers lost.
     assert!(router.poll_ack_tx(100).is_none(), "no separate ACK");
     assert!(router.poll_traceroute_tx(100).is_some(), "reply queued");
 }

@@ -1,19 +1,13 @@
-//! RX/TX frame types exchanged between the radio driver and router.
-
 use crate::config::PACKET_HEADER_LEN;
 
 pub type RadioId = u8;
 
-/// Compile-time radio slots (v1: only slot 0 active).
 pub const MAX_RADIOS: usize = 2;
 
-/// Maximum cross-preset bridge targets per RX (one less than `MAX_RADIOS`).
 pub const MAX_BRIDGE_TARGETS: usize = MAX_RADIOS.saturating_sub(1);
 
-/// Maximum LoRa payload on the mesh air interface.
 pub const MAX_LORA_PAYLOAD: usize = 255;
 
-/// Raw bytes received from the radio (header + ciphertext).
 #[derive(Clone, Copy)]
 pub struct RxFrame {
     pub radio_id: RadioId,
@@ -47,7 +41,6 @@ impl RxFrame {
     }
 }
 
-/// Outbound frame queued for transmission.
 #[derive(Clone, Copy)]
 pub struct TxFrame {
     pub radio_id: RadioId,

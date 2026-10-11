@@ -1,5 +1,3 @@
-//! Broadcast relay slot scheduling (phased stock → SR → downstream → coverage).
-
 use mesh_routing::{
     EdgeSource, NeighborGraph, DEVICE_ROLE_CLIENT, DEVICE_ROLE_REPEATER, DEVICE_ROLE_ROUTER,
 };

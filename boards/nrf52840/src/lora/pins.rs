@@ -1,11 +1,8 @@
-//! Pin assignments for Pro Micro DIY + HT-RA62 (validated on nice!nano carrier).
-
 use embassy_nrf::gpio::{Input, Level, Output, Pin, Pull};
 
 pub struct LoRaPins {
     pub reset: Output<'static>,
     pub busy: Input<'static>,
-    /// Module power / antenna enable (3V3_EN on Pro Micro DIY; POWER_EN on E22P).
     pub ant_en: Output<'static>,
     pub dio1: Input<'static>,
 }

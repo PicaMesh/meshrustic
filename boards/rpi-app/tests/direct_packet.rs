@@ -12,7 +12,6 @@ fn direct_relay_node_matches_from_low_byte() {
 
 #[test]
 fn not_direct_relay_node_mismatch() {
-    // Stock relay without hop decrement: hop_start == hop_limit but relay_node wrong.
     assert!(!is_direct_packet(0x1234_5678, 3, 3, 0xAB));
 }
 

@@ -1,19 +1,13 @@
-//! Arm Adafruit BLE OTA DFU from a PKI private text message.
-
-/// Exact DM body the Meshtastic app can send (trimmed). Case-sensitive.
 pub const ENTER_DFU_TEXT: &[u8] = b"ENTER DFU";
 
-/// PKI text sent back to the admin before the node leaves the application.
 pub const DFU_CONFIRM_TEXT: &[u8] = b"Entering DFU";
 
-/// Seconds to wait after arming so the ACK and the confirmation can leave.
 pub const DFU_ENTER_DELAY_SECS: i32 = 2;
 
 fn is_ascii_ws(b: u8) -> bool {
     b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
 }
 
-/// True when `payload` is exactly [`ENTER_DFU_TEXT`] after ASCII whitespace trim.
 pub fn payload_is_enter_dfu(payload: &[u8]) -> bool {
     let start = payload
         .iter()

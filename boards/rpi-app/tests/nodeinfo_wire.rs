@@ -1,5 +1,3 @@
-//! NODEINFO wire-format tests (port 4 User payload and request/reply).
-
 use mesh_crypto::{encrypt_packet, CryptoKey, DEFAULT_PSK};
 use mesh_protocol::{PacketHeader, User, PACKET_HEADER_LEN};
 use mesh_radio::{primary_channel_hash, MODEM_SHORT_SLOW};
@@ -146,7 +144,6 @@ fn router_replies_to_nodeinfo_request() {
         bytes: &wire,
     };
     assert!(router.process_inbound(&inbound, 1_000).is_some());
-    // Replies are jittered by a contention window so colocated responders do not collide.
     let mut logs = heapless::Vec::new();
     router.drain_sr_logs(&mut logs);
     let delay = logs

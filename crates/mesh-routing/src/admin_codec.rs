@@ -1,35 +1,26 @@
-//! Hand-rolled AdminMessage / Config wire codecs (public LoRa mesh admin format, v1 subset).
-
 use crate::nodeinfo::NodeInfoIdentity;
+use crate::protobuf::{read_varint, skip_field};
 
-/// `ADMIN_APP` port number.
 pub const ADMIN_APP: u32 = 6;
 
-/// `ConfigType` values used by `get_config_request`.
 pub const CONFIG_TYPE_DEVICE: u32 = 0;
 pub const CONFIG_TYPE_POSITION: u32 = 1;
 pub const CONFIG_TYPE_LORA: u32 = 5;
 pub const CONFIG_TYPE_SECURITY: u32 = 7;
 pub const CONFIG_TYPE_SESSIONKEY: u32 = 8;
 
-/// `ModuleConfigType.TELEMETRY_CONFIG`.
 pub const MODULE_CONFIG_TYPE_TELEMETRY: u32 = 5;
 
-/// `RegionCode.EU_868`.
 pub const REGION_EU_868: u32 = 3;
 
-/// `Channel.Role` values.
 pub const CHANNEL_ROLE_DISABLED: u32 = 0;
 pub const CHANNEL_ROLE_PRIMARY: u32 = 1;
 pub const CHANNEL_ROLE_SECONDARY: u32 = 2;
 
-/// Session passkey length on the wire (AdminMessage field 101).
 pub const SESSION_PASSKEY_LEN: usize = 8;
 
-/// Max configurable admin keys in SecurityConfig.
 pub const MAX_ADMIN_KEYS: usize = 3;
 
-/// Max channel name bytes we encode/decode.
 pub const CHANNEL_NAME_MAX: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +30,6 @@ pub struct WireLoRaConfig {
     pub region: u32,
     pub hop_limit: u32,
     pub tx_power: i32,
-    /// Field 105, stock's `config_ok_to_mqtt`.
     pub config_ok_to_mqtt: bool,
 }
 
@@ -64,7 +54,6 @@ pub struct WireDeviceConfig {
 impl Default for WireDeviceConfig {
     fn default() -> Self {
         Self {
-            // Protobuf default for an omitted role field is CLIENT (0), not ROUTER.
             role: crate::nodeinfo::DEVICE_ROLE_CLIENT,
         }
     }
@@ -139,15 +128,12 @@ impl Default for WireChannel {
     }
 }
 
-/// `Config.PositionConfig` fields this node honors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct WirePositionConfig {
-    /// Seconds; 0 = role default (1 h, or 12 h for ROUTER / ROUTER_LATE).
     pub position_broadcast_secs: u32,
     pub fixed_position: bool,
 }
 
-/// Lat/lon from `AdminMessage.set_fixed_position`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct WireFixedPosition {
     pub latitude_i: i32,
@@ -166,10 +152,8 @@ pub enum ConfigPayload {
     Sessionkey,
 }
 
-/// `ModuleConfig.TelemetryConfig` wire fields we honor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct WireTelemetryConfig {
-    /// Seconds; 0 = unset / use firmware default.
     pub device_update_interval: u32,
 }
 
@@ -236,7 +220,6 @@ impl Default for AdminMessage {
     }
 }
 
-/// Encode `Config` oneof payload bytes (no AdminMessage wrapper).
 pub fn encode_config(config: &ConfigPayload) -> heapless::Vec<u8, 240> {
     let mut out = heapless::Vec::new();
     match config {
@@ -258,7 +241,6 @@ pub fn encode_config(config: &ConfigPayload) -> heapless::Vec<u8, 240> {
             push_bytes_field(&mut out, 8, &inner);
         }
         ConfigPayload::Sessionkey => {
-            // Empty SessionkeyConfig message on field 9.
             push_bytes_field(&mut out, 9, &[]);
         }
     }
@@ -282,6 +264,9 @@ pub fn decode_position_config(payload: &[u8]) -> Option<WirePositionConfig> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
@@ -295,7 +280,6 @@ pub fn decode_position_config(payload: &[u8]) -> Option<WirePositionConfig> {
                 i = ni;
             }
             _ => {
-                // Smart broadcast, GPS, position flags, and GPIO are not stored.
                 i = skip_field(payload, i, wire)?;
             }
         }
@@ -310,6 +294,9 @@ fn decode_fixed_position_admin(payload: &[u8]) -> Option<WireFixedPosition> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 5) if i + 4 <= payload.len() => {
@@ -356,7 +343,6 @@ pub fn encode_lora_config(lora: &WireLoRaConfig) -> heapless::Vec<u8, 64> {
     let mut out = heapless::Vec::new();
     if lora.use_preset {
         push_varint_field(&mut out, 1, 1);
-        // Always emit preset id when use_preset (LONG_FAST = 0 must not be omitted).
         push_varint_field(&mut out, 2, lora.modem_preset);
     }
     if lora.region != 0 {
@@ -403,7 +389,6 @@ pub fn encode_telemetry_config(tel: &WireTelemetryConfig) -> heapless::Vec<u8, 1
     out
 }
 
-/// Encode `ModuleConfig` oneof payload bytes.
 pub fn encode_module_config(config: &ModuleConfigPayload) -> heapless::Vec<u8, 64> {
     let mut out = heapless::Vec::new();
     match config {
@@ -422,6 +407,9 @@ pub fn decode_telemetry_config(payload: &[u8]) -> Option<WireTelemetryConfig> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
@@ -444,11 +432,14 @@ pub fn decode_module_config(payload: &[u8]) -> Option<ModuleConfigPayload> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (6, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -468,7 +459,7 @@ pub fn decode_module_config(payload: &[u8]) -> Option<ModuleConfigPayload> {
 pub fn encode_channel(ch: &WireChannel) -> heapless::Vec<u8, 96> {
     let mut out = heapless::Vec::new();
     if ch.index != 0 {
-        push_svarint_field(&mut out, 1, ch.index);
+        push_int32_field(&mut out, 1, ch.index);
     }
     if ch.has_settings {
         let inner = encode_channel_settings(&ch.settings);
@@ -491,25 +482,26 @@ pub fn encode_channel_settings(settings: &WireChannelSettings) -> heapless::Vec<
         push_bytes_field(&mut out, 3, &settings.name[..len]);
     }
     if settings.has_id {
-        // fixed32 field 4
         push_tag(&mut out, 4, 5);
         let _ = out.extend_from_slice(&settings.id.to_le_bytes());
     }
     out
 }
 
-/// Decode a `Config` protobuf (fields 1 / 6 / 8 / 9).
 pub fn decode_config(payload: &[u8]) -> Option<ConfigPayload> {
     let mut result = ConfigPayload::Empty;
     let mut idx = 0usize;
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -518,7 +510,7 @@ pub fn decode_config(payload: &[u8]) -> Option<ConfigPayload> {
             }
             (2, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -527,7 +519,7 @@ pub fn decode_config(payload: &[u8]) -> Option<ConfigPayload> {
             }
             (6, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -536,7 +528,7 @@ pub fn decode_config(payload: &[u8]) -> Option<ConfigPayload> {
             }
             (8, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -545,7 +537,7 @@ pub fn decode_config(payload: &[u8]) -> Option<ConfigPayload> {
             }
             (9, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -567,6 +559,9 @@ pub fn decode_device_config(payload: &[u8]) -> Option<WireDeviceConfig> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
@@ -584,7 +579,6 @@ pub fn decode_device_config(payload: &[u8]) -> Option<WireDeviceConfig> {
 }
 
 pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
-    // Fields absent from the wire decode as zero/false, not as the firmware defaults.
     let mut lora = WireLoRaConfig {
         use_preset: false,
         modem_preset: 0,
@@ -597,6 +591,9 @@ pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
@@ -644,11 +641,14 @@ pub fn decode_security_config(payload: &[u8]) -> Option<WireSecurityConfig> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -661,7 +661,7 @@ pub fn decode_security_config(payload: &[u8]) -> Option<WireSecurityConfig> {
             }
             (2, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -674,7 +674,7 @@ pub fn decode_security_config(payload: &[u8]) -> Option<WireSecurityConfig> {
             }
             (3, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -711,16 +711,19 @@ pub fn decode_channel(payload: &[u8]) -> Option<WireChannel> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
-                let (v, ni) = read_svarint(payload, i)?;
+                let (v, ni) = read_int32(payload, i)?;
                 ch.index = v;
                 i = ni;
             }
             (2, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -748,11 +751,14 @@ pub fn decode_channel_settings(payload: &[u8]) -> Option<WireChannelSettings> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (2, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -764,7 +770,7 @@ pub fn decode_channel_settings(payload: &[u8]) -> Option<WireChannelSettings> {
             }
             (3, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -854,7 +860,7 @@ pub fn encode_admin_message(msg: &AdminMessage) -> heapless::Vec<u8, 240> {
             push_varint_field(&mut out, 65, 1);
         }
         AdminPayload::RebootSeconds(secs) => {
-            push_svarint_field(&mut out, 97, *secs);
+            push_int32_field(&mut out, 97, *secs);
         }
     }
     if msg.has_session_passkey {
@@ -869,6 +875,9 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 0) => {
@@ -878,7 +887,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (2, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -894,7 +903,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (4, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -910,7 +919,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (6, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -924,7 +933,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (8, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -941,7 +950,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (13, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -952,7 +961,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (34, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -961,7 +970,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (35, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -971,7 +980,7 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
             }
             (41, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -1001,13 +1010,13 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
                 i = ni;
             }
             (97, 0) => {
-                let (v, ni) = read_svarint(payload, i)?;
+                let (v, ni) = read_int32(payload, i)?;
                 msg.payload = AdminPayload::RebootSeconds(v);
                 i = ni;
             }
             (101, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -1028,13 +1037,13 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
 }
 
 fn encode_owner_user(node_num: u32, identity: &NodeInfoIdentity) -> heapless::Vec<u8, 240> {
-    // Reuse NODEINFO User encoding; node_num 0 still emits id if needed by clients.
     crate::nodeinfo::encode_user(node_num, identity)
 }
 
 fn encode_device_metadata(meta: &DeviceMetadata) -> heapless::Vec<u8, 64> {
     let mut out = heapless::Vec::new();
-    let ver = &meta.firmware_version[..meta.firmware_version_len as usize];
+    let ver = &meta.firmware_version
+        [..(meta.firmware_version_len as usize).min(meta.firmware_version.len())];
     if !ver.is_empty() {
         push_bytes_field(&mut out, 1, ver);
     }
@@ -1050,11 +1059,14 @@ fn decode_device_metadata(payload: &[u8]) -> Option<DeviceMetadata> {
     while idx < payload.len() {
         let (tag, mut i) = read_varint(payload, idx)?;
         let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, 2) => {
                 let (len, ni) = read_varint(payload, i)?;
-                let end = ni + len as usize;
+                let end = ni.checked_add(len as usize)?;
                 if end > payload.len() {
                     return None;
                 }
@@ -1078,48 +1090,28 @@ fn decode_device_metadata(payload: &[u8]) -> Option<DeviceMetadata> {
     Some(meta)
 }
 
-fn read_varint(data: &[u8], mut idx: usize) -> Option<(u32, usize)> {
-    let mut result = 0u32;
-    let mut shift = 0u32;
-    for _ in 0..5 {
-        if idx >= data.len() {
-            return None;
+fn read_int32(data: &[u8], idx: usize) -> Option<(i32, usize)> {
+    let (v, end) = crate::protobuf::read_varint64(data, idx)?;
+    Some((v as i32, end))
+}
+
+fn push_int32_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, value: i32) {
+    push_tag(out, field, 0);
+    let mut v = value as i64 as u64;
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        let _ = out.push(byte | if v != 0 { 0x80 } else { 0 });
+        if v == 0 {
+            break;
         }
-        let byte = data[idx];
-        idx += 1;
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, idx));
-        }
-        shift += 7;
     }
-    None
 }
 
 fn read_svarint(data: &[u8], idx: usize) -> Option<(i32, usize)> {
     let (v, ni) = read_varint(data, idx)?;
     let decoded = ((v >> 1) as i32) ^ (-((v & 1) as i32));
     Some((decoded, ni))
-}
-
-fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
-    match wire {
-        0 => {
-            let (_, i) = read_varint(data, idx)?;
-            Some(i)
-        }
-        2 => {
-            let (len, mut i) = read_varint(data, idx)?;
-            i += len as usize;
-            if i > data.len() {
-                None
-            } else {
-                Some(i)
-            }
-        }
-        1 | 5 => Some(idx + if wire == 1 { 8 } else { 4 }),
-        _ => None,
-    }
 }
 
 fn push_tag<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, wire: u8) {
@@ -1163,10 +1155,11 @@ mod tests {
 
     #[test]
     fn admin_get_set_lora_round_trip_golden() {
-        let mut msg = AdminMessage::default();
-        msg.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA);
-        msg.has_session_passkey = true;
-        msg.session_passkey = [1, 2, 3, 4, 5, 6, 7, 8];
+        let msg = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_LORA),
+            has_session_passkey: true,
+            session_passkey: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
         let encoded = encode_admin_message(&msg);
         let decoded = decode_admin_message(&encoded).unwrap();
         assert_eq!(
@@ -1184,10 +1177,11 @@ mod tests {
             tx_power: 27,
             config_ok_to_mqtt: false,
         };
-        let mut set = AdminMessage::default();
-        set.payload = AdminPayload::SetConfig(ConfigPayload::Lora(lora));
-        set.has_session_passkey = true;
-        set.session_passkey = [9, 8, 7, 6, 5, 4, 3, 2];
+        let set = AdminMessage {
+            payload: AdminPayload::SetConfig(ConfigPayload::Lora(lora)),
+            has_session_passkey: true,
+            session_passkey: [9, 8, 7, 6, 5, 4, 3, 2],
+        };
         let set_bytes = encode_admin_message(&set);
         let set_decoded = decode_admin_message(&set_bytes).unwrap();
         match set_decoded.payload {
@@ -1201,11 +1195,13 @@ mod tests {
 
     #[test]
     fn admin_security_admin_keys_round_trip() {
-        let mut sec = WireSecurityConfig::default();
-        sec.has_public_key = true;
-        sec.public_key = [0x11; 32];
-        sec.has_private_key = true;
-        sec.private_key = [0x22; 32];
+        let mut sec = WireSecurityConfig {
+            has_public_key: true,
+            public_key: [0x11; 32],
+            has_private_key: true,
+            private_key: [0x22; 32],
+            ..Default::default()
+        };
         sec.admin_keys[0] = [0xAA; 32];
         sec.admin_keys[1] = [0xBB; 32];
         sec.admin_key_count = 2;
@@ -1233,33 +1229,40 @@ mod tests {
 
     #[test]
     fn admin_sessionkey_and_edit_fields() {
-        let mut msg = AdminMessage::default();
-        msg.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_SESSIONKEY);
+        let msg = AdminMessage {
+            payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SESSIONKEY),
+            ..Default::default()
+        };
         let bytes = encode_admin_message(&msg);
         assert_eq!(
             decode_admin_message(&bytes).unwrap().payload,
             AdminPayload::GetConfigRequest(CONFIG_TYPE_SESSIONKEY)
         );
 
-        let mut begin = AdminMessage::default();
-        begin.payload = AdminPayload::BeginEditSettings;
-        begin.has_session_passkey = true;
-        begin.session_passkey = [0xFE; 8];
+        let begin = AdminMessage {
+            payload: AdminPayload::BeginEditSettings,
+            has_session_passkey: true,
+            session_passkey: [0xFE; 8],
+        };
         let begin_bytes = encode_admin_message(&begin);
         let begin_dec = decode_admin_message(&begin_bytes).unwrap();
         assert_eq!(begin_dec.payload, AdminPayload::BeginEditSettings);
         assert_eq!(begin_dec.session_passkey, [0xFE; 8]);
 
-        let mut commit = AdminMessage::default();
-        commit.payload = AdminPayload::CommitEditSettings;
+        let commit = AdminMessage {
+            payload: AdminPayload::CommitEditSettings,
+            ..Default::default()
+        };
         let commit_bytes = encode_admin_message(&commit);
         assert_eq!(
             decode_admin_message(&commit_bytes).unwrap().payload,
             AdminPayload::CommitEditSettings
         );
 
-        let mut reboot = AdminMessage::default();
-        reboot.payload = AdminPayload::RebootSeconds(5);
+        let reboot = AdminMessage {
+            payload: AdminPayload::RebootSeconds(5),
+            ..Default::default()
+        };
         let reboot_bytes = encode_admin_message(&reboot);
         assert_eq!(
             decode_admin_message(&reboot_bytes).unwrap().payload,
@@ -1269,7 +1272,6 @@ mod tests {
 
     #[test]
     fn admin_skips_unknown_fields() {
-        // Field 99 (unknown) varint + get_config_request LORA.
         let mut bytes = heapless::Vec::<u8, 32>::new();
         push_varint_field(&mut bytes, 99, 42);
         push_varint_field(&mut bytes, 5, CONFIG_TYPE_LORA);
@@ -1291,10 +1293,6 @@ mod tests {
             config_ok_to_mqtt: false,
         };
         let bytes = encode_lora_config(&lora);
-        // use_preset=true → field 1 varint 1: 08 01
-        // modem_preset=5 → field 2 varint 5: 10 05
-        // region=3 → field 7 varint 3: 38 03
-        // hop_limit/tx_power omitted when zero
         assert_eq!(bytes.as_slice(), &[0x08, 0x01, 0x10, 0x05, 0x38, 0x03]);
     }
 
@@ -1351,12 +1349,11 @@ mod tests {
     #[test]
     fn sessionkey_empty_config_encodes_field_9() {
         let bytes = encode_config(&ConfigPayload::Sessionkey);
-        assert_eq!(bytes.as_slice(), &[0x4a, 0x00]); // field 9, length 0
+        assert_eq!(bytes.as_slice(), &[0x4a, 0x00]);
     }
 
     #[test]
     fn position_config_keeps_cadence_and_fixed_flag_only() {
-        // field 1 = 7200s, field 2 smart=true, field 3 fixed=true, field 13 gps_mode=ENABLED
         let raw = [0x08, 0xA0, 0x38, 0x10, 0x01, 0x18, 0x01, 0x68, 0x01];
         let pos = decode_position_config(&raw).unwrap();
         assert_eq!(pos.position_broadcast_secs, 7200);
@@ -1369,13 +1366,15 @@ mod tests {
 
     #[test]
     fn set_fixed_position_round_trips_lat_lon() {
-        let mut msg = AdminMessage::default();
-        msg.payload = AdminPayload::SetFixedPosition(WireFixedPosition {
-            latitude_i: 52_520_000,
-            longitude_i: 13_405_000,
-            has_latitude_i: true,
-            has_longitude_i: true,
-        });
+        let msg = AdminMessage {
+            payload: AdminPayload::SetFixedPosition(WireFixedPosition {
+                latitude_i: 52_520_000,
+                longitude_i: 13_405_000,
+                has_latitude_i: true,
+                has_longitude_i: true,
+            }),
+            ..Default::default()
+        };
         let bytes = encode_admin_message(&msg);
         match decode_admin_message(&bytes).unwrap().payload {
             AdminPayload::SetFixedPosition(pos) => {
@@ -1385,5 +1384,26 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn int32_fields_match_protobuf_instead_of_zigzag() {
+        let channel = WireChannel {
+            index: 1,
+            ..WireChannel::default()
+        };
+        assert_eq!(encode_channel(&channel).as_slice(), &[8, 1]);
+        let msg = AdminMessage {
+            payload: AdminPayload::RebootSeconds(-1),
+            ..AdminMessage::default()
+        };
+        let wire = encode_admin_message(&msg);
+        assert_eq!(wire.len(), 12);
+        assert_eq!(decode_admin_message(&wire), Some(msg));
+        let positive = AdminMessage {
+            payload: AdminPayload::RebootSeconds(5),
+            ..AdminMessage::default()
+        };
+        assert_eq!(encode_admin_message(&positive).as_slice(), &[0x88, 0x06, 5]);
     }
 }

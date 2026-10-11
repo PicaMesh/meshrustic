@@ -1,5 +1,3 @@
-//! Device role get/set via admin and persistence across store reload (X2).
-
 use mesh_crypto::CryptoEngine;
 use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_routing::{
@@ -83,9 +81,9 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC101_0001u32;
     let peer = 0xD101_0002u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x41; 16]), 41);
-    let (b1_priv, b1_pub) = generate_keypair(Some(&[0x42; 16]), 42);
-    let (_b2_priv, b2_pub) = generate_keypair(Some(&[0x43; 16]), 43);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -96,8 +94,10 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
     router.set_builtin_admin_public_keys_for_test([b1_pub, b2_pub]);
     assert_eq!(router.device_role(), DEVICE_ROLE_CLIENT);
 
-    let mut get = mesh_routing::AdminMessage::default();
-    get.payload = AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE);
+    let get = mesh_routing::AdminMessage {
+        payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_DEVICE),
+        ..Default::default()
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -110,12 +110,13 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
     let _ = router.poll_admin_tx(1_000);
     let passkey = router.admin_state().session_passkey;
 
-    let mut set = mesh_routing::AdminMessage::default();
-    set.payload = AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
-        role: DEVICE_ROLE_ROUTER,
-    }));
-    set.has_session_passkey = true;
-    set.session_passkey = passkey;
+    let set = mesh_routing::AdminMessage {
+        payload: AdminPayload::SetConfig(ConfigPayload::Device(WireDeviceConfig {
+            role: DEVICE_ROLE_ROUTER,
+        })),
+        has_session_passkey: true,
+        session_passkey: passkey,
+    };
     let frame = build_pki_admin_frame(
         our,
         peer,
@@ -142,8 +143,6 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
 
     let reloaded = store.load();
     assert_eq!(reloaded.device_role, DEVICE_ROLE_ROUTER as u8);
-
-    // Same order as boards/nrf52840/src/main.rs: load, then set_node_identity(for_node).
     static ROUTER2: StaticCell<Router> = StaticCell::new();
     let router2 = ROUTER2.init(Router::new(our));
     router2.load_node_config(&reloaded);
@@ -167,7 +166,7 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
 fn corrupt_flash_role_clamps_to_client() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC102_0001u32;
-    let (node_priv, node_pub) = generate_keypair(Some(&[0x51; 16]), 51);
+    let (node_priv, node_pub) = generate_keypair([0x51; 32]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.device_role = 99;
     let router = ROUTER.init(Router::new(our));
