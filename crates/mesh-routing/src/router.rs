@@ -3567,17 +3567,18 @@ impl Router {
                 let _ = inner.map(decode_routing_payload);
                 return;
             }
-            if parsed.from != self.node_num && parsed.from != 0 && !self.module_reply_suppresses_ack
+            if parsed.from != self.node_num
+                && parsed.from != 0
+                && parsed.want_ack
+                && !self.module_reply_suppresses_ack
             {
-                if parsed.want_ack {
-                    if data.request_id == 0 && data.reply_id == 0 {
-                        self.schedule_ack(parsed, data.has_bitfield, parsed.channel, now_ms);
-                    } else if hops_away(parsed.hop_start, parsed.hop_limit, data.has_bitfield)
-                        == Some(0)
-                        || parsed.next_hop != 0
-                    {
-                        self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
-                    }
+                if data.request_id == 0 && data.reply_id == 0 {
+                    self.schedule_ack(parsed, data.has_bitfield, parsed.channel, now_ms);
+                } else if hops_away(parsed.hop_start, parsed.hop_limit, data.has_bitfield)
+                    == Some(0)
+                    || parsed.next_hop != 0
+                {
+                    self.schedule_ack_with_hop(parsed, parsed.channel, 0, 0, now_ms);
                 }
             }
         } else if parsed.from != self.node_num
@@ -6996,12 +6997,18 @@ mod tests {
             };
             let _ = router.process_inbound(&inbound, id).unwrap();
             if !want_ack {
-                assert!(router.poll_ack_tx(id).is_none(), "unsolicited delivery has no ack");
+                assert!(
+                    router.poll_ack_tx(id).is_none(),
+                    "unsolicited delivery has no ack"
+                );
                 let duplicate = router
                     .process_inbound(&inbound, id.wrapping_add(1))
                     .unwrap();
                 assert!(duplicate.duplicate);
-                assert!(router.poll_ack_tx(id).is_none(), "duplicate has no implicit ack");
+                assert!(
+                    router.poll_ack_tx(id).is_none(),
+                    "duplicate has no implicit ack"
+                );
                 continue;
             }
             let ack = router.poll_ack_tx(id).expect("requested ack");
