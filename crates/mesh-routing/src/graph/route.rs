@@ -881,7 +881,12 @@ mod tests {
         let mut edges = EdgeStore::new();
         edges.ensure_local_node(ME, 0);
         edges.update_edge(ME, ME, PEER, 5.2, 0, EdgeSource::Reported, true, 0);
-        edges.find_node_mut(ME).unwrap().find_edge_mut(PEER).unwrap().etx_variance = 43;
+        edges
+            .find_node_mut(ME)
+            .unwrap()
+            .find_edge_mut(PEER)
+            .unwrap()
+            .etx_variance = 43;
 
         let scored = delivery_direction_cost_fixed(&edges, None, ME, PEER, 0, ME).unwrap();
         assert_eq!(scored, 950, "ETX 5.2 plus variance penalty 4.3");
