@@ -307,11 +307,19 @@ pub fn delivery_hop_cost_fixed(
     delivery_direction_cost_fixed(edges, capability, from, to, now_ms, my_node)
 }
 
-pub fn has_strong_hop_to(edges: &EdgeStore, from: u32, peer: u32) -> bool {
+pub fn has_strong_hop_to(
+    edges: &EdgeStore,
+    capability: Option<&CapabilityCache>,
+    from: u32,
+    peer: u32,
+    now_ms: u32,
+    my_node: u32,
+) -> bool {
     if peer == 0 {
         return false;
     }
-    hop_cost_fixed(edges, from, peer).is_some_and(|c| c <= COVERAGE_ETX_CEILING_FIXED)
+    delivery_direction_cost_fixed(edges, capability, from, peer, now_ms, my_node)
+        .is_some_and(|cost| cost <= COVERAGE_ETX_CEILING_FIXED)
 }
 
 pub fn has_strong_delivery_hop(
@@ -322,8 +330,8 @@ pub fn has_strong_delivery_hop(
     now_ms: u32,
     my_node: u32,
 ) -> bool {
-    delivery_hop_cost_fixed(edges, capability, from, dest, now_ms, my_node).is_some()
-        && has_strong_hop_to(edges, from, dest)
+    delivery_hop_cost_fixed(edges, capability, from, dest, now_ms, my_node)
+        .is_some_and(|cost| cost <= COVERAGE_ETX_CEILING_FIXED)
 }
 
 /// Cost buckets prevent tiny differences in local measurements from assigning different owners on
@@ -865,6 +873,20 @@ mod tests {
     use crate::capability::CapabilityCache;
     use crate::graph::{DownstreamTable, EdgeSource, EdgeStore, NodeClass};
     use crate::nodeinfo::{DEVICE_ROLE_CLIENT, DEVICE_ROLE_CLIENT_MUTE};
+
+    #[test]
+    fn strong_hop_gate_uses_variance_aware_delivery_score() {
+        const ME: u32 = 0xAA;
+        const PEER: u32 = 0xBB;
+        let mut edges = EdgeStore::new();
+        edges.ensure_local_node(ME, 0);
+        edges.update_edge(ME, ME, PEER, 5.2, 0, EdgeSource::Reported, true, 0);
+        edges.find_node_mut(ME).unwrap().find_edge_mut(PEER).unwrap().etx_variance = 43;
+
+        let scored = delivery_direction_cost_fixed(&edges, None, ME, PEER, 0, ME).unwrap();
+        assert_eq!(scored, 950, "ETX 5.2 plus variance penalty 4.3");
+        assert!(!has_strong_hop_to(&edges, None, ME, PEER, 0, ME));
+    }
 
     #[test]
     fn direct_neighbor_is_next_hop() {

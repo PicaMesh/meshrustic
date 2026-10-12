@@ -193,9 +193,10 @@ is actually waiting for.
   config) along with the observed RSSI and SNR. A LoRa frame decodes when SNR clears the
   demodulator's minimum for the spreading factor in use — a datasheet figure that runs from about
   -7.5 dB at the fastest preset's spreading factor to about -20 dB at the slowest — so the curve's
-  dominant term is *decode margin*, the reported SNR minus that preset's threshold: deeply negative
-  margin prices a link near the curve's floor regardless of RSSI, margin at the threshold itself
-  prices a link as marginal, and margin a few dB above it saturates the price near its best. RSSI
+  dominant term is *decode margin*, the reported SNR minus that preset's threshold. The lower-margin
+  ramp is deliberately conservative: a link at the decoder threshold is priced above the default
+  strong-hop ceiling, and the price improves quickly only after several dB of margin. Deeply negative
+  margin prices a link near the curve's floor regardless of RSSI. RSSI
   contributes only a second, much narrower term — a mild, monotonic shading for capture effect,
   interference margin and estimate confidence at very weak absolute signal strength — never enough
   on its own to move a link across the coverage ceiling except in a narrow band right at the

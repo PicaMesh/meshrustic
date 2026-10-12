@@ -17,7 +17,8 @@ fn preset_snr_threshold_db(modem_preset: u8) -> f32 {
 }
 
 const MARGIN_BREAK_DB: [f32; 7] = [-10.0, -5.0, -2.0, 0.0, 6.0, 12.0, 17.0];
-const MARGIN_PROB: [f32; 7] = [0.025, 0.05, 0.10, 0.15, 0.50, 0.62, 0.95];
+// Be conservative near/below the decoder threshold: zero margin must exceed the strong-hop ceiling.
+const MARGIN_PROB: [f32; 7] = [0.025, 0.035, 0.065, 0.10, 0.40, 0.62, 0.95];
 const MARGIN_LAST: usize = MARGIN_BREAK_DB.len() - 1;
 
 const RSSI_FACTOR_BREAK_DBM: [i32; 2] = [-120, -60];
@@ -262,7 +263,7 @@ mod tests {
     fn margin_at_threshold_pins_the_zero_margin_probability() {
         let etx = calculate_etx(-60, -10.0, MODEM_SHORT_SLOW);
         assert!(
-            (etx - 6.6667).abs() < 0.001,
+            (etx - 10.0).abs() < 0.001,
             "zero-margin ETX drifted off its pinned value: got {etx}"
         );
     }
@@ -271,7 +272,7 @@ mod tests {
     fn margin_one_db_below_threshold_pins_the_zero_margin_breakpoint() {
         let etx = calculate_etx(-60, -11.0, MODEM_SHORT_SLOW);
         assert!(
-            (etx - 8.0).abs() < 0.001,
+            (etx - 12.1212).abs() < 0.001,
             "-1 dB margin ETX drifted off its pinned value: got {etx}"
         );
     }
@@ -280,7 +281,7 @@ mod tests {
     fn margin_five_db_below_threshold_pins_the_low_breakpoint_probability() {
         let etx = calculate_etx(-60, -15.0, MODEM_SHORT_SLOW);
         assert!(
-            (etx - 20.0).abs() < 0.001,
+            (etx - 28.5714).abs() < 0.001,
             "-5 dB margin ETX drifted off its pinned value: got {etx}"
         );
     }

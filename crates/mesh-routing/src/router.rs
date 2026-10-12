@@ -2236,7 +2236,14 @@ impl Router {
                 self.node_num,
             )
         } else {
-            crate::graph::has_strong_hop_to(self.graph.edges(), self.node_num, intended_hop)
+            crate::graph::has_strong_hop_to(
+                self.graph.edges(),
+                Some(self.graph.capability()),
+                self.node_num,
+                intended_hop,
+                now_ms,
+                self.node_num,
+            )
         };
         let stamp_hop = if unicast_plan.as_ref().is_some_and(|p| p.nonfinal_flood) {
             0
