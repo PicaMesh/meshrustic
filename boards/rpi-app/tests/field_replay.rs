@@ -69,8 +69,7 @@ fn topology_frame(
     id: u32,
     packed: &[u8],
 ) -> (u8, [u8; mesh_routing::MAX_WIRE_LEN]) {
-    build_topology_wire_frame(from, id, CHANNEL, 5, &bench.key, packed, false)
-        .expect("topology frame")
+    build_topology_wire_frame(from, id, CHANNEL, &bench.key, packed, false).expect("topology frame")
 }
 #[test]
 fn czar_reboot_restarts_its_version_counter_without_stale_rejections() {

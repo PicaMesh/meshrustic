@@ -39,7 +39,7 @@ impl Default for WireLoRaConfig {
             use_preset: true,
             modem_preset: mesh_radio::MODEM_DEFAULT_PRESET as u32,
             region: REGION_EU_868,
-            hop_limit: 3,
+            hop_limit: mesh_radio::DEFAULT_HOP_LIMIT as u32,
             tx_power: 27,
             config_ok_to_mqtt: true,
         }
@@ -348,9 +348,7 @@ pub fn encode_lora_config(lora: &WireLoRaConfig) -> heapless::Vec<u8, 64> {
     if lora.region != 0 {
         push_varint_field(&mut out, 7, lora.region);
     }
-    if lora.hop_limit != 0 {
-        push_varint_field(&mut out, 8, lora.hop_limit);
-    }
+    push_varint_field(&mut out, 8, lora.hop_limit);
     if lora.tx_power != 0 {
         push_svarint_field(&mut out, 11, lora.tx_power);
     }
@@ -583,7 +581,7 @@ pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
         use_preset: false,
         modem_preset: 0,
         region: 0,
-        hop_limit: 0,
+        hop_limit: mesh_radio::DEFAULT_HOP_LIMIT as u32,
         tx_power: 0,
         config_ok_to_mqtt: false,
     };
@@ -1293,7 +1291,20 @@ mod tests {
             config_ok_to_mqtt: false,
         };
         let bytes = encode_lora_config(&lora);
-        assert_eq!(bytes.as_slice(), &[0x08, 0x01, 0x10, 0x05, 0x38, 0x03]);
+        assert_eq!(
+            bytes.as_slice(),
+            &[0x08, 0x01, 0x10, 0x05, 0x38, 0x03, 0x40, 0x00]
+        );
+        assert_eq!(decode_lora_config(&bytes).unwrap().hop_limit, 0);
+    }
+
+    #[test]
+    fn missing_lora_hop_limit_uses_default() {
+        let bytes = [0x08, 0x01, 0x10, 0x05, 0x38, 0x03];
+        assert_eq!(
+            decode_lora_config(&bytes).unwrap().hop_limit,
+            mesh_radio::DEFAULT_HOP_LIMIT as u32
+        );
     }
 
     #[test]

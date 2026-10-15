@@ -108,7 +108,11 @@ is actually waiting for.
 - **Hop fields.** Originated frames carry `hop_start` equal to `hop_limit`, as stock does.
   Replies (`Router::response_header`) use stock's hops-used-plus-margin rule from
   `hop_limit_for_response`. A request that reached us through a relay keeps its reply's hop
-  budget. Tests: `reply_to_direct_hearing_neighbour_is_hop_limited_when_stock_nodes_are_around`.
+  budget. The persisted/admin-configurable LoRa hop limit defaults to 7 and applies to all regular
+  packets. If the hop-limit field is missing, config loading uses the default; an explicit zero
+  remains a valid zero-hop limit. Signal Routing topology broadcasts use their fixed 4-hop budget,
+  independent of the LoRa setting. Tests:
+  `reply_to_direct_hearing_neighbour_is_hop_limited_when_stock_nodes_are_around`.
 - **Last hop (originated).** A unicast we originate or a reply to a direct neighbour that hears
   us, while stock neighbours listen (`NeighborGraph::caps_last_hop`), goes out with
   `LAST_HOP_BUDGET` (one hop) and the destination's byte as next hop (`Router::send_local`,

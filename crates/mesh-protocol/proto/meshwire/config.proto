@@ -62,7 +62,7 @@ message Config {
   message LoRaConfig {
     bool use_preset = 1;
     ModemPreset modem_preset = 2;
-    uint32 hop_limit = 8;
+    optional uint32 hop_limit = 8;
     sint32 tx_power = 11;
     RegionCode region = 7;
   }

@@ -1,7 +1,7 @@
 use mesh_crypto::CryptoKey;
 use mesh_radio::{
-    modem_preset_params, RegionInfo, EU_868, EU_868_DEFAULT_FREQ_MHZ, MODEM_DEFAULT_PRESET,
-    MODEM_SHORT_SLOW, SYNC_WORD,
+    modem_preset_params, RegionInfo, DEFAULT_HOP_LIMIT, EU_868, EU_868_DEFAULT_FREQ_MHZ,
+    MODEM_DEFAULT_PRESET, MODEM_SHORT_SLOW, SYNC_WORD,
 };
 
 pub const DEFAULT_PSK: [u8; 16] = [
@@ -26,6 +26,10 @@ pub struct LoRaConfig {
 }
 
 impl LoRaConfig {
+    pub fn effective_hop_limit(self) -> u8 {
+        self.hop_limit.min(mesh_radio::MAX_HOP_LIMIT)
+    }
+
     pub fn eu868_default() -> Self {
         let mut cfg = Self {
             region: EU_868,
@@ -35,7 +39,7 @@ impl LoRaConfig {
             spreading_factor: 11,
             coding_rate: 5,
             sync_word: SYNC_WORD,
-            hop_limit: 3,
+            hop_limit: DEFAULT_HOP_LIMIT,
             tx_power_dbm: mesh_radio::MAX_TX_POWER_DBM,
             use_preset: true,
             ok_to_mqtt: true,
@@ -53,7 +57,7 @@ impl LoRaConfig {
             spreading_factor: 8,
             coding_rate: 5,
             sync_word: SYNC_WORD,
-            hop_limit: 3,
+            hop_limit: DEFAULT_HOP_LIMIT,
             tx_power_dbm: mesh_radio::MAX_TX_POWER_DBM,
             use_preset: true,
             ok_to_mqtt: true,
@@ -134,6 +138,7 @@ mod tests {
     fn primary_channel_hash_matches_default_preset() {
         let config = NodeConfig::first_boot(1, [0; 32], [0; 32]);
         assert_eq!(config.lora.modem_preset, MODEM_DEFAULT_PRESET);
+        assert_eq!(config.lora.hop_limit, DEFAULT_HOP_LIMIT);
         assert_eq!(
             config.primary_channel_hash(),
             mesh_radio::primary_channel_hash("", MODEM_DEFAULT_PRESET, true, &DEFAULT_PSK)
@@ -149,6 +154,17 @@ mod tests {
         assert_eq!(lora.bandwidth_khz, params.bandwidth_khz);
         assert_eq!(lora.spreading_factor, params.spreading_factor);
         assert!(lora.use_preset);
+    }
+
+    #[test]
+    fn effective_hop_limit_preserves_zero_and_caps_invalid_ones() {
+        let mut lora = LoRaConfig::eu868_default();
+        lora.hop_limit = 0;
+        assert_eq!(lora.effective_hop_limit(), 0);
+        lora.hop_limit = 5;
+        assert_eq!(lora.effective_hop_limit(), 5);
+        lora.hop_limit = u8::MAX;
+        assert_eq!(lora.effective_hop_limit(), mesh_radio::MAX_HOP_LIMIT);
     }
 
     #[test]

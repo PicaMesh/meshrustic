@@ -1,6 +1,6 @@
 use crate::config::{
-    modem_preset_params, RadioConfig, EU_868, EU_868_DEFAULT_FREQ_MHZ, MODEM_LONG_FAST,
-    MODEM_LONG_MODERATE, MODEM_LONG_SLOW, MODEM_SHORT_FAST, MODEM_SHORT_TURBO,
+    modem_preset_params, RadioConfig, DEFAULT_HOP_LIMIT, EU_868, EU_868_DEFAULT_FREQ_MHZ,
+    MODEM_LONG_FAST, MODEM_LONG_MODERATE, MODEM_LONG_SLOW, MODEM_SHORT_FAST, MODEM_SHORT_TURBO,
     MODEM_VERY_LONG_SLOW, PREAMBLE_LENGTH, SYNC_WORD,
 };
 
@@ -20,7 +20,7 @@ pub fn eu868_config_for_preset(modem_preset: u8) -> RadioConfig {
         sync_word: SYNC_WORD,
         preamble_length: PREAMBLE_LENGTH,
         tx_power_dbm: 22,
-        hop_limit: 3,
+        hop_limit: DEFAULT_HOP_LIMIT,
     }
 }
 

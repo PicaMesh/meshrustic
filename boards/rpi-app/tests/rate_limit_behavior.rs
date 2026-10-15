@@ -67,7 +67,7 @@ fn flood_routing_bucket(router: &mut Router, from: u32, channel: u8, key: &Crypt
     write_packed_header(&mut packed, 1, true);
     for i in 0..10u32 {
         let (len, frame) =
-            build_topology_wire_frame(from, 0x6000 + i, channel, 3, key, &packed, false)
+            build_topology_wire_frame(from, 0x6000 + i, channel, key, &packed, false)
                 .expect("routing flood wire");
         router
             .process_inbound(&inbound(&frame[..len as usize]), t)
@@ -89,16 +89,9 @@ fn build_topology_wire(
     packed[10] = 8;
     packed[11] = 0x02;
     let packed_len = PACKED_NEIGHBOR_HEADER_SIZE + 8;
-    let (len, frame) = build_topology_wire_frame(
-        from,
-        packet_id,
-        channel,
-        3,
-        key,
-        &packed[..packed_len],
-        false,
-    )
-    .expect("topology wire");
+    let (len, frame) =
+        build_topology_wire_frame(from, packet_id, channel, key, &packed[..packed_len], false)
+            .expect("topology wire");
     let mut out = heapless::Vec::new();
     out.extend_from_slice(&frame[..len as usize]).unwrap();
     out

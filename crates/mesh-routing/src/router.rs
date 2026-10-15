@@ -4,7 +4,8 @@ use mesh_protocol::{
     PACKET_HEADER_LEN,
 };
 use mesh_radio::{
-    eu868_config_for_preset, packet_time_ms, primary_channel_hash, MODEM_DEFAULT_PRESET,
+    eu868_config_for_preset, packet_time_ms, primary_channel_hash, DEFAULT_HOP_LIMIT,
+    MODEM_DEFAULT_PRESET,
 };
 
 #[cfg(feature = "pki")]
@@ -54,7 +55,7 @@ use crate::telemetry::{
 use crate::topology::{
     build_app_wire_frame, build_topology_wire_frame, extract_packed_neighbors,
     try_decrypt_data_full, DataBitfield, DataEncodeOpts, DecodedData, MAX_TOPOLOGY_PACKETS,
-    SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION, SR_BROADCAST_MAX_HOPS,
+    SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION, SR_BROADCAST_HOP_LIMIT,
 };
 use crate::traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,
@@ -272,7 +273,7 @@ impl Router {
             MODEM_DEFAULT_PRESET,
             true,
             CryptoKey::from_bytes(&DEFAULT_PSK),
-            3,
+            DEFAULT_HOP_LIMIT,
         )
     }
 
@@ -316,7 +317,14 @@ impl Router {
     /// Static initialization avoids constructing the large routing graph on the constrained firmware
     /// stack.
     pub const fn unconfigured() -> Self {
-        Self::with_channel(0, CryptoKey::none(), 0, MODEM_DEFAULT_PRESET, true, 3)
+        Self::with_channel(
+            0,
+            CryptoKey::none(),
+            0,
+            MODEM_DEFAULT_PRESET,
+            true,
+            DEFAULT_HOP_LIMIT,
+        )
     }
 
     pub const fn with_channel(
@@ -477,7 +485,7 @@ impl Router {
         );
         self.pending_radio_settings = None;
         self.operating_preset = self.modem_preset;
-        self.hop_limit = cfg.lora.hop_limit;
+        self.hop_limit = cfg.lora.effective_hop_limit();
     }
 
     pub fn write_admin_into_config(&self, cfg: &mut mesh_store::NodeConfig) {
@@ -837,7 +845,7 @@ impl Router {
             broadcast_secs: (TOPOLOGY_BROADCAST_MS / 1000) as u16,
             dirty_secs: (TOPOLOGY_DIRTY_MIN_MS / 1000) as u16,
             node_ttl_secs: NEIGHBOR_TTL_MS / 1000,
-            max_hops: SR_BROADCAST_MAX_HOPS,
+            max_hops: SR_BROADCAST_HOP_LIMIT,
         });
     }
 
@@ -4072,7 +4080,6 @@ impl Router {
                 self.node_num,
                 packet_id,
                 self.channel_hash,
-                self.hop_limit,
                 &self.channel_key,
                 &packed_buf[..packed_len],
                 self.ok_to_mqtt(),
@@ -4867,6 +4874,37 @@ mod tests {
     use mesh_protocol::PacketHeader;
     use static_cell::StaticCell;
 
+    fn router_with_hop_limit(node_num: u32, hop_limit: u8) -> Router {
+        Router::with_modem_preset(
+            node_num,
+            "",
+            MODEM_DEFAULT_PRESET,
+            true,
+            CryptoKey::from_bytes(&DEFAULT_PSK),
+            hop_limit,
+        )
+    }
+
+    #[test]
+    fn new_router_uses_configured_hop_limit_default() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        assert_eq!(router.hop_limit(), DEFAULT_HOP_LIMIT);
+    }
+
+    #[test]
+    fn zero_configured_hop_limit_is_preserved() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        let mut config = mesh_store::NodeConfig::first_boot(1, [0; 32], [0; 32]);
+        config.lora.hop_limit = 0;
+
+        router.load_node_config(&config);
+
+        assert_eq!(router.hop_limit(), 0);
+        assert_eq!(router.radio_config().hop_limit, 0);
+    }
+
     #[test]
     fn pki_curve_attempts_are_globally_bounded_per_second() {
         let mut router = Router::new(1);
@@ -5005,7 +5043,7 @@ mod tests {
     #[test]
     fn admin_reliable_reply_waits_for_tracking_capacity() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
-        let router = ROUTER.init(Router::new(1));
+        let router = ROUTER.init(router_with_hop_limit(1, 3));
         let header = PacketHeader::from_fields(2, 1, 99, 0, 3, 3, true, false, 0, 0);
         let wire = encode_wire(header, &[1, 2]);
         let mut bytes = [0; MAX_WIRE_LEN];
@@ -5316,8 +5354,7 @@ mod tests {
 
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 1, true);
-        let (len, frame) =
-            build_topology_wire_frame(PEER, 99, 0x77, 3, &key, &packed, false).unwrap();
+        let (len, frame) = build_topology_wire_frame(PEER, 99, 0x77, &key, &packed, false).unwrap();
         let inbound = InboundPacket {
             radio_id: 0,
             rssi: -70,
@@ -5366,7 +5403,7 @@ mod tests {
             0,
         );
         let (len, frame) =
-            build_topology_wire_frame(PEER, 0xA1, 0x77, 3, &key, &packed, false).unwrap();
+            build_topology_wire_frame(PEER, 0xA1, 0x77, &key, &packed, false).unwrap();
         router
             .process_inbound(
                 &InboundPacket {
@@ -5512,7 +5549,7 @@ mod tests {
         let bootstrap = |from: u32, id: u32| {
             let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
             write_packed_header(&mut packed, 1, true);
-            build_topology_wire_frame(from, id, 0x77, 3, &key, &packed, false).unwrap()
+            build_topology_wire_frame(from, id, 0x77, &key, &packed, false).unwrap()
         };
         let feed = |router: &mut Router, frame: &(u8, [u8; MAX_WIRE_LEN]), at: u32| {
             router
@@ -5556,7 +5593,7 @@ mod tests {
         let mut router = Router::with_channel(ME, key, 0x77, MODEM_SHORT_SLOW, true, 3);
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 1, true);
-        let frame = build_topology_wire_frame(PEER, 0x94, 0x77, 3, &key, &packed, false).unwrap();
+        let frame = build_topology_wire_frame(PEER, 0x94, 0x77, &key, &packed, false).unwrap();
         router
             .process_inbound(
                 &InboundPacket {
@@ -6846,7 +6883,7 @@ mod tests {
     #[test]
     fn forwarded_want_ack_unicast_is_repeated_then_dropped_without_alternate() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
-        let router = ROUTER.init(Router::new(UNI_ME));
+        let router = ROUTER.init(router_with_hop_limit(UNI_ME, 3));
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x601, true);
         let (sent, armed_at) = forward_unicast(router, &wire, 0);
@@ -6887,7 +6924,7 @@ mod tests {
     #[test]
     fn forwarded_unicast_without_want_ack_arms_repeat_and_redirect_not_flood() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
-        let router = ROUTER.init(Router::new(UNI_ME));
+        let router = ROUTER.init(router_with_hop_limit(UNI_ME, 3));
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x602, false);
         let (sent, armed_at) = forward_unicast(router, &wire, 0);
@@ -7068,7 +7105,7 @@ mod tests {
     #[test]
     fn named_followup_waits_for_our_airtime_and_ranked_slot_one() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
-        let router = ROUTER.init(Router::new(UNI_ME));
+        let router = ROUTER.init(router_with_hop_limit(UNI_ME, 3));
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x612, false);
         let (sent, armed_at) = forward_unicast(router, &wire, 1_000);
@@ -7135,7 +7172,7 @@ mod tests {
     #[test]
     fn named_forward_repeats_then_redirects_to_stampable_alternate() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
-        let router = ROUTER.init(Router::new(UNI_ME));
+        let router = ROUTER.init(router_with_hop_limit(UNI_ME, 3));
         setup_unicast_graph(router);
         add_second_path(router, UNI_PEER);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x613, false);
@@ -7216,7 +7253,7 @@ mod tests {
     #[test]
     fn upstream_and_originator_copies_keep_the_named_followup() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
-        let router = ROUTER.init(Router::new(UNI_ME));
+        let router = ROUTER.init(router_with_hop_limit(UNI_ME, 3));
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x615, false);
         let (sent, _) = forward_unicast(router, &wire, 0);

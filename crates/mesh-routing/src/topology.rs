@@ -14,7 +14,7 @@ pub const PACKED_HEADER_FLAG_SR_ACTIVE: u8 = 0x01;
 pub const PACKED_HEADER_FLAG_MORE_CHUNKS: u8 = 0x02;
 pub const PACKED_HEADER_FLAG_CONTINUATION: u8 = 0x04;
 pub const MAX_NEIGHBORS_PER_PACKET: usize = 28;
-pub const SR_BROADCAST_MAX_HOPS: u8 = 4;
+pub const SR_BROADCAST_HOP_LIMIT: u8 = 4;
 pub const SIGNAL_ROUTING_APP: u32 = 88;
 
 pub const DATA_BITFIELD_OK_TO_MQTT: u32 = 1 << 0;
@@ -389,7 +389,6 @@ pub fn build_topology_wire_frame(
     node_num: u32,
     packet_id: u32,
     channel_hash: u8,
-    hop_limit: u8,
     key: &CryptoKey,
     packed: &[u8],
     ok_to_mqtt: bool,
@@ -428,8 +427,8 @@ pub fn build_topology_wire_frame(
         node_num,
         packet_id,
         channel_hash,
-        hop_limit.min(SR_BROADCAST_MAX_HOPS),
-        hop_limit.min(SR_BROADCAST_MAX_HOPS),
+        SR_BROADCAST_HOP_LIMIT,
+        SR_BROADCAST_HOP_LIMIT,
         false,
         false,
         0,
@@ -670,8 +669,7 @@ mod tests {
         let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
         write_packed_header(&mut packed, 3, true);
         let (len, frame) =
-            build_topology_wire_frame(0x1234_5678, 99, channel_hash, 3, &key, &packed, false)
-                .unwrap();
+            build_topology_wire_frame(0x1234_5678, 99, channel_hash, &key, &packed, false).unwrap();
         let mut cipher = frame[PACKET_HEADER_LEN..len as usize].to_vec();
         let (portnum, payload) = try_decrypt_data(
             &key,
@@ -686,6 +684,19 @@ mod tests {
         let (hdr, neighbors) = extract_packed_neighbors(&payload).unwrap();
         assert_eq!(hdr.topology_version, 3);
         assert_eq!(neighbors.len(), 0);
+    }
+
+    #[test]
+    fn topology_broadcast_uses_fixed_sr_hop_limit() {
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let mut packed = [0u8; PACKED_NEIGHBOR_HEADER_SIZE];
+        write_packed_header(&mut packed, 3, true);
+
+        let (len, frame) =
+            build_topology_wire_frame(0x1234_5678, 99, 0, &key, &packed, false).unwrap();
+        let header = PacketHeader::decode(&frame[..len as usize]).unwrap();
+        assert_eq!(header.hop_limit(), SR_BROADCAST_HOP_LIMIT);
+        assert_eq!(header.hop_start(), SR_BROADCAST_HOP_LIMIT);
     }
     #[test]
     fn malformed_packed_lists_cannot_become_authoritative() {

@@ -1,4 +1,6 @@
 pub const REGION_EU_868: u8 = 3;
+pub const DEFAULT_HOP_LIMIT: u8 = 7;
+pub const MAX_HOP_LIMIT: u8 = (1 << 3) - 1;
 
 pub const MODEM_LONG_FAST: u8 = 0;
 pub const MODEM_LONG_SLOW: u8 = 1;
@@ -183,7 +185,7 @@ impl RadioConfig {
             sync_word: SYNC_WORD,
             preamble_length: PREAMBLE_LENGTH,
             tx_power_dbm: 22,
-            hop_limit: 3,
+            hop_limit: DEFAULT_HOP_LIMIT,
         }
     }
 
@@ -206,7 +208,7 @@ impl RadioConfig {
             sync_word: SYNC_WORD,
             preamble_length: PREAMBLE_LENGTH,
             tx_power_dbm: 22,
-            hop_limit: 3,
+            hop_limit: DEFAULT_HOP_LIMIT,
         }
     }
 

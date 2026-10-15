@@ -16,11 +16,11 @@ pub use bus::SpiLoRaBus;
 pub use channel::primary_channel_hash;
 pub use config::{
     is_valid_modem_preset, modem_preset_channel_name, modem_preset_params, normalize_modem_preset,
-    sync_word_sx126x, RadioConfig, RegionInfo, EU_868, EU_868_DEFAULT_FREQ_MHZ, MAX_TX_POWER_DBM,
-    MODEM_DEFAULT_PRESET, MODEM_LONG_FAST, MODEM_LONG_MODERATE, MODEM_LONG_SLOW, MODEM_LONG_TURBO,
-    MODEM_MEDIUM_FAST, MODEM_MEDIUM_SLOW, MODEM_SHORT_FAST, MODEM_SHORT_SLOW, MODEM_SHORT_TURBO,
-    MODEM_VERY_LONG_SLOW, PACKET_HEADER_LEN, PREAMBLE_LENGTH, REGION_EU_868,
-    SX126X_SYNC_CONTROL_BITS, SYNC_WORD,
+    sync_word_sx126x, RadioConfig, RegionInfo, DEFAULT_HOP_LIMIT, EU_868, EU_868_DEFAULT_FREQ_MHZ,
+    MAX_HOP_LIMIT, MAX_TX_POWER_DBM, MODEM_DEFAULT_PRESET, MODEM_LONG_FAST, MODEM_LONG_MODERATE,
+    MODEM_LONG_SLOW, MODEM_LONG_TURBO, MODEM_MEDIUM_FAST, MODEM_MEDIUM_SLOW, MODEM_SHORT_FAST,
+    MODEM_SHORT_SLOW, MODEM_SHORT_TURBO, MODEM_VERY_LONG_SLOW, PACKET_HEADER_LEN, PREAMBLE_LENGTH,
+    REGION_EU_868, SX126X_SYNC_CONTROL_BITS, SYNC_WORD,
 };
 pub use frame::{RadioId, RxFrame, TxFrame, MAX_BRIDGE_TARGETS, MAX_LORA_PAYLOAD, MAX_RADIOS};
 pub use interface::{RadioError, RadioInterface, TxStatus};
@@ -44,6 +44,7 @@ mod tests {
         let params = modem_preset_params(MODEM_SHORT_SLOW, false);
         assert_eq!(params.bandwidth_khz, 250.0);
         assert_eq!(params.spreading_factor, 8);
+        assert_eq!(RadioConfig::eu868_default().hop_limit, DEFAULT_HOP_LIMIT);
         assert_eq!(EU_868.duty_cycle_percent, 10);
         const {
             assert!(EU_868_DEFAULT_FREQ_MHZ >= EU_868.freq_start_mhz);

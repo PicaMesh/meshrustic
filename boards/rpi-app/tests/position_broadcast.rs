@@ -78,6 +78,7 @@ fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
         .parse();
     assert_eq!(header.to, mesh_protocol::NODENUM_BROADCAST);
     assert_eq!(header.from, our);
+    assert_eq!(header.hop_limit, mesh_radio::DEFAULT_HOP_LIMIT);
     let mut cipher = tx.bytes[PACKET_HEADER_LEN..tx.len as usize].to_vec();
     let (data, body) = try_decrypt_data_full(
         &CryptoKey::from_bytes(&DEFAULT_PSK),

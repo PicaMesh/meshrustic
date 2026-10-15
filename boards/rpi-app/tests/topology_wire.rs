@@ -53,7 +53,7 @@ fn empty_graph_builds_header_only_boot_topology() {
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
     let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
     let (wire_len, frame) =
-        build_topology_wire_frame(0x677A_1CAF, 1, channel_hash, 3, &key, &packed[..len], false)
+        build_topology_wire_frame(0x677A_1CAF, 1, channel_hash, &key, &packed[..len], false)
             .expect("empty topology must encode to wire frame");
     assert!(wire_len > 16);
 
@@ -118,16 +118,9 @@ fn router_topology_tx_decrypt_round_trip() {
         .expect("chunk");
     let key = CryptoKey::from_bytes(&DEFAULT_PSK);
     let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
-    let (wire_len, frame) = build_topology_wire_frame(
-        0xAABB_CCDD,
-        42,
-        channel_hash,
-        3,
-        &key,
-        &packed[..len],
-        false,
-    )
-    .unwrap();
+    let (wire_len, frame) =
+        build_topology_wire_frame(0xAABB_CCDD, 42, channel_hash, &key, &packed[..len], false)
+            .unwrap();
 
     let header = PacketHeader::decode(&frame).unwrap();
     assert_eq!(header.channel, channel_hash);

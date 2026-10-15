@@ -133,7 +133,7 @@ async fn main(spawner: Spawner) {
     let mut driver = create_radio(spim, cs, lora_pins, Sx1262ModuleProfile::default_board());
     let mut radio_config =
         eu868_config_for_preset(mesh_radio::normalize_modem_preset(config.lora.modem_preset));
-    radio_config.hop_limit = config.lora.hop_limit;
+    radio_config.hop_limit = config.lora.effective_hop_limit();
     radio_config.tx_power_dbm = config.lora.tx_power_dbm.min(mesh_radio::MAX_TX_POWER_DBM) as i8;
     driver.set_radio_config(radio_config);
     let slot = RADIO_SLOT.init(RadioSlot::new(0, driver));

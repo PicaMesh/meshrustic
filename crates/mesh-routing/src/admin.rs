@@ -85,7 +85,7 @@ impl AdminState {
             public_key: [0; 32],
             modem_preset: mesh_radio::MODEM_DEFAULT_PRESET,
             use_preset: true,
-            hop_limit: 3,
+            hop_limit: mesh_radio::DEFAULT_HOP_LIMIT,
             tx_power_dbm: MAX_TX_POWER_DBM,
             ok_to_mqtt: true,
             device_update_interval_secs: 0,
@@ -116,7 +116,7 @@ impl AdminState {
         self.public_key = cfg.public_key;
         self.modem_preset = mesh_radio::normalize_modem_preset(cfg.lora.modem_preset);
         self.use_preset = cfg.lora.use_preset;
-        self.hop_limit = cfg.lora.hop_limit;
+        self.hop_limit = cfg.lora.effective_hop_limit();
         self.tx_power_dbm = cfg.lora.tx_power_dbm.min(MAX_TX_POWER_DBM);
         self.ok_to_mqtt = cfg.lora.ok_to_mqtt;
         self.device_update_interval_secs = cfg.device_update_interval_secs;
@@ -654,7 +654,7 @@ fn lora_region_accepted(lora: &WireLoRaConfig) -> bool {
     lora.use_preset
         && (lora.region == 0 || lora.region == REGION_EU_868)
         && valid_preset
-        && lora.hop_limit <= 7
+        && lora.hop_limit <= u32::from(mesh_radio::MAX_HOP_LIMIT)
         && (0..=27).contains(&lora.tx_power)
 }
 
@@ -1439,6 +1439,11 @@ mod tests {
         assert!(apply_lora_to_state(&mut state, &wire).is_ok());
         assert_eq!(state.hop_limit, 5);
         assert_eq!(state.tx_power_dbm, 10);
+        wire.hop_limit = 0;
+        assert!(apply_lora_to_state(&mut state, &wire).is_ok());
+        assert_eq!(state.hop_limit, 0);
+        wire.hop_limit = 5;
+        assert!(apply_lora_to_state(&mut state, &wire).is_ok());
         for (use_preset, hop_limit, tx_power) in
             [(false, 5, 10), (true, 8, 10), (true, 5, -1), (true, 5, 28)]
         {

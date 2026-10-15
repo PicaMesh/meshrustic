@@ -139,7 +139,7 @@ pub use topology::{
     DataBitfield, DataEncodeOpts, DecodedData, PackedHeader, PackedNeighbor,
     DATA_BITFIELD_OK_TO_MQTT, DATA_BITFIELD_WANT_RESPONSE, MAX_NEIGHBORS_PER_PACKET,
     MAX_TOPOLOGY_PACKETS, PACKED_NEIGHBOR_HEADER_SIZE, SIGNAL_ROUTING_APP, SIGNAL_ROUTING_VERSION,
-    SR_BROADCAST_MAX_HOPS,
+    SR_BROADCAST_HOP_LIMIT,
 };
 pub use traceroute::{
     alter_on_relay, decode_route_discovery, encode_route_discovery, rebuild_relay_ciphertext,
