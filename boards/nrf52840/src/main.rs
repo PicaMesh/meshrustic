@@ -131,9 +131,10 @@ async fn main(spawner: Spawner) {
     );
     let lora_pins = LoRaPins::power_on(p.P0_13, p.P0_09, p.P0_29, p.P0_10);
     let mut driver = create_radio(spim, cs, lora_pins, Sx1262ModuleProfile::default_board());
-    let mut radio_config = eu868_config_for_preset(config.lora.modem_preset);
+    let mut radio_config =
+        eu868_config_for_preset(mesh_radio::normalize_modem_preset(config.lora.modem_preset));
     radio_config.hop_limit = config.lora.hop_limit;
-    radio_config.tx_power_dbm = config.lora.tx_power_dbm.min(22) as i8;
+    radio_config.tx_power_dbm = config.lora.tx_power_dbm.min(mesh_radio::MAX_TX_POWER_DBM) as i8;
     driver.set_radio_config(radio_config);
     let slot = RADIO_SLOT.init(RadioSlot::new(0, driver));
 
@@ -142,6 +143,7 @@ async fn main(spawner: Spawner) {
     rng.blocking_fill_bytes(&mut seed);
     router.seed_tx_ids(u32::from_le_bytes(seed));
     router.load_node_config(&config);
+    router.set_bridge_enabled(false);
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(
         config.node_num,
         config.public_key,

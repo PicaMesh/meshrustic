@@ -76,6 +76,14 @@ fn inbound(router: &mut Router, bytes: &[u8], now_ms: u32) {
     );
 }
 
+fn poll_admin_tx(router: &mut Router, now_ms: u32) -> Option<RelayPlan> {
+    let tx = router.poll_admin_tx(now_ms)?;
+    let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN]).unwrap();
+    let parsed = header.parse();
+    router.note_tx_enqueued(parsed.from, parsed.id);
+    Some(tx)
+}
+
 #[test]
 fn set_router_role_survives_reload_with_firmware_boot_order() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -107,7 +115,7 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 1_000);
-    let _ = router.poll_admin_tx(1_000);
+    let _ = poll_admin_tx(router, 1_000);
     let passkey = router.admin_state().session_passkey;
 
     let set = mesh_routing::AdminMessage {
@@ -126,9 +134,7 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 2_000);
-    let set_tx = router
-        .poll_admin_tx(2_000)
-        .expect("device set completion reply");
+    let set_tx = poll_admin_tx(router, 2_000).expect("device set completion reply");
     assert_eq!(
         decrypt_pki_routing_error(&set_tx, &b1_priv, &node_pub),
         ROUTING_ERROR_NONE

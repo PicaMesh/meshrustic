@@ -4,7 +4,7 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use mesh_protocol::PacketHeader;
 use mesh_radio::{
     packet_time_ms, sync_word_sx126x, RadioConfig, RadioError, RadioId, RadioInterface, RxFrame,
-    TxFrame, MAX_LORA_PAYLOAD,
+    TxFrame, TxStatus, MAX_LORA_PAYLOAD,
 };
 use sx126x::conf::Config;
 use sx126x::op::calib::CalibParam;
@@ -42,6 +42,7 @@ pub struct Sx1262Driver {
     chip: RadioChip,
     module_ready: bool,
     rx_active_since: Option<embassy_time::Instant>,
+    tx_deadline: Option<embassy_time::Instant>,
 }
 
 impl Sx1262Driver {
@@ -58,6 +59,7 @@ impl Sx1262Driver {
             chip,
             module_ready,
             rx_active_since: None,
+            tx_deadline: None,
         }
     }
 
@@ -78,21 +80,34 @@ impl Sx1262Driver {
         self.profile
     }
 
-    fn lora_bandwidth(bw_khz: f32) -> LoRaBandWidth {
-        match bw_khz as u32 {
-            125 => LoRaBandWidth::BW125,
-            250 => LoRaBandWidth::BW250,
-            500 => LoRaBandWidth::BW500,
-            _ => LoRaBandWidth::BW250,
+    fn lora_bandwidth(bw_khz: f32) -> Option<LoRaBandWidth> {
+        if (bw_khz - 62.5).abs() < 0.1 {
+            Some(LoRaBandWidth::BW62)
+        } else if (bw_khz - 125.0).abs() < 0.1 {
+            Some(LoRaBandWidth::BW125)
+        } else if (bw_khz - 250.0).abs() < 0.1 {
+            Some(LoRaBandWidth::BW250)
+        } else if (bw_khz - 500.0).abs() < 0.1 {
+            Some(LoRaBandWidth::BW500)
+        } else {
+            None
         }
     }
 
-    fn lora_coding_rate(cr: u8) -> LoraCodingRate {
+    fn lora_spread_factor(sf: u8) -> Option<LoRaSpreadFactor> {
+        match sf {
+            5..=12 => Some(LoRaSpreadFactor::from(sf)),
+            _ => None,
+        }
+    }
+
+    fn lora_coding_rate(cr: u8) -> Option<LoraCodingRate> {
         match cr {
-            6 => LoraCodingRate::CR4_6,
-            7 => LoraCodingRate::CR4_7,
-            8 => LoraCodingRate::CR4_8,
-            _ => LoraCodingRate::CR4_5,
+            5 => Some(LoraCodingRate::CR4_5),
+            6 => Some(LoraCodingRate::CR4_6),
+            7 => Some(LoraCodingRate::CR4_7),
+            8 => Some(LoraCodingRate::CR4_8),
+            _ => None,
         }
     }
 
@@ -108,11 +123,21 @@ impl Sx1262Driver {
             .map_err(|_| RadioError::Hardware)
     }
 
-    fn sx126x_config(profile: Sx1262ModuleProfile, radio: &RadioConfig) -> Config {
+    fn sx126x_config(
+        profile: Sx1262ModuleProfile,
+        radio: &RadioConfig,
+    ) -> Result<Config, RadioError> {
         let mod_params: ModParams = LoraModParams::default()
-            .set_spread_factor(LoRaSpreadFactor::from(radio.spreading_factor))
-            .set_bandwidth(Self::lora_bandwidth(radio.bandwidth_khz))
-            .set_coding_rate(Self::lora_coding_rate(radio.coding_rate))
+            .set_spread_factor(
+                Self::lora_spread_factor(radio.spreading_factor)
+                    .ok_or(RadioError::InvalidConfig)?,
+            )
+            .set_bandwidth(
+                Self::lora_bandwidth(radio.bandwidth_khz).ok_or(RadioError::InvalidConfig)?,
+            )
+            .set_coding_rate(
+                Self::lora_coding_rate(radio.coding_rate).ok_or(RadioError::InvalidConfig)?,
+            )
             .into();
 
         let packet_params: PacketParams = LoRaPacketParams {
@@ -134,7 +159,7 @@ impl Sx1262Driver {
             .combine(IrqMaskBit::CrcErr)
             .combine(IrqMaskBit::Timeout);
 
-        Config {
+        Ok(Config {
             packet_type: PacketType::LoRa,
             sync_word: sync_word_sx126x(radio.sync_word),
             calib_param: CalibParam::all(),
@@ -150,7 +175,7 @@ impl Sx1262Driver {
             rf_freq: calc_rf_freq(radio.frequency_mhz, 32.0),
             rf_frequency: (radio.frequency_mhz * 1_000_000.0) as u32,
             tcxo_opts: profile.tcxo_opts(),
-        }
+        })
     }
 
     fn irq_raw(irq: IrqStatus) -> u16 {
@@ -378,13 +403,14 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn init(&mut self) -> Result<(), RadioError> {
+        self.tx_deadline = None;
         // An absent module can hold BUSY forever; entering the blocking driver then would starve the
         // executor and prevent USB enumeration.
         if !self.module_ready {
             return Err(RadioError::InitFailed);
         }
         self.chip
-            .init(Self::sx126x_config(self.profile, &self.config))
+            .init(Self::sx126x_config(self.profile, &self.config)?)
             .map_err(|_| RadioError::InitFailed)?;
 
         if self.profile.dio2_rf_switch() {
@@ -494,34 +520,84 @@ impl RadioInterface for Sx1262Driver {
         Ok(Some(frame))
     }
 
-    fn send(&mut self, frame: &TxFrame) -> Result<(), RadioError> {
+    fn start_send(&mut self, frame: &TxFrame) -> Result<(), RadioError> {
         if frame.len as usize > MAX_LORA_PAYLOAD {
             return Err(RadioError::InvalidLength);
         }
 
         self.chip
             .set_ant_enabled(true)
-            .map_err(|_| RadioError::Hardware)?;
+            .map_err(|_| RadioError::TxNotStarted)?;
 
-        let status = self
+        self.chip
+            .clear_irq_status(IrqMask::all())
+            .and_then(|()| self.chip.write_buffer(0, frame.payload()))
+            .and_then(|()| {
+                self.chip.set_packet_params(
+                    LoRaPacketParams::default()
+                        .set_preamble_len(self.config.preamble_length)
+                        .set_payload_len(frame.len)
+                        .set_crc_type(LoRaCrcType::CrcOn)
+                        .into(),
+                )
+            })
+            .map_err(|_| RadioError::TxNotStarted)?;
+        let timeout_ms = mesh_radio::packet_time_ms(&self.config, frame.len as usize, false)
+            .saturating_add(2_000)
+            .min(30_000);
+        self.tx_deadline = Some(
+            embassy_time::Instant::now() + embassy_time::Duration::from_millis(timeout_ms as u64),
+        );
+        let tx_status = self
             .chip
-            .write_bytes(
-                frame.payload(),
-                RxTxTimeout::from_ms(
-                    mesh_radio::packet_time_ms(&self.config, frame.len as usize, false)
-                        .saturating_add(2_000)
-                        .min(30_000),
-                ),
-                self.config.preamble_length,
-                LoRaCrcType::CrcOn,
-            )
-            .map_err(|_| RadioError::Hardware)?;
-
+            .set_tx(RxTxTimeout::from_ms(timeout_ms))
+            .map_err(|_| RadioError::TxOutcomeUnknown)?;
+        self.chip
+            .wait_on_busy()
+            .map_err(|_| RadioError::TxOutcomeUnknown)?;
         defmt::trace!(
-            "[Radio0] TX complete mode={}",
-            Self::chip_mode_name(status.chip_mode())
+            "[Radio0] TX started mode={}",
+            Self::chip_mode_name(tx_status.chip_mode())
         );
         Ok(())
+    }
+
+    fn poll_tx(&mut self) -> Result<Option<TxStatus>, RadioError> {
+        self.chip
+            .wait_on_busy()
+            .map_err(|_| RadioError::TxOutcomeUnknown)?;
+        let irq = match self.chip.get_irq_status() {
+            Ok(irq) => irq,
+            Err(_)
+                if self
+                    .tx_deadline
+                    .is_some_and(|deadline| embassy_time::Instant::now() >= deadline) =>
+            {
+                self.clear_irqs()?;
+                self.tx_deadline = None;
+                return Ok(Some(TxStatus::OutcomeUnknown));
+            }
+            Err(_) => return Err(RadioError::TxOutcomeUnknown),
+        };
+        if !irq.tx_done() && !irq.timeout() {
+            if self
+                .tx_deadline
+                .is_some_and(|deadline| embassy_time::Instant::now() >= deadline)
+            {
+                self.clear_irqs()?;
+                self.tx_deadline = None;
+                return Ok(Some(TxStatus::OutcomeUnknown));
+            }
+            return Ok(None);
+        }
+        self.clear_irqs()?;
+        self.tx_deadline = None;
+        if irq.tx_done() {
+            defmt::trace!("[Radio0] TX done IRQ confirmed");
+            Ok(Some(TxStatus::Complete))
+        } else {
+            Ok(Some(TxStatus::OutcomeUnknown))
+        }
     }
 
     fn start_rx(&mut self) -> Result<(), RadioError> {

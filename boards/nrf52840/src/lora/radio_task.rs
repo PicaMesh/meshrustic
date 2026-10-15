@@ -20,6 +20,21 @@ pub fn air_time() -> &'static mut AirTime {
     AIR_TIME.init(AirTime::new(EU_868))
 }
 
+fn radio_error_message(err: RadioError) -> &'static str {
+    match err {
+        RadioError::InitFailed => {
+            "SX1262 not responding (BUSY stuck high after reset) - check module power/wiring"
+        }
+        RadioError::Busy => "radio busy",
+        RadioError::Timeout => "timeout",
+        RadioError::InvalidLength => "invalid length",
+        RadioError::InvalidConfig => "invalid radio config",
+        RadioError::TxNotStarted => "TX did not start",
+        RadioError::TxOutcomeUnknown => "TX outcome unknown",
+        RadioError::Hardware => "hardware/SPI error",
+    }
+}
+
 #[embassy_executor::task]
 pub async fn radio_task(
     slot: &'static mut RadioSlot<Sx1262Driver>,
@@ -34,18 +49,12 @@ pub async fn radio_task(
     let profile = slot.driver.profile();
 
     if let Err(err) = slot.init() {
-        let reason = match err {
-            RadioError::InitFailed => "init FAILED: SX1262 not responding (BUSY stuck high after reset) - check module power/wiring",
-            RadioError::Busy => "init FAILED: radio busy",
-            RadioError::Timeout => "init FAILED: timeout",
-            RadioError::InvalidLength => "init FAILED: invalid length",
-            RadioError::Hardware => "init FAILED: hardware/SPI error",
-        };
+        let reason = radio_error_message(err);
         loop {
             if let Some(wdt) = watchdog.as_mut() {
                 wdt.pet();
             }
-            defmt::error!("[Radio0] {}", reason);
+            defmt::error!("[Radio0] init FAILED: {}", reason);
             crate::usb_log::log::radio::warn(reason);
             Timer::after_secs(10).await;
         }
@@ -77,6 +86,8 @@ pub async fn radio_task(
     let mut ota_dfu_deadline: Option<Instant> = None;
     let mut ota_park_at: Option<Instant> = None;
     let mut radio_reinit_pending = false;
+    let mut radio_reinit_attempts = 0u8;
+    let mut next_radio_reinit_at = Instant::now();
     let mut next_store_attempt = Instant::now();
     let mut access = ChannelAccess::new();
     let mut tx_cancels: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
@@ -228,7 +239,9 @@ pub async fn radio_task(
                 break;
             }
             if let Ok(header) = mesh_protocol::PacketHeader::decode(frame.payload()) {
-                router.discard_queued_forward(header.from, header.id);
+                let parsed = header.parse();
+                router.discard_queued_forward(parsed.from, parsed.id);
+                router.note_tx_queue_rejected(parsed.from, parsed.id, now_ms);
             }
             let _ = slot.tx_queue.pop();
         }
@@ -255,7 +268,8 @@ pub async fn radio_task(
                     report.rx = slot.rx_queue.pop().ok();
                 }
                 if report.receptions > 0 {
-                    let cw_slot = mesh_routing::slot_time_for_preset(router.modem_preset());
+                    let cw_slot =
+                        mesh_routing::slot_time_for_preset(router.operating_modem_preset());
                     let backoff = mesh_routing::coordinated_relay::tx_delay_ms_contention(
                         air.channel_utilization_percent(),
                         cw_slot,
@@ -288,11 +302,12 @@ pub async fn radio_task(
                         len
                     );
                     crate::usb_log::log::radio::tx_done(report.tx_id, report.tx_to, len);
+                    let tx_done_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
                     if let (Some(from), Some(id)) = (report.tx_from, report.tx_id) {
-                        router.record_tx_on_air(from, id, now_ms);
-                        router.note_tx_done(from, id);
+                        router.record_tx_on_air(from, id, tx_done_ms);
+                        router.note_tx_done(from, id, tx_done_ms);
                     }
-                    access.note_tx_done((Instant::now().as_millis() & 0xFFFF_FFFF) as u32);
+                    access.note_tx_done(tx_done_ms);
                 }
                 if report.tx_deferred_rx_busy {
                     defmt::trace!("[Radio0] TX deferred: reception in progress");
@@ -329,6 +344,21 @@ pub async fn radio_task(
                 defmt::warn!("[Radio0] bad length");
                 crate::usb_log::log::radio::warn("bad length");
             }
+            Err(RadioError::InvalidConfig) => {
+                defmt::error!("[Radio0] invalid radio config");
+                crate::usb_log::log::radio::warn("invalid radio config");
+            }
+            Err(RadioError::TxNotStarted) => {
+                defmt::warn!("[Radio0] TX did not start; frame retained");
+                crate::usb_log::log::radio::warn("TX did not start; frame retained");
+            }
+            Err(RadioError::TxOutcomeUnknown) => {
+                if let Some((from, id)) = slot.take_tx_failure() {
+                    router.note_tx_failure(from, id, now_ms);
+                }
+                defmt::warn!("[Radio0] TX outcome unknown");
+                crate::usb_log::log::radio::warn("TX outcome unknown");
+            }
             Err(RadioError::Hardware) => {
                 defmt::warn!("[Radio0] hardware error");
                 crate::usb_log::log::radio::warn("hardware error");
@@ -336,10 +366,24 @@ pub async fn radio_task(
         }
 
         // Pending replies must leave on the old RF parameters before the requester loses contact.
-        if radio_reinit_pending && slot.tx_queue_len() == 0 && !router.has_pending_control_tx() {
-            apply_modem_preset_soft(slot, router);
-            router.radio_reconfigured(now_ms, slot_ms);
-            radio_reinit_pending = false;
+        if radio_reinit_pending
+            && Instant::now() >= next_radio_reinit_at
+            && slot.tx_queue_len() == 0
+            && !slot.tx_in_flight()
+            && !router.has_pending_control_tx()
+        {
+            match apply_modem_preset_soft(slot, router) {
+                Ok(()) => {
+                    router.radio_reconfigured(now_ms, slot_ms);
+                    radio_reinit_pending = false;
+                    radio_reinit_attempts = 0;
+                }
+                Err(_) => {
+                    radio_reinit_attempts = radio_reinit_attempts.saturating_add(1);
+                    let retry_secs = 1u64 << radio_reinit_attempts.saturating_sub(1).min(5);
+                    next_radio_reinit_at = Instant::now() + Duration::from_secs(retry_secs);
+                }
+            }
         }
 
         // A persistent flash fault must not trigger an erase on every 5 ms radio loop.
@@ -391,17 +435,21 @@ pub async fn radio_task(
         let busy = usb_active
             || router.has_pending_work()
             || slot.tx_queue_len() > 0
+            || slot.tx_in_flight()
             || !slot.rx_queue.is_empty();
         let sleep_ms = if busy { LOOP_ACTIVE_MS } else { LOOP_IDLE_MS };
 
-        // DIO1 remains high until its interrupt is cleared; a level wait would spin instead of yielding.
-        match select(
-            Timer::after_millis(sleep_ms),
-            dio1_wake.wait_for_rising_edge(),
-        )
-        .await
-        {
-            Either::First(()) | Either::Second(()) => {}
+        if dio1_wake.is_high() {
+            Timer::after_millis(LOOP_ACTIVE_MS).await;
+        } else {
+            match select(
+                Timer::after_millis(sleep_ms),
+                dio1_wake.wait_for_rising_edge(),
+            )
+            .await
+            {
+                Either::First(()) | Either::Second(()) => {}
+            }
         }
     }
 }
@@ -524,10 +572,16 @@ fn handle_rx_frame(
 fn enqueue_tx(
     relay: mesh_routing::RelayPlan,
     slot: &mut RadioSlot<Sx1262Driver>,
-    _router: &mut Router,
+    router: &mut Router,
     node_num: u32,
     kind: &[u8],
 ) {
+    let tx_identity = mesh_protocol::PacketHeader::decode(&relay.bytes[..relay.len as usize])
+        .ok()
+        .map(|header| {
+            let parsed = header.parse();
+            (parsed.from, parsed.id)
+        });
     crate::usb_log::log::radio::tx_enqueue(
         kind,
         &relay.bytes[..relay.len as usize],
@@ -538,18 +592,30 @@ fn enqueue_tx(
 
     if let Some(tx) = TxFrame::new(slot.id, &relay.bytes[..relay.len as usize]) {
         match slot.enqueue_tx(tx) {
-            Ok(()) => defmt::info!(
-                "[Router] {} enqueue {} bytes hop={} delay={}ms",
-                kind,
-                relay.len,
-                relay.bytes[12] & 0x07,
-                relay.delay_ms
-            ),
+            Ok(()) => {
+                if let Some((from, id)) = tx_identity {
+                    router.note_tx_enqueued(from, id);
+                }
+                defmt::info!(
+                    "[Router] {} enqueue {} bytes hop={} delay={}ms",
+                    kind,
+                    relay.len,
+                    relay.bytes[12] & 0x07,
+                    relay.delay_ms
+                );
+            }
             Err(_) => {
+                if let Some((from, id)) = tx_identity {
+                    let now_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
+                    router.note_tx_queue_rejected(from, id, now_ms);
+                }
                 defmt::warn!("[Router] TX queue full");
                 crate::usb_log::log::radio::warn("TX queue full");
             }
         }
+    } else if let Some((from, id)) = tx_identity {
+        let now_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
+        router.note_tx_queue_rejected(from, id, now_ms);
     }
 }
 
@@ -583,8 +649,12 @@ fn persist_config(store: &mut NvmcConfigStore, router: &mut Router) -> bool {
 }
 
 /// A software reset would enter UF2 upload mode instead of applying radio settings.
-fn apply_modem_preset_soft(slot: &mut RadioSlot<Sx1262Driver>, router: &Router) {
+fn apply_modem_preset_soft(
+    slot: &mut RadioSlot<Sx1262Driver>,
+    router: &Router,
+) -> Result<(), RadioError> {
     let cfg = router.radio_config();
+    let previous_config = *slot.config();
     let name = cfg.preset_log_name();
     defmt::info!(
         "[Radio0] soft-reinit preset {} @ {} MHz (no reboot)",
@@ -596,10 +666,19 @@ fn apply_modem_preset_soft(slot: &mut RadioSlot<Sx1262Driver>, router: &Router) 
         Ok(()) => {
             slot.driver.log_config();
             let _ = slot.driver.log_chip_status();
+            Ok(())
         }
-        Err(_) => {
-            defmt::error!("[Radio0] soft-reinit failed");
+        Err(err) => {
+            slot.driver.set_radio_config(previous_config);
+            defmt::error!("[Radio0] soft-reinit failed: {}", radio_error_message(err));
             crate::usb_log::log::radio::warn("modem soft-reinit failed");
+            if let Err(recovery_err) = slot.init() {
+                defmt::error!(
+                    "[Radio0] previous radio config recovery failed: {}",
+                    radio_error_message(recovery_err)
+                );
+            }
+            Err(err)
         }
     }
 }

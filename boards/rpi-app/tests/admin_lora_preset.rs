@@ -61,6 +61,18 @@ fn inbound(router: &mut Router, frame: &[u8], now: u32) {
         .unwrap();
 }
 
+fn poll_admin_tx(router: &mut Router, now: u32) -> Option<RelayPlan> {
+    let tx = router.poll_admin_tx(now)?;
+    let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN]).unwrap();
+    let parsed = header.parse();
+    router.note_tx_enqueued(parsed.from, parsed.id);
+    let preset = router.radio_config().modem_preset;
+    if preset != router.modem_preset() {
+        router.radio_reconfigured(now, mesh_routing::slot_time_for_preset(preset));
+    }
+    Some(tx)
+}
+
 fn decrypt_pki_routing_error(tx: &RelayPlan, peer_priv: &[u8; 32], node_pub: &[u8; 32]) -> u32 {
     let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
@@ -117,7 +129,7 @@ fn set_lora_persists_and_reloads_channel_hash() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 1_000);
-    let _ = router.poll_admin_tx(1_000);
+    let _ = poll_admin_tx(router, 1_000);
     let passkey = router.admin_state().session_passkey;
 
     let set = mesh_routing::AdminMessage {
@@ -141,9 +153,7 @@ fn set_lora_persists_and_reloads_channel_hash() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 2_000);
-    let set_tx = router
-        .poll_admin_tx(2_000)
-        .expect("LoRa set completion reply");
+    let set_tx = poll_admin_tx(router, 2_000).expect("LoRa set completion reply");
     assert_eq!(
         decrypt_pki_routing_error(&set_tx, &b1_priv, &node_pub),
         ROUTING_ERROR_NONE,
@@ -222,7 +232,7 @@ fn set_long_fast_persists_to_store() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 1_000);
-    let _ = router.poll_admin_tx(1_000);
+    let _ = poll_admin_tx(router, 1_000);
     let passkey = router.admin_state().session_passkey;
 
     let set = mesh_routing::AdminMessage {
@@ -246,7 +256,7 @@ fn set_long_fast_persists_to_store() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 2_000);
-    let _ = router.poll_admin_tx(2_000);
+    let _ = poll_admin_tx(router, 2_000);
     assert_eq!(router.modem_preset(), MODEM_LONG_FAST);
     assert!(router.admin_config_dirty());
 
@@ -296,7 +306,7 @@ fn get_lora_reports_current_preset_after_set() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 1_000);
-    let _ = router.poll_admin_tx(1_000);
+    let _ = poll_admin_tx(router, 1_000);
     assert_eq!(router.admin_state().modem_preset, MODEM_DEFAULT_PRESET);
     let passkey = router.admin_state().session_passkey;
 
@@ -321,6 +331,6 @@ fn get_lora_reports_current_preset_after_set() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 2_000);
-    let _ = router.poll_admin_tx(2_000);
+    let _ = poll_admin_tx(router, 2_000);
     assert_eq!(router.modem_preset(), MODEM_SHORT_FAST);
 }

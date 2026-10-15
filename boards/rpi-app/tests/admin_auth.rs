@@ -90,6 +90,18 @@ fn pki_inbound(router: &mut Router, frame: &[u8], now: u32) {
         .unwrap();
 }
 
+fn poll_admin_tx(router: &mut Router, now: u32) -> Option<mesh_routing::RelayPlan> {
+    let tx = router.poll_admin_tx(now)?;
+    let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN]).unwrap();
+    let parsed = header.parse();
+    router.note_tx_enqueued(parsed.from, parsed.id);
+    let preset = router.radio_config().modem_preset;
+    if preset != router.modem_preset() {
+        router.radio_reconfigured(now, mesh_routing::slot_time_for_preset(preset));
+    }
+    Some(tx)
+}
+
 fn session_via_pki(
     router: &mut Router,
     peer: u32,
@@ -111,7 +123,7 @@ fn session_via_pki(
         &encode_admin_message(&get),
     );
     pki_inbound(router, &frame, now);
-    let _ = router.poll_admin_tx(now);
+    let _ = poll_admin_tx(router, now);
     router.admin_state().session_passkey
 }
 
@@ -179,7 +191,7 @@ fn unauthorized_cannot_change_config() {
     );
     pki_inbound(router, &frame, 100);
     assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
-    let tx = router.poll_admin_tx(100).unwrap();
+    let tx = poll_admin_tx(router, 100).unwrap();
     assert_eq!(
         decrypt_pki_routing_nak(&tx, &peer_priv, &node_pub),
         ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED
@@ -229,7 +241,7 @@ fn builtin1_and_builtin2_can_set_lora() {
             &encode_admin_message(&set),
         );
         pki_inbound(router, &frame, 2_000);
-        let _ = router.poll_admin_tx(2_000);
+        let _ = poll_admin_tx(router, 2_000);
         assert_eq!(router.modem_preset(), MODEM_SHORT_FAST);
     }
 }
@@ -270,7 +282,7 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
         &encode_admin_message(&set),
     );
     pki_inbound(router, &frame, 3_100);
-    let _ = router.poll_admin_tx(3_100);
+    let _ = poll_admin_tx(router, 3_100);
     assert_eq!(router.modem_preset(), MODEM_SHORT_FAST);
 
     let sget = mesh_routing::AdminMessage {
@@ -287,7 +299,7 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
         &encode_admin_message(&sget),
     );
     pki_inbound(router, &frame, 3_200);
-    let _ = router.poll_admin_tx(3_200);
+    let _ = poll_admin_tx(router, 3_200);
 
     let msg = mesh_routing::AdminMessage {
         payload: AdminPayload::GetConfigRequest(CONFIG_TYPE_SECURITY),
@@ -349,7 +361,7 @@ fn stale_pki_then_channel_admin_cannot_mutate() {
     let frame = channel_admin_frame(our, peer, 0x61, &encode_admin_message(&set));
     pki_inbound(router, &frame, 6_100);
     assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
-    let tx = router.poll_admin_tx(6_100).unwrap();
+    let tx = poll_admin_tx(router, 6_100).unwrap();
     let mut cipher = tx.bytes[PACKET_HEADER_LEN..tx.len as usize].to_vec();
     let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
@@ -400,7 +412,7 @@ fn clearing_flash_keys_leaves_builtins() {
         &encode_admin_message(&set),
     );
     pki_inbound(router, &frame, 4_100);
-    let _ = router.poll_admin_tx(4_100);
+    let _ = poll_admin_tx(router, 4_100);
     assert_eq!(router.admin_state().admin_public_keys[0], EMPTY_ADMIN_KEY);
     let _ = session_via_pki(router, peer, &b2_priv, &node_pub, 0x42, 4_200);
 }
@@ -442,7 +454,7 @@ fn bad_session_key_rejects_set() {
     );
     pki_inbound(router, &frame, 5_100);
     assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
-    let tx = router.poll_admin_tx(5_100).unwrap();
+    let tx = poll_admin_tx(router, 5_100).unwrap();
     assert_eq!(
         decrypt_pki_routing_nak(&tx, &b1_priv, &node_pub),
         ROUTING_ERROR_ADMIN_BAD_SESSION_KEY
@@ -476,7 +488,7 @@ fn pki_decrypt_failure_nak_is_pki_encrypted() {
         &encode_admin_message(&get),
     );
     pki_inbound(router, &frame, 7_000);
-    let tx = router.poll_admin_tx(7_000).unwrap();
+    let tx = poll_admin_tx(router, 7_000).unwrap();
     assert_eq!(
         decrypt_pki_routing_nak(&tx, &peer_priv, &node_pub),
         ROUTING_ERROR_PKI_FAILED

@@ -3,8 +3,8 @@ use mesh_protocol::{PacketHeader, PACKET_HEADER_LEN};
 use mesh_radio::{MODEM_DEFAULT_PRESET, MODEM_SHORT_FAST};
 use mesh_routing::{
     encode_admin_message, encode_data_payload_opts, AdminPayload, ConfigPayload, DataEncodeOpts,
-    InboundPacket, NodeInfoIdentity, Router, WireLoRaConfig, ADMIN_APP, CONFIG_TYPE_LORA,
-    CONFIG_TYPE_SESSIONKEY, REGION_EU_868,
+    InboundPacket, NodeInfoIdentity, RelayPlan, Router, WireLoRaConfig, ADMIN_APP,
+    CONFIG_TYPE_LORA, CONFIG_TYPE_SESSIONKEY, REGION_EU_868,
 };
 use mesh_store::{generate_keypair, NodeConfig};
 use static_cell::StaticCell;
@@ -57,6 +57,18 @@ fn inbound(router: &mut Router, frame: &[u8], now: u32) {
         .unwrap();
 }
 
+fn poll_admin_tx(router: &mut Router, now: u32) -> Option<RelayPlan> {
+    let tx = router.poll_admin_tx(now)?;
+    let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN]).unwrap();
+    let parsed = header.parse();
+    router.note_tx_enqueued(parsed.from, parsed.id);
+    let preset = router.radio_config().modem_preset;
+    if preset != router.modem_preset() {
+        router.radio_reconfigured(now, mesh_routing::slot_time_for_preset(preset));
+    }
+    Some(tx)
+}
+
 #[test]
 fn admin_sessionkey_and_owner_metadata_seed() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
@@ -84,7 +96,7 @@ fn admin_sessionkey_and_owner_metadata_seed() {
         &encode_admin_message(&req),
     );
     inbound(router, &frame, 1_000);
-    assert!(router.poll_admin_tx(1_000).is_some());
+    assert!(poll_admin_tx(router, 1_000).is_some());
     assert!(router.admin_state().has_session);
 
     let owner = mesh_routing::AdminMessage {
@@ -100,7 +112,7 @@ fn admin_sessionkey_and_owner_metadata_seed() {
         &encode_admin_message(&owner),
     );
     inbound(router, &frame, 1_100);
-    assert!(router.poll_admin_tx(1_100).is_some());
+    assert!(poll_admin_tx(router, 1_100).is_some());
 
     let meta = mesh_routing::AdminMessage {
         payload: AdminPayload::GetDeviceMetadataRequest,
@@ -115,7 +127,7 @@ fn admin_sessionkey_and_owner_metadata_seed() {
         &encode_admin_message(&meta),
     );
     inbound(router, &frame, 1_200);
-    assert!(router.poll_admin_tx(1_200).is_some());
+    assert!(poll_admin_tx(router, 1_200).is_some());
 }
 
 #[test]
@@ -145,7 +157,7 @@ fn admin_get_lora_and_begin_commit() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 2_000);
-    assert!(router.poll_admin_tx(2_000).is_some());
+    assert!(poll_admin_tx(router, 2_000).is_some());
     assert_eq!(router.admin_state().modem_preset, MODEM_DEFAULT_PRESET);
     let passkey = router.admin_state().session_passkey;
     const GAP: u32 = 1_000;
@@ -164,7 +176,7 @@ fn admin_get_lora_and_begin_commit() {
         &encode_admin_message(&begin),
     );
     inbound(router, &frame, 2_000 + GAP);
-    let _ = router.poll_admin_tx(2_000 + GAP);
+    let _ = poll_admin_tx(router, 2_000 + GAP);
 
     let set = mesh_routing::AdminMessage {
         payload: AdminPayload::SetConfig(ConfigPayload::Lora(WireLoRaConfig {
@@ -187,7 +199,7 @@ fn admin_get_lora_and_begin_commit() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 2_000 + 2 * GAP);
-    let _ = router.poll_admin_tx(2_000 + 2 * GAP);
+    let _ = poll_admin_tx(router, 2_000 + 2 * GAP);
     assert_eq!(router.modem_preset(), MODEM_DEFAULT_PRESET);
 
     let commit = mesh_routing::AdminMessage {
@@ -204,7 +216,7 @@ fn admin_get_lora_and_begin_commit() {
         &encode_admin_message(&commit),
     );
     inbound(router, &frame, 2_000 + 3 * GAP);
-    let _ = router.poll_admin_tx(2_000 + 3 * GAP);
+    let _ = poll_admin_tx(router, 2_000 + 3 * GAP);
     assert_eq!(router.modem_preset(), MODEM_SHORT_FAST);
     assert!(
         router.take_pending_radio_reinit(),

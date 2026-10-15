@@ -16,7 +16,7 @@ use crate::nodeinfo::{
 use crate::position::coerce_position_broadcast_secs;
 use crate::telemetry::min_device_update_interval_secs;
 use mesh_crypto::DEFAULT_PSK;
-use mesh_radio::eu868_config_for_preset;
+use mesh_radio::{eu868_config_for_preset, MAX_TX_POWER_DBM};
 
 pub const ADMIN_SESSION_TTL_MS: u32 = 300_000;
 
@@ -86,7 +86,7 @@ impl AdminState {
             modem_preset: mesh_radio::MODEM_DEFAULT_PRESET,
             use_preset: true,
             hop_limit: 3,
-            tx_power_dbm: 27,
+            tx_power_dbm: MAX_TX_POWER_DBM,
             ok_to_mqtt: true,
             device_update_interval_secs: 0,
             device_role: DEVICE_ROLE_CLIENT,
@@ -114,10 +114,10 @@ impl AdminState {
         self.admin_public_keys = cfg.admin_public_keys;
         self.private_key = cfg.private_key;
         self.public_key = cfg.public_key;
-        self.modem_preset = cfg.lora.modem_preset;
+        self.modem_preset = mesh_radio::normalize_modem_preset(cfg.lora.modem_preset);
         self.use_preset = cfg.lora.use_preset;
         self.hop_limit = cfg.lora.hop_limit;
-        self.tx_power_dbm = cfg.lora.tx_power_dbm;
+        self.tx_power_dbm = cfg.lora.tx_power_dbm.min(MAX_TX_POWER_DBM);
         self.ok_to_mqtt = cfg.lora.ok_to_mqtt;
         self.device_update_interval_secs = cfg.device_update_interval_secs;
         self.device_role = sanitize_device_role(u32::from(cfg.device_role));
@@ -648,9 +648,12 @@ fn security_keys_from_wire(sec: &WireSecurityConfig) -> [[u8; 32]; ADMIN_KEY_SLO
 }
 
 fn lora_region_accepted(lora: &WireLoRaConfig) -> bool {
+    let valid_preset = u8::try_from(lora.modem_preset)
+        .ok()
+        .is_some_and(mesh_radio::is_valid_modem_preset);
     lora.use_preset
         && (lora.region == 0 || lora.region == REGION_EU_868)
-        && matches!(lora.modem_preset, 0 | 1 | 3..=9)
+        && valid_preset
         && lora.hop_limit <= 7
         && (0..=27).contains(&lora.tx_power)
 }
@@ -664,9 +667,9 @@ fn apply_lora_to_state(state: &mut AdminState, lora: &WireLoRaConfig) -> Result<
     state.use_preset = true;
     state.hop_limit = lora.hop_limit as u8;
     state.tx_power_dbm = if lora.tx_power == 0 {
-        27
+        MAX_TX_POWER_DBM
     } else {
-        lora.tx_power as u8
+        (lora.tx_power as u8).min(MAX_TX_POWER_DBM)
     };
     state.ok_to_mqtt = lora.config_ok_to_mqtt;
     Ok(preset)
@@ -1446,5 +1449,16 @@ mod tests {
             assert_eq!(state.hop_limit, 5);
             assert_eq!(state.tx_power_dbm, 10);
         }
+    }
+
+    #[test]
+    fn lora_tx_power_is_normalized_to_the_radio_limit() {
+        let mut state = AdminState::new();
+        let wire = WireLoRaConfig {
+            tx_power: 27,
+            ..Default::default()
+        };
+        assert!(apply_lora_to_state(&mut state, &wire).is_ok());
+        assert_eq!(state.tx_power_dbm, MAX_TX_POWER_DBM);
     }
 }

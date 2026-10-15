@@ -22,6 +22,10 @@ pub struct PendingReliable {
     pub relayed: bool,
     pub named: Option<NamedFollowup>,
     pub num_retx: u8,
+    pub awaiting_tx: bool,
+    pub has_transmitted: bool,
+    pub terminal_tx: bool,
+    pub retx_delay_ms: u32,
     pub next_tx_ms: u32,
     pub len: u8,
     pub bytes: [u8; MAX_WIRE_LEN],
@@ -37,6 +41,10 @@ impl PendingReliable {
             relayed: false,
             named: None,
             num_retx: 0,
+            awaiting_tx: false,
+            has_transmitted: false,
+            terminal_tx: false,
+            retx_delay_ms: 0,
             next_tx_ms: 0,
             len: 0,
             bytes: [0; MAX_WIRE_LEN],
@@ -53,7 +61,7 @@ pub fn schedule_reliable(
     len: u8,
     bytes: [u8; MAX_WIRE_LEN],
     retx_delay_ms: u32,
-    now_ms: u32,
+    _now_ms: u32,
     num_retx: u8,
     named: Option<NamedFollowup>,
 ) -> bool {
@@ -75,7 +83,11 @@ pub fn schedule_reliable(
         relayed,
         named,
         num_retx,
-        next_tx_ms: now_ms.wrapping_add(retx_delay_ms),
+        awaiting_tx: true,
+        has_transmitted: false,
+        terminal_tx: false,
+        retx_delay_ms,
+        next_tx_ms: 0,
         len,
         bytes,
     };
@@ -110,7 +122,7 @@ pub fn stop_reliable_for(
 
 pub fn bump_reliable_delays(slots: &mut [PendingReliable; MAX_PENDING_RELIABLE], airtime_ms: u32) {
     for slot in slots.iter_mut() {
-        if slot.active {
+        if slot.active && !slot.awaiting_tx {
             slot.next_tx_ms = slot.next_tx_ms.wrapping_add(airtime_ms);
         }
     }
@@ -133,7 +145,7 @@ pub fn due_retransmit(
     retx_delay_for: impl Fn(u32, u32, u8) -> u32,
 ) -> Option<DueRetransmit> {
     for slot in slots.iter_mut() {
-        if !slot.active {
+        if !slot.active || slot.awaiting_tx {
             continue;
         }
         if now_ms.wrapping_sub(slot.next_tx_ms) >= 0x8000_0000 {
@@ -148,11 +160,11 @@ pub fn due_retransmit(
             Some(n) => n.delay_ms,
             None => retx_delay_for(slot.from, slot.packet_id, slot.len),
         };
-        slot.next_tx_ms = now_ms.wrapping_add(delay);
+        slot.awaiting_tx = true;
+        slot.retx_delay_ms = delay;
+        slot.next_tx_ms = 0;
         let redirect = slot.named.is_some_and(|n| n.redirect_on_last) && slot.num_retx == 0;
-        if redirect {
-            slot.active = false;
-        }
+        slot.terminal_tx = redirect;
         return Some(DueRetransmit {
             from: slot.from,
             packet_id: slot.packet_id,

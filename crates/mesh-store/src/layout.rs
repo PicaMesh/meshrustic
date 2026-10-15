@@ -115,11 +115,12 @@ fn decode_v2_to_v4(buf: &[u8], version: u32) -> Result<NodeConfig, StoreError> {
     if !frequency_mhz.is_finite() || frequency_mhz <= 0.0 {
         return Err(StoreError::BadConfig);
     }
+    let modem_preset = mesh_radio::normalize_modem_preset(buf[110]);
     let lora = LoRaConfig {
         region: EU_868,
-        modem_preset: buf[110],
+        modem_preset,
         frequency_mhz,
-        bandwidth_khz: bandwidth_for_preset(buf[110]),
+        bandwidth_khz: bandwidth_for_preset(modem_preset),
         spreading_factor: buf[115],
         coding_rate: buf[116],
         sync_word: buf[117],
@@ -190,7 +191,7 @@ fn decode_v1(buf: &[u8]) -> Result<NodeConfig, StoreError> {
     };
 
     let frequency_mhz = f32::from_le_bytes(buf[98..102].try_into().unwrap());
-    let modem_preset = buf[97];
+    let modem_preset = mesh_radio::normalize_modem_preset(buf[97]);
     if !frequency_mhz.is_finite() || frequency_mhz <= 0.0 {
         return Err(StoreError::BadConfig);
     }
@@ -362,6 +363,21 @@ mod tests {
         assert_eq!(decoded.admin_public_keys[0], [0x11; 32]);
         assert_eq!(decoded.admin_public_keys[1], [0u8; 32]);
         assert_eq!(decoded.admin_public_keys[2], [0x33; 32]);
+    }
+
+    #[test]
+    fn invalid_stored_modem_preset_migrates_to_default() {
+        let mut config = NodeConfig::first_boot(1, [1; 32], [2; 32]);
+        config.lora.modem_preset = u8::MAX;
+        let mut buf = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut buf).unwrap();
+
+        let decoded = decode(&buf).expect("invalid preset is migrated");
+        assert_eq!(decoded.lora.modem_preset, mesh_radio::MODEM_DEFAULT_PRESET);
+        assert_eq!(
+            decoded.lora.bandwidth_khz,
+            mesh_radio::modem_preset_params(mesh_radio::MODEM_DEFAULT_PRESET, false).bandwidth_khz
+        );
     }
 
     #[test]

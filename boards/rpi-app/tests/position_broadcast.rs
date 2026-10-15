@@ -51,7 +51,11 @@ fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
         session_passkey: key,
     };
     admin(&mut router, peer, &peer_pub, &set, now + 1);
-    let _ = router.poll_admin_tx(now + 1);
+    if let Some(tx) = router.poll_admin_tx(now + 1) {
+        let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN]).unwrap();
+        let parsed = header.parse();
+        router.note_tx_enqueued(parsed.from, parsed.id);
+    }
 
     let key = passkey(&mut router, peer, &peer_pub, now + 2);
     let fix = AdminMessage {

@@ -60,6 +60,18 @@ fn inbound(router: &mut Router, frame: &[u8], now: u32) {
         .unwrap();
 }
 
+fn poll_admin_tx(router: &mut Router, now: u32) -> Option<RelayPlan> {
+    let tx = router.poll_admin_tx(now)?;
+    let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN]).unwrap();
+    let parsed = header.parse();
+    router.note_tx_enqueued(parsed.from, parsed.id);
+    let preset = router.radio_config().modem_preset;
+    if preset != router.modem_preset() {
+        router.radio_reconfigured(now, mesh_routing::slot_time_for_preset(preset));
+    }
+    Some(tx)
+}
+
 fn decrypt_pki_admin(tx: &RelayPlan, peer_priv: &[u8; 32], node_pub: &[u8; 32]) -> AdminMessage {
     let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
@@ -125,7 +137,7 @@ fn issue_passkey(
         &encode_admin_message(&get),
     );
     inbound(router, &frame, now);
-    let tx = router.poll_admin_tx(now).expect("telemetry get reply");
+    let tx = poll_admin_tx(router, now).expect("telemetry get reply");
     let msg = decrypt_pki_admin(&tx, b1_priv, node_pub);
     assert!(msg.has_session_passkey);
     match msg.payload {
@@ -205,7 +217,7 @@ fn zero_means_default_not_disable() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 1_100);
-    let tx = router.poll_admin_tx(1_100).unwrap();
+    let tx = poll_admin_tx(router, 1_100).unwrap();
     assert_eq!(
         decrypt_pki_routing_error(&tx, &b1_priv, &node_pub),
         ROUTING_ERROR_NONE
@@ -258,7 +270,7 @@ fn set_interval_and_persist_reload() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 3_100);
-    let tx = router.poll_admin_tx(3_100).unwrap();
+    let tx = poll_admin_tx(router, 3_100).unwrap();
     assert_eq!(
         decrypt_pki_routing_error(&tx, &b1_priv, &node_pub),
         ROUTING_ERROR_NONE
@@ -301,7 +313,7 @@ fn set_interval_and_persist_reload() {
         &encode_admin_message(&get),
     );
     inbound(router2, &frame, 20_000);
-    let tx = router2.poll_admin_tx(20_000).unwrap();
+    let tx = poll_admin_tx(router2, 20_000).unwrap();
     match decrypt_pki_admin(&tx, &b1_priv, &node_pub).payload {
         AdminPayload::GetModuleConfigResponse(ModuleConfigPayload::Telemetry(tel)) => {
             assert_eq!(tel.device_update_interval, interval_secs);
@@ -346,7 +358,7 @@ fn below_airtime_floor_is_rejected() {
         &encode_admin_message(&set),
     );
     inbound(router, &frame, 5_100);
-    let tx = router.poll_admin_tx(5_100).unwrap();
+    let tx = poll_admin_tx(router, 5_100).unwrap();
     assert_eq!(
         decrypt_pki_routing_error(&tx, &b1_priv, &node_pub),
         ROUTING_ERROR_BAD_REQUEST

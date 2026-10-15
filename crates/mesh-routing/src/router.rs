@@ -196,7 +196,16 @@ struct PendingAdmin {
     bytes: [u8; MAX_WIRE_LEN],
 }
 
+#[derive(Clone, Copy)]
+struct PendingRadioSettings {
+    modem_preset: u8,
+    use_preset: bool,
+    channel_key: CryptoKey,
+    channel_hash: u8,
+}
+
 pub const BOOTSTRAP_REPLY_MIN_MS: u32 = 120_000;
+const PKI_CURVE_ATTEMPTS_PER_SECOND: u8 = 16;
 
 pub struct Router {
     node_num: u32,
@@ -237,14 +246,18 @@ pub struct Router {
     modem_preset: u8,
     operating_preset: u8,
     use_preset: bool,
+    pending_radio_settings: Option<PendingRadioSettings>,
     hop_limit: u8,
     next_tx_id: u32,
     sr_log: SrLog,
     bridge_dedup: crate::bridge::BridgeDedupCache,
+    bridge_enabled: bool,
     admin: AdminState,
     admin_reply_remote_pk: Option<[u8; 32]>,
     admin_reply_use_pki: bool,
     pending_pki_error: Option<u32>,
+    pki_work_window_ms: u32,
+    pki_work_used: u8,
     module_reply_suppresses_ack: bool,
     pending_radio_reinit: bool,
     designated_repeat_id: Option<(u32, u32)>,
@@ -271,6 +284,7 @@ impl Router {
         channel_key: CryptoKey,
         hop_limit: u8,
     ) -> Self {
+        let modem_preset = mesh_radio::normalize_modem_preset(modem_preset);
         let psk = psk_bytes(&channel_key);
         Self::with_channel(
             node_num,
@@ -313,6 +327,7 @@ impl Router {
         use_preset: bool,
         hop_limit: u8,
     ) -> Self {
+        let modem_preset = mesh_radio::normalize_modem_preset(modem_preset);
         let mut graph = NeighborGraph::new();
         graph.set_my_node(node_num);
         graph.set_modem_preset(modem_preset);
@@ -416,14 +431,18 @@ impl Router {
             modem_preset,
             operating_preset: modem_preset,
             use_preset,
+            pending_radio_settings: None,
             hop_limit,
             next_tx_id: 1,
             sr_log: SrLog::new(),
             bridge_dedup: crate::bridge::BridgeDedupCache::new(),
+            bridge_enabled: true,
             admin: AdminState::new(),
             admin_reply_remote_pk: None,
             admin_reply_use_pki: false,
             pending_pki_error: None,
+            pki_work_window_ms: 0,
+            pki_work_used: 0,
             module_reply_suppresses_ack: false,
             pending_radio_reinit: false,
             designated_repeat_id: None,
@@ -452,10 +471,11 @@ impl Router {
         self.set_device_role(u32::from(cfg.device_role));
         self.set_modem_preset(
             "",
-            cfg.lora.modem_preset,
+            mesh_radio::normalize_modem_preset(cfg.lora.modem_preset),
             cfg.lora.use_preset,
             cfg.channel_key,
         );
+        self.pending_radio_settings = None;
         self.operating_preset = self.modem_preset;
         self.hop_limit = cfg.lora.hop_limit;
     }
@@ -484,10 +504,17 @@ impl Router {
 
     /// A software reset would enter the UF2 bootloader rather than simply apply radio settings.
     pub fn radio_config(&self) -> mesh_radio::RadioConfig {
-        let mut config = mesh_radio::eu868_config_for_preset(self.modem_preset);
+        let modem_preset = self
+            .pending_radio_settings
+            .map_or(self.modem_preset, |settings| settings.modem_preset);
+        let mut config = mesh_radio::eu868_config_for_preset(modem_preset);
         config.hop_limit = self.hop_limit;
-        config.tx_power_dbm = self.admin.tx_power_dbm.min(22) as i8;
+        config.tx_power_dbm = self.admin.tx_power_dbm.min(mesh_radio::MAX_TX_POWER_DBM) as i8;
         config
+    }
+
+    pub fn set_bridge_enabled(&mut self, enabled: bool) {
+        self.bridge_enabled = enabled;
     }
 
     pub fn has_pending_control_tx(&self) -> bool {
@@ -514,6 +541,14 @@ impl Router {
 
     /// Links learned on the previous RF parameters cannot establish connectivity on the new preset.
     pub fn radio_reconfigured(&mut self, now_ms: u32, slot_ms: u32) {
+        if let Some(settings) = self.pending_radio_settings.take() {
+            self.apply_modem_settings(
+                settings.modem_preset,
+                settings.use_preset,
+                settings.channel_key,
+                settings.channel_hash,
+            );
+        }
         let mut dropped = 0usize;
         for p in &mut self.pending {
             if p.active {
@@ -626,16 +661,56 @@ impl Router {
         use_preset: bool,
         channel_key: CryptoKey,
     ) {
-        self.channel_key = channel_key;
-        self.modem_preset = modem_preset;
-        self.use_preset = use_preset;
-        self.graph.set_modem_preset(modem_preset);
-        self.channel_hash = primary_channel_hash(
+        if !mesh_radio::is_valid_modem_preset(modem_preset) {
+            return;
+        }
+        let channel_hash = primary_channel_hash(
             stored_channel_name,
             modem_preset,
             use_preset,
             psk_bytes(&channel_key),
         );
+        self.apply_modem_settings(modem_preset, use_preset, channel_key, channel_hash);
+        self.pending_radio_settings = None;
+    }
+
+    pub fn request_modem_preset(
+        &mut self,
+        stored_channel_name: &str,
+        modem_preset: u8,
+        use_preset: bool,
+        channel_key: CryptoKey,
+    ) -> bool {
+        if !mesh_radio::is_valid_modem_preset(modem_preset) {
+            return false;
+        }
+        self.pending_radio_settings = Some(PendingRadioSettings {
+            modem_preset,
+            use_preset,
+            channel_key,
+            channel_hash: primary_channel_hash(
+                stored_channel_name,
+                modem_preset,
+                use_preset,
+                psk_bytes(&channel_key),
+            ),
+        });
+        self.pending_radio_reinit = true;
+        true
+    }
+
+    fn apply_modem_settings(
+        &mut self,
+        modem_preset: u8,
+        use_preset: bool,
+        channel_key: CryptoKey,
+        channel_hash: u8,
+    ) {
+        self.channel_key = channel_key;
+        self.modem_preset = modem_preset;
+        self.use_preset = use_preset;
+        self.graph.set_modem_preset(modem_preset);
+        self.channel_hash = channel_hash;
         self.qos = ChannelQoS::with_primary_channel(self.channel_hash);
     }
 
@@ -667,6 +742,10 @@ impl Router {
 
     pub fn modem_preset(&self) -> u8 {
         self.modem_preset
+    }
+
+    pub fn operating_modem_preset(&self) -> u8 {
+        self.operating_preset
     }
 
     pub fn hop_limit(&self) -> u8 {
@@ -774,7 +853,8 @@ impl Router {
         if payload_len > MAX_PACKET_PAYLOAD {
             return None;
         }
-        let (decode, inner, decoded_data) = self.decode_payload(&parsed, packet.bytes, payload_len);
+        let (decode, inner, decoded_data) =
+            self.decode_payload(&parsed, packet.bytes, payload_len, now_ms);
 
         match self
             .history
@@ -1110,6 +1190,7 @@ impl Router {
         parsed: &ParsedPacket,
         wire: &[u8],
         payload_len: usize,
+        now_ms: u32,
     ) -> (
         RxDecodeInfo,
         Option<heapless::Vec<u8, 240>>,
@@ -1138,7 +1219,7 @@ impl Router {
                 Some(data),
             )
         } else if parsed.to == self.node_num {
-            self.try_pki_decrypt(parsed, wire, payload_len)
+            self.try_pki_decrypt(parsed, wire, payload_len, now_ms)
         } else {
             self.admin_reply_remote_pk = None;
             self.admin_reply_use_pki = false;
@@ -1155,6 +1236,7 @@ impl Router {
         parsed: &ParsedPacket,
         wire: &[u8],
         payload_len: usize,
+        now_ms: u32,
     ) -> (
         RxDecodeInfo,
         Option<heapless::Vec<u8, 240>>,
@@ -1162,6 +1244,7 @@ impl Router {
     ) {
         self.admin_reply_remote_pk = None;
         self.admin_reply_use_pki = false;
+        self.pending_pki_error = None;
 
         #[cfg(feature = "pki")]
         {
@@ -1185,6 +1268,14 @@ impl Router {
             let mut engine = CryptoEngine::new();
             engine.set_dh_private_key(&self.admin.private_key);
             for remote_pk in candidates {
+                if !self.allow_pki_curve_attempt(now_ms) {
+                    self.pending_pki_error = None;
+                    return (
+                        RxDecodeInfo::encrypted(payload_len.min(u16::MAX as usize) as u16),
+                        None,
+                        None,
+                    );
+                }
                 let mut plain = [0u8; MAX_PACKET_PAYLOAD];
                 let cipher = &wire[PACKET_HEADER_LEN..PACKET_HEADER_LEN + payload_len];
                 if !engine.decrypt_curve25519(
@@ -1223,7 +1314,7 @@ impl Router {
         }
         #[cfg(not(feature = "pki"))]
         {
-            let _ = (parsed, wire, payload_len);
+            let _ = (parsed, wire, payload_len, now_ms);
             self.pending_pki_error = Some(ROUTING_ERROR_PKI_FAILED);
         }
         (
@@ -1231,6 +1322,18 @@ impl Router {
             None,
             None,
         )
+    }
+
+    fn allow_pki_curve_attempt(&mut self, now_ms: u32) -> bool {
+        if now_ms.wrapping_sub(self.pki_work_window_ms) >= 1_000 {
+            self.pki_work_window_ms = now_ms;
+            self.pki_work_used = 0;
+        }
+        if self.pki_work_used >= PKI_CURVE_ATTEMPTS_PER_SECOND {
+            return false;
+        }
+        self.pki_work_used += 1;
+        true
     }
 
     fn maybe_arm_ota_dfu(
@@ -1337,8 +1440,7 @@ impl Router {
 
         if let Some(preset) = outcome.apply_modem_preset {
             self.hop_limit = self.admin.hop_limit;
-            self.set_modem_preset("", preset, true, self.channel_key);
-            self.pending_radio_reinit = true;
+            let _ = self.request_modem_preset("", preset, true, self.channel_key);
         }
         if let Some(role) = outcome.apply_device_role {
             self.set_device_role(role);
@@ -1492,25 +1594,6 @@ impl Router {
 
     fn enqueue_admin_tx(&mut self, now_ms: u32, len: u8, bytes: [u8; MAX_WIRE_LEN]) {
         self.module_reply_suppresses_ack = true;
-        if let Ok(hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) {
-            let p = hdr.parse();
-            if p.want_ack {
-                let delay = self.reliable_retx_delay_ms(len, self.node_num, p.id);
-                let _ = schedule_reliable(
-                    &mut self.pending_reliable,
-                    self.node_num,
-                    p.id,
-                    p.to,
-                    false,
-                    len,
-                    bytes,
-                    delay,
-                    now_ms,
-                    NUM_RELIABLE_RETX,
-                    None,
-                );
-            }
-        }
         for slot in &mut self.pending_admin {
             if !slot.active {
                 *slot = PendingAdmin {
@@ -2361,7 +2444,8 @@ impl Router {
 
         let cw_slot = self.cw_slot_ms();
 
-        if parsed.to != NODENUM_BROADCAST
+        if self.bridge_enabled
+            && parsed.to != NODENUM_BROADCAST
             && route.next_hop != 0
             && route.egress_radio != result.radio_id
         {
@@ -2483,19 +2567,21 @@ impl Router {
                 delay_ms: 0,
             };
             plan.relay = Some(relay);
-            let _ = crate::bridge::evaluate_bridge_targets(
-                &bridge_eval,
-                &relay,
-                &mut self.graph,
-                &mut self.bridge_dedup,
-                &self.qos,
-                &mut self.sr_log,
-                self.node_num,
-                result.snr,
-                slot_ms,
-                cw_slot,
-                &mut plan,
-            );
+            if self.bridge_enabled {
+                let _ = crate::bridge::evaluate_bridge_targets(
+                    &bridge_eval,
+                    &relay,
+                    &mut self.graph,
+                    &mut self.bridge_dedup,
+                    &self.qos,
+                    &mut self.sr_log,
+                    self.node_num,
+                    result.snr,
+                    slot_ms,
+                    cw_slot,
+                    &mut plan,
+                );
+            }
             return plan;
         }
 
@@ -2518,19 +2604,21 @@ impl Router {
             delay_ms: 0,
         };
         plan.relay = Some(relay);
-        let _ = crate::bridge::evaluate_bridge_targets(
-            &bridge_eval,
-            &relay,
-            &mut self.graph,
-            &mut self.bridge_dedup,
-            &self.qos,
-            &mut self.sr_log,
-            self.node_num,
-            result.snr,
-            slot_ms,
-            cw_slot,
-            &mut plan,
-        );
+        if self.bridge_enabled {
+            let _ = crate::bridge::evaluate_bridge_targets(
+                &bridge_eval,
+                &relay,
+                &mut self.graph,
+                &mut self.bridge_dedup,
+                &self.qos,
+                &mut self.sr_log,
+                self.node_num,
+                result.snr,
+                slot_ms,
+                cw_slot,
+                &mut plan,
+            );
+        }
         plan
     }
 
@@ -3012,7 +3100,7 @@ impl Router {
         )?;
         if want_ack {
             let delay = self.reliable_retx_delay_ms(len, self.node_num, packet_id);
-            let _ = schedule_reliable(
+            if !schedule_reliable(
                 &mut self.pending_reliable,
                 self.node_num,
                 packet_id,
@@ -3024,7 +3112,9 @@ impl Router {
                 now_ms,
                 NUM_RELIABLE_RETX,
                 None,
-            );
+            ) {
+                return None;
+            }
         }
         if to == NODENUM_BROADCAST && portnum != SIGNAL_ROUTING_APP {
             let half = crate::coordinated_relay::half_airtime_ms(airtime_ms);
@@ -3062,8 +3152,21 @@ impl Router {
         self.channel_util_pct = pct;
     }
 
+    fn retx_delay_after_tx_done(
+        preset: u8,
+        util: f32,
+        node_num: u32,
+        from: u32,
+        id: u32,
+        wire_len: u8,
+    ) -> u32 {
+        let airtime_ms =
+            packet_time_ms(&eu868_config_for_preset(preset), wire_len as usize, false).max(1);
+        Self::retx_delay_for(preset, util, node_num, from, id, wire_len).saturating_sub(airtime_ms)
+    }
+
     pub fn reliable_retx_delay_ms(&self, wire_len: u8, from: u32, id: u32) -> u32 {
-        Self::retx_delay_for(
+        Self::retx_delay_after_tx_done(
             self.modem_preset,
             self.channel_util_pct,
             self.node_num,
@@ -3093,7 +3196,7 @@ impl Router {
     pub fn poll_reliable_retransmit(&mut self, now_ms: u32) -> Option<RelayPlan> {
         let (preset, util, node_num) = (self.modem_preset, self.channel_util_pct, self.node_num);
         let delay_for = |from: u32, id: u32, len: u8| {
-            Self::retx_delay_for(preset, util, node_num, from, id, len)
+            Self::retx_delay_after_tx_done(preset, util, node_num, from, id, len)
         };
         let due = due_retransmit(&mut self.pending_reliable, now_ms, delay_for)?;
         let Some(named) = due.named else {
@@ -3152,12 +3255,14 @@ impl Router {
         if !stampable {
             self.sr_log
                 .push(SrLogEvent::RelayRetxNoAlternate { id: due.packet_id });
+            self.note_tx_plan_deferred(due.from, due.packet_id, now_ms);
             return None;
         }
         let mut bytes = due.bytes;
         let Ok(mut hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) else {
             self.sr_log
                 .push(SrLogEvent::RelayRetxNoAlternate { id: due.packet_id });
+            self.note_tx_plan_deferred(due.from, due.packet_id, now_ms);
             return None;
         };
         hdr.next_hop = alt_byte;
@@ -3295,10 +3400,12 @@ impl Router {
             .unicast_named_slot_delay_ms(1, 0, half, airtime_ms)
             .saturating_add(crate::coordinated_relay::tie_break_range_ms(half))
             .saturating_add(airtime_ms);
-        self.sr_peer_relay_wait_ms(airtime_ms).saturating_add(
-            self.next_hop_carry_wait_ms(nominated_hop, airtime_ms)
-                .max(slot1_end),
-        )
+        self.sr_peer_relay_wait_ms(airtime_ms)
+            .saturating_add(
+                self.next_hop_carry_wait_ms(nominated_hop, airtime_ms)
+                    .max(slot1_end),
+            )
+            .saturating_sub(airtime_ms)
     }
 
     fn unicast_named_slot_delay_ms(
@@ -3439,11 +3546,31 @@ impl Router {
             });
         }
         let idx = best?;
-        let slot = &mut self.pending_admin[idx];
-        slot.active = false;
+        let pending = self.pending_admin[idx];
+        if let Ok(header) = PacketHeader::decode(&pending.bytes[..PACKET_HEADER_LEN]) {
+            let parsed = header.parse();
+            if parsed.want_ack {
+                let delay = self.reliable_retx_delay_ms(pending.len, self.node_num, parsed.id);
+                if !schedule_reliable(
+                    &mut self.pending_reliable,
+                    self.node_num,
+                    parsed.id,
+                    parsed.to,
+                    false,
+                    pending.len,
+                    pending.bytes,
+                    delay,
+                    now_ms,
+                    NUM_RELIABLE_RETX,
+                    None,
+                ) {
+                    return None;
+                }
+            }
+        }
         Some(RelayPlan {
-            len: slot.len,
-            bytes: slot.bytes,
+            len: pending.len,
+            bytes: pending.bytes,
             delay_ms: 0,
         })
     }
@@ -4039,13 +4166,85 @@ impl Router {
         }
     }
 
-    pub fn note_tx_done(&mut self, from: u32, packet_id: u32) {
+    pub fn note_tx_done(&mut self, from: u32, packet_id: u32, now_ms: u32) {
         if packet_id != 0 {
             self.graph.cancel_relay(from, packet_id);
             for slot in &mut self.pending_retransmits {
                 if slot.from == from && slot.packet_id == packet_id {
                     slot.fired = false;
                 }
+            }
+            for slot in &mut self.pending_reliable {
+                if slot.active
+                    && slot.from == from
+                    && slot.packet_id == packet_id
+                    && slot.awaiting_tx
+                {
+                    slot.has_transmitted = true;
+                    if slot.terminal_tx {
+                        slot.active = false;
+                        continue;
+                    }
+                    slot.awaiting_tx = false;
+                    slot.next_tx_ms = now_ms.wrapping_add(slot.retx_delay_ms);
+                }
+            }
+        }
+    }
+
+    pub fn note_tx_failure(&mut self, from: u32, packet_id: u32, now_ms: u32) {
+        for slot in &mut self.pending_reliable {
+            if slot.active && slot.from == from && slot.packet_id == packet_id && slot.awaiting_tx {
+                slot.has_transmitted = true;
+                slot.terminal_tx = false;
+                slot.awaiting_tx = false;
+                slot.next_tx_ms = now_ms.wrapping_add(slot.retx_delay_ms);
+            }
+        }
+    }
+
+    pub fn note_tx_queue_rejected(&mut self, from: u32, packet_id: u32, now_ms: u32) {
+        for slot in &mut self.pending_reliable {
+            if !slot.active || slot.from != from || slot.packet_id != packet_id {
+                continue;
+            }
+            if slot.has_transmitted {
+                if slot.awaiting_tx {
+                    slot.num_retx = slot.num_retx.saturating_add(1);
+                    slot.awaiting_tx = false;
+                    slot.terminal_tx = false;
+                    slot.next_tx_ms = now_ms;
+                }
+            } else {
+                slot.active = false;
+            }
+        }
+    }
+
+    fn note_tx_plan_deferred(&mut self, from: u32, packet_id: u32, now_ms: u32) {
+        for slot in &mut self.pending_reliable {
+            if slot.active && slot.from == from && slot.packet_id == packet_id && slot.awaiting_tx {
+                slot.awaiting_tx = false;
+                slot.terminal_tx = false;
+                slot.next_tx_ms = now_ms.wrapping_add(slot.retx_delay_ms);
+            }
+        }
+    }
+
+    pub fn note_tx_enqueued(&mut self, from: u32, packet_id: u32) {
+        for slot in &mut self.pending_admin {
+            if !slot.active {
+                continue;
+            }
+            if PacketHeader::decode(&slot.bytes[..PACKET_HEADER_LEN])
+                .ok()
+                .is_some_and(|header| {
+                    let parsed = header.parse();
+                    parsed.from == from && parsed.id == packet_id
+                })
+            {
+                slot.active = false;
+                return;
             }
         }
     }
@@ -4667,6 +4866,179 @@ mod tests {
     use mesh_crypto::{CryptoKey, DEFAULT_PSK};
     use mesh_protocol::PacketHeader;
     use static_cell::StaticCell;
+
+    #[test]
+    fn pki_curve_attempts_are_globally_bounded_per_second() {
+        let mut router = Router::new(1);
+        for _ in 0..PKI_CURVE_ATTEMPTS_PER_SECOND {
+            assert!(router.allow_pki_curve_attempt(100));
+        }
+        assert!(!router.allow_pki_curve_attempt(100));
+        assert!(router.allow_pki_curve_attempt(1_100));
+    }
+
+    #[test]
+    fn reliable_timeout_arms_only_after_tx_completion_and_each_retry_completion() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        let plan = router
+            .send_local(2, TEXT_MESSAGE_APP, b"reliable", true, 3, 0, 100)
+            .expect("reliable packet");
+        let packet = PacketHeader::decode(&plan.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        let delay = router.reliable_retx_delay_ms(plan.len, packet.from, packet.id);
+
+        assert!(router.poll_reliable_retransmit(u32::MAX / 2).is_none());
+        router.note_tx_done(packet.from, packet.id, 50);
+        assert!(router.poll_reliable_retransmit(50 + delay - 1).is_none());
+        let retry = router
+            .poll_reliable_retransmit(50 + delay)
+            .expect("retry becomes due after the completed send");
+        assert!(router.poll_reliable_retransmit(u32::MAX / 2).is_none());
+
+        let retry_packet = PacketHeader::decode(&retry.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        router.note_tx_done(retry_packet.from, retry_packet.id, 50 + delay + 10);
+        assert!(router
+            .poll_reliable_retransmit(50 + delay + 10 + delay - 1)
+            .is_none());
+        assert!(router
+            .poll_reliable_retransmit(50 + delay + 10 + delay)
+            .is_some());
+    }
+
+    #[test]
+    fn queue_rejection_releases_unsent_reliable_and_restores_retry_admission() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        let first = router
+            .send_local(2, TEXT_MESSAGE_APP, b"first", true, 3, 100, 100)
+            .expect("first reliable packet");
+        let first_header = PacketHeader::decode(&first.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        assert!(router.has_pending_reliable(first_header.id));
+        router.note_tx_queue_rejected(first_header.from, first_header.id, 100);
+        assert!(!router.has_pending_reliable(first_header.id));
+
+        let second = router
+            .send_local(2, TEXT_MESSAGE_APP, b"second", true, 3, 100, 100)
+            .expect("reliable slot released");
+        let second_header = PacketHeader::decode(&second.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        let delay = router.reliable_retx_delay_ms(second.len, second_header.from, second_header.id);
+        router.note_tx_done(second_header.from, second_header.id, 200);
+        let retry = router
+            .poll_reliable_retransmit(200 + delay)
+            .expect("retry becomes due");
+        router.note_tx_queue_rejected(second_header.from, second_header.id, 200 + delay);
+        assert!(router.has_pending_reliable(second_header.id));
+        assert!(router
+            .poll_reliable_retransmit(200 + delay)
+            .is_some_and(
+                |again| again.bytes[..again.len as usize] == retry.bytes[..retry.len as usize]
+            ));
+    }
+
+    #[test]
+    fn modem_settings_remain_active_until_radio_reconfiguration_succeeds() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::with_modem_preset(
+            1,
+            "",
+            mesh_radio::MODEM_SHORT_SLOW,
+            true,
+            CryptoKey::from_bytes(&mesh_crypto::DEFAULT_PSK),
+            3,
+        ));
+        let active_hash = router.channel_hash();
+        assert!(router.request_modem_preset(
+            "",
+            mesh_radio::MODEM_VERY_LONG_SLOW,
+            true,
+            CryptoKey::from_bytes(&mesh_crypto::DEFAULT_PSK),
+        ));
+
+        assert_eq!(router.modem_preset(), mesh_radio::MODEM_SHORT_SLOW);
+        assert_eq!(
+            router.operating_modem_preset(),
+            mesh_radio::MODEM_SHORT_SLOW
+        );
+        assert_eq!(router.channel_hash(), active_hash);
+        assert_eq!(
+            router.radio_config().modem_preset,
+            mesh_radio::MODEM_VERY_LONG_SLOW
+        );
+
+        router.radio_reconfigured(1_000, 100);
+        assert_eq!(router.modem_preset(), mesh_radio::MODEM_VERY_LONG_SLOW);
+        assert_eq!(
+            router.operating_modem_preset(),
+            mesh_radio::MODEM_VERY_LONG_SLOW
+        );
+    }
+
+    #[test]
+    fn invalid_modem_preset_requests_are_rejected_without_changing_active_config() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        let active = router.modem_preset();
+        assert!(!router.request_modem_preset(
+            "",
+            u8::MAX,
+            true,
+            CryptoKey::from_bytes(&mesh_crypto::DEFAULT_PSK),
+        ));
+        router.set_modem_preset(
+            "",
+            u8::MAX,
+            true,
+            CryptoKey::from_bytes(&mesh_crypto::DEFAULT_PSK),
+        );
+        assert_eq!(router.modem_preset(), active);
+        assert!(!router.take_pending_radio_reinit());
+    }
+
+    #[test]
+    fn admin_reliable_reply_waits_for_tracking_capacity() {
+        static ROUTER: StaticCell<Router> = StaticCell::new();
+        let router = ROUTER.init(Router::new(1));
+        let header = PacketHeader::from_fields(2, 1, 99, 0, 3, 3, true, false, 0, 0);
+        let wire = encode_wire(header, &[1, 2]);
+        let mut bytes = [0; MAX_WIRE_LEN];
+        bytes[..wire.len()].copy_from_slice(&wire);
+        for (idx, slot) in router.pending_reliable.iter_mut().enumerate() {
+            *slot = PendingReliable {
+                active: true,
+                from: 10 + idx as u32,
+                packet_id: idx as u32,
+                ..PendingReliable::inactive()
+            };
+        }
+
+        router.enqueue_admin_tx(0, wire.len() as u8, bytes);
+        assert!(router.poll_admin_tx(0).is_none());
+        assert!(!router.has_pending_reliable(99));
+        assert!(router.pending_admin.iter().any(|pending| pending.active));
+
+        router.pending_reliable[0].active = false;
+        let queued = router.poll_admin_tx(1).expect("reply remains queued");
+        assert_eq!(queued.len, wire.len() as u8);
+        assert!(router.has_pending_reliable(99));
+        assert!(router.has_pending_control_tx());
+        router.note_tx_queue_rejected(2, 99, 1);
+        assert!(!router.has_pending_reliable(99));
+        let queued_again = router
+            .poll_admin_tx(2)
+            .expect("admin response is retained after queue rejection");
+        assert_eq!(queued_again.len, wire.len() as u8);
+        assert!(router.has_pending_reliable(99));
+        router.note_tx_enqueued(2, 99);
+        assert!(!router.has_pending_control_tx());
+    }
 
     fn encode_wire(header: PacketHeader, payload: &[u8]) -> heapless::Vec<u8, 128> {
         let mut out = heapless::Vec::new();
@@ -5620,7 +5992,7 @@ mod tests {
             cancels.contains(&(NEIGHBOR, 99)),
             "the queued insurance frame must be pulled out of the radio queue"
         );
-        router.note_tx_done(NEIGHBOR, 99);
+        router.note_tx_done(NEIGHBOR, 99, 0);
         let _ = router.process_inbound(
             &InboundPacket {
                 radio_id: 0,
@@ -6440,12 +6812,11 @@ mod tests {
                 (router.poll_ready_relay(tx).expect("relay released"), tx)
             }
         };
-        (
-            PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
-                .unwrap()
-                .parse(),
-            released_at,
-        )
+        let sent = PacketHeader::decode(&relay.bytes[..PACKET_HEADER_LEN])
+            .unwrap()
+            .parse();
+        router.note_tx_done(sent.from, sent.id, released_at);
+        (sent, released_at)
     }
 
     fn named_followup_delay(router: &Router, wire: &[u8], nominated: u32) -> u32 {
@@ -6459,6 +6830,7 @@ mod tests {
         let hdr = PacketHeader::decode(&repeat.bytes[..PACKET_HEADER_LEN])
             .unwrap()
             .parse();
+        router.note_tx_done(hdr.from, hdr.id, at);
         assert_eq!(hdr.next_hop, sent.next_hop, "repeat names the same hop");
         assert_eq!(hdr.hop_limit, sent.hop_limit);
         assert_eq!(hdr.relay_node, sent.relay_node);
@@ -7923,7 +8295,7 @@ mod tests {
             .expect("later slot");
         assert!(router.poll_ready_relay(tx_after).is_some());
         assert!(router.graph_mut().is_committed_relay(UNI_SOURCE, 0x902));
-        router.note_tx_done(UNI_SOURCE, 0x902);
+        router.note_tx_done(UNI_SOURCE, 0x902, 0);
         assert!(!router.graph_mut().is_committed_relay(UNI_SOURCE, 0x902));
         assert!(!router.graph_mut().has_active_relay_commits());
     }

@@ -7,7 +7,16 @@ pub enum RadioError {
     Busy,
     Timeout,
     InvalidLength,
+    InvalidConfig,
+    TxNotStarted,
+    TxOutcomeUnknown,
     Hardware,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxStatus {
+    Complete,
+    OutcomeUnknown,
 }
 
 pub trait RadioInterface {
@@ -19,7 +28,11 @@ pub trait RadioInterface {
 
     fn poll_recv(&mut self) -> Result<Option<RxFrame>, RadioError>;
 
-    fn send(&mut self, frame: &TxFrame) -> Result<(), RadioError>;
+    fn start_send(&mut self, frame: &TxFrame) -> Result<(), RadioError>;
+
+    fn poll_tx(&mut self) -> Result<Option<TxStatus>, RadioError> {
+        Ok(Some(TxStatus::Complete))
+    }
 
     fn start_rx(&mut self) -> Result<(), RadioError>;
 

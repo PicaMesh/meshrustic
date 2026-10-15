@@ -36,7 +36,7 @@ impl LoRaConfig {
             coding_rate: 5,
             sync_word: SYNC_WORD,
             hop_limit: 3,
-            tx_power_dbm: 27,
+            tx_power_dbm: mesh_radio::MAX_TX_POWER_DBM,
             use_preset: true,
             ok_to_mqtt: true,
         };
@@ -54,13 +54,14 @@ impl LoRaConfig {
             coding_rate: 5,
             sync_word: SYNC_WORD,
             hop_limit: 3,
-            tx_power_dbm: 27,
+            tx_power_dbm: mesh_radio::MAX_TX_POWER_DBM,
             use_preset: true,
             ok_to_mqtt: true,
         }
     }
 
     pub fn apply_modem_preset(&mut self, modem_preset: u8) {
+        let modem_preset = mesh_radio::normalize_modem_preset(modem_preset);
         let params = modem_preset_params(modem_preset, false);
         self.modem_preset = modem_preset;
         self.use_preset = true;

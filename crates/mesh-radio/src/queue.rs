@@ -118,6 +118,16 @@ impl<const N: usize> TxQueue<N> {
         Ok(())
     }
 
+    pub fn push_front(&mut self, frame: TxFrame) -> Result<(), QueueError> {
+        if self.len == N {
+            return Err(QueueError::Full);
+        }
+        self.head = (self.head + N - 1) % N;
+        self.buf[self.head] = frame;
+        self.len += 1;
+        Ok(())
+    }
+
     pub fn remove_where(&mut self, mut drop: impl FnMut(&TxFrame) -> bool) -> usize {
         let mut kept: [TxFrame; N] = self.buf;
         let mut kept_len = 0usize;

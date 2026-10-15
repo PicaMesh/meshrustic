@@ -107,6 +107,18 @@ fn inbound(router: &mut Router, frame: &[u8], now: u32) {
         .unwrap();
 }
 
+fn poll_admin_tx(router: &mut Router, now: u32) -> Option<RelayPlan> {
+    let tx = router.poll_admin_tx(now)?;
+    let header = PacketHeader::decode(&tx.bytes[..PACKET_HEADER_LEN]).unwrap();
+    let parsed = header.parse();
+    router.note_tx_enqueued(parsed.from, parsed.id);
+    let preset = router.radio_config().modem_preset;
+    if preset != router.modem_preset() {
+        router.radio_reconfigured(now, mesh_routing::slot_time_for_preset(preset));
+    }
+    Some(tx)
+}
+
 fn decrypt_pki_admin(
     tx: &RelayPlan,
     peer_priv: &[u8; 32],
@@ -169,7 +181,7 @@ fn get_channel_primary_psk_and_disabled() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 1_000);
-    let tx = router.poll_admin_tx(1_000).unwrap();
+    let tx = poll_admin_tx(router, 1_000).unwrap();
     match decrypt_pki_admin(&tx, &b1_priv, &node_pub).1.payload {
         AdminPayload::GetChannelResponse(ch) => {
             assert_eq!(ch.index, 0);
@@ -195,7 +207,7 @@ fn get_channel_primary_psk_and_disabled() {
         &encode_admin_message(&get2),
     );
     inbound(router, &frame, 1_100);
-    let tx = router.poll_admin_tx(1_100).unwrap();
+    let tx = poll_admin_tx(router, 1_100).unwrap();
     match decrypt_pki_admin(&tx, &b1_priv, &node_pub).1.payload {
         AdminPayload::GetChannelResponse(ch) => {
             assert_eq!(ch.index, 1);
@@ -243,8 +255,8 @@ fn field_log_channel_then_lora_both_admin_replies() {
     );
     inbound(router, &frame, 2_010);
 
-    let tx1 = router.poll_admin_tx(2_010).unwrap();
-    let tx2 = router.poll_admin_tx(2_010).unwrap();
+    let tx1 = poll_admin_tx(router, 2_010).unwrap();
+    let tx2 = poll_admin_tx(router, 2_010).unwrap();
     let mut payloads = [
         decrypt_pki_admin(&tx1, &b1_priv, &node_pub).1.payload,
         decrypt_pki_admin(&tx2, &b1_priv, &node_pub).1.payload,
@@ -297,7 +309,7 @@ fn security_get_set_persist_and_identity_immutable() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 3_000);
-    let tx = router.poll_admin_tx(3_000).unwrap();
+    let tx = poll_admin_tx(router, 3_000).unwrap();
     let (_meta, sec_msg) = decrypt_pki_admin(&tx, &b1_priv, &node_pub);
     match &sec_msg.payload {
         AdminPayload::GetConfigResponse(ConfigPayload::Security(sec)) => {
@@ -338,7 +350,7 @@ fn security_get_set_persist_and_identity_immutable() {
         router.poll_ack_tx(3_100).is_none(),
         "admin Routing NONE reply suppresses a separate WantAck ACK"
     );
-    let set_tx = router.poll_admin_tx(3_100).expect("set completion reply");
+    let set_tx = poll_admin_tx(router, 3_100).expect("set completion reply");
     let set_hdr = PacketHeader::decode(&set_tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
         .parse();
@@ -357,7 +369,7 @@ fn security_get_set_persist_and_identity_immutable() {
     );
     inbound(router, &frame, 3_150);
     assert!(
-        router.poll_admin_tx(3_150).is_none(),
+        poll_admin_tx(router, 3_150).is_none(),
         "WantAck dupe must not re-run admin / enqueue another completion"
     );
     let dupe_ack = router
@@ -416,7 +428,7 @@ fn security_get_set_persist_and_identity_immutable() {
         &encode_admin_message(&clear),
     );
     inbound(router, &frame, 3_200);
-    let _ = router.poll_admin_tx(3_200);
+    let _ = poll_admin_tx(router, 3_200);
     assert_eq!(router.admin_state().admin_public_keys[0], EMPTY_ADMIN_KEY);
 }
 
@@ -443,7 +455,7 @@ fn get_device_role_and_module_config_stub() {
         &encode_admin_message(&get),
     );
     inbound(router, &frame, 4_000);
-    let tx = router.poll_admin_tx(4_000).unwrap();
+    let tx = poll_admin_tx(router, 4_000).unwrap();
     match decrypt_pki_admin(&tx, &b1_priv, &node_pub).1.payload {
         AdminPayload::GetConfigResponse(ConfigPayload::Device(dev)) => {
             assert_eq!(dev.role, DEVICE_ROLE_ROUTER);
@@ -464,7 +476,7 @@ fn get_device_role_and_module_config_stub() {
         &encode_admin_message(&modreq),
     );
     inbound(router, &frame, 4_100);
-    let tx = router.poll_admin_tx(4_100).unwrap();
+    let tx = poll_admin_tx(router, 4_100).unwrap();
     assert!(matches!(
         decrypt_pki_admin(&tx, &b1_priv, &node_pub).1.payload,
         AdminPayload::GetModuleConfigResponse(_)
@@ -506,7 +518,7 @@ fn rapid_multi_get_queue_and_rate_limit() {
     }
 
     let mut replies = 0;
-    while let Some(tx) = router.poll_admin_tx(now) {
+    while let Some(tx) = poll_admin_tx(router, now) {
         let (_meta, msg) = decrypt_pki_admin(&tx, &b1_priv, &node_pub);
         assert!(matches!(
             msg.payload,
@@ -550,7 +562,7 @@ fn pki_want_ack_ack_is_pki_and_admin_sets_request_id() {
         "AdminMessage reply suppresses a separate WantAck ACK"
     );
 
-    let admin_tx = router.poll_admin_tx(6_000).expect("admin reply");
+    let admin_tx = poll_admin_tx(router, 6_000).expect("admin reply");
     let hdr = PacketHeader::decode(&admin_tx.bytes[..PACKET_HEADER_LEN])
         .unwrap()
         .parse();
@@ -599,7 +611,7 @@ fn pki_want_ack_dupe_resends_idempotent_admin_get() {
         true,
     );
     inbound(router, &frame, 7_000);
-    let first = router.poll_admin_tx(7_000).expect("first admin reply");
+    let first = poll_admin_tx(router, 7_000).expect("first admin reply");
     assert!(
         router.poll_ack_tx(7_000).is_none(),
         "admin reply suppresses separate WantAck ACK"
@@ -610,9 +622,8 @@ fn pki_want_ack_dupe_resends_idempotent_admin_get() {
         router.poll_ack_tx(7_050).is_none(),
         "idempotent admin GET dupe re-sends admin body, not routing ACK"
     );
-    let second = router
-        .poll_admin_tx(7_050)
-        .expect("WantAck dupe must re-send idempotent admin GET reply");
+    let second =
+        poll_admin_tx(router, 7_050).expect("WantAck dupe must re-send idempotent admin GET reply");
     let (meta, msg) = decrypt_pki_admin(&second, &b1_priv, &node_pub);
     assert_eq!(meta.request_id, req_id);
     assert_eq!(meta.reply_id, 0);

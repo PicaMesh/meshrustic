@@ -13,6 +13,30 @@ pub const MODEM_LONG_TURBO: u8 = 9;
 
 pub const MODEM_DEFAULT_PRESET: u8 = MODEM_LONG_FAST;
 
+pub const fn is_valid_modem_preset(preset: u8) -> bool {
+    matches!(
+        preset,
+        MODEM_LONG_FAST
+            | MODEM_LONG_SLOW
+            | MODEM_VERY_LONG_SLOW
+            | MODEM_MEDIUM_SLOW
+            | MODEM_MEDIUM_FAST
+            | MODEM_SHORT_SLOW
+            | MODEM_SHORT_FAST
+            | MODEM_LONG_MODERATE
+            | MODEM_SHORT_TURBO
+            | MODEM_LONG_TURBO
+    )
+}
+
+pub const fn normalize_modem_preset(preset: u8) -> u8 {
+    if is_valid_modem_preset(preset) {
+        preset
+    } else {
+        MODEM_DEFAULT_PRESET
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RegionInfo {
     pub code: u8,
@@ -89,10 +113,15 @@ pub fn modem_preset_params(preset: u8, wide_lora: bool) -> ModemParams {
             spreading_factor: 12,
             coding_rate: 8,
         },
+        MODEM_VERY_LONG_SLOW => ModemParams {
+            bandwidth_khz: if wide_lora { 406.25 } else { 62.5 },
+            spreading_factor: 12,
+            coding_rate: 8,
+        },
         _ => ModemParams {
-            bandwidth_khz: if wide_lora { 812.5 } else { 250.0 },
-            spreading_factor: 11,
-            coding_rate: 5,
+            bandwidth_khz: 0.0,
+            spreading_factor: 0,
+            coding_rate: 0,
         },
     }
 }
@@ -124,6 +153,7 @@ pub const fn sync_word_sx126x(sync_word: u8) -> u16 {
 }
 
 pub const PREAMBLE_LENGTH: u16 = 16;
+pub const MAX_TX_POWER_DBM: u8 = 22;
 
 pub const PACKET_HEADER_LEN: usize = 16;
 
@@ -217,7 +247,7 @@ mod preset_table_tests {
             (MODEM_LONG_MODERATE, 125.0, 406.25, 11, 8),
             (MODEM_LONG_FAST, 250.0, 812.5, 11, 5),
             (MODEM_LONG_SLOW, 125.0, 406.25, 12, 8),
-            (MODEM_VERY_LONG_SLOW, 250.0, 812.5, 11, 5),
+            (MODEM_VERY_LONG_SLOW, 62.5, 406.25, 12, 8),
         ];
         for &(preset, narrow, wide, sf, cr) in expected {
             let n = modem_preset_params(preset, false);
@@ -260,5 +290,14 @@ mod preset_table_tests {
         );
         assert_ne!(lt.spreading_factor, st.spreading_factor);
         assert_ne!(lt.coding_rate, st.coding_rate);
+    }
+
+    #[test]
+    fn unknown_preset_does_not_masquerade_as_a_supported_modulation() {
+        let params = modem_preset_params(u8::MAX, false);
+        assert_eq!(params.bandwidth_khz, 0.0);
+        assert_eq!(params.spreading_factor, 0);
+        assert_eq!(params.coding_rate, 0);
+        assert_eq!(normalize_modem_preset(u8::MAX), MODEM_DEFAULT_PRESET);
     }
 }

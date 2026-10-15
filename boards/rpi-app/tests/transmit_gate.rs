@@ -23,7 +23,7 @@ impl RadioInterface for MockRadio {
     fn poll_recv(&mut self) -> Result<Option<RxFrame>, RadioError> {
         Ok(self.inbox.take())
     }
-    fn send(&mut self, _frame: &TxFrame) -> Result<(), RadioError> {
+    fn start_send(&mut self, _frame: &TxFrame) -> Result<(), RadioError> {
         self.sent += 1;
         Ok(())
     }
@@ -166,6 +166,9 @@ fn continuous_busy_still_releases_once_the_hold_expires_and_the_channel_is_clear
         "hold must have expired despite continuous busy"
     );
     slot.driver.busy = false;
+    let started = slot.service(&mut air, access.may_transmit(now)).unwrap();
+    assert_eq!(started.tx_id, Some(TX_ID));
+    assert!(started.tx_len.is_none());
     let sent = slot.service(&mut air, access.may_transmit(now)).unwrap();
     assert_eq!(sent.tx_id, Some(TX_ID));
     assert_eq!(sent.tx_len, Some(20));
@@ -188,8 +191,19 @@ fn a_due_frame_keeps_its_identity_when_the_gate_opens_late() {
 
     let late = PEER_TURNAROUND_MS + 10;
     assert!(access.may_transmit(late));
+    let started = slot.service(&mut air, true).unwrap();
+    assert_eq!(
+        started.tx_id,
+        Some(TX_ID),
+        "same frame, not a redrawn delay"
+    );
+    assert!(started.tx_len.is_none());
     let sent = slot.service(&mut air, true).unwrap();
-    assert_eq!(sent.tx_id, Some(TX_ID), "same frame, not a redrawn delay");
+    assert_eq!(
+        sent.tx_id,
+        Some(TX_ID),
+        "completion keeps the frame identity"
+    );
     assert_eq!(sent.tx_len, Some(20));
 }
 

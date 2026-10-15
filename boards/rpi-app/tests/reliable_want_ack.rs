@@ -46,6 +46,7 @@ fn send_local_schedules_reliable_retransmit() {
         .unwrap()
         .parse()
         .id;
+    router.note_tx_done(router.node_num(), sent_id, 1_000);
     let fire_ms = router.reliable_retx_delay_ms(plan.len, router.node_num(), sent_id);
     assert!(fire_ms >= mesh_routing::RETX_PROCESSING_TIME_MS);
     assert!(router
