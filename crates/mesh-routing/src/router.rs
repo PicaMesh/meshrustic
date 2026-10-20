@@ -3268,14 +3268,12 @@ impl Router {
         if !stampable {
             self.sr_log
                 .push(SrLogEvent::RelayRetxNoAlternate { id: due.packet_id });
-            self.note_tx_plan_deferred(due.from, due.packet_id, now_ms);
             return None;
         }
         let mut bytes = due.bytes;
         let Ok(mut hdr) = PacketHeader::decode(&bytes[..PACKET_HEADER_LEN]) else {
             self.sr_log
                 .push(SrLogEvent::RelayRetxNoAlternate { id: due.packet_id });
-            self.note_tx_plan_deferred(due.from, due.packet_id, now_ms);
             return None;
         };
         hdr.next_hop = alt_byte;
@@ -3418,7 +3416,6 @@ impl Router {
                 self.next_hop_carry_wait_ms(nominated_hop, airtime_ms)
                     .max(slot1_end),
             )
-            .saturating_sub(airtime_ms)
     }
 
     fn unicast_named_slot_delay_ms(
@@ -4184,8 +4181,11 @@ impl Router {
         }
     }
 
+    /// The frame has left the air. This is also the only place that records that we
+    /// sent it, so the duplicate window can recognise our own copy coming back.
     pub fn note_tx_done(&mut self, from: u32, packet_id: u32, now_ms: u32) {
         if packet_id != 0 {
+            self.graph.record_our_transmission(from, packet_id, now_ms);
             self.graph.cancel_relay(from, packet_id);
             for slot in &mut self.pending_retransmits {
                 if slot.from == from && slot.packet_id == packet_id {
@@ -4199,10 +4199,6 @@ impl Router {
                     && slot.awaiting_tx
                 {
                     slot.has_transmitted = true;
-                    if slot.terminal_tx {
-                        slot.active = false;
-                        continue;
-                    }
                     slot.awaiting_tx = false;
                     slot.next_tx_ms = now_ms.wrapping_add(slot.retx_delay_ms);
                 }
@@ -4214,7 +4210,6 @@ impl Router {
         for slot in &mut self.pending_reliable {
             if slot.active && slot.from == from && slot.packet_id == packet_id && slot.awaiting_tx {
                 slot.has_transmitted = true;
-                slot.terminal_tx = false;
                 slot.awaiting_tx = false;
                 slot.next_tx_ms = now_ms.wrapping_add(slot.retx_delay_ms);
             }
@@ -4228,23 +4223,13 @@ impl Router {
             }
             if slot.has_transmitted {
                 if slot.awaiting_tx {
+                    // The retry never went out, so the attempt is given back.
                     slot.num_retx = slot.num_retx.saturating_add(1);
                     slot.awaiting_tx = false;
-                    slot.terminal_tx = false;
                     slot.next_tx_ms = now_ms;
                 }
             } else {
                 slot.active = false;
-            }
-        }
-    }
-
-    fn note_tx_plan_deferred(&mut self, from: u32, packet_id: u32, now_ms: u32) {
-        for slot in &mut self.pending_reliable {
-            if slot.active && slot.from == from && slot.packet_id == packet_id && slot.awaiting_tx {
-                slot.awaiting_tx = false;
-                slot.terminal_tx = false;
-                slot.next_tx_ms = now_ms.wrapping_add(slot.retx_delay_ms);
             }
         }
     }
@@ -5078,14 +5063,14 @@ mod tests {
         assert_eq!(queued.len, wire.len() as u8);
         assert!(router.has_pending_reliable(99));
         assert!(router.has_pending_control_tx());
-        router.note_tx_queue_rejected(2, 99, 1);
+        router.note_tx_queue_rejected(1, 99, 1);
         assert!(!router.has_pending_reliable(99));
         let queued_again = router
             .poll_admin_tx(2)
             .expect("admin response is retained after queue rejection");
         assert_eq!(queued_again.len, wire.len() as u8);
         assert!(router.has_pending_reliable(99));
-        router.note_tx_enqueued(2, 99);
+        router.note_tx_enqueued(1, 99);
         assert!(!router.has_pending_control_tx());
     }
 
@@ -7267,8 +7252,11 @@ mod tests {
         let router = ROUTER.init(router_with_hop_limit(UNI_ME, 3));
         setup_unicast_graph(router);
         let wire = unicast_wire_ack(3, 3, 0, 0xDD, 0x615, false);
-        let (sent, _) = forward_unicast(router, &wire, 0);
+        let (sent, released_at) = forward_unicast(router, &wire, 0);
         assert_eq!(sent.next_hop, 0xBB);
+        // The originator's copy can only be recognised as a duplicate once we know
+        // we forwarded the packet ourselves, so it has to arrive after our own
+        // transmission.
         let retry = unicast_wire_ack(3, 3, 0, 0xDD, 0x615, false);
         let dupe = router
             .process_inbound(
@@ -7278,7 +7266,7 @@ mod tests {
                     snr: 8,
                     bytes: &retry,
                 },
-                200,
+                released_at + 1,
             )
             .unwrap();
         assert!(dupe.duplicate);
@@ -7295,7 +7283,7 @@ mod tests {
                     snr: 8,
                     bytes: &carried,
                 },
-                400,
+                released_at + 2,
             )
             .unwrap();
         assert!(!router.has_pending_reliable(0x615));

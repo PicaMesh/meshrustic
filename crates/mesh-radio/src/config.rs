@@ -238,7 +238,7 @@ mod preset_table_tests {
     use super::*;
 
     #[test]
-    fn modem_presets_match_stock() {
+    fn modem_presets_match_the_public_table() {
         let expected: &[(u8, f32, f32, u8, u8)] = &[
             (MODEM_SHORT_TURBO, 500.0, 1625.0, 7, 5),
             (MODEM_SHORT_FAST, 250.0, 812.5, 7, 5),

@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn retransmission_delay_matches_meshtastic_formula() {
+    fn retransmission_delay_matches_the_public_formula() {
         assert_eq!(
             retransmission_delay_ms(730, 28, 0.0),
             2 * 730 + 56 * 28 + RETX_PROCESSING_TIME_MS

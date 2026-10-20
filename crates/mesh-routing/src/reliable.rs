@@ -24,7 +24,6 @@ pub struct PendingReliable {
     pub num_retx: u8,
     pub awaiting_tx: bool,
     pub has_transmitted: bool,
-    pub terminal_tx: bool,
     pub retx_delay_ms: u32,
     pub next_tx_ms: u32,
     pub len: u8,
@@ -43,7 +42,6 @@ impl PendingReliable {
             num_retx: 0,
             awaiting_tx: false,
             has_transmitted: false,
-            terminal_tx: false,
             retx_delay_ms: 0,
             next_tx_ms: 0,
             len: 0,
@@ -85,7 +83,6 @@ pub fn schedule_reliable(
         num_retx,
         awaiting_tx: true,
         has_transmitted: false,
-        terminal_tx: false,
         retx_delay_ms,
         next_tx_ms: 0,
         len,
@@ -164,7 +161,13 @@ pub fn due_retransmit(
         slot.retx_delay_ms = delay;
         slot.next_tx_ms = 0;
         let redirect = slot.named.is_some_and(|n| n.redirect_on_last) && slot.num_retx == 0;
-        slot.terminal_tx = redirect;
+        if redirect {
+            // The redirect is the last try. Whether it is stamped onto an alternate
+            // or dropped because no alternate is usable, the packet is finished with
+            // here, so the slot is released now. Holding it would keep one of the
+            // few reliable slots busy for another delay window.
+            slot.active = false;
+        }
         return Some(DueRetransmit {
             from: slot.from,
             packet_id: slot.packet_id,

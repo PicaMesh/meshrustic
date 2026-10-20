@@ -304,7 +304,8 @@ pub async fn radio_task(
                     crate::usb_log::log::radio::tx_done(report.tx_id, report.tx_to, len);
                     let tx_done_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
                     if let (Some(from), Some(id)) = (report.tx_from, report.tx_id) {
-                        router.record_tx_on_air(from, id, tx_done_ms);
+                        // note_tx_done also records that we sent the frame, so the
+                        // duplicate window can recognise our own copy coming back.
                         router.note_tx_done(from, id, tx_done_ms);
                     }
                     access.note_tx_done(tx_done_ms);

@@ -28,7 +28,7 @@ is actually waiting for.
   channel. Five rows were wrong — SHORT_TURBO's wide bandwidth, LONG_TURBO and VERY_LONG_SLOW
   ungrouped, LONG_MODERATE a copy of MEDIUM_SLOW, and LONG_SLOW's coding rate — and every
   quantity below derives from them, so the error reached the symbol time, the airtime, the rung
-  spacing and the slot time alike. Tests: `modem_presets_match_stock`,
+  spacing and the slot time alike. Tests: `modem_presets_match_the_public_table`,
   `long_moderate_is_not_medium_slow`, `long_turbo_is_not_short_turbo`.
 - **The CAD slot time truncates once, where stock truncates.** Stock computes its slot time as a
   CAD duration plus a fixed propagation-and-MAC allowance and lets integer arithmetic drop the
@@ -36,8 +36,9 @@ is actually waiting for.
   1000× and truncating only on the final division. Rounding at a different point moves the slot
   time by a millisecond at some presets, and since the contention bands are whole multiples of
   it, a one-millisecond disagreement scales into a band that no longer lines up with stock's.
-  The result is pinned per preset (8, 8, 10, 12, 17, 17, 48, 28, 89, and the LONG_FAST default
-  for VERY_LONG_SLOW) by `slot_time_matches_stock_at_every_preset`.
+  The result is pinned per preset (8, 8, 10, 12, 17, 17, 48, 28, 89, and 171 for
+  VERY_LONG_SLOW, which has its own 62.5 kHz / SF12 row) by
+  `slot_time_matches_the_public_table_at_every_preset`.
 - **No frame within the turnaround after a reception.** After any received frame the node keys
   up no sooner than the turnaround or the contention backoff, whichever is longer. Implemented
   by `ChannelAccess::note_rx` and `ChannelAccess::may_transmit`. A busy modem or a receive

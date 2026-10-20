@@ -61,7 +61,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_time_matches_stock_at_every_preset() {
+    fn slot_time_matches_the_public_table_at_every_preset() {
         use crate::config::{
             MODEM_LONG_FAST, MODEM_LONG_MODERATE, MODEM_LONG_SLOW, MODEM_LONG_TURBO,
             MODEM_MEDIUM_FAST, MODEM_MEDIUM_SLOW, MODEM_SHORT_TURBO, MODEM_VERY_LONG_SLOW,
@@ -76,14 +76,16 @@ mod tests {
             (MODEM_LONG_MODERATE, 48),
             (MODEM_LONG_FAST, 28),
             (MODEM_LONG_SLOW, 89),
-            (MODEM_VERY_LONG_SLOW, 28),
+            // VeryLongSlow has its own preset row (62.5 kHz, SF12), so it gets the
+            // long symbol time instead of the LONG_FAST default.
+            (MODEM_VERY_LONG_SLOW, 171),
         ];
         for &(preset, slot) in expected {
             let cfg = eu868_config_for_preset(preset);
             assert_eq!(
                 slot_time_ms(&cfg),
                 slot,
-                "slot time for preset {preset} must match stock"
+                "slot time for preset {preset} must match the public table"
             );
         }
     }
