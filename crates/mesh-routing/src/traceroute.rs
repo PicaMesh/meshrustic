@@ -93,6 +93,9 @@ pub fn decode_route_discovery(data: &[u8]) -> Option<RouteDiscovery> {
 
 pub fn encode_route_discovery(rd: &RouteDiscovery, out: &mut heapless::Vec<u8, 128>) -> bool {
     out.clear();
+    // A repeated numeric field is carried packed: one length-delimited run per
+    // field instead of one tag per element. It is the canonical form and it costs
+    // fewer bytes on the air.
     let snr_len = |snr: &i32| {
         if *snr < 0 {
             10
@@ -106,27 +109,29 @@ pub fn encode_route_discovery(rd: &RouteDiscovery, out: &mut heapless::Vec<u8, 1
             len
         }
     };
-    let needed = 5 * (rd.route.len() + rd.route_back.len())
-        + rd.snr_towards
-            .iter()
-            .chain(rd.snr_back.iter())
-            .map(|snr| 1 + snr_len(snr))
-            .sum::<usize>();
+    let snr_bytes = |values: &heapless::Vec<i32, ROUTE_SIZE>| -> usize {
+        values.iter().map(snr_len).sum()
+    };
+    // An empty repeated field is left out entirely rather than written as an empty
+    // run, so the size estimate has to skip it too.
+    let field_len = |count: usize, payload: usize| -> usize {
+        if count == 0 {
+            0
+        } else {
+            1 + varint_len(payload) + payload
+        }
+    };
+    let needed = field_len(rd.route.len(), 4 * rd.route.len())
+        + field_len(rd.snr_towards.len(), snr_bytes(&rd.snr_towards))
+        + field_len(rd.route_back.len(), 4 * rd.route_back.len())
+        + field_len(rd.snr_back.len(), snr_bytes(&rd.snr_back));
     if needed > out.capacity() {
         return false;
     }
-    for &node in rd.route.iter() {
-        push_fixed32_field(out, 1, node);
-    }
-    for &snr in rd.snr_towards.iter() {
-        push_signed_varint_field(out, 2, snr);
-    }
-    for &node in rd.route_back.iter() {
-        push_fixed32_field(out, 3, node);
-    }
-    for &snr in rd.snr_back.iter() {
-        push_signed_varint_field(out, 4, snr);
-    }
+    push_packed_fixed32(out, 1, &rd.route);
+    push_packed_int32(out, 2, &rd.snr_towards, snr_len);
+    push_packed_fixed32(out, 3, &rd.route_back);
+    push_packed_int32(out, 4, &rd.snr_back, snr_len);
     true
 }
 
@@ -343,14 +348,57 @@ fn parse_int32_packed(
     Some(end)
 }
 
-fn push_fixed32_field(out: &mut heapless::Vec<u8, 128>, field: u32, value: u32) {
-    let _ = out.push(((field << 3) | 5) as u8);
-    let bytes = value.to_le_bytes();
-    let _ = out.extend_from_slice(&bytes);
+fn varint_len(mut v: usize) -> usize {
+    let mut len = 1;
+    while v >= 128 {
+        v >>= 7;
+        len += 1;
+    }
+    len
 }
 
-fn push_signed_varint_field(out: &mut heapless::Vec<u8, 128>, field: u32, v: i32) {
-    let _ = out.push((field << 3) as u8);
+fn push_packed_fixed32(out: &mut heapless::Vec<u8, 128>, field: u32, values: &[u32]) {
+    if values.is_empty() {
+        return;
+    }
+    let _ = out.push(((field << 3) | 2) as u8);
+    push_varint(out, values.len() * 4);
+    for &v in values {
+        let _ = out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn push_packed_int32(
+    out: &mut heapless::Vec<u8, 128>,
+    field: u32,
+    values: &[i32],
+    len_of: impl Fn(&i32) -> usize,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let _ = out.push(((field << 3) | 2) as u8);
+    push_varint(out, values.iter().map(len_of).sum::<usize>());
+    for &v in values {
+        push_signed_varint(out, v);
+    }
+}
+
+fn push_varint(out: &mut heapless::Vec<u8, 128>, mut v: usize) {
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        let _ = out.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+fn push_signed_varint(out: &mut heapless::Vec<u8, 128>, v: i32) {
     let mut value = v as i64 as u64;
     loop {
         let byte = (value & 0x7f) as u8;
@@ -422,7 +470,7 @@ mod tests {
         route.snr_towards.push(-128).unwrap();
         let mut wire = heapless::Vec::new();
         assert!(encode_route_discovery(&route, &mut wire));
-        assert_eq!(wire.len(), 11);
+        assert_eq!(wire.len(), 12);
         assert_eq!(decode_route_discovery(&wire), Some(route.clone()));
         for _ in 1..ROUTE_SIZE {
             route.snr_towards.push(-128).unwrap();
@@ -432,6 +480,43 @@ mod tests {
         }
         assert!(!encode_route_discovery(&route, &mut wire));
         assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn repeated_fields_are_encoded_packed() {
+        let mut rd = RouteDiscovery::default();
+        rd.route.push(0x1111_1111).unwrap();
+        rd.route.push(0x2222_2222).unwrap();
+        rd.snr_towards.push(40).unwrap();
+        rd.snr_towards.push(-32).unwrap();
+        let mut wire = heapless::Vec::<u8, 128>::new();
+        assert!(encode_route_discovery(&rd, &mut wire));
+
+        // One length-delimited run per repeated field, not one tag per element.
+        assert_eq!(wire[0], (1 << 3) | 2);
+        assert_eq!(wire[1], 8, "two fixed32 elements");
+        assert_eq!(&wire[2..6], &0x1111_1111u32.to_le_bytes()[..]);
+        assert_eq!(&wire[6..10], &0x2222_2222u32.to_le_bytes()[..]);
+
+        let decoded = decode_route_discovery(&wire).unwrap();
+        assert_eq!(decoded.route.as_slice(), rd.route.as_slice());
+        assert_eq!(decoded.snr_towards.as_slice(), rd.snr_towards.as_slice());
+    }
+
+    #[test]
+    fn the_unpacked_form_is_still_accepted() {
+        // A repeated field written one element at a time must still decode.
+        let mut wire = heapless::Vec::<u8, 128>::new();
+        wire.push((1 << 3) | 5).unwrap();
+        wire.extend_from_slice(&0x1111_1111u32.to_le_bytes()).unwrap();
+        wire.push((1 << 3) | 5).unwrap();
+        wire.extend_from_slice(&0x2222_2222u32.to_le_bytes()).unwrap();
+        wire.push((2 << 3) as u8).unwrap();
+        wire.push(40).unwrap();
+
+        let decoded = decode_route_discovery(&wire).unwrap();
+        assert_eq!(decoded.route.as_slice(), &[0x1111_1111, 0x2222_2222]);
+        assert_eq!(decoded.snr_towards.as_slice(), &[40]);
     }
 
     #[test]

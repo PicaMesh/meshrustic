@@ -63,7 +63,7 @@ message Config {
     bool use_preset = 1;
     ModemPreset modem_preset = 2;
     optional uint32 hop_limit = 8;
-    sint32 tx_power = 11;
+    int32 tx_power = 10;
     RegionCode region = 7;
   }
 

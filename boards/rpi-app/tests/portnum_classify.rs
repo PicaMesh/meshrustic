@@ -1,5 +1,25 @@
-use mesh_protocol::{num, qos_tier, rate_limit_bucket, QosTier, RateLimitBucket};
+use mesh_protocol::{num, qos_tier, rate_limit_bucket, PortNum, QosTier, RateLimitBucket};
 use mesh_routing::ChannelQoS;
+
+/// The hand-written table in `mesh_protocol::num` and the generated `PortNum` are two
+/// views of the same public port registry. They must not drift: a wrong number here
+/// silently routes a payload to the wrong handler.
+#[test]
+fn generated_port_numbers_match_the_hand_written_table() {
+    assert_eq!(PortNum::UnknownApp as u32, num::UNKNOWN_APP);
+    assert_eq!(PortNum::TextMessageApp as u32, num::TEXT_MESSAGE_APP);
+    assert_eq!(PortNum::PositionApp as u32, num::POSITION_APP);
+    assert_eq!(PortNum::NodeinfoApp as u32, num::NODEINFO_APP);
+    assert_eq!(PortNum::RoutingApp as u32, num::ROUTING_APP);
+    assert_eq!(PortNum::AdminApp as u32, num::ADMIN_APP);
+    assert_eq!(
+        PortNum::TextMessageCompressedApp as u32,
+        num::TEXT_MESSAGE_COMPRESSED_APP
+    );
+    assert_eq!(PortNum::TelemetryApp as u32, num::TELEMETRY_APP);
+    assert_eq!(PortNum::TracerouteApp as u32, num::TRACEROUTE_APP);
+    assert_eq!(PortNum::SignalRoutingApp as u32, num::SIGNAL_ROUTING_APP);
+}
 
 #[test]
 fn telemetry_uses_other_bucket_and_low_qos() {

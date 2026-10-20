@@ -139,9 +139,13 @@ async fn main(spawner: Spawner) {
     let slot = RADIO_SLOT.init(RadioSlot::new(0, driver));
 
     let router = ROUTER.take();
-    let mut seed = [0u8; 4];
+    let mut seed = [0u8; 8];
     rng.blocking_fill_bytes(&mut seed);
-    router.seed_tx_ids(u32::from_le_bytes(seed));
+    router.seed_tx_ids(u32::from_le_bytes([seed[0], seed[1], seed[2], seed[3]]));
+    // A second, independent draw salts the direct-message nonce.
+    router.seed_pki_nonce(u32::from_le_bytes([
+        seed[4], seed[5], seed[6], seed[7],
+    ]));
     router.load_node_config(&config);
     router.set_bridge_enabled(false);
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(

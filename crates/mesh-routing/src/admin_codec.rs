@@ -350,7 +350,8 @@ pub fn encode_lora_config(lora: &WireLoRaConfig) -> heapless::Vec<u8, 64> {
     }
     push_varint_field(&mut out, 8, lora.hop_limit);
     if lora.tx_power != 0 {
-        push_svarint_field(&mut out, 11, lora.tx_power);
+        // The public schema carries the power as a plain int32 varint on field 10.
+        push_varint_field(&mut out, 10, lora.tx_power as u32);
     }
     if lora.config_ok_to_mqtt {
         push_varint_field(&mut out, 105, 1);
@@ -614,9 +615,9 @@ pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
                 lora.hop_limit = v;
                 i = ni;
             }
-            (11, 0) => {
-                let (v, ni) = read_svarint(payload, i)?;
-                lora.tx_power = v;
+            (10, 0) => {
+                let (v, ni) = read_varint(payload, i)?;
+                lora.tx_power = v as i32;
                 i = ni;
             }
             (105, 0) => {
@@ -1106,12 +1107,6 @@ fn push_int32_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, 
     }
 }
 
-fn read_svarint(data: &[u8], idx: usize) -> Option<(i32, usize)> {
-    let (v, ni) = read_varint(data, idx)?;
-    let decoded = ((v >> 1) as i32) ^ (-((v & 1) as i32));
-    Some((decoded, ni))
-}
-
 fn push_tag<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, wire: u8) {
     push_varint(out, (field << 3) | u32::from(wire));
 }
@@ -1119,11 +1114,6 @@ fn push_tag<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, wire: u8
 fn push_varint_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, value: u32) {
     push_tag(out, field, 0);
     push_varint(out, value);
-}
-
-fn push_svarint_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, value: i32) {
-    let zigzag = ((value << 1) ^ (value >> 31)) as u32;
-    push_varint_field(out, field, zigzag);
 }
 
 fn push_bytes_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, data: &[u8]) {
@@ -1319,9 +1309,11 @@ mod tests {
             config_ok_to_mqtt: false,
         };
         let bytes = encode_lora_config(&lora);
+        // use_preset(1), modem_preset(2), region(7), hop_limit(8), tx_power(10).
+        // The power is a plain int32 varint on field 10.
         assert_eq!(
             bytes.as_slice(),
-            &[0x08, 0x01, 0x10, 0x00, 0x38, 0x03, 0x40, 0x03, 0x58, 0x36]
+            &[0x08, 0x01, 0x10, 0x00, 0x38, 0x03, 0x40, 0x03, 0x50, 0x1b]
         );
         let decoded = decode_lora_config(&bytes).unwrap();
         assert_eq!(decoded.modem_preset, MODEM_LONG_FAST as u32);

@@ -2,11 +2,19 @@ syntax = "proto3";
 
 package meshwire;
 
+// Port numbers carried in `Data.portnum`. The numbering is the public on-air
+// registry; only the ports this firmware actually sends or receives are declared.
+// `mesh_protocol::num` mirrors these values, and a test asserts that the two
+// agree, so neither can drift from the other.
 enum PortNum {
   UNKNOWN_APP = 0;
+  TEXT_MESSAGE_APP = 1;
+  POSITION_APP = 3;
   NODEINFO_APP = 4;
   ROUTING_APP = 5;
   ADMIN_APP = 6;
+  TEXT_MESSAGE_COMPRESSED_APP = 7;
+  TELEMETRY_APP = 67;
   TRACEROUTE_APP = 70;
   SIGNAL_ROUTING_APP = 88;
   MAX = 511;

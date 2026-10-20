@@ -1,3 +1,7 @@
+/// The public on-air port registry, restricted to the ports this firmware carries.
+///
+/// The numbers are also declared in `proto/meshwire/portnums.proto`; a test asserts
+/// that the generated enum and this table agree, so neither can drift.
 pub mod num {
     pub const UNKNOWN_APP: u32 = 0;
     pub const TEXT_MESSAGE_APP: u32 = 1;

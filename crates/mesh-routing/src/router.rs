@@ -250,6 +250,7 @@ pub struct Router {
     pending_radio_settings: Option<PendingRadioSettings>,
     hop_limit: u8,
     next_tx_id: u32,
+    pki_nonce_salt: u32,
     sr_log: SrLog,
     bridge_dedup: crate::bridge::BridgeDedupCache,
     bridge_enabled: bool,
@@ -442,6 +443,7 @@ impl Router {
             pending_radio_settings: None,
             hop_limit,
             next_tx_id: 1,
+            pki_nonce_salt: 0,
             sr_log: SrLog::new(),
             bridge_dedup: crate::bridge::BridgeDedupCache::new(),
             bridge_enabled: true,
@@ -1653,7 +1655,10 @@ impl Router {
             let mut engine = CryptoEngine::new();
             engine.set_dh_private_key(&self.admin.private_key);
             let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
-            let extra_nonce = packet_id;
+            // The extra nonce must be unique per message and must not be derivable
+            // from the header, which travels in the clear. Mixing the packet id
+            // with a per-boot secret keeps both properties.
+            let extra_nonce = packet_id ^ self.pki_nonce_salt;
             if !engine.encrypt_curve25519(
                 remote_pk,
                 self.node_num,
@@ -4113,6 +4118,12 @@ impl Router {
     /// A hardware-random boot seed prevents deterministic packet-ID reuse across restarts.
     pub fn seed_tx_ids(&mut self, seed: u32) {
         self.next_tx_id = seed;
+    }
+
+    /// A second, independent random draw salts the direct-message nonce so that it
+    /// cannot be reconstructed from the packet id in the clear-text header.
+    pub fn seed_pki_nonce(&mut self, salt: u32) {
+        self.pki_nonce_salt = salt;
     }
 
     fn alloc_tx_id(&mut self) -> u32 {
