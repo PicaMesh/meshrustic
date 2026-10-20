@@ -185,9 +185,9 @@ fn zero_means_default_not_disable() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC0A1_0001u32;
     let peer = 0xD0A1_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x21; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x22; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x21; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x22; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32], &[0; 8]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -237,9 +237,9 @@ fn set_interval_and_persist_reload() {
     static ROUTER2: StaticCell<Router> = StaticCell::new();
     let our = 0xC0A2_0001u32;
     let peer = 0xD0A2_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x31; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x32; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x31; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x32; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32], &[0; 8]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -327,9 +327,9 @@ fn below_airtime_floor_is_rejected() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC0A3_0001u32;
     let peer = 0xD0A3_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32], &[0; 8]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&defaults);

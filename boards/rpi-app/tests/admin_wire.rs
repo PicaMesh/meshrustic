@@ -74,9 +74,9 @@ fn admin_sessionkey_and_owner_metadata_seed() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0x1000_0001u32;
     let peer = 0x2000_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x11; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x21; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x31; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x11; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x21; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x31; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
@@ -135,9 +135,9 @@ fn admin_get_lora_and_begin_commit() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0x1000_0011u32;
     let peer = 0x2000_0022u32;
-    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);

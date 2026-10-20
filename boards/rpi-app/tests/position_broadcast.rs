@@ -32,9 +32,9 @@ fn passkey(router: &mut Router, from: u32, remote_pk: &[u8; 32], now: u32) -> [u
 fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
     let our = 0xA11C_E001;
     let peer = 0xB22D_E002;
-    let (node_priv, node_pub) = generate_keypair([0x31; 32]);
-    let (_peer_priv, peer_pub) = generate_keypair([0x32; 32]);
-    let (_other_priv, other_pub) = generate_keypair([0x33; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x31; 32], &[0; 8]);
+    let (_peer_priv, peer_pub) = generate_keypair([0x32; 32], &[0; 8]);
+    let (_other_priv, other_pub) = generate_keypair([0x33; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut router = Router::new(our);
     router.load_node_config(&cfg);
@@ -145,9 +145,9 @@ fn fixed_position_broadcasts_on_the_configured_cadence_and_ignores_requests() {
 fn no_broadcast_until_fixed_position_is_enabled_and_coordinates_are_set() {
     let our = 0xA11C_E010;
     let peer = 0xB22D_E011;
-    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
-    let (_peer_priv, peer_pub) = generate_keypair([0x42; 32]);
-    let (_other_priv, other_pub) = generate_keypair([0x43; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32], &[0; 8]);
+    let (_peer_priv, peer_pub) = generate_keypair([0x42; 32], &[0; 8]);
+    let (_other_priv, other_pub) = generate_keypair([0x43; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut router = Router::new(our);
     router.load_node_config(&cfg);

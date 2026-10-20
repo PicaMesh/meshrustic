@@ -163,9 +163,9 @@ fn get_channel_primary_psk_and_disabled() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE001_0001u32;
     let peer = 0xF001_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x01; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x02; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x03; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x01; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x02; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x03; 32], &[0; 8]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let get = AdminMessage {
@@ -222,9 +222,9 @@ fn field_log_channel_then_lora_both_admin_replies() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE002_0001u32;
     let peer = 0xF002_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x11; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x12; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x13; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x11; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x12; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x13; 32], &[0; 8]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let ch = AdminMessage {
@@ -282,10 +282,10 @@ fn security_get_set_persist_and_identity_immutable() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE003_0001u32;
     let peer = 0xF003_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x21; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x22; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32]);
-    let (flash_priv, flash_pub) = generate_keypair([0x24; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x21; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x22; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32], &[0; 8]);
+    let (flash_priv, flash_pub) = generate_keypair([0x24; 32], &[0; 8]);
     let _ = flash_priv;
 
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
@@ -437,9 +437,9 @@ fn get_device_role_and_module_config_stub() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE004_0001u32;
     let peer = 0xF004_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x31; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x32; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x31; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x32; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32], &[0; 8]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let get = AdminMessage {
@@ -488,9 +488,9 @@ fn rapid_multi_get_queue_and_rate_limit() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE005_0001u32;
     let peer = 0xF005_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32], &[0; 8]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let requests = [
@@ -536,9 +536,9 @@ fn pki_want_ack_ack_is_pki_and_admin_sets_request_id() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE006_0001u32;
     let peer = 0xF006_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x51; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x52; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x53; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x51; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x52; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x53; 32], &[0; 8]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let req_id = 0x8f8b_7001u32;
@@ -591,9 +591,9 @@ fn pki_want_ack_dupe_resends_idempotent_admin_get() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xE006_0003u32;
     let peer = 0xF006_0004u32;
-    let (node_priv, node_pub) = generate_keypair([0x61; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x62; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x63; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x61; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x62; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x63; 32], &[0; 8]);
     let router = setup_router(&ROUTER, our, node_priv, node_pub, b1_pub, b2_pub);
 
     let req_id = 0x8f8b_7002u32;

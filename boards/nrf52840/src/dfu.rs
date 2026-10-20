@@ -1,9 +1,15 @@
 //! A running watchdog survives software reset and would eject the bootloader before a phone can connect.
 
 use cortex_m::peripheral::SCB;
+use embassy_time::{Duration, Instant};
 
 pub const DFU_MAGIC_SKIP: u32 = 0x6d;
 pub const DFU_MAGIC_OTA_RESET: u32 = 0xA8;
+
+/// How long the node waits for the watchdog to time out before it resets itself.
+/// The watchdog period is 30 s, so this leaves room for the timeout and for the
+/// peripheral to be slow.
+pub const WATCHDOG_PARK_SECS: u64 = 35;
 
 const NRF_POWER_GPREGRET: *mut u32 = 0x4000_051C as *mut u32;
 const DFU_DBL_RESET_MEM: *mut u32 = 0x2000_7F7C as *mut u32;
@@ -32,12 +38,19 @@ fn silence_watchdog_irq() {
     }
 }
 
+/// Wait for the watchdog to time out and reset the node into the bootloader.
+///
+/// The watchdog is the intended trigger, but it may not be running. The wait is
+/// therefore bounded: a node that parks forever would be unreachable without a
+/// physical reset, which is exactly the situation the park is trying to avoid.
 pub fn park_for_watchdog_reset() -> ! {
     write_gpregret(DFU_MAGIC_OTA_RESET);
     silence_watchdog_irq();
-    loop {
+    let deadline = Instant::now() + Duration::from_secs(WATCHDOG_PARK_SECS);
+    while Instant::now() < deadline {
         cortex_m::asm::wfi();
     }
+    reset_into_ota_now()
 }
 
 pub fn reset_into_ota_now() -> ! {

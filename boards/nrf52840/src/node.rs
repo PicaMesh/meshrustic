@@ -11,7 +11,7 @@ impl NodeIdentity {
     pub fn from_hardware(seed: [u8; 32]) -> Self {
         let (id0, id1) = read_device_id();
         let node_num = derive_node_num(id0, id1);
-        let (private_key, public_key) = generate_keypair(seed);
+        let (private_key, public_key) = generate_keypair(seed, &device_id_bytes(id0, id1));
         Self {
             node_num,
             public_key,
@@ -69,6 +69,15 @@ fn read_device_id() -> (u32, u32) {
     }
 }
 
+/// The chip-unique device id as bytes, so it can be mixed into the key
+/// derivation.
+fn device_id_bytes(id0: u32, id1: u32) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&id0.to_le_bytes());
+    out[4..].copy_from_slice(&id1.to_le_bytes());
+    out
+}
+
 fn derive_node_num(id0: u32, id1: u32) -> u32 {
     let n = id0 ^ id1.rotate_left(13) ^ 0x5AA5_0000;
     let n = if n == u32::MAX || mesh_routing::is_placeholder_node(n) {
@@ -84,7 +93,7 @@ mod tests {
     use super::*;
     #[test]
     fn predictable_factory_key_is_rotated_but_random_keys_are_preserved() {
-        let (private_key, public_key) = generate_keypair([7; 32]);
+        let (private_key, public_key) = generate_keypair([7; 32], &[0; 8]);
         let replacement = NodeIdentity {
             node_num: 1,
             private_key,

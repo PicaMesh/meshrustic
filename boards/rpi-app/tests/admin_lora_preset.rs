@@ -99,9 +99,9 @@ fn set_lora_persists_and_reloads_channel_hash() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC001_0001u32;
     let peer = 0xD001_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x11; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x12; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x13; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x11; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x12; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x13; 32], &[0; 8]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -207,9 +207,9 @@ fn set_long_fast_persists_to_store() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC003_0001u32;
     let peer = 0xD003_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x21; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x22; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x21; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x22; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32], &[0; 8]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -284,9 +284,9 @@ fn get_lora_reports_current_preset_after_set() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC002_0001u32;
     let peer = 0xD002_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x88; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x89; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x8A; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x88; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x89; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x8A; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);

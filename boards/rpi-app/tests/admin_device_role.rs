@@ -89,9 +89,9 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC101_0001u32;
     let peer = 0xD101_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32], &[0; 8]);
     let defaults = NodeConfig::first_boot(our, node_priv, node_pub);
     let mut store = RamConfigStore::new(defaults);
     let cfg = store.load();
@@ -172,7 +172,7 @@ fn set_router_role_survives_reload_with_firmware_boot_order() {
 fn corrupt_flash_role_clamps_to_client() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xC102_0001u32;
-    let (node_priv, node_pub) = generate_keypair([0x51; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x51; 32], &[0; 8]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.device_role = 99;
     let router = ROUTER.init(Router::new(our));

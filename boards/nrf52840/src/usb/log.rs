@@ -316,6 +316,15 @@ pub mod mesh {
         finish_line(&mut line, pos);
     }
 
+    pub fn watchdog_state(timeout_secs: u32) {
+        let mut line = [0u8; 64];
+        let mut pos = line_prefix(&mut line);
+        put(&mut line, &mut pos, b"[meshrustic] watchdog=");
+        put_u32(&mut line, &mut pos, timeout_secs);
+        put(&mut line, &mut pos, b"s");
+        finish_line(&mut line, pos);
+    }
+
     pub fn enter_ota_dfu() {
         let mut line = [0u8; 64];
         let mut pos = line_prefix(&mut line);

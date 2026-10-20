@@ -52,7 +52,7 @@ fn store_flash_round_trip() {
     use mesh_store::{decode, encode, generate_keypair, NodeConfig, STORE_RECORD_LEN};
 
     let device_id = [0x01u8; 16];
-    let (priv_key, pub_key) = generate_keypair([device_id[0]; 32]);
+    let (priv_key, pub_key) = generate_keypair([device_id[0]; 32], &[0; 8]);
     let config = NodeConfig::first_boot(0x00A1_00B2, priv_key, pub_key);
 
     let mut buf = [0u8; STORE_RECORD_LEN];

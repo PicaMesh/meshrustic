@@ -71,19 +71,37 @@ async fn main(spawner: Spawner) {
     wdt_config.timeout_ticks = 32768 * WATCHDOG_TIMEOUT_SECS;
     wdt_config.action_during_sleep = wdt::SleepConfig::RUN;
     wdt_config.action_during_debug_halt = wdt::HaltConfig::PAUSE;
+    // A watchdog left running by an earlier image cannot be reconfigured while
+    // it runs, and the peripheral refuses a configuration that differs from the
+    // running one. Adopting the running configuration keeps the node
+    // self-healing instead of leaving it without any watchdog at all.
+    if let Some(running) = wdt::Config::try_new(&p.WDT) {
+        wdt_config = running;
+    }
+    let watchdog_ticks = wdt_config.timeout_ticks;
     let radio_wdt = match wdt::Watchdog::try_new::<1>(p.WDT, wdt_config) {
         Ok((_wdt, [handle])) => Some(handle),
-        // An inherited watchdog configuration cannot be safely claimed by this firmware; recovery
-        // requires a power cycle.
+        // The running configuration uses a different channel count, so it cannot
+        // be adopted and the peripheral cannot be reprogrammed while it runs.
         Err(_) => None,
+    };
+    let watchdog_secs = if radio_wdt.is_some() {
+        watchdog_ticks / 32768
+    } else {
+        0
     };
     // Clearing stale reset reasons prevents an ordinary reset from being mistaken for the bootloader’s
     // double-reset trigger.
     let reset_reason = clear_resetreas();
 
     let mut rng = rng::Rng::new(p.RNG, Irqs);
+    // A degenerate random draw would give the node a predictable identity, so
+    // it is drawn again rather than used.
     let mut identity_seed = [0; 32];
-    rng.blocking_fill_bytes(&mut identity_seed);
+    if !draw_random(&mut rng, &mut identity_seed).await {
+        defmt::error!("[meshrustic] the random source did not answer");
+        usb_log::log::push_line("[meshrustic] random source unavailable: degraded identity");
+    }
     let hw = NodeIdentity::from_hardware(identity_seed);
     let defaults = hw.first_boot_config();
     let store = CONFIG_STORE.init(NvmcConfigStore::new(Nvmc::new(p.NVMC), defaults));
@@ -103,10 +121,11 @@ async fn main(spawner: Spawner) {
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
     usb_log::log::mesh::reset_reason(reset_reason);
     usb_log::log::push_line(if radio_wdt.is_some() {
-        "[meshrustic] watchdog armed: 30 s, pet by the radio task"
+        "[meshrustic] watchdog armed, pet by the radio task"
     } else {
-        "[meshrustic] watchdog NOT armed: earlier firmware left the WDT running; resets until power-cycled"
+        "[meshrustic] watchdog NOT armed: the peripheral refused this configuration"
     });
+    usb_log::log::mesh::watchdog_state(watchdog_secs);
     usb_log::log::mesh::config_boot(load_src == ConfigLoadSource::Flash, admin_keys);
     defmt::info!(
         "[store] boot preset={} from_flash={}",
@@ -140,12 +159,23 @@ async fn main(spawner: Spawner) {
 
     let router = ROUTER.take();
     let mut seed = [0u8; 8];
-    rng.blocking_fill_bytes(&mut seed);
-    router.seed_tx_ids(u32::from_le_bytes([seed[0], seed[1], seed[2], seed[3]]));
+    if !draw_random(&mut rng, &mut seed).await {
+        defmt::error!("[meshrustic] the random source did not answer");
+        usb_log::log::push_line("[meshrustic] random source unavailable: degraded nonce");
+    }
+    // The packet ids are the channel-encryption nonce, so a counter that always
+    // restarts at the same value would repeat the nonce after every reboot.
+    let mut tx_seed = u32::from_le_bytes([seed[0], seed[1], seed[2], seed[3]]);
+    if tx_seed == 0 {
+        tx_seed = 1; // packet id zero is reserved
+    }
+    router.seed_tx_ids(tx_seed);
     // A second, independent draw salts the direct-message nonce.
-    router.seed_pki_nonce(u32::from_le_bytes([
-        seed[4], seed[5], seed[6], seed[7],
-    ]));
+    let mut nonce_salt = u32::from_le_bytes([seed[4], seed[5], seed[6], seed[7]]);
+    if nonce_salt == 0 {
+        nonce_salt = 0x9E37_79B9;
+    }
+    router.seed_pki_nonce(nonce_salt);
     router.load_node_config(&config);
     router.set_bridge_enabled(false);
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(
@@ -194,4 +224,26 @@ fn clear_resetreas() -> u32 {
         core::ptr::write_volatile(NRF_POWER_RESETREAS, v);
         v
     }
+}
+
+/// Draw random bytes with a deadline.
+///
+/// The random source is a peripheral, and waiting for it without a bound would
+/// hang the node before the watchdog exists. A draw that times out or comes
+/// back all zero is retried, because a degenerate value would make the node
+/// identity predictable and would restart the packet-id counter, which repeats
+/// the channel-encryption nonce.
+async fn draw_random(
+    rng: &mut rng::Rng<'static, embassy_nrf::peripherals::RNG>,
+    out: &mut [u8],
+) -> bool {
+    const DRAW_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(200);
+    for _ in 0..4 {
+        if embassy_time::with_timeout(DRAW_TIMEOUT, rng.fill_bytes(out)).await.is_ok()
+            && out.iter().any(|&b| b != 0)
+        {
+            return true;
+        }
+    }
+    false
 }

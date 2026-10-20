@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn ok_to_mqtt_off_survives_round_trip() {
-        let (priv_key, pub_key) = generate_keypair([0x5Au8; 32]);
+        let (priv_key, pub_key) = generate_keypair([0x5Au8; 32], &[0; 8]);
         let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
         assert!(config.lora.ok_to_mqtt, "on by default");
         config.lora.ok_to_mqtt = false;
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn v3_record_migrates_with_ok_to_mqtt_on() {
-        let (priv_key, pub_key) = generate_keypair([0x5Bu8; 32]);
+        let (priv_key, pub_key) = generate_keypair([0x5Bu8; 32], &[0; 8]);
         let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
         config.lora.ok_to_mqtt = false;
         let mut buf = [0u8; STORE_RECORD_LEN];
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn flash_round_trip_v3() {
         let device_id = [0xAAu8; 16];
-        let (priv_key, pub_key) = generate_keypair([device_id[0]; 32]);
+        let (priv_key, pub_key) = generate_keypair([device_id[0]; 32], &[0; 8]);
         let mut config = NodeConfig::first_boot(0x1234_5678, priv_key, pub_key);
         config.admin_public_keys[0] = [0x11; 32];
         config.admin_public_keys[2] = [0x33; 32];

@@ -138,9 +138,9 @@ fn payload_trim_and_reject() {
 fn pki_direct_admin_dm_arms_ota_dfu() {
     let our = 0xE010_0001u32;
     let peer = 0xF010_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x21; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x22; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x21; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x22; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x23; 32], &[0; 8]);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
 
     let frame = build_pki_text(
@@ -191,9 +191,9 @@ fn pki_direct_admin_dm_arms_ota_dfu() {
 fn channel_psk_dm_is_ignored() {
     let our = 0xE011_0001u32;
     let peer = 0xF011_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x31; 32]);
-    let (_b1_priv, b1_pub) = generate_keypair([0x32; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x31; 32], &[0; 8]);
+    let (_b1_priv, b1_pub) = generate_keypair([0x32; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x33; 32], &[0; 8]);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
 
     let frame = channel_text(
@@ -214,9 +214,9 @@ fn channel_psk_dm_is_ignored() {
 fn relayed_pki_dm_is_ignored() {
     let our = 0xE012_0001u32;
     let peer = 0xF012_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x41; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x42; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x41; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x42; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x43; 32], &[0; 8]);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
 
     let frame = build_pki_text(
@@ -239,9 +239,9 @@ fn relayed_pki_dm_is_ignored() {
 fn wrong_text_is_ignored() {
     let our = 0xE013_0001u32;
     let peer = 0xF013_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x51; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x52; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x53; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x51; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x52; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x53; 32], &[0; 8]);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
 
     let frame = build_pki_text(
@@ -255,9 +255,9 @@ fn wrong_text_is_ignored() {
 fn broadcast_is_ignored() {
     let our = 0xE014_0001u32;
     let peer = 0xF014_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x61; 32]);
-    let (_b1_priv, b1_pub) = generate_keypair([0x62; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x63; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x61; 32], &[0; 8]);
+    let (_b1_priv, b1_pub) = generate_keypair([0x62; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x63; 32], &[0; 8]);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
 
     let frame = channel_text(
@@ -278,10 +278,10 @@ fn broadcast_is_ignored() {
 fn non_admin_pki_peer_is_ignored() {
     let our = 0xE015_0001u32;
     let peer = 0xF015_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x71; 32]);
-    let (_b1_priv, b1_pub) = generate_keypair([0x72; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x73; 32]);
-    let (stranger_priv, stranger_pub) = generate_keypair([0x74; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x71; 32], &[0; 8]);
+    let (_b1_priv, b1_pub) = generate_keypair([0x72; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x73; 32], &[0; 8]);
+    let (stranger_priv, stranger_pub) = generate_keypair([0x74; 32], &[0; 8]);
     let mut router = setup_router(our, node_priv, node_pub, [b1_pub, b2_pub]);
     router.seed_nodeinfo_peer_for_test(peer, stranger_pub, 1_000);
 

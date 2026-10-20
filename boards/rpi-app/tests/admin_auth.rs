@@ -157,10 +157,10 @@ fn unauthorized_cannot_change_config() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA001_0001u32;
     let peer = 0xB001_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x10; 32]);
-    let (peer_priv, peer_pub) = generate_keypair([0x20; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x30; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x40; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x10; 32], &[0; 8]);
+    let (peer_priv, peer_pub) = generate_keypair([0x20; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x30; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x40; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
@@ -204,9 +204,9 @@ fn builtin1_and_builtin2_can_set_lora() {
     for (i, cell) in ROUTERS.iter().enumerate() {
         let our = 0xA002_0001u32 + i as u32;
         let peer = 0xB002_0002u32;
-        let (node_priv, node_pub) = generate_keypair([0x50 + i as u8; 32]);
-        let (b1_priv, b1_pub) = generate_keypair([0x60 + i as u8; 32]);
-        let (b2_priv, b2_pub) = generate_keypair([0x70 + i as u8; 32]);
+        let (node_priv, node_pub) = generate_keypair([0x50 + i as u8; 32], &[0; 8]);
+        let (b1_priv, b1_pub) = generate_keypair([0x60 + i as u8; 32], &[0; 8]);
+        let (b2_priv, b2_pub) = generate_keypair([0x70 + i as u8; 32], &[0; 8]);
         let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
         let router = cell.init(Router::new(our));
         router.load_node_config(&cfg);
@@ -251,8 +251,8 @@ fn flash_admin_key_pki_round_trip_and_get_omits_builtins() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA003_0001u32;
     let peer = 0xB003_0002u32;
-    let (admin_priv, admin_pub) = generate_keypair([0xAB; 32]);
-    let (node_priv, node_pub) = generate_keypair([0xCD; 32]);
+    let (admin_priv, admin_pub) = generate_keypair([0xAB; 32], &[0; 8]);
+    let (node_priv, node_pub) = generate_keypair([0xCD; 32], &[0; 8]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.admin_public_keys[0] = admin_pub;
     let router = ROUTER.init(Router::new(our));
@@ -336,8 +336,8 @@ fn stale_pki_then_channel_admin_cannot_mutate() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA006_0001u32;
     let peer = 0xB006_0002u32;
-    let (admin_priv, admin_pub) = generate_keypair([0x11; 32]);
-    let (node_priv, node_pub) = generate_keypair([0x22; 32]);
+    let (admin_priv, admin_pub) = generate_keypair([0x11; 32], &[0; 8]);
+    let (node_priv, node_pub) = generate_keypair([0x22; 32], &[0; 8]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.admin_public_keys[0] = admin_pub;
     let router = ROUTER.init(Router::new(our));
@@ -387,9 +387,9 @@ fn clearing_flash_keys_leaves_builtins() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA004_0001u32;
     let peer = 0xB004_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x81; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x82; 32]);
-    let (b2_priv, b2_pub) = generate_keypair([0x83; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x81; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x82; 32], &[0; 8]);
+    let (b2_priv, b2_pub) = generate_keypair([0x83; 32], &[0; 8]);
     let mut cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     cfg.admin_public_keys[0] = [0x77; 32];
     let router = ROUTER.init(Router::new(our));
@@ -422,9 +422,9 @@ fn bad_session_key_rejects_set() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA005_0001u32;
     let peer = 0xB005_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0x91; 32]);
-    let (b1_priv, b1_pub) = generate_keypair([0x92; 32]);
-    let (_b2_priv, b2_pub) = generate_keypair([0x93; 32]);
+    let (node_priv, node_pub) = generate_keypair([0x91; 32], &[0; 8]);
+    let (b1_priv, b1_pub) = generate_keypair([0x92; 32], &[0; 8]);
+    let (_b2_priv, b2_pub) = generate_keypair([0x93; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
@@ -466,9 +466,9 @@ fn pki_decrypt_failure_nak_is_pki_encrypted() {
     static ROUTER: StaticCell<Router> = StaticCell::new();
     let our = 0xA007_0001u32;
     let peer = 0xB007_0002u32;
-    let (node_priv, node_pub) = generate_keypair([0xA1; 32]);
-    let (peer_priv, peer_pub) = generate_keypair([0xA2; 32]);
-    let (wrong_priv, _wrong_pub) = generate_keypair([0xA3; 32]);
+    let (node_priv, node_pub) = generate_keypair([0xA1; 32], &[0; 8]);
+    let (peer_priv, peer_pub) = generate_keypair([0xA2; 32], &[0; 8]);
+    let (wrong_priv, _wrong_pub) = generate_keypair([0xA3; 32], &[0; 8]);
     let cfg = NodeConfig::first_boot(our, node_priv, node_pub);
     let router = ROUTER.init(Router::new(our));
     router.load_node_config(&cfg);
