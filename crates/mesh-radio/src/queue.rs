@@ -128,24 +128,30 @@ impl<const N: usize> TxQueue<N> {
         Ok(())
     }
 
+    /// Drop the frames the predicate rejects, keeping the rest in order.
+    ///
+    /// The queue is compacted in place: copying the whole array to the stack on
+    /// every call would cost a kilobyte of stack per call, and the radio loop
+    /// calls this for every queued frame it rejects.
     pub fn remove_where(&mut self, mut drop: impl FnMut(&TxFrame) -> bool) -> usize {
-        let mut kept: [TxFrame; N] = self.buf;
-        let mut kept_len = 0usize;
+        let len = self.len;
+        let mut write = 0usize;
         let mut removed = 0usize;
-        for i in 0..self.len {
-            let frame = self.buf[(self.head + i) % N];
-            if drop(&frame) {
+        for read in 0..len {
+            let src = (self.head + read) % N;
+            if drop(&self.buf[src]) {
                 removed += 1;
-            } else {
-                kept[kept_len] = frame;
-                kept_len += 1;
+                continue;
             }
+            if write != src {
+                self.buf[write] = self.buf[src];
+            }
+            write += 1;
         }
         if removed > 0 {
-            self.buf = kept;
             self.head = 0;
-            self.tail = kept_len % N;
-            self.len = kept_len;
+            self.tail = write % N;
+            self.len = write;
         }
         removed
     }

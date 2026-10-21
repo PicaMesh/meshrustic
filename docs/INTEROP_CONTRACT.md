@@ -134,6 +134,12 @@ is actually waiting for.
   stock does since 2.5 (`build_app_wire_frame`, the topology, nodeinfo and telemetry frame
   builders, the PKI frame builder). Receivers treat a relay byte equal to the sender's byte, or
   zero, as a direct transmission (`is_direct_packet`).
+- **The relay and next-hop fields carry one byte.** `relay_node` and `next_hop` hold the low byte
+  of a 32-bit node id, so two nodes that share a low byte are indistinguishable on the air. The
+  byte is a hint for the fast path only: the graph keeps full 32-bit ids, and a frame whose byte
+  cannot be resolved to a known neighbour is treated as coming from an unknown one rather than
+  being trusted. Node ids are therefore chosen so that the low byte is unlikely to collide — the
+  node id is derived from the chip's unique device id, not from a counter.
 - **Device telemetry interval is stock's field, in stock's units.** The periodic device-metrics
   broadcast is driven by `ModuleConfig.TelemetryConfig.device_update_interval`, in **seconds**, so a
   stock client setting it does what that client expects. **Zero means unset, not disabled** — it

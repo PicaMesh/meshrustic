@@ -39,15 +39,23 @@ impl LogRing {
     }
 
     fn push(&mut self, data: &[u8]) {
-        for &byte in data {
+        // Copy in blocks rather than one byte at a time: this runs inside a
+        // critical section, and a byte-at-a-time loop holds the interrupts off
+        // for the whole line.
+        let mut rest = data;
+        while !rest.is_empty() {
             if self.len() >= RING_SIZE {
                 self.drop_oldest_line();
             }
             if self.len() >= RING_SIZE {
                 self.tail = self.tail.wrapping_add(1);
             }
-            self.buf[self.head % RING_SIZE] = byte;
-            self.head = self.head.wrapping_add(1);
+            let free = RING_SIZE.saturating_sub(self.len());
+            let head = self.head % RING_SIZE;
+            let chunk = free.min(rest.len()).min(RING_SIZE - head);
+            self.buf[head..head + chunk].copy_from_slice(&rest[..chunk]);
+            self.head = self.head.wrapping_add(chunk);
+            rest = &rest[chunk..];
         }
     }
 

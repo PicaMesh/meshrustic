@@ -6,6 +6,11 @@ pub const CHANNEL_UTILIZATION_PERIODS: usize = 6;
 pub const MINUTES_IN_HOUR: usize = 60;
 pub const MS_IN_HOUR: u32 = 3_600_000;
 
+/// The longest a legal frame can take, at the slowest preset. A malformed
+/// configuration must not be able to pin the utilisation counter, because a
+/// pinned counter stops the node from transmitting for good.
+pub const MAX_FRAME_AIRTIME_MS: u32 = 20_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AirtimeLog {
     Tx,
@@ -58,6 +63,7 @@ impl AirTime {
     }
 
     pub fn log_airtime(&mut self, kind: AirtimeLog, airtime_ms: u32) {
+        let airtime_ms = airtime_ms.min(MAX_FRAME_AIRTIME_MS);
         self.channel_utilization[self.period_util_minute() as usize] =
             self.channel_utilization[self.period_util_minute() as usize].saturating_add(airtime_ms);
 

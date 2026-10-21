@@ -8,6 +8,10 @@ const NUM_SYM_CAD_NUMER: u32 = 5;
 const NUM_SYM_CAD_DENOM: u32 = 2;
 const PROP_TURNAROUND_MAC_MS_X1000: u32 = 7600;
 
+/// The longest slot time a legal preset produces. A malformed configuration
+/// must not be able to push the coordinated ladder out by hours.
+pub const MAX_SLOT_TIME_MS: u32 = 1_000;
+
 pub fn eu868_config_for_preset(modem_preset: u8) -> RadioConfig {
     let params = modem_preset_params(modem_preset, false);
     RadioConfig {
@@ -30,7 +34,7 @@ pub fn slot_time_ms(config: &RadioConfig) -> u32 {
         || !config.bandwidth_khz.is_finite()
         || config.bandwidth_khz < 1.0
     {
-        return u32::MAX;
+        return MAX_SLOT_TIME_MS;
     }
     let sf = config.spreading_factor as u32;
     let bw_hz = (config.bandwidth_khz * 1000.0) as u32;
@@ -38,7 +42,6 @@ pub fn slot_time_ms(config: &RadioConfig) -> u32 {
     let cad_ms_x1000 = (NUM_SYM_CAD_NUMER * symbol_time_x1000) / NUM_SYM_CAD_DENOM;
     (cad_ms_x1000 + PROP_TURNAROUND_MAC_MS_X1000) / 1000
 }
-
 pub fn contention_window_ms(modem_preset: u8) -> u32 {
     match modem_preset {
         MODEM_LONG_FAST | MODEM_LONG_MODERATE => 3000,

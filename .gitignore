@@ -4,6 +4,7 @@
 # Build output for every board (boards/*/target, plus any future
 # workspace-level target/) — never commit compiled artifacts.
 target/
+target-*/
 
 # rustfmt backup files
 **/*.rs.bk

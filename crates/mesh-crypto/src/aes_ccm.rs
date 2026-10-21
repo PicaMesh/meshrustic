@@ -2,6 +2,12 @@ use crate::aes::aes_ecb_encrypt_block;
 
 const AES_BLOCK_SIZE: usize = 16;
 
+/// The largest payload the direct-message path carries. The authentication tag
+/// is computed over the plaintext, so the plaintext has to exist before it can
+/// be checked; decrypting into a scratch buffer keeps the unverified bytes out
+/// of the caller's buffer.
+pub const MAX_CCM_PAYLOAD: usize = 240;
+
 fn put_be16(out: &mut [u8], val: u16) {
     out[0] = (val >> 8) as u8;
     out[1] = (val & 0xff) as u8;
@@ -187,6 +193,7 @@ pub fn aes_ccm_ad(
     const L: usize = 2;
     if !valid_parameters(key, nonce, tag_len, crypt.len(), aad, tag.len())
         || plain.len() < crypt.len()
+        || crypt.len() > MAX_CCM_PAYLOAD
     {
         return false;
     }
@@ -194,16 +201,21 @@ pub fn aes_ccm_ad(
     let mut x = [0u8; AES_BLOCK_SIZE];
     let mut a = [0u8; AES_BLOCK_SIZE];
     let mut t = [0u8; AES_BLOCK_SIZE];
+    // The tag covers the plaintext, so the plaintext has to be produced before
+    // it can be checked. It is produced in a scratch buffer so that the
+    // caller's buffer only ever holds verified bytes.
+    let mut scratch = [0u8; MAX_CCM_PAYLOAD];
 
     encr_start(L, nonce, &mut a);
     decr_auth(tag_len, &mut a, tag, &mut t, key);
-    encr(crypt, &mut plain[..crypt.len()], &mut a, key);
+    encr(crypt, &mut scratch[..crypt.len()], &mut a, key);
     auth_start(tag_len, L, nonce, aad, crypt.len(), &mut x, key);
-    auth_blocks(&plain[..crypt.len()], &mut x, key);
+    auth_blocks(&scratch[..crypt.len()], &mut x, key);
     let authenticated = constant_time_compare(&x[..tag_len], &t[..tag_len]);
-    if !authenticated {
-        plain[..crypt.len()].fill(0);
+    if authenticated {
+        plain[..crypt.len()].copy_from_slice(&scratch[..crypt.len()]);
     }
+    scratch.fill(0);
     authenticated
 }
 
@@ -297,5 +309,36 @@ mod tests {
             &mut plain
         ));
         assert_eq!(plain, [0; 8]);
+    }
+
+    #[test]
+    fn a_failed_decryption_leaves_the_callers_buffer_untouched() {
+        let mut crypt = [0; 8];
+        let mut tag = [0; 8];
+        assert!(aes_ccm_ae(
+            &[3; 32],
+            &[4; 16],
+            8,
+            b"testtext",
+            &[],
+            &mut crypt,
+            &mut tag
+        ));
+        tag[7] ^= 0x80;
+        let mut plain = [0xAAu8; 8];
+        assert!(!aes_ccm_ad(
+            &[3; 32],
+            &[4; 16],
+            8,
+            &crypt,
+            &[],
+            &tag,
+            &mut plain
+        ));
+        assert_eq!(
+            plain,
+            [0xAA; 8],
+            "unverified plaintext must not reach the caller"
+        );
     }
 }

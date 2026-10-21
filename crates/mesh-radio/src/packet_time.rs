@@ -1,5 +1,12 @@
+use crate::airtime::MAX_FRAME_AIRTIME_MS;
 use crate::config::RadioConfig;
 
+/// The time on air of a frame, in milliseconds.
+///
+/// A malformed configuration returns the longest a legal frame can take rather
+/// than a sentinel: every caller feeds the result into delay and budget
+/// arithmetic, and a huge value there would either stall the node or pin a
+/// counter.
 pub fn packet_time_ms(config: &RadioConfig, payload_len: usize, received: bool) -> u32 {
     let _ = received;
     if !(5..=12).contains(&config.spreading_factor)
@@ -8,7 +15,7 @@ pub fn packet_time_ms(config: &RadioConfig, payload_len: usize, received: bool) 
         || config.bandwidth_khz < 1.0
         || payload_len > 255
     {
-        return u32::MAX;
+        return MAX_FRAME_AIRTIME_MS;
     }
     let sf = config.spreading_factor as u32;
     let bw_hz = (config.bandwidth_khz * 1000.0) as u32;
@@ -61,8 +68,8 @@ mod tests {
         let mut config = RadioConfig::eu868_default();
         for bandwidth in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             config.bandwidth_khz = bandwidth;
-            assert_eq!(packet_time_ms(&config, 1, false), u32::MAX);
-            assert_eq!(crate::timing::slot_time_ms(&config), u32::MAX);
+            assert_eq!(packet_time_ms(&config, 1, false), MAX_FRAME_AIRTIME_MS);
+            assert_eq!(crate::timing::slot_time_ms(&config), crate::timing::MAX_SLOT_TIME_MS);
         }
     }
 }

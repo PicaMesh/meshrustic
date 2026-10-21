@@ -12,6 +12,15 @@ pub struct CryptoEngine {
     pub shared_key: [u8; 32],
 }
 
+/// The private key and the derived shared secret must not outlive their use.
+impl Drop for CryptoEngine {
+    fn drop(&mut self) {
+        self.private_key.fill(0);
+        self.shared_key.fill(0);
+        self.nonce.fill(0);
+    }
+}
+
 impl Default for CryptoEngine {
     fn default() -> Self {
         Self::new()

@@ -417,6 +417,12 @@ impl RadioInterface for Sx1262Driver {
             self.chip
                 .set_dio2_as_rf_switch_ctrl(true)
                 .map_err(|_| RadioError::Hardware)?;
+        } else {
+            // The radio chip turns the line on by itself when it starts up, so
+            // a module that does not use it has to be told to leave it alone.
+            self.chip
+                .set_dio2_as_rf_switch_ctrl(false)
+                .map_err(|_| RadioError::Hardware)?;
         }
 
         self.configure_ocp()?;

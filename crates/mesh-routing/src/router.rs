@@ -1000,9 +1000,11 @@ impl Router {
                 id != 0 && !crate::graph::is_placeholder_node(id) && id != self.node_num
             })
         };
-        let payload_air_len = packet.bytes.len().saturating_sub(PACKET_HEADER_LEN);
+        // The airtime is the time on air of the whole frame, header included:
+        // the header is transmitted too, and every other call site measures the
+        // full frame.
         let air_cfg = mesh_radio::eu868_config_for_preset(self.operating_preset);
-        let airtime_ms = mesh_radio::packet_time_ms(&air_cfg, payload_air_len, true).max(1);
+        let airtime_ms = mesh_radio::packet_time_ms(&air_cfg, packet.bytes.len(), true).max(1);
         let on_default_channel = parsed.channel == self.channel_hash
             && psk_bytes(&self.channel_key) == DEFAULT_PSK.as_slice();
         let rl_pkt = crate::rate_limit::RateLimitPacket {
@@ -4088,11 +4090,16 @@ impl Router {
             ) else {
                 continue;
             };
+            // The chunk count comes from the neighbour table, so it can grow with
+            // it. The frame array has a fixed size, and writing past it would
+            // take the node down.
+            if built as usize >= MAX_TOPOLOGY_PACKETS {
+                break;
+            }
             self.pending_topology.frames[built as usize] = frame;
             self.pending_topology.lens[built as usize] = len;
             longest_frame = longest_frame.max(len as usize);
-            built += 1;
-        }
+            built += 1;        }
         if built == 0 {
             return false;
         }
@@ -9103,3 +9110,4 @@ mod tests {
         assert!(!router.pending_retransmits[0].active);
     }
 }
+
