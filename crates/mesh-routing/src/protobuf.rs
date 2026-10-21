@@ -19,6 +19,17 @@ pub(crate) fn read_varint(data: &[u8], idx: usize) -> Option<(u32, usize)> {
     Some((u32::try_from(value).ok()?, end))
 }
 
+/// Read a signed 32-bit varint.
+///
+/// Protobuf encodes a negative `int32` as a ten-byte varint that carries the
+/// sign-extended 64-bit value, so the value has to be read as a 64-bit varint
+/// and truncated afterwards. Reading it as a 32-bit varint rejects the
+/// canonical encoding of every negative number.
+pub(crate) fn read_varint_i32(data: &[u8], idx: usize) -> Option<(i32, usize)> {
+    let (value, end) = read_varint64(data, idx)?;
+    Some((value as u32 as i32, end))
+}
+
 pub(crate) fn skip_field(data: &[u8], idx: usize, wire: u8) -> Option<usize> {
     let end = match wire {
         0 => read_varint64(data, idx)?.1,

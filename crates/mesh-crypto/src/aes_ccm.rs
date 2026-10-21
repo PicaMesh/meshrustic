@@ -2,11 +2,16 @@ use crate::aes::aes_ecb_encrypt_block;
 
 const AES_BLOCK_SIZE: usize = 16;
 
-/// The largest payload the direct-message path carries. The authentication tag
-/// is computed over the plaintext, so the plaintext has to exist before it can
-/// be checked; decrypting into a scratch buffer keeps the unverified bytes out
-/// of the caller's buffer.
-pub const MAX_CCM_PAYLOAD: usize = 240;
+/// The largest payload the direct-message path carries.
+///
+/// The frame carries a 16-byte air header and the CCM envelope adds 12 bytes
+/// of overhead, so the largest ciphertext that can reach this code is
+/// 255 - 16 - 12 = 227 bytes.
+///
+/// The authentication tag is computed over the plaintext, so the plaintext has
+/// to exist before it can be checked; decrypting into a scratch buffer keeps
+/// the unverified bytes out of the caller's buffer.
+pub const MAX_CCM_PAYLOAD: usize = 227;
 
 fn put_be16(out: &mut [u8], val: u16) {
     out[0] = (val >> 8) as u8;
@@ -215,7 +220,7 @@ pub fn aes_ccm_ad(
     if authenticated {
         plain[..crypt.len()].copy_from_slice(&scratch[..crypt.len()]);
     }
-    scratch.fill(0);
+    crate::zeroize::zeroize(&mut scratch);
     authenticated
 }
 
@@ -336,8 +341,7 @@ mod tests {
             &mut plain
         ));
         assert_eq!(
-            plain,
-            [0xAA; 8],
+            plain, [0xAA; 8],
             "unverified plaintext must not reach the caller"
         );
     }

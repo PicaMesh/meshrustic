@@ -250,7 +250,8 @@ pub struct Router {
     pending_radio_settings: Option<PendingRadioSettings>,
     hop_limit: u8,
     next_tx_id: u32,
-    pki_nonce_salt: u32,
+    #[cfg(feature = "pki")]
+    pki_nonce_secret: [u8; 32],
     sr_log: SrLog,
     bridge_dedup: crate::bridge::BridgeDedupCache,
     bridge_enabled: bool,
@@ -443,7 +444,8 @@ impl Router {
             pending_radio_settings: None,
             hop_limit,
             next_tx_id: 1,
-            pki_nonce_salt: 0,
+            #[cfg(feature = "pki")]
+            pki_nonce_secret: [0; 32],
             sr_log: SrLog::new(),
             bridge_dedup: crate::bridge::BridgeDedupCache::new(),
             bridge_enabled: true,
@@ -1657,10 +1659,11 @@ impl Router {
             let mut engine = CryptoEngine::new();
             engine.set_dh_private_key(&self.admin.private_key);
             let mut cipher = [0u8; MAX_PACKET_PAYLOAD];
-            // The extra nonce must be unique per message and must not be derivable
-            // from the header, which travels in the clear. Mixing the packet id
-            // with a per-boot secret keeps both properties.
-            let extra_nonce = packet_id ^ self.pki_nonce_salt;
+            // The extra nonce must be unique per message and must not be
+            // derivable from the header, which travels in the clear. It is
+            // derived from a per-boot secret, so an observer that has seen one
+            // message cannot predict the nonce of the next one.
+            let extra_nonce = self.pki_extra_nonce(packet_id);
             if !engine.encrypt_curve25519(
                 remote_pk,
                 self.node_num,
@@ -3270,6 +3273,10 @@ impl Router {
         if !stampable {
             self.sr_log
                 .push(SrLogEvent::RelayRetxNoAlternate { id: due.packet_id });
+            // The plain repeat has already gone out over the nominated hop.
+            // Re-sending it would only repeat a frame a silent hop has
+            // already ignored, so the directed retry drops instead of
+            // flooding. The reliable slot is released by `due_retransmit`.
             return None;
         }
         let mut bytes = due.bytes;
@@ -3413,11 +3420,10 @@ impl Router {
             .unicast_named_slot_delay_ms(1, 0, half, airtime_ms)
             .saturating_add(crate::coordinated_relay::tie_break_range_ms(half))
             .saturating_add(airtime_ms);
-        self.sr_peer_relay_wait_ms(airtime_ms)
-            .saturating_add(
-                self.next_hop_carry_wait_ms(nominated_hop, airtime_ms)
-                    .max(slot1_end),
-            )
+        self.sr_peer_relay_wait_ms(airtime_ms).saturating_add(
+            self.next_hop_carry_wait_ms(nominated_hop, airtime_ms)
+                .max(slot1_end),
+        )
     }
 
     fn unicast_named_slot_delay_ms(
@@ -4099,7 +4105,8 @@ impl Router {
             self.pending_topology.frames[built as usize] = frame;
             self.pending_topology.lens[built as usize] = len;
             longest_frame = longest_frame.max(len as usize);
-            built += 1;        }
+            built += 1;
+        }
         if built == 0 {
             return false;
         }
@@ -4124,10 +4131,37 @@ impl Router {
         self.next_tx_id = seed;
     }
 
-    /// A second, independent random draw salts the direct-message nonce so that it
-    /// cannot be reconstructed from the packet id in the clear-text header.
-    pub fn seed_pki_nonce(&mut self, salt: u32) {
-        self.pki_nonce_salt = salt;
+    /// A second, independent random draw seeds the direct-message nonce so
+    /// that it cannot be reconstructed from the packet id in the clear-text
+    /// header.
+    #[cfg(feature = "pki")]
+    pub fn seed_pki_secret(&mut self, secret: [u8; 32]) {
+        self.pki_nonce_secret = secret;
+    }
+
+    /// The extra nonce of a direct message.
+    ///
+    /// It is derived from the per-boot secret and the packet id, so it is
+    /// unique per message and unpredictable to an observer: the packet id
+    /// travels in the clear, and the secret does not. The value is never zero,
+    /// because a zero extra nonce would switch the nonce layout and reuse the
+    /// high half of the packet id instead.
+    #[cfg(feature = "pki")]
+    fn pki_extra_nonce(&self, packet_id: u32) -> u32 {
+        let mut material = [0u8; 32 + 8];
+        material[..32].copy_from_slice(&self.pki_nonce_secret);
+        material[32..].copy_from_slice(&(packet_id as u64).to_le_bytes());
+        let len = material.len();
+        if !mesh_crypto::sha256_in_place(&mut material, len) {
+            // The buffer is longer than the digest, so this cannot happen.
+            return 1;
+        }
+        let nonce = u32::from_le_bytes([material[0], material[1], material[2], material[3]]);
+        if nonce == 0 {
+            1
+        } else {
+            nonce
+        }
     }
 
     fn alloc_tx_id(&mut self) -> u32 {
@@ -9086,6 +9120,18 @@ mod tests {
         assert!(ready);
     }
     #[test]
+    fn the_ccm_payload_limit_covers_the_largest_frame() {
+        // The direct-message path decrypts the whole payload after the air
+        // header, and the CCM envelope adds twelve bytes. The crypto crate
+        // has to accept everything that can reach it.
+        let largest = mesh_protocol::MAX_LORA_PAYLOAD_LEN - mesh_protocol::PACKET_HEADER_LEN - 12;
+        assert!(
+            mesh_crypto::MAX_CCM_PAYLOAD >= largest,
+            "the CCM limit must cover the largest frame"
+        );
+    }
+
+    #[test]
     fn local_packet_ids_are_unique_and_never_zero() {
         static ROUTER: StaticCell<Router> = StaticCell::new();
         let router = ROUTER.init(Router::new(1));
@@ -9110,4 +9156,3 @@ mod tests {
         assert!(!router.pending_retransmits[0].active);
     }
 }
-

@@ -6,9 +6,12 @@ pub const CHANNEL_UTILIZATION_PERIODS: usize = 6;
 pub const MINUTES_IN_HOUR: usize = 60;
 pub const MS_IN_HOUR: u32 = 3_600_000;
 
-/// The longest a legal frame can take, at the slowest preset. A malformed
-/// configuration must not be able to pin the utilisation counter, because a
-/// pinned counter stops the node from transmitting for good.
+/// The longest a legal frame can take, at the slowest preset.
+///
+/// This is an overflow guard on the occupancy counter, not a substitute for a
+/// known airtime: an unknown airtime is reported as zero and is not charged
+/// to the budget at all, because a configuration fault must not be turned
+/// into a channel-occupancy fault.
 pub const MAX_FRAME_AIRTIME_MS: u32 = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -12,12 +12,16 @@ pub struct CryptoEngine {
     pub shared_key: [u8; 32],
 }
 
-/// The private key and the derived shared secret must not outlive their use.
+/// The key material must not outlive its use.
+///
+/// The writes are volatile: a plain `fill(0)` on a buffer that is dead by the
+/// time the engine is dropped is a store the optimiser is free to remove.
 impl Drop for CryptoEngine {
     fn drop(&mut self) {
-        self.private_key.fill(0);
-        self.shared_key.fill(0);
-        self.nonce.fill(0);
+        crate::zeroize::zeroize(&mut self.private_key);
+        crate::zeroize::zeroize(&mut self.shared_key);
+        crate::zeroize::zeroize(&mut self.nonce);
+        crate::zeroize::zeroize(&mut self.key.bytes);
     }
 }
 

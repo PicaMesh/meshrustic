@@ -465,7 +465,13 @@ is actually waiting for.
   then the later of the nominated hop's carry wait and ranked slot 1 with its tie-break. The
   alternate search excludes the nominated hop, upstream, originator and ourselves (never the
   destination; cache bypassed). A stock alternate is refused because stock judges a duplicate
-  by the first `next_hop` it recorded. Tests: `named_followup_waits_for_our_airtime_and_ranked_slot_one`,
+  by the first `next_hop` it recorded. The strong named delay is measured from the end of the
+  previous transmission: it is the sum of the peer-relay wait and the later of the nominated
+  hop's carry wait and ranked slot 1, **without** a compensating subtraction of the airtime,
+  so the follow-up can never fire before the previous transmission has cleared. A directed
+  retry that cannot be stamped on an alternate is dropped rather than repeated: the plain
+  repeat has already gone out over the nominated hop, and re-sending it would only repeat a
+  frame a silent hop has already ignored. Tests: `named_followup_waits_for_our_airtime_and_ranked_slot_one`,
   `named_forward_repeats_then_redirects_to_stampable_alternate`,
   `redirect_refuses_an_alternate_sharing_the_nominated_byte`,
   `redirect_refuses_a_stock_alternate`, `upstream_and_originator_copies_keep_the_named_followup`,
@@ -1000,13 +1006,33 @@ is actually waiting for.
   (`Router::seed_tx_ids`), so no two boots or two nodes replay the same id sequence; stock
   draws random ids too. Our own-transmission record is keyed by id alone and topology receive
   no longer consults it (the sender check already excludes our own echoes).
+- **A failed random draw keeps the node off the mesh.** The identity seed, the packet-id
+  seed and the direct-message seed are three independent draws. If any of them fails, the
+  node does not transmit and does not persist a key: it keeps the console and the watchdog
+  alive and reports the fault. Running with a guessable identity, or with a
+  channel-encryption nonce that repeats after every reboot, is worse than being off the
+  mesh.
+- **The direct-message extra nonce is unpredictable.** It is
+  `SHA256(per-boot secret ‖ packet id)`, truncated to 32 bits and never zero. The packet id
+  travels in the clear header, so the extra nonce must not be a function of it alone: an
+  observer that has seen one message must not be able to predict the nonce of the next one.
+  A zero extra nonce would switch the nonce layout, so it is never zero.
+- **The admin `LoRaConfig.tx_power` is field 10, a plain `int32`.** A negative power is
+  encoded the canonical way — a ten-byte varint that carries the sign-extended 64-bit value
+  — and is decoded the same way. Field 11 is `channel_num` in the public schema, so a
+  power on field 11 reads as a channel number to every stock client.
 
 - A panic or hard fault resets the chip (`main.rs` panic and HardFault handlers); flip-link
   places the stack below the statics so an overflow faults instead of corrupting them; a 30 s
   hardware watchdog is fed from the radio loop and from the radio-init failure loop. The
   watchdog peripheral belongs to the bootloader image on a deployed node, so the firmware
   **adopts** the running configuration instead of reprogramming it — the timeout it then
-  runs with is the one the previous image left, and the boot log reports it. The boot
+  runs with is the one the previous image left. The boot log reports the counter the
+  peripheral **really** runs with, read back from the `CRV` register: the value that was
+  asked for is not necessarily the value the register can hold, and the effective period
+  is what the boot path has to live with. The handle lives in a critical section, so the
+  boot path feeds the watchdog too and a short adopted period cannot kill the node
+  before the radio task is running. The boot
   log reports the reset reason. `just size nrf52840` prints sections, largest statics and
   largest stack frames; check it whenever a static or a frame grows.
 - Every USB log line is written through bounded helpers (`put`, `put_u32`, `put_hex8`, and

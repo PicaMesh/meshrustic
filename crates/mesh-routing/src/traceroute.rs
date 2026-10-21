@@ -109,9 +109,8 @@ pub fn encode_route_discovery(rd: &RouteDiscovery, out: &mut heapless::Vec<u8, 1
             len
         }
     };
-    let snr_bytes = |values: &heapless::Vec<i32, ROUTE_SIZE>| -> usize {
-        values.iter().map(snr_len).sum()
-    };
+    let snr_bytes =
+        |values: &heapless::Vec<i32, ROUTE_SIZE>| -> usize { values.iter().map(snr_len).sum() };
     // An empty repeated field is left out entirely rather than written as an empty
     // run, so the size estimate has to skip it too.
     let field_len = |count: usize, payload: usize| -> usize {
@@ -508,9 +507,11 @@ mod tests {
         // A repeated field written one element at a time must still decode.
         let mut wire = heapless::Vec::<u8, 128>::new();
         wire.push((1 << 3) | 5).unwrap();
-        wire.extend_from_slice(&0x1111_1111u32.to_le_bytes()).unwrap();
+        wire.extend_from_slice(&0x1111_1111u32.to_le_bytes())
+            .unwrap();
         wire.push((1 << 3) | 5).unwrap();
-        wire.extend_from_slice(&0x2222_2222u32.to_le_bytes()).unwrap();
+        wire.extend_from_slice(&0x2222_2222u32.to_le_bytes())
+            .unwrap();
         wire.push((2 << 3) as u8).unwrap();
         wire.push(40).unwrap();
 

@@ -1,5 +1,5 @@
 use crate::nodeinfo::NodeInfoIdentity;
-use crate::protobuf::{read_varint, skip_field};
+use crate::protobuf::{read_varint, read_varint_i32, skip_field};
 
 pub const ADMIN_APP: u32 = 6;
 
@@ -351,7 +351,9 @@ pub fn encode_lora_config(lora: &WireLoRaConfig) -> heapless::Vec<u8, 64> {
     push_varint_field(&mut out, 8, lora.hop_limit);
     if lora.tx_power != 0 {
         // The public schema carries the power as a plain int32 varint on field 10.
-        push_varint_field(&mut out, 10, lora.tx_power as u32);
+        // A negative power is encoded the canonical way: a ten-byte varint that
+        // carries the sign-extended 64-bit value.
+        push_varint_i32(&mut out, 10, lora.tx_power);
     }
     if lora.config_ok_to_mqtt {
         push_varint_field(&mut out, 105, 1);
@@ -616,8 +618,11 @@ pub fn decode_lora_config(payload: &[u8]) -> Option<WireLoRaConfig> {
                 i = ni;
             }
             (10, 0) => {
-                let (v, ni) = read_varint(payload, i)?;
-                lora.tx_power = v as i32;
+                // The power is a plain `int32`. A negative value is encoded as
+                // a ten-byte sign-extended varint, so it has to be read as a
+                // 64-bit varint and truncated afterwards.
+                let (v, ni) = read_varint_i32(payload, i)?;
+                lora.tx_power = v;
                 i = ni;
             }
             (105, 0) => {
@@ -1122,6 +1127,27 @@ fn push_bytes_field<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, 
     let _ = out.extend_from_slice(data);
 }
 
+/// Push a signed 32-bit field.
+///
+/// Protobuf encodes a negative `int32` as a ten-byte varint that carries the
+/// sign-extended 64-bit value. A shorter encoding is not canonical and a
+/// strict parser may reject it.
+fn push_varint_i32<const N: usize>(out: &mut heapless::Vec<u8, N>, field: u32, value: i32) {
+    push_tag(out, field, 0);
+    let mut v = value as i64 as u64;
+    loop {
+        let mut byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        let _ = out.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
 fn push_varint<const N: usize>(out: &mut heapless::Vec<u8, N>, mut v: u32) {
     loop {
         let mut byte = (v & 0x7F) as u8;
@@ -1295,6 +1321,39 @@ mod tests {
             decode_lora_config(&bytes).unwrap().hop_limit,
             mesh_radio::DEFAULT_HOP_LIMIT as u32
         );
+    }
+
+    #[test]
+    fn a_negative_tx_power_survives_the_round_trip() {
+        let lora = WireLoRaConfig {
+            use_preset: true,
+            modem_preset: 0,
+            region: REGION_EU_868,
+            hop_limit: 3,
+            tx_power: -1,
+            config_ok_to_mqtt: false,
+        };
+        let bytes = encode_lora_config(&lora);
+        // The canonical encoding of a negative int32 is a ten-byte varint that
+        // carries the sign-extended 64-bit value.
+        assert_eq!(
+            &bytes.as_slice()[8..],
+            &[0x50, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
+        );
+        let decoded = decode_lora_config(&bytes).unwrap();
+        assert_eq!(decoded.tx_power, -1);
+    }
+
+    #[test]
+    fn a_canonically_encoded_negative_tx_power_is_accepted() {
+        // What a stock client sends for `tx_power = -1`.
+        let mut bytes = heapless::Vec::<u8, 64>::new();
+        bytes.push(0x50).unwrap();
+        for byte in [0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01] {
+            bytes.push(byte).unwrap();
+        }
+        let decoded = decode_lora_config(&bytes).expect("the config must not be dropped");
+        assert_eq!(decoded.tx_power, -1);
     }
 
     #[test]

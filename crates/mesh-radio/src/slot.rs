@@ -377,6 +377,45 @@ mod tests {
         assert_eq!(third.tx_id, Some(3));
     }
 
+    /// Cancelling a queued frame has to work after a frame has been popped.
+    ///
+    /// The radio task transmits frames and cancels the ones it hears a copy
+    /// of, so the queue head is normally not zero when a cancellation runs.
+    /// A compaction that assumes a zero head destroys the frames it has not
+    /// read yet, which silently keeps the duplicate on the air.
+    #[test]
+    fn remove_tx_cancels_the_right_frame_after_a_frame_was_sent() {
+        let mut slot = RadioSlot::<MockRadio>::new(
+            0,
+            MockRadio {
+                busy: false,
+                sent: 0,
+                cfg: RadioConfig::eu868_default(),
+                inbox: None,
+            },
+        );
+        for id in [1u32, 2, 3] {
+            slot.enqueue_tx(TxFrame::new(0, &frame_with_id(id)).unwrap())
+                .unwrap();
+        }
+        let mut air = AirTime::new(EU_868);
+        // Send the first frame: the queue head moves.
+        let first = slot.service(&mut air, true).unwrap();
+        assert_eq!(first.tx_id, Some(1));
+        assert_eq!(slot.tx_queue_len(), 2);
+
+        // Cancel the last queued frame: it must go, and the other must stay.
+        assert_eq!(slot.remove_tx(0, 3), 1);
+        assert_eq!(slot.tx_queue_len(), 1);
+        assert_eq!(slot.remove_tx(0, 3), 0);
+        assert_eq!(slot.tx_queue_len(), 1);
+
+        let second = slot.service(&mut air, true).unwrap();
+        assert_eq!(second.tx_id, Some(1), "the in-flight frame completes");
+        let third = slot.service(&mut air, true).unwrap();
+        assert_eq!(third.tx_id, Some(2), "the cancelled frame must not go out");
+    }
+
     #[test]
     fn a_held_frame_is_named_and_attributed_to_the_reception() {
         let mut slot = RadioSlot::<MockRadio>::new(

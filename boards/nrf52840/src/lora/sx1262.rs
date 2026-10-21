@@ -53,7 +53,16 @@ const BUSY_COMMAND_TIMEOUT_MS: u32 = 100;
 
 /// The longest a transmission may take before the chip is expected to be idle
 /// again. A stuck busy line is reported rather than waited on for ever.
-const BUSY_TX_TIMEOUT_MS: u32 = 30_000;
+///
+/// The wait is a busy-wait, so it has to stay well below the watchdog period:
+/// the executor cannot feed the watchdog while it runs.
+const BUSY_TX_TIMEOUT_MS: u32 = 2_000;
+
+/// The chip asserts the busy line a few microseconds after the command's
+/// chip-select rises. The `sx126x` driver used to wait that long before it
+/// sampled the line; without it the next command can be issued while the chip
+/// is still busy, and the chip drops it silently.
+const BUSY_SETTLE_US: u64 = 2;
 
 impl Sx1262Driver {
     pub fn new(
@@ -83,6 +92,10 @@ impl Sx1262Driver {
     /// whole of a transmission. Waiting without a bound would hang the node for
     /// ever if the line were stuck, so the wait always has a deadline.
     fn wait_busy(&self, timeout_ms: u32) -> Result<(), RadioError> {
+        // The chip asserts the busy line a moment after the command's
+        // chip-select rises. Sampling it too early reads "idle" for a chip
+        // that is still busy, and the next command is dropped silently.
+        embassy_time::block_for(embassy_time::Duration::from_micros(BUSY_SETTLE_US));
         let deadline =
             embassy_time::Instant::now() + embassy_time::Duration::from_millis(timeout_ms as u64);
         while self.busy.is_high() {
@@ -610,11 +623,26 @@ impl RadioInterface for Sx1262Driver {
                 .is_some_and(|deadline| embassy_time::Instant::now() >= deadline)
             {
                 self.tx_deadline = None;
+                defmt::warn!("[Radio0] TX produced no interrupt");
+                crate::usb_log::log::radio::warn("TX produced no interrupt");
                 return Ok(Some(TxStatus::OutcomeUnknown));
             }
             return Ok(None);
         }
-        self.wait_busy(BUSY_TX_TIMEOUT_MS)
+        // The wait is bounded by the time the transmission may still take: the
+        // chip has to be idle long before the deadline expires, and a busy-wait
+        // that outlasts the watchdog would reset the node instead of reporting
+        // the fault.
+        let budget = self
+            .tx_deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(embassy_time::Instant::now())
+                    .as_millis() as u32
+            })
+            .unwrap_or(BUSY_TX_TIMEOUT_MS)
+            .min(BUSY_TX_TIMEOUT_MS);
+        self.wait_busy(budget)
             .map_err(|_| RadioError::TxOutcomeUnknown)?;
         let irq = match self.chip.get_irq_status() {
             Ok(irq) => irq,

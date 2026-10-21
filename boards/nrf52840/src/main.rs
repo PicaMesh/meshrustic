@@ -10,6 +10,7 @@ mod store;
 #[path = "usb/mod.rs"]
 mod usb_log;
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use cortex_m_rt::{exception, ExceptionFrame};
 use defmt_rtt as _;
@@ -56,6 +57,40 @@ bind_interrupts!(struct Irqs {
 
 const WATCHDOG_TIMEOUT_SECS: u32 = 30;
 
+/// The watchdog handle lives in a critical section so that the boot path and
+/// the radio task can both feed it. The radio task is spawned late, and a
+/// watchdog that was adopted from an earlier image can have a short period:
+/// nothing may let it expire while the node is still booting.
+static WATCHDOG: critical_section::Mutex<RefCell<Option<embassy_nrf::wdt::WatchdogHandle>>> =
+    critical_section::Mutex::new(RefCell::new(None));
+
+/// Feed the watchdog, if one is armed.
+fn pet_watchdog() {
+    critical_section::with(|cs| {
+        if let Some(handle) = WATCHDOG.borrow_ref_mut(cs).as_mut() {
+            handle.pet();
+        }
+    });
+}
+
+/// Whether a watchdog is armed. The DFU park needs to know: it waits for the
+/// watchdog to reset the node into the bootloader.
+pub fn watchdog_armed() -> bool {
+    critical_section::with(|cs| WATCHDOG.borrow_ref(cs).is_some())
+}
+
+/// The counter the watchdog runs with, in 32.768 kHz ticks.
+///
+/// The register is read back rather than taken from the configuration: the
+/// value that was asked for is not necessarily the value the register can
+/// hold, and the effective period is what the boot path has to live with.
+fn watchdog_counter() -> u32 {
+    const NRF_WDT_CRV: *const u32 = 0x4001_0504 as *const u32;
+    // SAFETY: the watchdog counter register is always readable, and the
+    // address is the one the nRF52840 reference manual gives for it.
+    unsafe { core::ptr::read_volatile(NRF_WDT_CRV) }
+}
+
 static RADIO_SLOT: StaticCell<RadioSlot<lora::Sx1262Driver>> = StaticCell::new();
 static ROUTER: ConstStaticCell<Router> = ConstStaticCell::new(Router::unconfigured());
 static CONFIG_STORE: StaticCell<NvmcConfigStore> = StaticCell::new();
@@ -78,15 +113,22 @@ async fn main(spawner: Spawner) {
     if let Some(running) = wdt::Config::try_new(&p.WDT) {
         wdt_config = running;
     }
-    let watchdog_ticks = wdt_config.timeout_ticks;
     let radio_wdt = match wdt::Watchdog::try_new::<1>(p.WDT, wdt_config) {
         Ok((_wdt, [handle])) => Some(handle),
         // The running configuration uses a different channel count, so it cannot
         // be adopted and the peripheral cannot be reprogrammed while it runs.
         Err(_) => None,
     };
-    let watchdog_secs = if radio_wdt.is_some() {
-        watchdog_ticks / 32768
+    let watchdog_armed = radio_wdt.is_some();
+    if let Some(handle) = radio_wdt {
+        critical_section::with(|cs| *WATCHDOG.borrow_ref_mut(cs) = Some(handle));
+    }
+    // The counter the peripheral really runs with, read back rather than
+    // assumed: the value that was asked for is not necessarily the value the
+    // register can hold, and the effective period is what decides whether the
+    // boot path has to hurry.
+    let watchdog_secs = if watchdog_armed {
+        watchdog_counter() / 32768
     } else {
         0
     };
@@ -96,18 +138,36 @@ async fn main(spawner: Spawner) {
 
     let mut rng = rng::Rng::new(p.RNG, Irqs);
     // A degenerate random draw would give the node a predictable identity, so
-    // it is drawn again rather than used.
+    // it is drawn again rather than used. The three draws are independent:
+    // the identity seed, the packet-id seed (which is the channel-encryption
+    // nonce) and the direct-message nonce seed.
     let mut identity_seed = [0; 32];
-    if !draw_random(&mut rng, &mut identity_seed).await {
+    let identity_ok = draw_random(&mut rng, &mut identity_seed).await;
+    pet_watchdog();
+    let mut tx_seed_bytes = [0u8; 4];
+    let tx_seed_ok = draw_random(&mut rng, &mut tx_seed_bytes).await;
+    pet_watchdog();
+    let mut pki_secret = [0u8; 32];
+    let pki_ok = draw_random(&mut rng, &mut pki_secret).await;
+    pet_watchdog();
+    let randomness_ok = identity_ok && tx_seed_ok && pki_ok;
+    if !randomness_ok {
         defmt::error!("[meshrustic] the random source did not answer");
-        usb_log::log::push_line("[meshrustic] random source unavailable: degraded identity");
+        usb_log::log::push_line(
+            "[meshrustic] random source unavailable: the node stays off the mesh",
+        );
     }
     let hw = NodeIdentity::from_hardware(identity_seed);
+
     let defaults = hw.first_boot_config();
     let store = CONFIG_STORE.init(NvmcConfigStore::new(Nvmc::new(p.NVMC), defaults));
     let (mut config, load_src) = store.load_with_source();
-    let upgraded_identity = hw.replace_predictable_key(&mut config);
-    if (load_src == ConfigLoadSource::Defaults || upgraded_identity) && store.save(&config).is_err()
+    // A node whose identity could not be drawn must not persist the guessable
+    // key it would otherwise fall back to.
+    let upgraded_identity = identity_ok && hw.replace_predictable_key(&mut config);
+    if randomness_ok
+        && (load_src == ConfigLoadSource::Defaults || upgraded_identity)
+        && store.save(&config).is_err()
     {
         defmt::error!("failed to persist secure identity");
         usb_log::log::push_line("[store] secure identity save failed");
@@ -120,7 +180,7 @@ async fn main(spawner: Spawner) {
 
     defmt::info!("[meshrustic] nodeId !{:08x}", config.node_num);
     usb_log::log::mesh::reset_reason(reset_reason);
-    usb_log::log::push_line(if radio_wdt.is_some() {
+    usb_log::log::push_line(if watchdog_armed {
         "[meshrustic] watchdog armed, pet by the radio task"
     } else {
         "[meshrustic] watchdog NOT armed: the peripheral refused this configuration"
@@ -137,6 +197,28 @@ async fn main(spawner: Spawner) {
     let _ = lora::dual_radio::SECOND_RADIO_ID;
     let _ = lora::dual_radio::bridge_target_capacity();
 
+    // The console comes up first: a node that cannot run has to be able to
+    // say why.
+    let host_cmd_channel = HOST_CMD_CHANNEL.init(usb_log::HostCommandChannel::new());
+    spawner
+        .spawn(usb_log::usb_task(p.USBD, config.node_num, host_cmd_channel))
+        .unwrap();
+    pet_watchdog();
+
+    if !randomness_ok {
+        // Without usable randomness the node has either a guessable identity
+        // or a channel-encryption nonce that repeats after every reboot. Both
+        // are worse than being off the mesh, so the node stays off it: it
+        // keeps the console and the watchdog alive and reports the fault.
+        loop {
+            pet_watchdog();
+            usb_log::log::push_line(
+                "[meshrustic] the node is off the mesh: no usable random source",
+            );
+            embassy_time::Timer::after_secs(5).await;
+        }
+    }
+
     let mut spi_cfg = spim::Config::default();
     spi_cfg.frequency = spim::Frequency::M4;
     let spim = spim::Spim::new(p.SPI3, Irqs, p.P1_11, p.P0_02, p.P1_15, spi_cfg);
@@ -150,6 +232,11 @@ async fn main(spawner: Spawner) {
     );
     // A second handle on the busy and interrupt lines, so the driver can
     // observe them. They are inputs that never drive the line.
+    //
+    // SAFETY: the probe handles read the same pins as the chip driver. Both
+    // are inputs with no pull, so they agree on the level and neither of them
+    // drives the line. The invariant this relies on is that the chip driver
+    // never reconfigures those two pins: it only reads them.
     let busy_probe = Input::new(
         unsafe { embassy_nrf::Peripheral::clone_unchecked(&p.P0_29) },
         Pull::None,
@@ -168,24 +255,15 @@ async fn main(spawner: Spawner) {
     let slot = RADIO_SLOT.init(RadioSlot::new(0, driver));
 
     let router = ROUTER.take();
-    let mut seed = [0u8; 8];
-    if !draw_random(&mut rng, &mut seed).await {
-        defmt::error!("[meshrustic] the random source did not answer");
-        usb_log::log::push_line("[meshrustic] random source unavailable: degraded nonce");
-    }
     // The packet ids are the channel-encryption nonce, so a counter that always
     // restarts at the same value would repeat the nonce after every reboot.
-    let mut tx_seed = u32::from_le_bytes([seed[0], seed[1], seed[2], seed[3]]);
+    let mut tx_seed = u32::from_le_bytes(tx_seed_bytes);
     if tx_seed == 0 {
         tx_seed = 1; // packet id zero is reserved
     }
     router.seed_tx_ids(tx_seed);
-    // A second, independent draw salts the direct-message nonce.
-    let mut nonce_salt = u32::from_le_bytes([seed[4], seed[5], seed[6], seed[7]]);
-    if nonce_salt == 0 {
-        nonce_salt = 0x9E37_79B9;
-    }
-    router.seed_pki_nonce(nonce_salt);
+    // An independent draw seeds the direct-message nonce.
+    router.seed_pki_secret(pki_secret);
     router.load_node_config(&config);
     router.set_bridge_enabled(false);
     router.set_node_identity(mesh_routing::NodeInfoIdentity::for_node(
@@ -198,10 +276,6 @@ async fn main(spawner: Spawner) {
     usb_log::publish_device_role(own_role);
     usb_log::log::mesh::device_role(own_role);
 
-    let host_cmd_channel = HOST_CMD_CHANNEL.init(usb_log::HostCommandChannel::new());
-    spawner
-        .spawn(usb_log::usb_task(p.USBD, config.node_num, host_cmd_channel))
-        .unwrap();
     let saadc_config = saadc::Config::default();
     let mut saadc_channel = saadc::ChannelConfig::single_ended(p.P0_31);
     // The software conversion reference must agree with the configured ADC gain and reference.
@@ -218,7 +292,6 @@ async fn main(spawner: Spawner) {
             router,
             store,
             config.node_num,
-            radio_wdt,
             host_cmd_channel,
             dio1_wake,
         ))
@@ -249,7 +322,9 @@ async fn draw_random(
 ) -> bool {
     const DRAW_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(200);
     for _ in 0..4 {
-        if embassy_time::with_timeout(DRAW_TIMEOUT, rng.fill_bytes(out)).await.is_ok()
+        if embassy_time::with_timeout(DRAW_TIMEOUT, rng.fill_bytes(out))
+            .await
+            .is_ok()
             && out.iter().any(|&b| b != 0)
         {
             return true;

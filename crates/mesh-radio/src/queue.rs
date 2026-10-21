@@ -133,6 +133,12 @@ impl<const N: usize> TxQueue<N> {
     /// The queue is compacted in place: copying the whole array to the stack on
     /// every call would cost a kilobyte of stack per call, and the radio loop
     /// calls this for every queued frame it rejects.
+    ///
+    /// The destination index is circular as well, so it trails the source: the
+    /// slot it writes to always holds a frame that has already been read. A
+    /// linear destination would disagree with the circular source as soon as
+    /// the ring head is not zero, and would overwrite a frame that has not been
+    /// read yet.
     pub fn remove_where(&mut self, mut drop: impl FnMut(&TxFrame) -> bool) -> usize {
         let len = self.len;
         let mut write = 0usize;
@@ -143,14 +149,14 @@ impl<const N: usize> TxQueue<N> {
                 removed += 1;
                 continue;
             }
-            if write != src {
-                self.buf[write] = self.buf[src];
+            let dst = (self.head + write) % N;
+            if write != read {
+                self.buf[dst] = self.buf[src];
             }
             write += 1;
         }
         if removed > 0 {
-            self.head = 0;
-            self.tail = write % N;
+            self.tail = (self.head + write) % N;
             self.len = write;
         }
         removed
@@ -164,5 +170,82 @@ impl<const N: usize> TxQueue<N> {
         self.head = (self.head + 1) % N;
         self.len -= 1;
         Ok(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const N: usize = 4;
+
+    fn frame(tag: u8) -> TxFrame {
+        TxFrame::new(0, &[tag]).unwrap()
+    }
+
+    /// The tags of the queued frames, in order, padded with zero.
+    fn tags(queue: &TxQueue<N>) -> [u8; N] {
+        let mut out = [0u8; N];
+        for (i, slot) in out.iter_mut().enumerate().take(queue.len()) {
+            *slot = queue.buf[(queue.head + i) % N].bytes[0];
+        }
+        out
+    }
+
+    /// The compaction must not depend on where the ring head happens to be.
+    ///
+    /// The radio loop pops frames before it cancels a queued one, so the
+    /// head is normally non-zero. A compaction that mixes a circular source
+    /// with a linear destination destroys the frame it has not read yet.
+    #[test]
+    fn remove_where_keeps_the_queue_intact_after_a_pop() {
+        let mut queue = TxQueue::<4>::new();
+        for tag in [1u8, 2, 3, 4] {
+            queue.push(frame(tag)).unwrap();
+        }
+        queue.pop().unwrap();
+        queue.pop().unwrap();
+        queue.push(frame(5)).unwrap();
+        assert_eq!(tags(&queue), [3, 4, 5, 0]);
+
+        assert_eq!(queue.remove_where(|f| f.bytes[0] == 5), 1);
+        assert_eq!(tags(&queue), [3, 4, 0, 0]);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn remove_where_drops_only_the_rejected_frames() {
+        let mut queue = TxQueue::<4>::new();
+        for tag in [1u8, 2, 3, 4] {
+            queue.push(frame(tag)).unwrap();
+        }
+        queue.pop().unwrap();
+        queue.push(frame(5)).unwrap();
+
+        assert_eq!(queue.remove_where(|f| f.bytes[0] == 3), 1);
+        assert_eq!(tags(&queue), [2, 4, 5, 0]);
+        assert_eq!(queue.remove_where(|f| f.bytes[0] == 3), 0);
+        assert_eq!(tags(&queue), [2, 4, 5, 0]);
+    }
+
+    #[test]
+    fn remove_where_keeps_the_order_of_the_survivors() {
+        let mut queue = TxQueue::<4>::new();
+        for tag in [1u8, 2, 3, 4] {
+            queue.push(frame(tag)).unwrap();
+        }
+        queue.pop().unwrap();
+        assert_eq!(
+            queue.remove_where(|f| f.bytes[0] == 2 || f.bytes[0] == 4),
+            2
+        );
+        assert_eq!(tags(&queue), [3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn remove_where_on_an_empty_queue_does_nothing() {
+        let mut queue = TxQueue::<4>::new();
+        assert_eq!(queue.remove_where(|_| true), 0);
+        assert_eq!(queue.len(), 0);
     }
 }

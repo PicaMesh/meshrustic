@@ -41,7 +41,6 @@ pub async fn radio_task(
     router: &'static mut Router,
     store: &'static mut NvmcConfigStore,
     node_num: u32,
-    mut watchdog: Option<embassy_nrf::wdt::WatchdogHandle>,
     host_cmd: &'static HostCommandChannel,
     mut dio1_wake: embassy_nrf::gpio::Input<'static>,
 ) {
@@ -51,9 +50,7 @@ pub async fn radio_task(
     if let Err(err) = slot.init() {
         let reason = radio_error_message(err);
         loop {
-            if let Some(wdt) = watchdog.as_mut() {
-                wdt.pet();
-            }
+            crate::pet_watchdog();
             defmt::error!("[Radio0] init FAILED: {}", reason);
             crate::usb_log::log::radio::warn(reason);
             Timer::after_secs(10).await;
@@ -96,9 +93,7 @@ pub async fn radio_task(
     const LOOP_IDLE_MS: u64 = 100;
 
     loop {
-        if let Some(wdt) = watchdog.as_mut() {
-            wdt.pet();
-        }
+        crate::pet_watchdog();
         let now_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
         let slot_ms = packet_time_ms(slot.config(), 64, true).max(1);
 
@@ -214,7 +209,7 @@ pub async fn radio_task(
         }
         if let Some(park_at) = ota_park_at {
             if Instant::now() >= park_at {
-                if watchdog.is_some() {
+                if crate::watchdog_armed() {
                     crate::dfu::park_for_watchdog_reset();
                 } else {
                     crate::dfu::reset_into_ota_now();

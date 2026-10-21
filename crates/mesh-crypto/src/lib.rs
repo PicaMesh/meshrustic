@@ -9,6 +9,7 @@ mod channel_hash;
 mod hash;
 mod key;
 mod nonce;
+mod zeroize;
 
 #[cfg(feature = "pki")]
 mod aes_ccm;
@@ -23,9 +24,12 @@ pub use channel_hash::{
 pub use hash::sha256_in_place;
 pub use key::CryptoKey;
 pub use nonce::init_nonce;
+pub use zeroize::zeroize;
 
 pub use aes::{aes_ctr_crypt, aes_ecb_encrypt_block};
 
+#[cfg(feature = "pki")]
+pub use aes_ccm::MAX_CCM_PAYLOAD;
 #[cfg(feature = "pki")]
 pub use pki::CryptoEngine;
 

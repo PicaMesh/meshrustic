@@ -98,8 +98,10 @@ jobs:
         run: ./just clippy ${{ matrix.board }} --workspace --exclude nrf52840 --all-targets
       - if: ${{ !matrix.run_tests }}
         # Lint the shared crates for the firmware target too: the host build
-        # never compiles the no_std paths.
-        run: ./just clippy ${{ matrix.board }} --workspace --exclude rpi-app --all-targets
+        # never compiles the no_std paths. `--all-targets` is deliberately not
+        # used here: it builds the unit-test harness of every crate, and the
+        # firmware target has no `std` and no `test` crate.
+        run: ./just clippy ${{ matrix.board }} --workspace --exclude rpi-app --lib --bins
       - run: ./just fmt-check ${{ matrix.board }}
       - if: matrix.run_tests
         run: ./just test ${{ matrix.board }} --workspace --exclude nrf52840

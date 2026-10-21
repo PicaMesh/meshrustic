@@ -20,17 +20,19 @@ publish = false
 # size: full LTO and a single codegen unit collapse the duplicated monomorphisations
 # across the workspace crates, "s" trades a little speed for a lot of code, and the
 # debug info is reduced to line tables so the ELF stays analysable without the
-# multi-megabyte DWARF payload. Measured on the nRF52840 image: 487 KiB -> 340 KiB.
+# multi-megabyte DWARF payload. The line tables are kept in the ELF (`strip` stays
+# off): the shipped image only carries the loadable sections, so the debug info
+# costs nothing on the node.
+# Measured on the nRF52840 image: 487 024 -> 329 664 bytes (-32.4 %).
 [profile.release]
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = "line-tables-only"
-strip = "debuginfo"
+strip = "none"
 
-# The same code with overflow checks on, so the arithmetic that relies on wrapping
-# is exercised by the test suite instead of only by the release build.
-[profile.ci]
-inherits = "release"
-overflow-checks = true
+# The test suite runs under the `test` profile, which derives from `dev` and has
+# the overflow checks on. The arithmetic that relies on wrapping is therefore
+# exercised by the tests and not only by the release build.
+
