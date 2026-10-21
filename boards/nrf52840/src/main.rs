@@ -148,7 +148,17 @@ async fn main(spawner: Spawner) {
         unsafe { embassy_nrf::Peripheral::clone_unchecked(&p.P0_10) },
         Pull::None,
     );
-    let lora_pins = LoRaPins::power_on(p.P0_13, p.P0_09, p.P0_29, p.P0_10);
+    // A second handle on the busy and interrupt lines, so the driver can
+    // observe them. They are inputs that never drive the line.
+    let busy_probe = Input::new(
+        unsafe { embassy_nrf::Peripheral::clone_unchecked(&p.P0_29) },
+        Pull::None,
+    );
+    let dio1_probe = Input::new(
+        unsafe { embassy_nrf::Peripheral::clone_unchecked(&p.P0_10) },
+        Pull::None,
+    );
+    let lora_pins = LoRaPins::power_on(p.P0_13, p.P0_09, p.P0_29, p.P0_10, busy_probe, dio1_probe);
     let mut driver = create_radio(spim, cs, lora_pins, Sx1262ModuleProfile::default_board());
     let mut radio_config =
         eu868_config_for_preset(mesh_radio::normalize_modem_preset(config.lora.modem_preset));

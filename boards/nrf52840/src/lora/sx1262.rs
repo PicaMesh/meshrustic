@@ -41,9 +41,19 @@ pub struct Sx1262Driver {
     config: RadioConfig,
     chip: RadioChip,
     module_ready: bool,
+    busy: Input<'static>,
+    dio1: Input<'static>,
     rx_active_since: Option<embassy_time::Instant>,
     tx_deadline: Option<embassy_time::Instant>,
 }
+
+/// How long the chip may hold the busy line while a command is processed. The
+/// chip ignores commands until it is idle, so this bounds every wait.
+const BUSY_COMMAND_TIMEOUT_MS: u32 = 100;
+
+/// The longest a transmission may take before the chip is expected to be idle
+/// again. A stuck busy line is reported rather than waited on for ever.
+const BUSY_TX_TIMEOUT_MS: u32 = 30_000;
 
 impl Sx1262Driver {
     pub fn new(
@@ -51,6 +61,8 @@ impl Sx1262Driver {
         profile: Sx1262ModuleProfile,
         chip: RadioChip,
         module_ready: bool,
+        busy: Input<'static>,
+        dio1: Input<'static>,
     ) -> Self {
         Self {
             id,
@@ -58,9 +70,28 @@ impl Sx1262Driver {
             config: RadioConfig::eu868_default(),
             chip,
             module_ready,
+            busy,
+            dio1,
             rx_active_since: None,
             tx_deadline: None,
         }
+    }
+
+    /// Wait for the chip to become idle.
+    ///
+    /// The chip holds the busy line while it processes a command and for the
+    /// whole of a transmission. Waiting without a bound would hang the node for
+    /// ever if the line were stuck, so the wait always has a deadline.
+    fn wait_busy(&self, timeout_ms: u32) -> Result<(), RadioError> {
+        let deadline =
+            embassy_time::Instant::now() + embassy_time::Duration::from_millis(timeout_ms as u64);
+        while self.busy.is_high() {
+            if embassy_time::Instant::now() >= deadline {
+                return Err(RadioError::Timeout);
+            }
+            cortex_m::asm::nop();
+        }
+        Ok(())
     }
 
     fn irq_rx_active(irq: IrqStatus) -> bool {
@@ -275,7 +306,7 @@ impl Sx1262Driver {
         self.chip
             .set_rx(RxTxTimeout::continuous_rx())
             .map_err(|_| RadioError::Hardware)?;
-        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        self.wait_busy(BUSY_COMMAND_TIMEOUT_MS)?;
         let status = self.chip.get_status().map_err(|_| RadioError::Hardware)?;
         if status.chip_mode() != Some(ChipMode::RX) {
             self.log_set_rx_failure(status);
@@ -305,8 +336,7 @@ impl Sx1262Driver {
         let mut msg: heapless::String<160> = heapless::String::new();
         let _ = write!(msg, "set_rx failed: mode={} cmd={}", mode, cmd);
         let errs = self
-            .chip
-            .wait_on_busy()
+            .wait_busy(BUSY_COMMAND_TIMEOUT_MS)
             .ok()
             .and_then(|_| self.chip.get_device_errors().ok());
         match errs {
@@ -333,7 +363,7 @@ impl Sx1262Driver {
     }
 
     pub fn chip_stats(&mut self) -> Result<(u16, u16, u16), RadioError> {
-        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        self.wait_busy(BUSY_COMMAND_TIMEOUT_MS)?;
         let stats = self.chip.get_stats().map_err(|_| RadioError::Hardware)?;
         Ok((stats.rx_pkt, stats.crc_error, stats.header_error))
     }
@@ -377,7 +407,7 @@ impl Sx1262Driver {
     }
 
     pub fn log_chip_status(&mut self) -> Result<(), RadioError> {
-        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        self.wait_busy(BUSY_COMMAND_TIMEOUT_MS)?;
         let status = self.chip.get_status().map_err(|_| RadioError::Hardware)?;
         let (rx_pkt, crc, hdr) = self.chip_stats()?;
         let mode = Self::chip_mode_name(status.chip_mode());
@@ -434,7 +464,7 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn poll_recv(&mut self) -> Result<Option<RxFrame>, RadioError> {
-        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        self.wait_busy(BUSY_COMMAND_TIMEOUT_MS)?;
         let irq = self
             .chip
             .get_irq_status()
@@ -558,9 +588,9 @@ impl RadioInterface for Sx1262Driver {
             .chip
             .set_tx(RxTxTimeout::from_ms(timeout_ms))
             .map_err(|_| RadioError::TxOutcomeUnknown)?;
-        self.chip
-            .wait_on_busy()
-            .map_err(|_| RadioError::TxOutcomeUnknown)?;
+        // The chip is now busy for the whole airtime. Waiting for it here would
+        // block the executor for the length of the transmission, so the wait is
+        // left to the poll, which watches the interrupt line instead.
         defmt::trace!(
             "[Radio0] TX started mode={}",
             Self::chip_mode_name(tx_status.chip_mode())
@@ -569,8 +599,22 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn poll_tx(&mut self) -> Result<Option<TxStatus>, RadioError> {
-        self.chip
-            .wait_on_busy()
+        // The chip raises the interrupt line when the transmission ends. While
+        // the line is low there is nothing to read, and reading the chip would
+        // be pointless: it ignores commands while it is busy. Checking the line
+        // first keeps the radio loop from blocking the executor for the whole
+        // airtime.
+        if self.dio1.is_low() {
+            if self
+                .tx_deadline
+                .is_some_and(|deadline| embassy_time::Instant::now() >= deadline)
+            {
+                self.tx_deadline = None;
+                return Ok(Some(TxStatus::OutcomeUnknown));
+            }
+            return Ok(None);
+        }
+        self.wait_busy(BUSY_TX_TIMEOUT_MS)
             .map_err(|_| RadioError::TxOutcomeUnknown)?;
         let irq = match self.chip.get_irq_status() {
             Ok(irq) => irq,
@@ -612,7 +656,7 @@ impl RadioInterface for Sx1262Driver {
     }
 
     fn rx_in_progress(&mut self) -> Result<bool, RadioError> {
-        self.chip.wait_on_busy().map_err(|_| RadioError::Hardware)?;
+        self.wait_busy(BUSY_COMMAND_TIMEOUT_MS)?;
         let irq = self
             .chip
             .get_irq_status()
@@ -649,6 +693,8 @@ pub fn create_radio(
 ) -> Sx1262Driver {
     let module_ready = probe_module_ready(&mut pins);
     let spi_dev = ExclusiveDevice::new(spim, cs, embassy_time::Delay);
+    let busy = pins.busy_probe;
+    let dio1 = pins.dio1_probe;
     let chip = SX126x::new(spi_dev, (pins.reset, pins.busy, pins.ant_en, pins.dio1));
-    Sx1262Driver::new(0, profile, chip, module_ready)
+    Sx1262Driver::new(0, profile, chip, module_ready, busy, dio1)
 }
