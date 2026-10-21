@@ -2,7 +2,9 @@ use core::cell::RefCell;
 
 use embassy_time::Instant;
 
-const RING_SIZE: usize = 16384;
+/// The console buffer. It is a fixed chunk of the node's memory, so it is
+/// sized for a readable scrollback rather than for a full log.
+const RING_SIZE: usize = 8192;
 
 pub const MAX_LOG_LINE: usize = 640;
 

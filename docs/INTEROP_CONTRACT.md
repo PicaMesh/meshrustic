@@ -987,6 +987,15 @@ is actually waiting for.
 
 ## 7. Robustness
 
+- **The built-in admin authorities.** Two public keys are compiled into every node
+  (`BUILTIN_ADMIN_PUBLIC_KEYS`), and a peer holding the matching private key can
+  administer any node in the field: read the channel, replace the admin keys, change
+  the radio settings, reboot the node, or take it into the bootloader. The matching
+  private keys are not part of this repository. These authorities are **not**
+  withdrawable from a node that is already deployed — clearing the per-node admin
+  keys leaves them in place — so a node that must not answer them needs a firmware
+  build without them. The per-node admin keys, which *are* withdrawable, are the
+  ones to use for day-to-day administration.
 - Packet ids are a counter mixed with uptime, seeded at boot from the RNG peripheral
   (`Router::seed_tx_ids`), so no two boots or two nodes replay the same id sequence; stock
   draws random ids too. Our own-transmission record is keyed by id alone and topology receive
@@ -994,7 +1003,10 @@ is actually waiting for.
 
 - A panic or hard fault resets the chip (`main.rs` panic and HardFault handlers); flip-link
   places the stack below the statics so an overflow faults instead of corrupting them; a 30 s
-  hardware watchdog is fed from the radio loop and from the radio-init failure loop. The boot
+  hardware watchdog is fed from the radio loop and from the radio-init failure loop. The
+  watchdog peripheral belongs to the bootloader image on a deployed node, so the firmware
+  **adopts** the running configuration instead of reprogramming it — the timeout it then
+  runs with is the one the previous image left, and the boot log reports it. The boot
   log reports the reset reason. `just size nrf52840` prints sections, largest statics and
   largest stack frames; check it whenever a static or a frame grows.
 - Every USB log line is written through bounded helpers (`put`, `put_u32`, `put_hex8`, and

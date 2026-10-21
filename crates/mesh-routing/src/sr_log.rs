@@ -1,4 +1,7 @@
-pub const MAX_SR_LOG: usize = 64;
+/// How many routing events are buffered before the oldest is dropped. The
+/// buffer is drained into the console on every radio loop, so a small buffer
+/// is enough, and it lives in the task arena.
+pub const MAX_SR_LOG: usize = 32;
 pub const DOWNSTREAM_LOG_GROUP: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

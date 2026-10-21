@@ -1,3 +1,12 @@
+/// The authorities that every node accepts, whoever holds the matching private
+/// key.
+///
+/// They are compiled into the firmware, so they cannot be withdrawn from a node
+/// that is already deployed: clearing the per-node keys leaves them in place.
+/// The matching private keys are not part of this repository, and whoever holds
+/// them can administer every node in the field for as long as the firmware
+/// carries these constants. A node that must not answer them needs a firmware
+/// build without them.
 pub const BUILTIN_ADMIN_PUBLIC_KEYS: [[u8; 32]; 2] = [
     [
         0x9d, 0x37, 0xec, 0x73, 0x30, 0xca, 0x6e, 0xd0, 0x6d, 0x5b, 0xad, 0x4f, 0xa0, 0xa1, 0x9c,
