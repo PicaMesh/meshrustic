@@ -32,11 +32,17 @@ fn mesh_header_id_to(payload: &[u8]) -> Option<(u32, u32, u32)> {
     Some((id, to, from))
 }
 
-fn oldest_rx_ordinal(last: u32, queued: usize) -> Option<u32> {
-    if last == 0 || queued == 0 {
+/// How many received frames the transmission is held behind.
+///
+/// The absolute reception counter is useless as a diagnostic: it grows for the
+/// lifetime of the node, so a log line that carries it says nothing about
+/// whether the router is keeping up. The depth of the receive queue is what
+/// matters, and it is bounded by the size of the queue.
+fn rx_queue_depth(queued: usize) -> Option<u32> {
+    if queued == 0 {
         return None;
     }
-    Some(last.wrapping_sub(queued as u32 - 1))
+    Some(queued as u32)
 }
 
 pub struct RadioSlot<D, const RX: usize = DEFAULT_RX_QUEUE, const TX: usize = DEFAULT_TX_QUEUE> {
@@ -164,12 +170,10 @@ where
                     // Sending before the router processes RX can race the duplicate cancellation and put an
                     // unnecessary relay on air.
                     report.tx_deferred_rx_pending = true;
-                    report.held_behind_rx = oldest_rx_ordinal(self.rx_ordinal, self.rx_queue.len());
+                    report.held_behind_rx = rx_queue_depth(self.rx_queue.len());
                 } else if !may_tx {
                     report.tx_held = true;
-                    if self.rx_ordinal != 0 {
-                        report.held_behind_rx = Some(self.rx_ordinal);
-                    }
+                    report.held_behind_rx = rx_queue_depth(self.rx_queue.len());
                 } else if !air_time.is_tx_allowed_duty_cycle() {
                     report.duty_cycle_blocked = true;
                 } else if let Ok(tx) = self.tx_queue.pop() {
@@ -436,6 +440,7 @@ mod tests {
         assert_eq!(first.rx_ordinal, 1);
         assert_eq!(first.tx_id, Some(0xBB));
         assert!(first.tx_deferred_rx_pending);
+        // One received frame is waiting, so the transmission is held behind one.
         assert_eq!(first.held_behind_rx, Some(1));
         assert!(first.tx_len.is_none());
 
@@ -446,7 +451,9 @@ mod tests {
         assert_eq!(held.rx_ordinal, 1);
         assert!(held.tx_held);
         assert_eq!(held.tx_id, Some(0xBB));
-        assert_eq!(held.held_behind_rx, Some(1));
+        // Nothing is waiting in the receive queue: the hold comes from the
+        // channel access, so there is no reception to be behind.
+        assert_eq!(held.held_behind_rx, None);
         assert_eq!(slot.tx_queue_len(), 1);
     }
 

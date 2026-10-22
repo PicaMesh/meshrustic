@@ -1,7 +1,9 @@
 use crate::protobuf::{read_varint, skip_field};
 use mesh_protocol::portnum::num;
 
-use crate::telemetry::{decode_device_metrics, extract_device_metrics, TELEMETRY_APP};
+use crate::telemetry::{
+    decode_device_metrics, extract_device_metrics, telemetry_without_device_metrics, TELEMETRY_APP,
+};
 use crate::topology::{extract_packed_neighbors, SIGNAL_ROUTING_APP};
 use crate::traceroute::{decode_route_discovery, TRACEROUTE_APP};
 
@@ -47,6 +49,11 @@ pub enum RxPayloadSummary {
     DeviceTelemetry {
         battery_level: u32,
         voltage_mv: u32,
+    },
+    /// A telemetry frame that carries no device metrics: the node sent one of
+    /// the other telemetry sub-messages, so it has no battery level to report.
+    TelemetryWithoutMetrics {
+        len: u16,
     },
     Raw {
         portnum: u32,
@@ -107,11 +114,18 @@ pub fn summarize_decrypted(portnum: u32, payload: &[u8]) -> RxPayloadSummary {
             hex: hex_preview(payload),
             hex_len: payload.len().min(RX_HEX_PREVIEW) as u8,
         }),
-        TELEMETRY_APP => decode_device_telemetry(payload).unwrap_or(RxPayloadSummary::Raw {
-            portnum,
-            len: payload.len().min(u16::MAX as usize) as u16,
-            hex: hex_preview(payload),
-            hex_len: payload.len().min(RX_HEX_PREVIEW) as u8,
+        TELEMETRY_APP => decode_device_telemetry(payload).unwrap_or_else(|| {
+            if telemetry_without_device_metrics(payload) {
+                return RxPayloadSummary::TelemetryWithoutMetrics {
+                    len: payload.len().min(u16::MAX as usize) as u16,
+                };
+            }
+            RxPayloadSummary::Raw {
+                portnum,
+                len: payload.len().min(u16::MAX as usize) as u16,
+                hex: hex_preview(payload),
+                hex_len: payload.len().min(RX_HEX_PREVIEW) as u8,
+            }
         }),
         SIGNAL_ROUTING_APP => {
             if let Some((hdr, neighbors)) = extract_packed_neighbors(payload) {
@@ -324,6 +338,47 @@ mod tests {
         match summarize_decrypted(num::ROUTING_APP, &payload) {
             RxPayloadSummary::Routing { error_reason } => assert_eq!(error_reason, 3),
             _ => panic!("expected routing"),
+        }
+    }
+
+    /// A telemetry frame that carries one of the other telemetry sub-messages
+    /// has no device metrics, and therefore no battery level. The log has to
+    /// say that, instead of dumping the payload as if it were unreadable.
+    #[test]
+    fn a_telemetry_without_device_metrics_is_not_raw() {
+        // The shape taken by the frames in the field: the time in field 1 and
+        // another sub-message in field 6.
+        let mut payload = heapless::Vec::<u8, 32>::new();
+        payload.push((1 << 3) | 5).unwrap();
+        payload
+            .extend_from_slice(&0x6ad99712u32.to_le_bytes())
+            .unwrap();
+        payload.push((6 << 3) | 2).unwrap();
+        payload.push(2).unwrap();
+        payload.extend_from_slice(&[0x08, 0x01]).unwrap();
+        match summarize_decrypted(TELEMETRY_APP, &payload) {
+            RxPayloadSummary::TelemetryWithoutMetrics { len } => assert_eq!(len, 9),
+            other => panic!("expected no device metrics, got {other:?}"),
+        }
+    }
+
+    /// A telemetry frame that does carry the device metrics is still decoded.
+    #[test]
+    fn a_telemetry_with_device_metrics_is_decoded() {
+        let mut payload = heapless::Vec::<u8, 32>::new();
+        payload.push((1 << 3) | 5).unwrap();
+        payload
+            .extend_from_slice(&0x6ad99712u32.to_le_bytes())
+            .unwrap();
+        payload.push((2 << 3) | 2).unwrap();
+        payload.push(2).unwrap();
+        payload.push(8).unwrap(); // battery level
+        payload.push(97).unwrap();
+        match summarize_decrypted(TELEMETRY_APP, &payload) {
+            RxPayloadSummary::DeviceTelemetry { battery_level, .. } => {
+                assert_eq!(battery_level, 97)
+            }
+            other => panic!("expected device telemetry, got {other:?}"),
         }
     }
 

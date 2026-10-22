@@ -153,6 +153,14 @@ is actually waiting for.
   stored config is invalidated by its introduction. Tests:
   `default_interval_is_twenty_minutes`, `zero_means_default_not_disable`,
   `set_interval_and_persist_reload`, `below_airtime_floor_is_rejected`.
+- **A telemetry frame without device metrics carries no battery level, and that is not a
+  fault.** The public schema puts the device metrics in field 2 of the telemetry message
+  and the other telemetry sub-messages — the local stats, the health, the air quality —
+  in the fields around it. A node that sends only those has no battery level to report.
+  The log distinguishes the two cases: a frame that carries no device metrics is printed
+  as `noDeviceMetrics`, and only a frame that cannot be read at all is dumped as hex.
+  Without that distinction "this node reports no battery" and "this payload is garbage"
+  look the same, and only the first is an answer to the question.
 - **The battery level in the telemetry is the level of the cell, not of the divider.** The
   converter measures the *difference* between the sense pin and its reference, so the pin
   voltage is the reference **plus** the measured difference, and the battery voltage is that
@@ -166,6 +174,7 @@ is actually waiting for.
   (`MAGIC_USB_BATTERY_LEVEL`), as stock does. Tests:
   `the_reference_offset_is_part_of_the_voltage`, `a_reading_reaches_the_air_as_a_battery_level`,
   `a_negative_count_is_not_plausible`, `a_count_below_the_reference_reads_as_no_battery`.
+
 - **Next hop.** A relayed unicast carries the next hop from our own route or zero, never the
   byte inherited from the incoming frame (`relay_header_with_next_hop_opts`). Zero means "any
   relay may carry it", stock's `NO_NEXT_HOP_PREFERENCE`.

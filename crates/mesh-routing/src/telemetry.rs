@@ -230,6 +230,40 @@ pub fn decode_device_metrics(payload: &[u8]) -> Option<DecodedDeviceMetrics> {
     Some(out)
 }
 
+/// Whether the payload is a telemetry frame that carries no device metrics.
+///
+/// The public schema puts the device metrics in field 2 and the other
+/// telemetry sub-messages — the local stats, the health, the air quality — in
+/// the fields around it. A node that sends only those has no battery level to
+/// report, and that is not a fault. The log has to be able to say so, because
+/// "this node sent no battery level" and "this payload cannot be read" look
+/// the same otherwise, and the first is the answer to "why does this node not
+/// report a battery".
+pub fn telemetry_without_device_metrics(payload: &[u8]) -> bool {
+    let mut i = 0usize;
+    let mut has_time = false;
+    while i < payload.len() {
+        let Some((tag, next)) = crate::protobuf::read_varint(payload, i) else {
+            return false;
+        };
+        if tag >> 3 == 0 {
+            return false;
+        }
+        if tag == (2 << 3) | 2 {
+            // It does carry the device metrics.
+            return false;
+        }
+        if tag >> 3 == 1 {
+            has_time = true;
+        }
+        let Some(end) = crate::protobuf::skip_field(payload, next, (tag & 7) as u8) else {
+            return false;
+        };
+        i = end;
+    }
+    has_time
+}
+
 pub fn extract_device_metrics(payload: &[u8]) -> Option<&[u8]> {
     let mut i = 0;
     let mut metrics = None;

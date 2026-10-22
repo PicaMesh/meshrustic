@@ -815,6 +815,13 @@ pub mod radio {
                 append_slice(&mut line, &mut pos, b" mV=");
                 append_u32(&mut line, &mut pos, voltage_mv);
             }
+            RxPayloadSummary::TelemetryWithoutMetrics { len } => {
+                // The node sent one of the other telemetry sub-messages, so it
+                // has no battery level to report. Saying so is what tells
+                // "no battery" apart from "unreadable payload".
+                append_slice(&mut line, &mut pos, b" Portnum=67 noDeviceMetrics len=");
+                append_u32(&mut line, &mut pos, len as u32);
+            }
             RxPayloadSummary::Raw {
                 portnum,
                 len,
