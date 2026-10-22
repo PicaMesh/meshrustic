@@ -125,11 +125,11 @@ pub use sr_log::{
 };
 pub use sr_role::{role_is_active_routing, role_is_mute, role_is_passive};
 pub use telemetry::{
-    battery_level_from_mv, build_device_telemetry_wire_frame, decode_device_metrics,
-    device_telemetry_interval_ms, extract_device_metrics, interpret_battery_reading,
-    is_plausible_battery_reading, min_device_update_interval_secs, DecodedDeviceMetrics,
-    DeviceMetricsSnapshot, DEFAULT_DEVICE_UPDATE_INTERVAL_SECS, DEVICE_TELEMETRY_BROADCAST_MS,
-    MAGIC_USB_BATTERY_LEVEL, TELEMETRY_APP,
+    battery_level_from_mv, battery_voltage_mv, build_device_telemetry_wire_frame,
+    decode_device_metrics, device_telemetry_interval_ms, extract_device_metrics,
+    interpret_battery_reading, is_plausible_battery_reading, min_device_update_interval_secs,
+    DecodedDeviceMetrics, DeviceMetricsSnapshot, DEFAULT_DEVICE_UPDATE_INTERVAL_SECS,
+    DEVICE_TELEMETRY_BROADCAST_MS, MAGIC_USB_BATTERY_LEVEL, TELEMETRY_APP,
 };
 pub use topology::{
     build_app_wire_frame, build_topology_wire_frame, decode_data_payload, decode_data_payload_full,

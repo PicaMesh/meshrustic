@@ -908,9 +908,9 @@ pub mod airtime {
 }
 
 pub mod battery {
-    use super::{finish_line, line_prefix, put, put_u32};
+    use super::{finish_line, line_prefix, put, put_i32, put_u32};
 
-    pub fn reading(voltage_mv: u32, battery_level: u32, raw_adc: u32) {
+    pub fn reading(voltage_mv: u32, battery_level: u32, raw_adc: i32) {
         let mut line = [0u8; 96];
         let mut pos = line_prefix(&mut line);
         let prefix = b"[Battery] ";
@@ -921,7 +921,7 @@ pub mod battery {
         put_u32(&mut line, &mut pos, battery_level);
         let raw = b" raw=";
         put(&mut line, &mut pos, raw);
-        put_u32(&mut line, &mut pos, raw_adc);
+        put_i32(&mut line, &mut pos, raw_adc);
         finish_line(&mut line, pos);
     }
 }

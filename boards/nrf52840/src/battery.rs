@@ -5,9 +5,15 @@ use embassy_nrf::saadc::Saadc;
 use embassy_time::{Duration, Timer};
 use mesh_routing::interpret_battery_reading;
 
-pub const ADC_MULTIPLIER: f32 = 2.0;
-pub const AREF_VOLTAGE: f32 = 3.6;
-pub const BATTERY_SENSE_BITS: u32 = 12;
+/// The internal reference of the nRF52840 analog converter. The converter
+/// measures the difference between the input pin and this reference, so the
+/// pin voltage is the reference plus the measured difference.
+pub const SAADC_REFERENCE_MV: i32 = 600;
+/// The configured gain spans six times the reference, and the twelve-bit
+/// result maps that range onto 4096 counts.
+pub const SAADC_MV_PER_COUNT: f32 = 6.0 * 600.0 / 4096.0;
+/// The board divides the battery in half before the sense pin.
+pub const BATTERY_DIVIDER: f32 = 2.0;
 pub const BATTERY_SENSE_SAMPLES: u32 = 15;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15,7 +21,9 @@ pub struct BatteryReading {
     pub voltage_mv: u32,
     pub battery_level: u32,
     pub valid: bool,
-    pub raw_adc: u32,
+    /// The converter count the reading came from. It is signed: a pin below
+    /// the reference reads negative.
+    pub raw_adc: i32,
     pub usb_powered: bool,
 }
 
@@ -54,15 +62,22 @@ pub async fn battery_task(mut saadc: Saadc<'static, 1>) {
 }
 
 async fn sample_battery(saadc: &mut Saadc<'static, 1>) -> BatteryReading {
-    let mut sum = 0u32;
+    let mut sum: i32 = 0;
     for _ in 0..BATTERY_SENSE_SAMPLES {
         let mut buf = [0i16; 1];
         saadc.sample(&mut buf).await;
-        sum += buf[0].max(0) as u32;
+        // The converter is signed: a pin below the reference reads negative.
+        // Clamping the sign away would throw the reading out and would bias
+        // the average of the samples that surround it.
+        sum += i32::from(buf[0]);
     }
-    let raw_avg = sum / BATTERY_SENSE_SAMPLES;
-    let mv_per_lsb = ADC_MULTIPLIER * (1000.0 * AREF_VOLTAGE / (1u32 << BATTERY_SENSE_BITS) as f32);
-    let measured_mv = (mv_per_lsb * raw_avg as f32) as u32;
+    let raw_avg = sum / BATTERY_SENSE_SAMPLES as i32;
+    let measured_mv = mesh_routing::battery_voltage_mv(
+        raw_avg,
+        SAADC_REFERENCE_MV,
+        SAADC_MV_PER_COUNT,
+        BATTERY_DIVIDER,
+    );
     let usb = crate::usb_log::is_usb_powered();
     let (voltage_mv, battery_level, valid) = interpret_battery_reading(measured_mv, raw_avg, usb);
     BatteryReading {

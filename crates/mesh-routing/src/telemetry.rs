@@ -11,7 +11,9 @@ pub const DEVICE_TELEMETRY_BROADCAST_MS: u32 = DEFAULT_DEVICE_UPDATE_INTERVAL_SE
 pub const MAGIC_USB_BATTERY_LEVEL: u32 = 101;
 pub const MIN_BATTERY_MV: u32 = 2500;
 pub const MAX_BATTERY_MV: u32 = 4350;
-pub const ADC_SATURATED_RAW: u32 = 3950;
+/// The count at which the converter saturates. A count at or above it means
+/// the input was outside the measurable range and the reading means nothing.
+pub const ADC_SATURATED_RAW: i32 = 3950;
 
 pub fn device_telemetry_interval_ms(stored_secs: u32) -> u32 {
     let secs = if stored_secs == 0 {
@@ -138,13 +140,31 @@ pub fn battery_level_from_mv(voltage_mv: u32) -> u32 {
     }
 }
 
-pub fn is_plausible_battery_reading(voltage_mv: u32, raw_adc: u32) -> bool {
-    raw_adc < ADC_SATURATED_RAW && (MIN_BATTERY_MV..=MAX_BATTERY_MV).contains(&voltage_mv)
+/// The battery voltage a sense network reports for a converter count.
+///
+/// The converter measures the **difference** between the input pin and its
+/// reference, so the pin voltage is the reference *plus* the measured
+/// difference, and the battery voltage is the pin voltage times the divider
+/// of the sense network.
+///
+/// Leaving the reference out loses twice the reference in the reported
+/// voltage: a converter that reports a 1.5 V difference for a pin that sits
+/// on 2.1 V reports 1.5 V for a battery that is really at 4.2 V. The error
+/// grows as the battery empties, and a reading that falls out of the
+/// plausible window is thrown away instead of being reported — which is how
+/// a node ends up sending telemetry with no battery level in it at all.
+pub fn battery_voltage_mv(count: i32, reference_mv: i32, mv_per_count: f32, divider: f32) -> u32 {
+    let pin_mv = reference_mv as f32 + count as f32 * mv_per_count;
+    (pin_mv * divider).max(0.0) as u32
+}
+
+pub fn is_plausible_battery_reading(voltage_mv: u32, raw_adc: i32) -> bool {
+    raw_adc.abs() < ADC_SATURATED_RAW && (MIN_BATTERY_MV..=MAX_BATTERY_MV).contains(&voltage_mv)
 }
 
 pub fn interpret_battery_reading(
     voltage_mv: u32,
-    raw_adc: u32,
+    raw_adc: i32,
     usb_powered: bool,
 ) -> (u32, u32, bool) {
     if is_plausible_battery_reading(voltage_mv, raw_adc) {
@@ -270,6 +290,65 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_count_is_not_plausible() {
+        // A pin below the reference reads negative, and the voltage it stands
+        // for is below the reference as well: there is no battery there.
+        let mv = battery_voltage_mv(-12, 600, 6.0 * 600.0 / 4096.0, 2.0);
+        assert!(mv < MIN_BATTERY_MV);
+        assert!(!is_plausible_battery_reading(mv, -12));
+    }
+
+    /// The converter measures the difference between the pin and its
+    /// reference, so the reference has to be added back before the divider is
+    /// applied. Leaving it out loses twice the reference in the reported
+    /// voltage, and a reading that falls out of the plausible window is
+    /// thrown away: that is how a node ends up with no battery level in its
+    /// telemetry at all.
+    #[test]
+    fn the_reference_offset_is_part_of_the_voltage() {
+        // The nRF52840 numbers: a 600 mV internal reference, a gain that
+        // spans six times the reference over 4096 counts, and a divider of two.
+        const REFERENCE_MV: i32 = 600;
+        const MV_PER_COUNT: f32 = 6.0 * 600.0 / 4096.0;
+        const DIVIDER: f32 = 2.0;
+
+        // A full cell: 4.2 V at the battery, 2.1 V at the pin, 1.5 V above
+        // the reference.
+        let count = ((2100 - 600) as f32 / MV_PER_COUNT) as i32;
+        let mv = battery_voltage_mv(count, REFERENCE_MV, MV_PER_COUNT, DIVIDER);
+        assert!(
+            (4190..=4210).contains(&mv),
+            "a full cell must read about 4200 mV, got {mv}"
+        );
+        let (reported, level, valid) = interpret_battery_reading(mv, count, false);
+        assert!(valid);
+        assert_eq!(reported, mv);
+        assert_eq!(level, 100);
+
+        // A cell that has run down: 3.5 V at the battery. Without the
+        // reference the reading would be 2.3 V, which is outside the
+        // plausible window, and the node would report no battery level.
+        let count = ((1750 - 600) as f32 / MV_PER_COUNT) as i32;
+        let mv = battery_voltage_mv(count, REFERENCE_MV, MV_PER_COUNT, DIVIDER);
+        assert!(
+            (3490..=3510).contains(&mv),
+            "a half-empty cell must read about 3500 mV, got {mv}"
+        );
+        let (reported, level, valid) = interpret_battery_reading(mv, count, false);
+        assert!(valid, "a half-empty cell must still report a level");
+        assert_eq!(reported, mv);
+        assert!(level > 30 && level < 45, "level was {level}");
+    }
+
+    #[test]
+    fn a_count_below_the_reference_reads_as_no_battery() {
+        // A disconnected or flat battery pulls the pin below the reference.
+        let mv = battery_voltage_mv(-100, 600, 6.0 * 600.0 / 4096.0, 2.0);
+        let (_, _, valid) = interpret_battery_reading(mv, -100, false);
+        assert!(!valid);
+    }
+
+    #[test]
     fn device_telemetry_interval_zero_is_default() {
         assert_eq!(
             device_telemetry_interval_ms(0),
@@ -326,6 +405,62 @@ mod tests {
         assert!((decoded.channel_utilization.unwrap() - 12.5).abs() < 0.001);
         assert!((decoded.air_util_tx.unwrap() - 4.0).abs() < 0.001);
         assert_eq!(decoded.uptime_seconds, Some(3600));
+    }
+
+    /// The whole chain: a converter count becomes a battery voltage, the
+    /// voltage becomes a level, and the level reaches the air in the
+    /// telemetry frame. A node whose battery has run down must still be
+    /// reported — that is the case that used to be thrown away.
+    #[test]
+    fn a_reading_reaches_the_air_as_a_battery_level() {
+        const REFERENCE_MV: i32 = 600;
+        const MV_PER_COUNT: f32 = 6.0 * 600.0 / 4096.0;
+        const DIVIDER: f32 = 2.0;
+
+        // A cell at 3.7 V: the pin sits on 1.85 V, 1.25 V above the reference.
+        let count = ((1850 - 600) as f32 / MV_PER_COUNT) as i32;
+        let mv = battery_voltage_mv(count, REFERENCE_MV, MV_PER_COUNT, DIVIDER);
+        let (_, level, valid) = interpret_battery_reading(mv, count, false);
+        assert!(valid, "a cell at 3.7 V must be reported");
+        assert!(
+            level > 50 && level < 60,
+            "3.7 V is about half a cell, got {level}"
+        );
+
+        let key = CryptoKey::from_bytes(&DEFAULT_PSK);
+        let channel_hash = primary_channel_hash("", MODEM_SHORT_SLOW, true, &DEFAULT_PSK);
+        let metrics = DeviceMetricsSnapshot {
+            battery_level: Some(level),
+            voltage_v: Some(mv as f32 / 1000.0),
+            channel_utilization: 0.0,
+            air_util_tx: 0.0,
+            uptime_seconds: 600,
+        };
+        let (len, frame) = build_device_telemetry_wire_frame(
+            0x677a_1caf,
+            89,
+            channel_hash,
+            3,
+            &key,
+            &metrics,
+            false,
+        )
+        .unwrap();
+        let mut cipher = frame[mesh_protocol::PACKET_HEADER_LEN..len as usize].to_vec();
+        let (portnum, payload) = crate::topology::try_decrypt_data(
+            &key,
+            0x677a_1caf,
+            89,
+            channel_hash,
+            channel_hash,
+            &mut cipher,
+        )
+        .unwrap();
+        assert_eq!(portnum, TELEMETRY_APP);
+        let nested = extract_device_metrics(&payload).expect("nested metrics");
+        let decoded = decode_device_metrics(nested).unwrap();
+        assert_eq!(decoded.battery_level, Some(level));
+        assert!((decoded.voltage_v.unwrap() - mv as f32 / 1000.0).abs() < 0.001);
     }
 
     #[test]
