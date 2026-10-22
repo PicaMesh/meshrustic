@@ -10,6 +10,16 @@ pub const DEFAULT_DEVICE_UPDATE_INTERVAL_SECS: u32 = 1_200;
 pub const DEVICE_TELEMETRY_BROADCAST_MS: u32 = DEFAULT_DEVICE_UPDATE_INTERVAL_SECS * 1_000;
 pub const MAGIC_USB_BATTERY_LEVEL: u32 = 101;
 pub const MIN_BATTERY_MV: u32 = 2500;
+/// The highest battery voltage that is still believable.
+///
+/// A cell that is not on charge cannot be above its charge cutoff, so 4.35 V is
+/// the ceiling of a real reading. The bound rejects a broken one: a
+/// disconnected battery reads zero, a saturated converter reads about 7.2 V, and
+/// a board with a different sense network reads 5 V and more.
+///
+/// It is deliberately tight, because a reading that is *just* above it is
+/// usually a board with the wrong sense network rather than a cell that is
+/// somehow fuller than the chemistry allows.
 pub const MAX_BATTERY_MV: u32 = 4350;
 /// The count at which the converter saturates. A count at or above it means
 /// the input was outside the measurable range and the reading means nothing.
@@ -167,11 +177,17 @@ pub fn interpret_battery_reading(
     raw_adc: i32,
     usb_powered: bool,
 ) -> (u32, u32, bool) {
-    if is_plausible_battery_reading(voltage_mv, raw_adc) {
-        return (voltage_mv, battery_level_from_mv(voltage_mv), true);
-    }
+    // A node that runs from the USB reads the battery **rail**, not a cell: the
+    // charger holds the rail at the mains voltage whether or not a cell is
+    // fitted, so the reading is the rail and says nothing about the state of
+    // charge. A board with no battery at all would otherwise report a full
+    // cell — 4.2 V of rail read as a 100 % cell, which is what the field logs
+    // show. The USB magic says exactly what is true: the node is on mains.
     if usb_powered {
         return (0, MAGIC_USB_BATTERY_LEVEL, true);
+    }
+    if is_plausible_battery_reading(voltage_mv, raw_adc) {
+        return (voltage_mv, battery_level_from_mv(voltage_mv), true);
     }
     (0, 0, false)
 }
@@ -323,6 +339,17 @@ mod tests {
         assert!(!is_plausible_battery_reading(4200, 4000));
     }
 
+    /// A broken reading is still rejected.
+    #[test]
+    fn a_broken_reading_is_rejected() {
+        // A disconnected battery, a saturated converter and a board with a
+        // different sense network.
+        assert!(!is_plausible_battery_reading(0, 0));
+        assert!(!is_plausible_battery_reading(7200, 4095));
+        assert!(!is_plausible_battery_reading(5109, 2906));
+        assert!(!is_plausible_battery_reading(12748, 7254));
+    }
+
     #[test]
     fn a_negative_count_is_not_plausible() {
         // A pin below the reference reads negative, and the voltage it stands
@@ -412,6 +439,32 @@ mod tests {
         assert_eq!(mv, 0);
         assert_eq!(level, MAGIC_USB_BATTERY_LEVEL);
         assert!(valid);
+    }
+
+    /// A node that runs from the USB reads the battery *rail*, not a cell.
+    ///
+    /// The charger holds the rail at the mains voltage whether or not a cell is
+    /// fitted, so a board with no battery reads about 4.2 V of rail. Reporting
+    /// that as a cell voltage claims a full battery for a node that has none —
+    /// the field logs show 91 % … 100 % on a board with no battery at all.
+    #[test]
+    fn a_node_on_usb_reports_the_usb_magic_even_when_the_reading_looks_like_a_cell() {
+        // The readings the field logs show on the USB-powered board.
+        for (mv, raw) in [(4158u32, 2366i32), (4245, 2415), (4380, 2491)] {
+            let (reported, level, valid) = interpret_battery_reading(mv, raw, true);
+            assert!(valid);
+            assert_eq!(reported, 0, "the rail voltage is not a cell voltage");
+            assert_eq!(level, MAGIC_USB_BATTERY_LEVEL);
+        }
+    }
+
+    /// A node that runs from its cell reports the level of the cell.
+    #[test]
+    fn a_node_on_its_cell_reports_the_level() {
+        let (mv, level, valid) = interpret_battery_reading(3700, 2104, false);
+        assert!(valid);
+        assert_eq!(mv, 3700);
+        assert_eq!(level, 55);
     }
 
     #[test]

@@ -161,19 +161,29 @@ is actually waiting for.
   as `noDeviceMetrics`, and only a frame that cannot be read at all is dumped as hex.
   Without that distinction "this node reports no battery" and "this payload is garbage"
   look the same, and only the first is an answer to the question.
-- **The battery level in the telemetry is the level of the cell, not of the divider.** The
-  converter measures the *difference* between the sense pin and its reference, so the pin
-  voltage is the reference **plus** the measured difference, and the battery voltage is that
-  pin voltage times the divider of the sense network (`battery_voltage_mv`). Leaving the
-  reference out loses twice the reference in the reported voltage, and the error grows as
-  the cell empties: a reading that falls out of the plausible window is thrown away instead
-  of being reported, and the node sends telemetry with **no battery level in it at all**.
-  The count is signed, because a pin below the reference reads negative, and the sign is
-  kept: clamping it away would throw the reading out and would bias the average of the
-  samples around it. A node that is on USB but has no readable cell reports `101`
-  (`MAGIC_USB_BATTERY_LEVEL`), as stock does. Tests:
+- **A node that runs from the USB reports `101`, not a battery level.** The sense input
+  reads the battery **rail**, and the charger holds the rail at the mains voltage
+  whether or not a cell is fitted, so on a board with no battery the reading is the
+  rail and says nothing about the state of charge. Reporting it as a cell voltage
+  claims a full battery for a node that has none — the field logs show 91 % … 100 % on
+  exactly such a board. The USB check therefore comes first: such a node reports `101`
+  (`MAGIC_USB_BATTERY_LEVEL`), the magic the public format uses for "on mains".
+- **Otherwise the battery level in the telemetry is the level of the cell, not of the
+  divider.** The converter measures the *difference* between the sense pin and its
+  reference, so the pin voltage is the reference **plus** the measured difference, and the
+  battery voltage is that pin voltage times the divider of the sense network
+  (`battery_voltage_mv`). Leaving the reference out loses twice the reference in the
+  reported voltage, and the error grows as the cell empties: a reading that falls out of
+  the plausible window (2.5 V … 4.35 V) is thrown away instead of being reported, and the
+  node sends telemetry with **no battery level in it at all**. The count is signed, because
+  a pin below the reference reads negative, and the sign is kept: clamping it away would
+  throw the reading out and would bias the average of the samples around it. A cell that
+  is not on charge cannot be above its cutoff, so a reading above that is a board with the
+  wrong sense network rather than a fuller cell. The scale belongs to the board, not to the
+  protocol. Tests:
   `the_reference_offset_is_part_of_the_voltage`, `a_reading_reaches_the_air_as_a_battery_level`,
-  `a_negative_count_is_not_plausible`, `a_count_below_the_reference_reads_as_no_battery`.
+  `a_negative_count_is_not_plausible`, `a_count_below_the_reference_reads_as_no_battery`,
+  `a_node_on_usb_reports_the_usb_magic_even_when_the_reading_looks_like_a_cell`.
 
 - **Next hop.** A relayed unicast carries the next hop from our own route or zero, never the
   byte inherited from the incoming frame (`relay_header_with_next_hop_opts`). Zero means "any
