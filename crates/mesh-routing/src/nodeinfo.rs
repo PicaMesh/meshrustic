@@ -146,6 +146,31 @@ impl NodeInfoIdentity {
         Self { advert, public_key }
     }
 
+    /// Build identity from flash: empty stored lengths keep the synthesized
+    /// `"MeshRustic xxxx"` / `"MRyy"` defaults; otherwise copy truncated names.
+    pub fn from_node_config(cfg: &mesh_store::NodeConfig) -> Self {
+        if cfg.short_name_len == 0 && cfg.long_name_len == 0 {
+            return Self::for_node(cfg.node_num, cfg.public_key);
+        }
+        let mut advert = NodeInfoAdvert::empty();
+        advert.hw_model = HW_MODEL_NRF52_PROMICRO_DIY;
+        advert.role = DEVICE_ROLE_CLIENT;
+        let short_len = (cfg.short_name_len as usize)
+            .min(mesh_store::OWNER_SHORT_NAME_MAX)
+            .min(NODEINFO_SHORT_NAME_MAX);
+        advert.short_name[..short_len].copy_from_slice(&cfg.short_name[..short_len]);
+        advert.short_name_len = short_len as u8;
+        let long_len = (cfg.long_name_len as usize)
+            .min(mesh_store::OWNER_LONG_NAME_MAX)
+            .min(NODEINFO_LONG_NAME_MAX);
+        advert.long_name[..long_len].copy_from_slice(&cfg.long_name[..long_len]);
+        advert.long_name_len = long_len as u8;
+        Self {
+            advert,
+            public_key: cfg.public_key,
+        }
+    }
+
     pub fn with_default_advert(public_key: [u8; 32]) -> Self {
         Self::for_node(0, public_key)
     }
@@ -536,6 +561,32 @@ mod tests {
             &identity.advert.short_name[..identity.advert.short_name_len as usize],
             b"MRaf"
         );
+    }
+
+    #[test]
+    fn from_node_config_empty_uses_defaults_custom_uses_stored() {
+        let empty = mesh_store::NodeConfig::first_boot(0x677a_1caf, [0; 32], TEST_PUBKEY);
+        let from_empty = NodeInfoIdentity::from_node_config(&empty);
+        assert_eq!(
+            &from_empty.advert.short_name[..from_empty.advert.short_name_len as usize],
+            b"MRaf"
+        );
+
+        let mut custom = empty;
+        custom.short_name[..2].copy_from_slice(b"XY");
+        custom.short_name_len = 2;
+        custom.long_name[..5].copy_from_slice(b"Cabin");
+        custom.long_name_len = 5;
+        let from_custom = NodeInfoIdentity::from_node_config(&custom);
+        assert_eq!(
+            &from_custom.advert.short_name[..from_custom.advert.short_name_len as usize],
+            b"XY"
+        );
+        assert_eq!(
+            &from_custom.advert.long_name[..from_custom.advert.long_name_len as usize],
+            b"Cabin"
+        );
+        assert_eq!(from_custom.public_key, TEST_PUBKEY);
     }
 
     #[test]

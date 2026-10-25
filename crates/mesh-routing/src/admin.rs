@@ -1,5 +1,8 @@
 use mesh_crypto::sha256_in_place;
-use mesh_store::{NodeConfig, ADMIN_KEY_SLOTS, BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_ADMIN_KEY};
+use mesh_store::{
+    NodeConfig, ADMIN_KEY_SLOTS, BUILTIN_ADMIN_PUBLIC_KEYS, EMPTY_ADMIN_KEY, OWNER_LONG_NAME_MAX,
+    OWNER_SHORT_NAME_MAX,
+};
 
 use crate::admin_codec::{
     decode_admin_message, encode_admin_message, AdminMessage, AdminPayload, ConfigPayload,
@@ -55,6 +58,10 @@ pub struct AdminState {
     pub latitude_i: i32,
     pub longitude_i: i32,
     pub has_fixed_coords: bool,
+    pub short_name: [u8; OWNER_SHORT_NAME_MAX],
+    pub short_name_len: u8,
+    pub long_name: [u8; OWNER_LONG_NAME_MAX],
+    pub long_name_len: u8,
     pub pending_reboot_seconds: Option<i32>,
     pub config_dirty: bool,
     #[cfg(any(test, feature = "std"))]
@@ -95,6 +102,10 @@ impl AdminState {
             latitude_i: 0,
             longitude_i: 0,
             has_fixed_coords: false,
+            short_name: [0; OWNER_SHORT_NAME_MAX],
+            short_name_len: 0,
+            long_name: [0; OWNER_LONG_NAME_MAX],
+            long_name_len: 0,
             pending_reboot_seconds: None,
             config_dirty: false,
             #[cfg(any(test, feature = "std"))]
@@ -126,6 +137,10 @@ impl AdminState {
         self.latitude_i = cfg.latitude_i;
         self.longitude_i = cfg.longitude_i;
         self.has_fixed_coords = cfg.has_fixed_coords;
+        self.short_name = cfg.short_name;
+        self.short_name_len = cfg.short_name_len.min(OWNER_SHORT_NAME_MAX as u8);
+        self.long_name = cfg.long_name;
+        self.long_name_len = cfg.long_name_len.min(OWNER_LONG_NAME_MAX as u8);
     }
 
     pub fn export_to_node_config(&self, cfg: &mut NodeConfig) {
@@ -144,6 +159,30 @@ impl AdminState {
         cfg.latitude_i = self.latitude_i;
         cfg.longitude_i = self.longitude_i;
         cfg.has_fixed_coords = self.has_fixed_coords;
+        let short_len = (self.short_name_len as usize).min(OWNER_SHORT_NAME_MAX);
+        cfg.short_name = [0; OWNER_SHORT_NAME_MAX];
+        cfg.short_name[..short_len].copy_from_slice(&self.short_name[..short_len]);
+        cfg.short_name_len = short_len as u8;
+        let long_len = (self.long_name_len as usize).min(OWNER_LONG_NAME_MAX);
+        cfg.long_name = [0; OWNER_LONG_NAME_MAX];
+        cfg.long_name[..long_len].copy_from_slice(&self.long_name[..long_len]);
+        cfg.long_name_len = long_len as u8;
+    }
+
+    /// Copy live owner name lengths/bytes from a NodeInfo advert (capped to flash limits).
+    pub fn apply_owner_from_advert(&mut self, advert: &crate::nodeinfo::NodeInfoAdvert) {
+        let short_len = (advert.short_name_len as usize)
+            .min(OWNER_SHORT_NAME_MAX)
+            .min(advert.short_name.len());
+        self.short_name = [0; OWNER_SHORT_NAME_MAX];
+        self.short_name[..short_len].copy_from_slice(&advert.short_name[..short_len]);
+        self.short_name_len = short_len as u8;
+        let long_len = (advert.long_name_len as usize)
+            .min(OWNER_LONG_NAME_MAX)
+            .min(advert.long_name.len());
+        self.long_name = [0; OWNER_LONG_NAME_MAX];
+        self.long_name[..long_len].copy_from_slice(&advert.long_name[..long_len]);
+        self.long_name_len = long_len as u8;
     }
 
     pub fn broadcasts_fixed_position(&self) -> bool {

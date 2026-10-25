@@ -479,7 +479,10 @@ impl Router {
         self.graph.set_my_node(cfg.node_num);
         self.rate_limit.set_node_num(cfg.node_num);
         self.admin.import_node_config(cfg);
-        self.nodeinfo_identity = NodeInfoIdentity::for_node(cfg.node_num, cfg.public_key);
+        self.nodeinfo_identity = NodeInfoIdentity::from_node_config(cfg);
+        // Keep AdminState live names aligned with the advert (synthesized or stored).
+        self.admin
+            .apply_owner_from_advert(&self.nodeinfo_identity.advert);
         self.set_device_role(u32::from(cfg.device_role));
         self.set_modem_preset(
             "",
