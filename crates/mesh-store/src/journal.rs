@@ -1,7 +1,9 @@
+use crate::layout::STORE_RECORD_LEN_V4;
 use crate::{decode, encode, NodeConfig, StoreError, STORE_RECORD_LEN};
 
 const MAGIC: u32 = 0x4d52_4a31;
 const RECORD_LEN: usize = STORE_RECORD_LEN + 12;
+const RECORD_LEN_V4: usize = STORE_RECORD_LEN_V4 + 12;
 
 pub trait ConfigFlash {
     fn read(&mut self, address: u32, out: &mut [u8]) -> Result<(), StoreError>;
@@ -30,15 +32,30 @@ impl<F: ConfigFlash> ConfigJournal<F> {
         let magic = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         if magic != MAGIC {
             // Legacy installations must keep their only valid page until a journal replacement has been
-            // verified.
-            return Ok(decode(&bytes[..STORE_RECORD_LEN]).ok().map(|cfg| (0, cfg)));
+            // verified. Accept both v5 and pre-v5 raw record sizes.
+            if let Ok(cfg) = decode(&bytes[..STORE_RECORD_LEN]) {
+                return Ok(Some((0, cfg)));
+            }
+            return Ok(decode(&bytes[..STORE_RECORD_LEN_V4])
+                .ok()
+                .map(|cfg| (0, cfg)));
         }
         let checksum = u32::from_le_bytes(bytes[RECORD_LEN - 4..].try_into().unwrap());
-        if checksum != crate::layout::crc32(&bytes[..RECORD_LEN - 4]) {
+        if checksum == crate::layout::crc32(&bytes[..RECORD_LEN - 4]) {
+            return Ok(decode(&bytes[8..8 + STORE_RECORD_LEN])
+                .ok()
+                .map(|cfg| {
+                    let generation = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    (generation, cfg)
+                }));
+        }
+        let checksum_v4 =
+            u32::from_le_bytes(bytes[RECORD_LEN_V4 - 4..RECORD_LEN_V4].try_into().unwrap());
+        if checksum_v4 != crate::layout::crc32(&bytes[..RECORD_LEN_V4 - 4]) {
             return Ok(None);
         }
         let generation = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        Ok(decode(&bytes[8..8 + STORE_RECORD_LEN])
+        Ok(decode(&bytes[8..8 + STORE_RECORD_LEN_V4])
             .ok()
             .map(|cfg| (generation, cfg)))
     }
@@ -147,6 +164,43 @@ mod tests {
         journal.flash.fail_after = Some(20);
         assert!(journal.save(&config).is_err());
         assert_eq!(journal.load().unwrap(), Some(config));
+    }
+    #[test]
+    fn legacy_v4_journal_record_loads_and_rewrites_as_v5() {
+        let config = NodeConfig::first_boot(3, [3; 32], [4; 32]);
+        let mut flash = MemoryFlash {
+            bytes: [0xff; 8192],
+            fail_after: None,
+        };
+        let mut payload = [0u8; STORE_RECORD_LEN];
+        encode(&config, &mut payload).unwrap();
+        payload[4..8].copy_from_slice(&crate::layout::STORE_VERSION_V4.to_le_bytes());
+        payload[STORE_RECORD_LEN_V4 - 4..].fill(0);
+        let payload_crc = crate::layout::crc32(&payload[..crate::layout::STORE_CRC_OFFSET_V4]);
+        payload[crate::layout::STORE_CRC_OFFSET_V4..STORE_RECORD_LEN_V4]
+            .copy_from_slice(&payload_crc.to_le_bytes());
+
+        let mut legacy = [0u8; RECORD_LEN_V4];
+        legacy[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        legacy[4..8].copy_from_slice(&1u32.to_le_bytes());
+        legacy[8..8 + STORE_RECORD_LEN_V4].copy_from_slice(&payload[..STORE_RECORD_LEN_V4]);
+        let checksum = crate::layout::crc32(&legacy[..RECORD_LEN_V4 - 4]);
+        legacy[RECORD_LEN_V4 - 4..].copy_from_slice(&checksum.to_le_bytes());
+        flash.bytes[..RECORD_LEN_V4].copy_from_slice(&legacy);
+
+        let mut journal = ConfigJournal::new(flash, 0, 4096);
+        let loaded = journal.load().unwrap().expect("v4 journal loads");
+        assert_eq!(loaded.short_name_len, 0);
+        assert_eq!(loaded.node_num, 3);
+        journal.save(&loaded).unwrap();
+        let again = journal.load().unwrap().unwrap();
+        assert_eq!(again.node_num, 3);
+        let mut check = [0u8; STORE_RECORD_LEN];
+        encode(&again, &mut check).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(check[4..8].try_into().unwrap()),
+            crate::layout::STORE_VERSION
+        );
     }
     #[test]
     fn generation_order_survives_wrap() {

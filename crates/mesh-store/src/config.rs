@@ -9,6 +9,8 @@ pub const DEFAULT_PSK: [u8; 16] = [
 ];
 
 pub const ADMIN_KEY_SLOTS: usize = 3;
+pub const OWNER_SHORT_NAME_MAX: usize = 4;
+pub const OWNER_LONG_NAME_MAX: usize = 39;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LoRaConfig {
@@ -93,6 +95,10 @@ pub struct NodeConfig {
     pub latitude_i: i32,
     pub longitude_i: i32,
     pub has_fixed_coords: bool,
+    pub short_name: [u8; OWNER_SHORT_NAME_MAX],
+    pub short_name_len: u8,
+    pub long_name: [u8; OWNER_LONG_NAME_MAX],
+    pub long_name_len: u8,
 }
 
 impl NodeConfig {
@@ -111,6 +117,10 @@ impl NodeConfig {
             latitude_i: 0,
             longitude_i: 0,
             has_fixed_coords: false,
+            short_name: [0; OWNER_SHORT_NAME_MAX],
+            short_name_len: 0,
+            long_name: [0; OWNER_LONG_NAME_MAX],
+            long_name_len: 0,
         }
     }
 
