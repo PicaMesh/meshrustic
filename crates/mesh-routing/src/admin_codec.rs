@@ -188,6 +188,7 @@ pub enum AdminPayload {
     GetChannelResponse(WireChannel),
     GetOwnerRequest,
     GetOwnerResponse(NodeInfoIdentity),
+    SetOwner(NodeInfoIdentity),
     GetConfigRequest(u32),
     GetConfigResponse(ConfigPayload),
     GetModuleConfigRequest(u32),
@@ -821,6 +822,10 @@ pub fn encode_admin_message(msg: &AdminMessage) -> heapless::Vec<u8, 240> {
             let user = encode_owner_user(0, identity);
             push_bytes_field(&mut out, 4, &user);
         }
+        AdminPayload::SetOwner(identity) => {
+            let user = encode_owner_user(0, identity);
+            push_bytes_field(&mut out, 32, &user);
+        }
         AdminPayload::GetConfigRequest(config_type) => {
             push_varint_field(&mut out, 5, *config_type);
         }
@@ -961,6 +966,17 @@ pub fn decode_admin_message(payload: &[u8]) -> Option<AdminMessage> {
                 msg.payload = AdminPayload::GetDeviceMetadataResponse(decode_device_metadata(
                     &payload[ni..end],
                 )?);
+                i = end;
+            }
+            (32, 2) => {
+                let (len, ni) = read_varint(payload, i)?;
+                let end = ni.checked_add(len as usize)?;
+                if end > payload.len() {
+                    return None;
+                }
+                if let Some(identity) = crate::nodeinfo::decode_user(&payload[ni..end]) {
+                    msg.payload = AdminPayload::SetOwner(identity);
+                }
                 i = end;
             }
             (34, 2) => {
@@ -1236,6 +1252,26 @@ mod tests {
                 assert_eq!(got.admin_keys[1], sec.admin_keys[1]);
                 assert!(got.is_managed);
                 assert!(!got.admin_channel_enabled);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn admin_set_owner_round_trip() {
+        let identity = NodeInfoIdentity::for_node(0x1234_5678, [0xAB; 32]);
+        let msg = AdminMessage {
+            payload: AdminPayload::SetOwner(identity),
+            has_session_passkey: true,
+            session_passkey: [9; 8],
+        };
+        let encoded = encode_admin_message(&msg);
+        let decoded = decode_admin_message(&encoded).unwrap();
+        assert_eq!(decoded.session_passkey, [9; 8]);
+        assert!(decoded.has_session_passkey);
+        match decoded.payload {
+            AdminPayload::SetOwner(got) => {
+                assert_eq!(got, identity);
             }
             other => panic!("unexpected: {:?}", other),
         }
