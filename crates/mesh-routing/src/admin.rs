@@ -215,6 +215,11 @@ impl AdminState {
         self.builtin_override = Some(keys);
     }
 
+    #[cfg(any(test, feature = "std"))]
+    pub fn issue_session_for_test(&mut self, now_ms: u32) -> [u8; SESSION_PASSKEY_LEN] {
+        self.issue_session(now_ms)
+    }
+
     pub fn is_authorized(&self, remote_pk: &[u8; 32]) -> bool {
         self.effective_builtin_admin_keys()
             .iter()

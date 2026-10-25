@@ -1463,6 +1463,24 @@ impl Router {
             self.set_device_role(role);
             self.last_nodeinfo_ms = None;
         }
+        if let Some(owner) = outcome.apply_owner {
+            let advert = &mut self.nodeinfo_identity.advert;
+            let short_len = (owner.short_name_len as usize)
+                .min(owner.short_name.len())
+                .min(advert.short_name.len());
+            advert.short_name = [0; crate::nodeinfo::NODEINFO_SHORT_NAME_MAX];
+            advert.short_name[..short_len].copy_from_slice(&owner.short_name[..short_len]);
+            advert.short_name_len = short_len as u8;
+            let long_len = (owner.long_name_len as usize)
+                .min(owner.long_name.len())
+                .min(advert.long_name.len());
+            advert.long_name = [0; crate::nodeinfo::NODEINFO_LONG_NAME_MAX];
+            advert.long_name[..long_len].copy_from_slice(&owner.long_name[..long_len]);
+            advert.long_name_len = long_len as u8;
+            advert.is_licensed = owner.is_licensed;
+            self.admin.config_dirty = true;
+            self.last_nodeinfo_ms = None;
+        }
         if !self.admin.broadcasts_fixed_position() {
             self.pending_position.active = false;
         } else if outcome.broadcast_position {
@@ -4943,6 +4961,74 @@ mod tests {
 
         assert_eq!(router.hop_limit(), 0);
         assert_eq!(router.radio_config().hop_limit, 0);
+    }
+
+    #[test]
+    fn set_owner_updates_identity_and_clears_nodeinfo_timer() {
+        use crate::admin_codec::{encode_admin_message, AdminMessage, AdminPayload};
+        use crate::nodeinfo::encode_user;
+        use mesh_store::BUILTIN_ADMIN_PUBLIC_KEYS;
+
+        let mut router = Router::new(0x11);
+        let mut config = mesh_store::NodeConfig::first_boot(0x11, [0x42; 32], [0x55; 32]);
+        config.short_name[..2].copy_from_slice(b"AB");
+        config.short_name_len = 2;
+        config.long_name[..4].copy_from_slice(b"Home");
+        config.long_name_len = 4;
+        router.load_node_config(&config);
+        router.last_nodeinfo_ms = Some(1_000);
+        router.set_builtin_admin_public_keys_for_test(BUILTIN_ADMIN_PUBLIC_KEYS);
+
+        let passkey = router.admin.issue_session_for_test(2_000);
+        let mut owner = NodeInfoIdentity::for_node(0x11, [0x55; 32]);
+        owner.advert.short_name = [0; crate::nodeinfo::NODEINFO_SHORT_NAME_MAX];
+        owner.advert.short_name[..2].copy_from_slice(b"ZZ");
+        owner.advert.short_name_len = 2;
+        owner.advert.long_name = [0; crate::nodeinfo::NODEINFO_LONG_NAME_MAX];
+        owner.advert.long_name[..5].copy_from_slice(b"Cabin");
+        owner.advert.long_name_len = 5;
+        let msg = AdminMessage {
+            payload: AdminPayload::SetOwner(owner),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
+        router.process_admin_as_pki_peer_for_test(
+            &BUILTIN_ADMIN_PUBLIC_KEYS[0],
+            0x22,
+            9,
+            &encode_admin_message(&msg),
+            2_100,
+        );
+
+        assert_eq!(router.last_nodeinfo_ms, None);
+        assert!(router.admin_config_dirty());
+        assert_eq!(
+            &router.nodeinfo_identity.advert.short_name
+                [..router.nodeinfo_identity.advert.short_name_len as usize],
+            b"ZZ"
+        );
+        assert_eq!(
+            &router.nodeinfo_identity.advert.long_name
+                [..router.nodeinfo_identity.advert.long_name_len as usize],
+            b"Cabin"
+        );
+        let user = encode_user(0x11, &router.nodeinfo_identity);
+        let decoded = crate::nodeinfo::decode_user(&user).unwrap();
+        assert_eq!(
+            &decoded.advert.short_name[..decoded.advert.short_name_len as usize],
+            b"ZZ"
+        );
+        assert_eq!(
+            &decoded.advert.long_name[..decoded.advert.long_name_len as usize],
+            b"Cabin"
+        );
+
+        let mut exported = mesh_store::NodeConfig::first_boot(0x11, [0; 32], [0; 32]);
+        router.write_admin_into_config(&mut exported);
+        assert_eq!(exported.short_name_len, 2);
+        assert_eq!(&exported.short_name[..2], b"ZZ");
+        assert_eq!(exported.long_name_len, 5);
+        assert_eq!(&exported.long_name[..5], b"Cabin");
     }
 
     #[test]
