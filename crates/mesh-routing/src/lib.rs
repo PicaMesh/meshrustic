@@ -38,9 +38,9 @@ pub mod unicast_relay;
 
 pub use admin::{
     encode_admin_response, encode_owner_response, handle_admin, AdminOutcome, AdminState,
-    ADMIN_PRESET_REBOOT_SECS, ADMIN_SESSION_TTL_MS, ROUTING_ERROR_ADMIN_BAD_SESSION_KEY,
-    ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED, ROUTING_ERROR_BAD_REQUEST,
-    ROUTING_ERROR_PKI_FAILED, ROUTING_ERROR_PKI_UNKNOWN_PUBKEY,
+    OwnerNames, ADMIN_PRESET_REBOOT_SECS, ADMIN_SESSION_TTL_MS,
+    ROUTING_ERROR_ADMIN_BAD_SESSION_KEY, ROUTING_ERROR_ADMIN_PUBLIC_KEY_UNAUTHORIZED,
+    ROUTING_ERROR_BAD_REQUEST, ROUTING_ERROR_PKI_FAILED, ROUTING_ERROR_PKI_UNKNOWN_PUBKEY,
 };
 pub use admin_codec::{
     decode_admin_message, decode_channel, decode_config, decode_module_config,

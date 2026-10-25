@@ -43,6 +43,7 @@ pub struct AdminState {
     pub buffered_device_update_interval_secs: Option<u32>,
     pub buffered_device_role: Option<u32>,
     pub buffered_position: Option<WirePositionConfig>,
+    pub buffered_owner: Option<OwnerNames>,
     pub admin_public_keys: [[u8; 32]; ADMIN_KEY_SLOTS],
     pub private_key: [u8; 32],
     pub public_key: [u8; 32],
@@ -87,6 +88,7 @@ impl AdminState {
             buffered_device_update_interval_secs: None,
             buffered_device_role: None,
             buffered_position: None,
+            buffered_owner: None,
             admin_public_keys: [EMPTY_ADMIN_KEY; ADMIN_KEY_SLOTS],
             private_key: [0; 32],
             public_key: [0; 32],
@@ -264,6 +266,28 @@ impl AdminState {
     }
 }
 
+/// Owner name bytes ready to apply to AdminState / NodeInfoIdentity (flash limits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerNames {
+    pub short_name: [u8; OWNER_SHORT_NAME_MAX],
+    pub short_name_len: u8,
+    pub long_name: [u8; OWNER_LONG_NAME_MAX],
+    pub long_name_len: u8,
+    pub is_licensed: bool,
+}
+
+impl Default for OwnerNames {
+    fn default() -> Self {
+        Self {
+            short_name: [0; OWNER_SHORT_NAME_MAX],
+            short_name_len: 0,
+            long_name: [0; OWNER_LONG_NAME_MAX],
+            long_name_len: 0,
+            is_licensed: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct AdminOutcome {
     pub response: Option<AdminMessage>,
@@ -271,6 +295,7 @@ pub struct AdminOutcome {
     pub routing_ok: bool,
     pub apply_modem_preset: Option<u8>,
     pub apply_device_role: Option<u32>,
+    pub apply_owner: Option<OwnerNames>,
     pub config_dirty: bool,
     pub reboot_seconds: Option<i32>,
     pub broadcast_position: bool,
@@ -396,6 +421,7 @@ pub fn handle_admin(
             state.buffered_device_update_interval_secs = None;
             state.buffered_device_role = None;
             state.buffered_position = None;
+            state.buffered_owner = None;
             outcome.routing_ok = true;
         }
         AdminPayload::CommitEditSettings => {
@@ -441,6 +467,11 @@ pub fn handle_admin(
             }
             if let Some(pos) = candidate.buffered_position.take() {
                 apply_position_config(&mut candidate, &pos);
+                outcome.config_dirty = true;
+            }
+            if let Some(owner) = candidate.buffered_owner.take() {
+                apply_owner_names(&mut candidate, &owner);
+                outcome.apply_owner = Some(owner);
                 outcome.config_dirty = true;
             }
             candidate.editing = false;
@@ -586,6 +617,26 @@ pub fn handle_admin(
             state.config_dirty = true;
             outcome.routing_ok = true;
         }
+        AdminPayload::SetOwner(owner_identity) => {
+            if !state.session_ok(&msg, now_ms) {
+                outcome.routing_error = Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY);
+                return outcome;
+            }
+            let current = owner_names_from_state(state);
+            let Ok(merged) = merge_owner_update(&owner_identity, &current) else {
+                outcome.routing_error = Some(ROUTING_ERROR_BAD_REQUEST);
+                return outcome;
+            };
+            if state.editing {
+                state.buffered_owner = Some(merged);
+            } else {
+                apply_owner_names(state, &merged);
+                outcome.apply_owner = Some(merged);
+                outcome.config_dirty = true;
+                state.config_dirty = true;
+            }
+            outcome.routing_ok = true;
+        }
         AdminPayload::RebootSeconds(secs) => {
             if !state.session_ok(&msg, now_ms) {
                 outcome.routing_error = Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY);
@@ -599,6 +650,60 @@ pub fn handle_admin(
     }
 
     outcome
+}
+
+fn name_is_whitespace_only(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name
+            .iter()
+            .all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+}
+
+fn owner_names_from_state(state: &AdminState) -> OwnerNames {
+    OwnerNames {
+        short_name: state.short_name,
+        short_name_len: state.short_name_len,
+        long_name: state.long_name,
+        long_name_len: state.long_name_len,
+        is_licensed: false,
+    }
+}
+
+fn merge_owner_update(
+    identity: &NodeInfoIdentity,
+    current: &OwnerNames,
+) -> Result<OwnerNames, ()> {
+    let mut out = *current;
+    let advert = &identity.advert;
+    let short_raw = &advert.short_name[..advert.short_name_len as usize];
+    if !short_raw.is_empty() {
+        if name_is_whitespace_only(short_raw) {
+            return Err(());
+        }
+        let len = short_raw.len().min(OWNER_SHORT_NAME_MAX);
+        out.short_name = [0; OWNER_SHORT_NAME_MAX];
+        out.short_name[..len].copy_from_slice(&short_raw[..len]);
+        out.short_name_len = len as u8;
+    }
+    let long_raw = &advert.long_name[..advert.long_name_len as usize];
+    if !long_raw.is_empty() {
+        if name_is_whitespace_only(long_raw) {
+            return Err(());
+        }
+        let len = long_raw.len().min(OWNER_LONG_NAME_MAX);
+        out.long_name = [0; OWNER_LONG_NAME_MAX];
+        out.long_name[..len].copy_from_slice(&long_raw[..len]);
+        out.long_name_len = len as u8;
+    }
+    out.is_licensed = advert.is_licensed;
+    Ok(out)
+}
+
+fn apply_owner_names(state: &mut AdminState, names: &OwnerNames) {
+    state.short_name = names.short_name;
+    state.short_name_len = names.short_name_len;
+    state.long_name = names.long_name;
+    state.long_name_len = names.long_name_len;
 }
 
 fn channel_for_request(index_plus_one: u32, channel_psk: &[u8], channel_hash: u8) -> WireChannel {
@@ -1504,5 +1609,190 @@ mod tests {
         };
         assert!(apply_lora_to_state(&mut state, &wire).is_ok());
         assert_eq!(state.tx_power_dbm, MAX_TX_POWER_DBM);
+    }
+
+    fn owner_identity(short: &[u8], long: &[u8]) -> NodeInfoIdentity {
+        let mut id = NodeInfoIdentity::for_node(0x11, [0x55; 32]);
+        id.advert.short_name = [0; crate::nodeinfo::NODEINFO_SHORT_NAME_MAX];
+        let sl = short.len().min(crate::nodeinfo::NODEINFO_SHORT_NAME_MAX);
+        id.advert.short_name[..sl].copy_from_slice(&short[..sl]);
+        id.advert.short_name_len = sl as u8;
+        id.advert.long_name = [0; crate::nodeinfo::NODEINFO_LONG_NAME_MAX];
+        let ll = long.len().min(crate::nodeinfo::NODEINFO_LONG_NAME_MAX);
+        id.advert.long_name[..ll].copy_from_slice(&long[..ll]);
+        id.advert.long_name_len = ll as u8;
+        id
+    }
+
+    #[test]
+    fn set_owner_requires_session() {
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            short_name: *b"AB  ",
+            short_name_len: 2,
+            ..Default::default()
+        };
+        let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
+        let msg = AdminMessage {
+            payload: AdminPayload::SetOwner(owner_identity(b"XY", b"Cabin")),
+            ..Default::default()
+        };
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&msg),
+            1_000,
+        );
+        assert_eq!(out.routing_error, Some(ROUTING_ERROR_ADMIN_BAD_SESSION_KEY));
+        assert!(out.apply_owner.is_none());
+        assert_eq!(state.short_name_len, 2);
+    }
+
+    #[test]
+    fn set_owner_rejects_whitespace_only_names() {
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            ..Default::default()
+        };
+        let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
+        let passkey = state.issue_session(2_000);
+        let msg = AdminMessage {
+            payload: AdminPayload::SetOwner(owner_identity(b"  ", b"Cabin")),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&msg),
+            2_100,
+        );
+        assert_eq!(out.routing_error, Some(ROUTING_ERROR_BAD_REQUEST));
+        assert!(out.apply_owner.is_none());
+    }
+
+    #[test]
+    fn set_owner_partial_update_and_edit_buffer() {
+        let mut state = AdminState {
+            private_key: [0x42; 32],
+            ..Default::default()
+        };
+        state.short_name[..2].copy_from_slice(b"AB");
+        state.short_name_len = 2;
+        state.long_name[..4].copy_from_slice(b"Home");
+        state.long_name_len = 4;
+        let remote = BUILTIN_ADMIN_PUBLIC_KEYS[0];
+        let passkey = state.issue_session(3_000);
+
+        let mut empty_short = owner_identity(b"", b"Cabin");
+        empty_short.advert.short_name_len = 0;
+        let msg = AdminMessage {
+            payload: AdminPayload::SetOwner(empty_short),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&msg),
+            3_100,
+        );
+        assert!(out.routing_ok);
+        assert!(out.config_dirty);
+        assert_eq!(state.short_name_len, 2);
+        assert_eq!(&state.short_name[..2], b"AB");
+        assert_eq!(state.long_name_len, 5);
+        assert_eq!(&state.long_name[..5], b"Cabin");
+        assert!(out.apply_owner.is_some());
+        assert!(out.reboot_seconds.is_none());
+
+        let passkey = state.issue_session(3_200);
+        let begin = AdminMessage {
+            payload: AdminPayload::BeginEditSettings,
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
+        assert!(handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&begin),
+            3_300,
+        )
+        .routing_ok);
+        assert!(state.editing);
+        assert!(state.buffered_owner.is_none());
+
+        let passkey = state.issue_session(3_400);
+        let buffered = AdminMessage {
+            payload: AdminPayload::SetOwner(owner_identity(b"ZZ", b"Buffered")),
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&buffered),
+            3_500,
+        );
+        assert!(out.routing_ok);
+        assert!(out.apply_owner.is_none());
+        assert_eq!(&state.short_name[..2], b"AB");
+        assert!(state.buffered_owner.is_some());
+
+        let passkey = state.issue_session(3_600);
+        let commit = AdminMessage {
+            payload: AdminPayload::CommitEditSettings,
+            has_session_passkey: true,
+            session_passkey: passkey,
+        };
+        let out = handle_admin(
+            &mut state,
+            &remote,
+            &identity(),
+            0x11,
+            &DEFAULT_PSK,
+            0x77,
+            DEVICE_ROLE_CLIENT,
+            &encode_admin_message(&commit),
+            3_700,
+        );
+        assert!(out.routing_ok);
+        assert_eq!(&state.short_name[..2], b"ZZ");
+        assert_eq!(&state.long_name[..8], b"Buffered");
+        assert_eq!(
+            out.apply_owner.map(|o| (
+                o.short_name_len,
+                o.long_name_len,
+                o.short_name[0],
+                o.long_name[0]
+            )),
+            Some((2, 8, b'Z', b'B'))
+        );
+        assert!(out.reboot_seconds.is_none());
     }
 }
